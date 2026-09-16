@@ -1,0 +1,17696 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""THE _con SET -- SPP'S OWN CONTINGENCIES, FROM THE DISIS RESULTS WORKBOOK.
+
+   Your _f panel and engines, setting for setting, with ONE change: the fault
+   list is not built from the topology, it is READ from
+
+       C:\\KV\\SPP_FAULTS_<project>.csv
+
+   which z4_disis_con.py writes from the stability tab of the DISIS results
+   workbook, filtered by branch distance from each project's POI. Run that once
+   before the first launch, and again whenever the workbook or the distance
+   settings change:
+
+       C:\\Python34\\python.exe z4_disis_con.py
+
+   Everything else -- the criteria, the plots, the scoring, the comparison, the
+   .dyr sweep, the core counts -- is exactly what your _f set carries, so a _con
+   study and an _f study differ only in WHICH EVENTS WERE RUN.
+"""
+
+"""
+================================================================================
+ SPP STUDY COMPARISON  --  base case  vs  case with the projects added
+================================================================================
+
+ THE QUESTION THIS ANSWERS
+ -------------------------
+ A fault fails the SPP criteria in the study that includes the four BESS
+ projects. Did adding the projects CAUSE that, or was the base system already
+ failing it? Those two answers lead to completely different conversations with
+ SPP, and a single study cannot tell them apart -- it has nothing to compare
+ against.
+
+ So: run the SAME fault list against BOTH cases, and put the two results side by
+ side. Every fault lands in exactly one of these buckets:
+
+     OK            passed in both               nothing to discuss
+     PRE-EXISTING  failed in both               the base system already fails it
+     NEW           passed base, fails with      >>> the projects introduced it
+     RESOLVED      failed base, passes with     the projects improved it
+     NOT COMPARABLE ran on one side only        cannot be judged
+
+ The same classification is applied at THREE levels, because a single verdict
+ hides too much:
+
+   1. FAULT      -- the headline: F27 PASS -> FAIL.
+   2. CRITERION  -- a fault can fail on BOTH sides for DIFFERENT reasons. F09
+                    failing voltage recovery in the base case and rotor-angle
+                    damping with the projects is "PRE-EXISTING" at fault level
+                    and a brand new problem in fact. Only the criterion level
+                    shows it.
+   3. ELEMENT    -- which BUSES and MACHINES. A fault failing overshoot on both
+                    sides may involve 3 buses in the base case and 315 with the
+                    projects. The element level names the ones that are new.
+
+ It also reports faults that PASS on both sides but moved materially closer to a
+ limit (WORSENED_WITHIN_LIMITS), because "still compliant, with no margin left"
+ is a finding even though it is not a failure.
+
+ WHAT IT READS
+ -------------
+ The reports each study already writes. It never opens a .out and never needs
+ PSS/E, so it runs in seconds on any Python:
+
+     <case>\\results\\<project>_<mode>\\SPP_CRITERIA_REPORT*.txt   (or .csv)
+                                       SPP_VIOLATIONS*.txt        (or .csv)
+                                       SPP_COMPLIANCE_TABLE*.csv
+                                       RUN_SUMMARY*.csv
+
+ CSV is preferred where it exists (exact fields, no parsing risk) and the .txt is
+ parsed when WRITE_CSV was off. Which source was used is stated in the report,
+ because a comparison whose inputs you cannot identify is not evidence.
+
+ WHAT IT WRITES  (into COMPARE_DIR)
+ ----------------------------------
+     COMPARISON_SUMMARY.txt          every project, the headline counts, and the
+                                     answer to "did the projects cause this"
+     COMPARISON_<project>_<mode>.txt fault by fault, criterion by criterion
+     COMPARISON_ELEMENTS_<project>_<mode>.txt   the buses/machines that are NEW
+     ... plus .csv companions of each (WRITE_CSV)
+
+ IT CAN ALSO RUN THE STUDIES
+ ---------------------------
+ With RUN_STUDIES = True it launches both launchers first -- each in its own
+ folder, with its own case and .dyr -- and compares when they finish. They are
+ independent PSS/E sessions, so RUN_IN_PARALLEL decides whether to spend the
+ licences and RAM on both at once or take them in turn.
+
+ Python 2.7 / 3.4+ (whatever your PSS/E install dictates). No imports beyond the
+ standard library -- this script never touches psspy.
+================================================================================
+"""
+
+import os, sys, re, csv, glob, time, subprocess, threading, io, json, socket
+# ast: to read BESS_PROJECTS and FEEDER_MAX_MW out of the study script for the
+# preflight, WITHOUT importing it -- importing it needs PSS/E and would run its
+# module-level checks, which is the very thing being checked for.
+import ast
+
+# ---- HOW LONG EACH PHASE TOOK ----------------------------------------------
+# Wall-clock seconds spent inside each phase of the run, printed as one table
+# when the whole process ends. Filled by the _timed() decorator on the phase
+# entry points: simulation + scoring (run_study), plotting
+# (plot_missing_everywhere), the comparison itself, and the merge-only pass.
+# A phase that ran more than once (one run_study per case) accumulates.
+_PHASE_T = {}
+_PHASE_N = {}
+_PHASE_ORDER = ["merge-only report rebuild", "simulation + scoring",
+                "plotting", "comparison"]
+# WALL CLOCK, NOT CPU-SECONDS. The two cases run in parallel threads, so two
+# run_study() calls overlap; adding their durations printed "17m 48s" for a
+# run whose total was 8m 54s. A phase is timed from the moment its FIRST call
+# starts to the moment its LAST concurrent call ends.
+_PHASE_ACTIVE = {}
+_PHASE_T0 = {}
+_PHASE_LOCK = threading.Lock()
+
+
+def _timed(phase):
+    """Decorator: credit the wrapped call's wall-clock time to _PHASE_T[phase],
+       overlapping calls counted once."""
+    def _wrap(fn):
+        def _inner(*a, **kw):
+            with _PHASE_LOCK:
+                if not _PHASE_ACTIVE.get(phase):
+                    _PHASE_T0[phase] = time.time()
+                _PHASE_ACTIVE[phase] = _PHASE_ACTIVE.get(phase, 0) + 1
+                _PHASE_N[phase] = _PHASE_N.get(phase, 0) + 1
+            try:
+                return fn(*a, **kw)
+            finally:
+                with _PHASE_LOCK:
+                    _PHASE_ACTIVE[phase] -= 1
+                    if _PHASE_ACTIVE[phase] == 0:
+                        _PHASE_T[phase] = (_PHASE_T.get(phase, 0.0)
+                                           + (time.time() - _PHASE_T0[phase]))
+        _inner.__name__ = getattr(fn, "__name__", "fn")
+        _inner.__doc__ = getattr(fn, "__doc__", None)
+        return _inner
+    return _wrap
+
+
+def _hms(sec):
+    """'1h 12m 05s' / '4m 31s' / '12 s' for a duration in seconds."""
+    try:
+        s = int(round(float(sec)))
+    except (TypeError, ValueError):
+        return "?"
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "%dh %02dm %02ds" % (h, m, s)
+    if m:
+        return "%dm %02ds" % (m, s)
+    return "%d s" % s
+
+
+def _print_phase_times(total):
+    """The table the run ends with: time per phase and in all.
+
+       'Simulation + scoring' is the time this launcher spent inside
+       run_study(), which starts the PSS/E workers AND the report shards and
+       waits for both -- per-scenario simulation times are in each study's
+       04_RUN_SUMMARY. Everything not inside a phase (preflight, fault-list
+       build, folder checks) is the 'other' line, so the lines add up to the
+       total."""
+    print("")
+    print("=" * 72)
+    print(" TIME SPENT -- wall clock, this launcher")
+    print("=" * 72)
+    _acc = 0.0
+    for _p in _PHASE_ORDER + sorted(k for k in _PHASE_T if k not in _PHASE_ORDER):
+        if _p not in _PHASE_T:
+            continue
+        print(" %-30s %14s   (%d call%s)"
+              % (_p, _hms(_PHASE_T[_p]), _PHASE_N.get(_p, 0),
+                 "" if _PHASE_N.get(_p, 0) == 1 else "s"))
+        _acc += _PHASE_T[_p]
+    _other = max(0.0, float(total) - _acc)
+    print(" %-30s %14s" % ("other (preflight, setup)", _hms(_other)))
+    print(" " + "-" * 46)
+    print(" %-30s %14s" % ("TOTAL", _hms(total)))
+    print(" started %s, finished %s"
+          % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - float(total))),
+             time.strftime("%Y-%m-%d %H:%M:%S")))
+    print("=" * 72)
+
+# ==========================================================================
+#                       QUICK SETTINGS -- EDIT HERE
+# ==========================================================================
+# Every setting you normally change, in one screenful, in the order you
+# normally think about them. The explanation of each one is still below,
+# under the same heading -- this is the panel, that is the manual.
+#
+# None almost always means "leave the study scripts' own value alone".
+# A value here is sent to BOTH cases, which is the point: a setting
+# applied to one case only is not a comparison.
+# ==========================================================================
+# ---- THE SETTINGS FOR THIS STUDY, AND WHERE THEY ARE ------------------------
+# An index, not a second copy: everything named here is DEFINED once, below.
+# A duplicated setting is a setting that drifts, so there is nothing to keep in
+# step -- follow the name down the panel to change it.
+#
+#   WHICH DECK
+#     BASE_SAV / PROJ_SAV         one deck per case, each in its OWN folder --
+#                                 no shared files. Both are the BASE case; the
+#                                 project case builds its plant into its copy.
+#     BASE_FOLDER / PROJ_FOLDER   the two case folders (separate results\)
+#     SHARED_DECK / _SAV / _DYR   set it to point BOTH cases at ONE file again;
+#                                 while it is set, BASE_SAV / PROJ_SAV are ignored
+#
+#   WHICH PROJECTS, AND HOW BIG
+#     PROJECTS                    all four, each a complete study, one at a time
+#     PROJECT_MW                  which rated size, where a project lists two
+#     MODES                       the fault set: spp | con | table | custom
+#
+#   HOW MUCH EACH PLANT PUTS ON THE SYSTEM
+#     POI_P_TARGET_MW             <-- THE NUMBER YOU ENTER, one per project:
+#                                 total P leaving the plant at its POI, new BESS
+#                                 and existing generation together
+#     POI_P_PROJECT_AT            where the project machines sit ("rated")
+#     POI_P_SHARE                 how the remainder splits between the existing
+#                                 machines ("capacity")
+#     POI_HOLD_AREA_MW            put the area back to its pre-project total
+#     POI_P_LEVELS                [] = one study; a list = one study per level
+#
+#   WHAT THIS RUN DOES
+#     PIPELINE                    all = simulate then compare | missing | compare
+#     RUN_CASES                   both | base | proj
+#     FRESH_START / SKIP_DONE     start over, or resume
+#
+#   FURTHER DOWN, AND RARELY CHANGED
+#     COLLECTOR_*                 collector impedances applied per project
+#     NEW_PLANT / NEW_PLANT_*     build a facility rather than adopt one
+#     DYR_* / DYR_SWEEP_*         dynamic-model edits and sweeps
+#     SURPLUS_SCENARIOS           BP-7250 7.6 SGF/EGF pair
+#     PLOT_* / REPORT_*           plotting and reporting behaviour
+#
+# ---- WHERE, WHAT, AND HOW MUCH ---------------------------------------------------
+# ============================================================================
+# CONTROL PANEL -- EVERY SETTING FOR THIS STUDY, ONE LINE EACH
+#
+# Change values here and nowhere else. The reasoning behind each one is in
+# NOTES ON THE SETTINGS at the BOTTOM of this file, under the same headings.
+# ============================================================================
+
+# ============================================================================
+# THE STUDY YOU ARE RUNNING -- ALL THE KNOBS FOR ONE Kqv (.dyr) SWEEP, HERE
+# ============================================================================
+# Everything needed to run "base vs the project with several .dyr changes, does
+# the overvoltage come down" is on this one screen. Set these; the rest of the
+# panel below is machine/output defaults you rarely touch. Each name is defined
+# ONCE -- here -- and the old scattered spots now just point back to this block.
+#
+#   1. PROJECTS / MODES : which case, which fault set.
+#   2. PIPELINE         : "all" to SIMULATE the sweep (must NOT be "compare",
+#                         which only re-reads folders already on disk).
+#   3. DYR_SWEEP        : the model, the constant, and the values to try.
+#   4. the rest         : leave as-is unless noted.
+#
+# Result lands in comparison\<project>\ :
+#   DYR_SWEEP_OVERVOLTAGE_<proj>_<mode>.xlsx  <- base | project | value1 | value2
+#                                                peak pu per bus, MITIGATED/... verdict
+#   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
+#   dyr_<value>\                              <- a full comparison per value
+
+PROJECTS   = ["SantaFe","IronStar","EmpirePrairie","EastFork"]                    # one project at a time for a sweep
+                                            # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
+# -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
+# "each"      one study per project in PROJECTS, each alone in the case (as before)
+# "together"  ONE study with EVERY project in PROJECTS built into the case at
+#             once -- every plant at its MW, every POI held to its POI_P_TARGET_MW,
+#             each area's total kept at its pre-project value with all the plants
+#             excluded from the scaling. Faults, monitored radius, protect set and
+#             plots are the union around every POI. It is compared against the
+#             base like any project: results\<TOGETHER_NAME>_spp.
+# "both"      the single-project studies AND the together study.
+PROJECTS_RUN  = "each"
+TOGETHER_NAME = "AllProjects"               # its name: the results folder and the comparison label
+TOGETHER_SPLIT = True                       # True  = ONE comparison PER MEMBER on the cluster case: every plant is built
+                                            #         once (area MW held), then each member gets its OWN fault list around
+                                            #         its POI, its own run set and its own comparison against the base --
+                                            #         results\<TOGETHER_NAME>-<member>_spp, e.g. Cluster-SantaFe_spp
+                                            # False = one study and one comparison for the whole cluster (one merged
+                                            #         fault list around every POI)
+TOGETHER_PROJECTS = []                      # the projects IN the together study; [] = PROJECTS. Name them here
+                                            # to run, say, SantaFe alone AND the whole cluster in one launch:
+                                            #   PROJECTS = ["SantaFe"]; PROJECTS_RUN = "both";
+                                            #   TOGETHER_PROJECTS = ["SantaFe","IronStar","EastFork","EmpirePrairie"]
+TOGETHER_MW   = {}                          # MW per project IN THE TOGETHER STUDY, e.g. {"EmpirePrairie": 769};
+                                            # a project not named here uses PROJECT_MW, else its rating
+TOGETHER_STEP_MISMATCH_MVA = 0.1            # after EACH plant goes into the cluster case, solve until the total
+                                            # system mismatch is below this before adding the next one
+                                            # (the final save still iterates to MISMATCH_MVA)
+
+
+def _panel_projects():
+    """PROJECTS as this run actually uses it -- the together names added or
+       substituted per PROJECTS_RUN. EVERY place that used to read PROJECTS
+       reads this: the launch, the fault-list build, the comparison filter
+       and the file names, so the cluster studies cannot be built by phase 0
+       and then not run, or run and then not compared."""
+    if not PROJECTS:
+        return []
+    _how = str(PROJECTS_RUN or "each").strip().lower()
+    _tg = ([("%s-%s" % (TOGETHER_NAME, _m)) for _m in (TOGETHER_PROJECTS or PROJECTS)]
+           if TOGETHER_SPLIT else [TOGETHER_NAME])
+    if _how == "together":
+        return _tg
+    if _how == "both":
+        return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
+    return list(PROJECTS)
+MODES      = ["spp"]                        # spp | con | table | custom | manual
+PIPELINE   = "all"                          # ***SET TO "all" TO RUN THE SWEEP***
+                                            #   "all"     simulate each value, then compare
+                                            #   "compare" only reads disk -- SKIPS the sweep
+
+# -- THE Kqv SWEEP ITSELF ----------------------------------------------------
+# model -> constant -> list of values. One study per value, each vs the base.
+# Replace REECCU1 with the model in YOUR .dyr that carries Kqv.
+DYR_SWEEP            = {}#{"REECCU1": {"Kqv": [2.0, 4.0]}, "REPCAU1": {"Ki": [10.0, 25.0 ]}}   # ONE key per model, values as a LIST: {"REECCU1": {"Kqv": [2.0, 4.0]}}. Two keys with the same model name keep only the last one (Python). Model names bare -- REPCAU1, not 'REPCAU1'. Every combination of the lists is one run.
+DYR_SWEEP_BY_PROJECT = {}                    # per-project override, e.g.
+                                            #   {"SantaFe": {"REECCU1": {"Kqv": [0.5, 1.5]}}}
+DYR_SWEEP_PROJECTS   = []                    # [] = every project in PROJECTS
+DYR_SWEEP_FAULTS     = "all"                # "all" every fault per value | "failing" only failures | "crashed" only the scenarios the as-studied project run CRASHED on / gave up (re-run those at each value, in their own folders; everything finished stays as it is)
+DYR_SWEEP_COMPARE    = True                 # also write a full comparison folder per value
+
+# -- DON'T RE-RUN A VALUE THE DECK ALREADY HAS -------------------------------
+# The sweep forces every listed value onto the project's machines regardless of
+# what the .dyr already carries. If a variant would force EXACTLY the values the
+# deck already has -- every swept constant, no other change -- that run is an
+# identical copy of "baseline (as studied)": same simulation, same numbers, a
+# wasted day of compute. Such variants are skipped; the comparison already
+# carries as-studied as its "project" column, so nothing is lost.
+#
+# THE DECK VALUES ARE READ AUTOMATICALLY from BESS_MODEL_TEMPLATE in z4_spp_p_con.py
+# (they are already there: Kqv 2.0, Khv 0.0, Volim 1.2, ...), overlaid by the
+# panel .dyr edits the as-studied run applies. You need declare nothing.
+#
+# DYR_DECK_VALUES is only for a PRODUCTION .dyr whose values differ from that
+# template -- what you put here WINS over the template read:
+#   e.g. {"REECCU1": {"Kqv": 1.0}, "REGCAU1": {"Khv": 0.0}}
+#
+# The POI and capacity sweeps already skip their own baseline level; this is the
+# same idea for the .dyr axis.
+DYR_SWEEP_SKIP_DECK  = True                 # False = run even a deck-identical variant
+DYR_DECK_VALUES      = {}                   # override the auto-read template values
+
+# -- the panel edit stays EMPTY so the sweep alone controls Kqv --------------
+DYR_EDITS            = []
+DYR_EDITS_BY_PROJECT = {}                    # e.g. {"SantaFe": [("REECCU1", {"Kqv": 0.0})]}
+DYR_APPLY_TO         = "project"            # edit the Project case only
+
+# -- the overvoltage criterion the table measures against --------------------
+V_OVERSHOOT_PU    = 1.20                     # no swing above this (pu)
+OVERSHOOT_SPIKE_S = 2.0 / 60.0             # over the limit for <= this = SPIKE, more = SWING
+
+# -- run it faster (already tuned for your 64 GB / many-core PC) -------------
+# CORES_MAX / CORES_FOR_REPORTS / SCORE_NO_CASE / FORCE_RESCORE keep their own
+# section below (they are machine settings, not this study's). See "HOW MANY
+# CORES" and "SCORING AND WHEN TO RE-SCORE".
+# ============================================================================
+# ============================================================================
+#  SPEED / RESOURCES -- everything that decides how fast a launch runs, in one place
+# ============================================================================
+# -- TIMINGS: size of every .out (drives sim time AND scoring time) --
+FLAT_RUN_S  = 25                # s, the no-fault initial-condition run
+PRE_FAULT_S = 5                 # s, steady state before the fault
+SIM_END_S   = 25.2              # s per fault; SPP needs ~2.5 s recovery + ~10 s damping; longer = bigger .out
+RUN_NPLT    = 2                 # write every N steps: 1 = every step (huge) | 2 = half-cycle | 4 = per cycle
+KILL_GRACE_MIN = 60             # minutes of worker silence before any watchdog may act
+# -- CORES / SESSIONS: how many PSS/E runs at once --
+RUN_IN_PARALLEL = True          # True = base and project at once | False = one after the other
+N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
+CORES_SPARE     = 2             # cores kept free for Windows / Excel / you (0-4)
+CORES_MAX       = 22            # ceiling on PSS/E sessions across BOTH cases; 0 = none; auto-clamped to the PC
+CORES_FOR_REPORTS = 8          # of CORES_MAX, cores for scoring shards + plotters (0 = hold none back)
+CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
+# -- SCORING: when and how results are scored --
+REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
+FORCE_RESCORE   = False       # True = re-score every folder every launch (only after a criterion change)
+RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
+SCORE_NO_CASE   = True          # True = shards score without loading the case (32-bit memory fix) -- keep
+# -- PLOTS: PDFs --
+MAKE_PLOTS      = None          # None = engine default (draw) | False = no PDFs (much faster)
+PLOT_MISSING_OUTS = True        # compare/missing run: draw PDFs for .out files that have none (slower)
+_LAUNCH_T0 = __import__("time").time()          # when this launch started (FORCE_REPLOT)
+FORCE_REPLOT    = False        # True = REDRAW every PDF from the .out files on this launch (PIPELINE = "compare" redraws without simulating)
+PLOT_SCOPE      = "compact"     # "compact" = SPP set + every violation (~5x fewer panels) | "full" = every kept channel
+PLOT_INRUN      = 1             # plotters trailing each running folder (1 = the old single plotter)
+PLOT_WORKERS    = 2             # plotters per case in the catch-up pass (0/1 = one)
+PLOT_TOTAL_MAX  = 4             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
+PLOT_ONE_PROJECT_AT_A_TIME = True   # True = finish one project's PDFs (base, then project case) before starting the next project's
+PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out stops before the end of the simulation (it did not run); False = draw it for diagnosis
+# ============================================================================
+
+# ---- WHERE THE STUDY LIVES ---------------------------------------------------
+ROOT = ""                                   # "" = the folder this file is in; everything else follows it
+BASE_FOLDER = "Base"                        # the folder holding the BASE case (projects NOT modelled)
+PROJ_FOLDER = "Projects"                    # the folder holding the case WITH the projects
+CMP_FOLDER  = "comparison_CON"                  # where the comparison output goes (created if absent)
+# PROJECTS -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
+# ---- THE DECK EACH CASE READS ------------------------------------------------
+SHARED_DECK     = ""                        # "" = NO SHARED FILES: each case reads its own deck, in its own ...
+SHARED_DECK_SAV = "DIS2201-25SP-G03-CQ_F.sav" # only read while SHARED_DECK is set
+SHARED_DECK_DYR = "DIS2201-25SP-G03-CQ.dyr"
+BASE_SAV = "DIS2201-25SP-G03-CQ_F.sav"      # a bare name = this file, in BASE_FOLDER
+BASE_DYR = "DIS2201-25SP-G03-CQ.dyr"        # run z4_split_cases.py --copy to put them there
+PROJ_SAV = "DIS2201-25SP-G03-CQ_F.sav"      # a bare name = this file, in PROJ_FOLDER
+PROJ_DYR = "DIS2201-25SP-G03-CQ.dyr"
+# -- A DIFFERENT DECK FOR ONE PROJECT'S RUNS -------------------------------------
+# When one project's base (or project) case will not converge on the deck above,
+# name the deck ITS runs read here. Matched by project name; a bare name is a file
+# in that case's folder (Base\ or Projects\). Every other project keeps the deck
+# above. The build files (.cnv/.snp) and the fault list follow the deck, so a
+# project on its own deck never shares a snapshot with the others.
+#     BASE_SAV_BY_PROJECT = {"EastFork": "DIS2201-25SP-G03-CQ_F_EastFork.sav"}
+BASE_SAV_BY_PROJECT = {}#{"EastFork": "DIS2201-25SP-G03-CQ_F_EF.sav"}   # EastFork base deck, in Base\ -- comment out to use the shared base
+BASE_DYR_BY_PROJECT = {}#{"EastFork": "DIS2201-25SP-G03-CQ_EF.dyr"}
+PROJ_SAV_BY_PROJECT = {}
+PROJ_DYR_BY_PROJECT = {}
+ADD_PROJECTS = []                           # A project lived only in BESS_PROJECTS inside BOTH study scripts ...
+
+# ---- HOW MANY CORES -- RUNS, REPORTS AND PLOTS, ALL IN ONE PLACE -------------
+#                                           # ^ this is now the REAL cap on scoring shards. With SCORE_NO_CASE
+#                                           #   a shard is light (no case), so scoring parallelises hard: with
+#                                           #   REPORT_WORKERS="auto" the report role runs
+#                                           #   min(CORES_FOR_REPORTS, cores-CORES_SPARE) // cases  shards per
+#                                           #   case. Raise this to use more cores for a rescore (it is bounded
+#                                           #   by the physical core count, so it never oversubscribes).
+#                                           # simulations for scoring and plotting.
+# WHAT THIS RESERVES, AND WHY IT IS A RESERVATION RATHER THAN AN EXTRA.
+#
+# The simulations and the scoring/plotting run AT THE SAME TIME -- a worker that
+# finishes a scenario asks for a plot child and goes straight on to the next
+# scenario -- so both were drawing from the same machine with only the
+# simulations counted. CORES_MAX = 7 meant 7 PSS/E sessions PLUS up to
+# PLOT_TOTAL_MAX plot children, and each plot child holds ~540 MB of a .out
+# while it reads. That is how a machine ends up with more heavy processes on it
+# than anybody asked for, and the plotters are what get killed.
+#
+# So the budget is now split rather than exceeded:
+#
+#     simulations   CORES_MAX - CORES_FOR_REPORTS      (at least 1)
+#     scoring/plots CORES_FOR_REPORTS
+#     -----------------------------------------------
+#     total         CORES_MAX, running in parallel
+#
+# 0 restores the old behaviour: every core to the simulations, and the plot
+# fleet sized by PLOT_TOTAL_MAX on top of them.
+PLOT_ROUNDS_MAX   = 3                       # retry the plot pass this many times, halving the fleet each round
+PLOT_RESTART_MAX  = 20                      # how many times one plotter slot may be restarted
+PLOT_STALL_MIN    = 30                      # give the whole plot pass up after this many minutes with NOTHING drawn (0 = never)
+PLOT_PASS_MAX_MIN = 0                       # hard wall-clock cap on the plot pass, minutes (0 = no cap)
+DYNAMIC_WORK = True                         # True = one shared queue; workers take the next free scenario
+LIVE_STATUS_ALL = "LIVE_STATUS.txt"         # both cases' live table in one file here ("" = off)
+CLAIM_STALE_S = 3600                        # backstop age for a stale claim; liveness decides first
+NEVER_KILL_WORKERS = True                   # True = no watchdog ever kills a running process
+LAUNCH_STAGGER_S = 20                       # worker i starts PSS/E i x this many s after launch, so N licence requests do not hit CodeMeter at once
+CLOSE_PSSE_DIALOGS = True                   # True = close modal PSS/E boxes ("CodeMeter runtime system is currently busy") shown by this launch's own processes
+LICENCE_BACKOFF_S = 60                      # pause before relaunching a worker whose PSS/E could not take a licence (doubles each time, max 15 min)
+STARTUP_SILENT_MIN = 15                     # a worker silent this long that holds NO scenario is killed and relaunched (nothing is lost)
+RETRY_GAVE_UP_ROUNDS = 0                    # after the workers finish, re-run the scenarios that GAVE UP this many more times with a fresh attempt budget (0 = off)
+STUDY_TIMEOUT_S = 0                         # kill a study that has run this long (0 = wait for ever)
+COMPILE_LOCK = True                         # True = one dsusr.dll build at a time, across both cases
+COMPILE_LOCK_WAIT_S = 900                   # seconds to wait for the compile lock before giving up
+
+# ---- WHAT THIS RUN DOES ------------------------------------------------------
+# PROJECTS AND MODES NAME A FOLDER, AND THE FOLDER HAS TO BE THERE.
+#
+#     results_dir = <case>\results\<project>_<mode>
+#
+# so PROJECTS = ["SantaFe"] with MODES = ["custom"] looks for
+# Base\results\SantaFe_custom and Projects\results\SantaFe_custom. What is on
+# disk is EmpirePrairie_spp, 143 .out files a side. Neither folder existed, so
+# nothing was comparable and the run ended "*** nothing was compared ***" --
+# having printed a table of the EmpirePrairie_spp results it had just found,
+# which is a different scan and is why the two did not seem to agree.
+#
+# FRESH_START = False MATTERS FOR A READ-ONLY PASS. It removes the .done
+# markers, and the report uses those markers to decide which .out finished
+# properly. Clearing them before a pass that simulates nothing produces an
+# empty report out of a complete set of results. (z4_lch_b_con.py ignores
+# FRESH_START entirely while REPORT_ONLY is on, for exactly this reason.)
+#
+# FORCE_RESCORE IS TRUE, AND NOTHING IS LOST BY IT. Scoring normally happens in
+# the worker as each scenario finishes and is cached in the folder's parts\, so
+# False is usually right. Here the campaign plan says 0 of 142 scored: there is
+# nothing cached to reuse, so True costs nothing today -- and it guarantees the
+# report is not built from a partial cache left by the runs where 101 .out
+# files were being wrongly condemned. Put it back to False once a full report
+# exists and the criteria have not changed.
+#
+# PLOT_MISSING_OUTS = False DRAWS THE PDFs IN THIS SAME PASS. The order is
+# plots, then the comparison, and a plot pass that fails does NOT stop the
+# comparison -- that was already true when 0 of 284 were drawn and the run went
+# on to the plan and the compare step. So asking for both costs nothing if the
+# plots go wrong again; the reports still come out.
+# ---- REBUILD EVERY REPORT FROM parts\, WITHOUT RE-SCORING ANYTHING --------
+# True = do NOTHING but the merge, for every project and both cases: read the
+# per-scenario parts already on disk and rewrite every report from them. No
+# PSS/E session, no case loaded, no .out opened, no scoring, no simulation, no
+# plotting -- and parts\ is only READ, never changed.
+#
+# WHY. The root reports (02_VIOLATIONS, 00_WHAT_FAILED, SPP_CRITERIA_REPORT,
+# the compliance table, 00_ALL_RESULTS, the measurements workbook) are written
+# by the merge, and the merge runs only after EVERY scoring shard for that case
+# has finished. One shard wedged on a diverged .out holds all of them back --
+# for an hour or more -- while forty-odd scored scenarios sit in parts\
+# complete and unread. The merge itself takes about twenty seconds a folder.
+#
+# Use it to:
+#   * get the reports NOW from whatever has been scored so far
+#   * rebuild every report after a criteria change, re-reading no .out at all
+#   * recover the reports when a shard died and the merge never ran
+#
+# It covers PROJECTS x MODES x both cases, so one run refreshes all of them.
+# Safe beside a live study: it opens nothing the run holds. The comparison is
+# written afterwards from the reports it has just rebuilt.
+MERGE_ONLY = False
+
+# ---- THE REPORT THAT WAS WRITTEN TOO EARLY -----------------------------------
+# A scoring pass writes each scenario's part as it finishes, and rewrites the
+# folder's reports as it goes. Stop reading at the wrong moment -- or let the
+# last scenario land a few seconds after the last rewrite -- and the reports in
+# that folder DISAGREE with each other and with parts\:
+#
+#     05_CONVERGED   F03 FAIL          (written 15:54:53)
+#     02_VIOLATIONS  F03 absent        (written 15:54:17, 36 s earlier)
+#
+# Nothing was wrong with the scoring; the report simply predates it. Chasing
+# that by hand costs an afternoon and looks exactly like a scoring bug.
+#
+# True = before anything is read, any results folder whose reports are OLDER
+# than the parts\ they should describe is rebuilt from those parts first. It is
+# the MERGE step only -- no PSS/E, no case, no .out is opened, a few seconds a
+# folder -- so it is cheap enough to do unconditionally. Sweep and capacity
+# folders (..._dyr_Kqv2, ..._cap50) are checked too.
+AUTO_REMERGE_STALE_PARTS = True
+
+# ---- EVERY .out MUST HAVE A VERDICT BEFORE ANYTHING IS COMPARED --------------
+# The timestamp check above catches a report written too early. This catches the
+# result of it, whatever the cause: an .out sitting in the folder with NO verdict
+# anywhere in the report beside it. That is the difference between
+#
+#     "F04 passed"                     and     "F04 was never judged"
+#
+# and the comparison cannot tell them apart -- an unscored fault reads as a fault
+# with nothing wrong. True = list every such scenario, rebuild the folder from
+# parts\ in case the parts already hold it, and say plainly which ones are still
+# unscored afterwards (those need SCORING, not merging -- the message names the
+# setting). Costs one directory listing per folder.
+VERIFY_SCORING_COVERAGE = True
+
+# PIPELINE, MODES -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
+RUN_CASES  = "both"                         # "both" | "base" | "proj" -- which case to SIMULATE
+RUN_STUDIES = False                         # kept for the older settings; PIPELINE wins
+RUN_MISSING = False                         # same as PIPELINE = "missing"
+RUN_FLAT   = None                           # the no-fault initial-condition check (leave it on)
+RUN_FAULTS = None                           # False = build and score only, simulate no fault
+# ---- HOW MUCH IS DRAWN (the throttle, when there is no matplotlib) -----------
+INDIVIDUAL_KEYWORDS = ["PROJ", "POI", "FLT", "GEN"]   # the SPP set. [] = a panel for EVERY signal -- see below
+PLOT_MAX_PANELS = 0                         # 0 = no cap. A number = at most that many panels per scenario
+PLOT_MAX_POINTS = 1800                      # samples per trace; lower draws faster
+PER_PAGE        = 3                         # panels per PDF page
+EXPORT_PDF_PUREPY = True                    # the pure-Python PDF writer -- what draws when matplotlib is absent
+EXPORT_CSV      = False                     # one CSV per run beside the plots: time, then a column per channel
+EXPORT_SVG      = False                     # one SVG per run; open in a browser, print to PDF if you want one
+PLOT_CLEAR_STALE_CLAIMS = True              # before a plot pass, free every claim whose plotter is no longer running
+FRESH_START    = False                     # False = resume where it stopped, True = start over False: nothing ...
+SKIP_DONE      = True                       # skip scenarios that already have a .done and a .out
+FORCE_REBUILD = None                        # True = rebuild the snapshot even if the flat run is done
+MAX_SCENARIO_ATTEMPTS = 2                   # give up on a scenario after this many crashes
+RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-machine labels differ from the newest group to *.oldbuild (guesswork; a PDF older than its .out is redrawn anyway)
+RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
+TRUNCATED_FRAC = 0.80                       # short = under this fraction of the folder's median .out size
+ONLY_EVENTS = []                            # [] = every event
+ONLY_FAULTS = ["F01-F50"]                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
+SEARCH_DEPTH = 4                            # how many folder levels below SEARCH_ROOT to look
+
+# ---- HOW MUCH EACH PLANT PUTS ON THE SYSTEM ----------------------------------
+PROJECT_MW = {                              # a LIST = one complete study per size, each in its own folder
+   # "EmpirePrairie": [604, 769],            # 604 MW, and the full 769 MW that fills the POI on its own
+}
+POI_P_TARGET_MW  = {
+    "SantaFe":        984.2,      # 502 MW BESS + the rest from 765912/765922/765932/765935
+    "IronStar":       290.5,      # 214 MW BESS + the rest from 587313/587317
+    "EastFork":       193.5,      # 112 MW BESS + the rest from 531620/531607
+    "EmpirePrairie":  769,      # BESS + the rest from 761379/761382/761400/761403
+}
+POI_P_LEVELS     = []                       # [] = off. [1000, 1200] = one COMPLETE study per level, each in ...
+POI_P_LEVELS_PCT = []                       # [] = off. [100, 80, 60, 40, 20] = the SAME sweep as
+#                                           # POI_P_LEVELS, entered as a PERCENTAGE of each project's
+#                                           # own POI_P_TARGET_MW instead of in MW.
+# WHY A PERCENTAGE LIST AS WELL AS AN MW ONE.
+#
+# POI_P_LEVELS is absolute, and one list of MW cannot serve four projects whose
+# POI totals are 983, 769, 290 and 193: 600 MW is 61 % of SantaFe and more than
+# three times EastFork. "every project at 20, 40, 60, 80 and 100 % of its own
+# interconnection" is one line here and would otherwise be four separate runs
+# with four hand-computed lists.
+#
+#     POI_P_LEVELS_PCT = [100, 80, 60, 40, 20]
+#
+# Each project's levels are that percentage of ITS OWN POI_P_TARGET_MW, so
+# SantaFe runs 983 / 786 / 590 / 393 / 197 and EastFork runs 193 / 154 / 116 /
+# 77 / 39, each into its own results folder named for the MW it actually ran.
+# Values above 1 are read as percent; 0.2 and 20 both mean 20 %.
+#
+# POI_HOLD_AREA_MW stays in force at every level, so the area total is put back
+# to its pre-project value each time and what moves between levels is the split
+# at the POI, not the area's generation.
+#
+# Both lists can be set; the totals are merged and de-duplicated.
+POI_P_AREA       = None                     # None = the project's own area
+POI_P_SHARE      = "capacity"               # how the REMAINDER splits between the existing machines ...
+COMPARE_REQUIRE_COMPLETE = False            # True = after SIMULATING, stop before the comparison if a project did not finish (it would otherwise be compared on partial results)
+POI_P_STRICT         = True                 # True = STOP the build when the POI total is not within tolerance of POI_P_TARGET_MW (no study runs on a case that is not at its interconnection)
+POI_P_STRICT_TOL_MW  = 2.0                  # how close it must be: this many MW, or 1 % of the target, whichever is larger
+POI_P_METER          = "delivered"          # "delivered" = MW arriving into the POI from the plant (SPP's "MW at the POI") | "export" = net MW leaving the POI to the system
+POI_P_MEASURE        = None                 # "metered" (default) = the number the one-line shows at the POI ...
+POI_P_PROJECT_AT = "rated"                  # where the PROJECT machines sit while that happens: "rated" ...
+POI_P_EXISTING_BUSES = []                   # a list for every project, or {"SantaFe": [765910, ...]} per project
+POI_P_COMPARE    = True                     # a FULL comparison per level, each in its own folder
+POI_P_FAULTS     = "all"                    # "all" every fault at each level | "failing" only the failures
+POI_P_METER_ITERS    = 8                    # solve/measure passes allowed (default 8)
+POI_P_METER_TOL_MW   = None                 # how close the POI meter must come (default 0.5 MW)
+POI_HOLD_AREA_MW = True                     # False = raise the POI and let the area total rise
+POI_HOLD_AREA_TOL_MW = None                 # how close the area must come back (default 0.5 MW)
+POI_HOLD_AREA_PASSES = None                 # solve/correct passes allowed to get there (default 4)
+POI_RADIUS_HOPS = None                      # how many bus-hops from the POI to MONITOR voltage
+STUDY_AREAS     = None                      # None = the study script's 21 areas. A list = monitor only these
+AREA_KV_MIN     = None                      # None = the study script's 100.0 kV -- MISO monitors from 100 kV
+
+# ---- THE FAULT SET -----------------------------------------------------------
+AUTO_SPP_FAULTS = False                     # THE _con SET READS ITS LIST, NEVER BUILDS ONE -- z4_disis_con.py writes SPP_FAULTS_<project>.csv from the DISIS workbook, filtered by distance from the POI. True here would build a list from the topology and throw SPP's own contingencies away
+REGEN_FAULTS = None                         # "if-missing" | "always" | "never" -- when to rewrite the files
+NEW_FAULT_LIST = False                      # True = build a BRAND-NEW fault list (renumbers, retires old ...
+MAKE_FAULT_LIST  = False                    # THE _con SET NEVER BUILDS OR COPIES A LIST. z4_disis_con.py
+                                            # already wrote SPP_FAULTS_CON_<project>.csv beside the cases from
+                                            # the DISIS workbook. True here made phase 0 walk the BASE case
+                                            # topology and write its own list over that path -- which is what
+                                            # "it keeps moving files from Base to the root folder" was. If the
+                                            # DISIS list is missing, phase 0 now STOPS and says to run
+                                            # z4_disis_con.py, instead of silently substituting a generated one.
+FAULT_LIST_FROM  = "BASE"                   # "BASE" | "TEST" -- whose topology defines it
+SHARED_FAULTS_CSV = r"{root}\SPP_FAULTS_CON_{project}.csv"   # THE _con SET HAS ITS OWN LIST. It shared SPP_FAULTS_{project}.csv with the _f set, which writes that file too -- so whichever ran last decided what BOTH of them simulated, and nothing in either said which # {root} = the folder the cases sit in, {project} = its name
+SPP_FAULT_HOPS   = None                     # how many levels out from the POI to build events
+SPP_FAULT_KV_MIN = None                     # ignore anything below this kV
+SPP_MAX_FAULTS   = None                     # keep only the N nearest the POI (0 = keep all)
+SPP_EVENTS_ON    = None                     # ["P1.2","P1.3","P4.2"] -- which planning events to build
+SPP_EVENT_HOPS = None                       # {"P1.2": 4, "P4.2": 2} -- per event; only what you name
+SPP_P4_MODE         = None                  # "spp-proxy" (SPP's own, the default) | "group" | "both"
+SPP_P4_GROUP        = None                  # mode "group"/"both" only: -1 all but one | 2 every pair | 1 one | ...
+SPP_P4_TAP_SEGMENTS = None                  # True = a tapped line goes out in all its segments
+SPP_SLG_RETAIN_VPU  = None                  # 0.6 -- the SLG fault is tuned to this bus voltage
+FAULTS_CON   = None                         # r"C:\ENGIE\con2022_DIS2201.con" (MODES = ["con"])
+FAULTS_TABLE = None                         # r"C:\ENGIE\SPP_GROPU3_FAULTS.xlsx" (MODES = ["table"])
+CON_NEAR_BY  = None                         # "fault_bus" = the faulted bus is within the event's hop
+TABLE_GROUPS = None                         # [] = every Group in the table
+CON_EVENTS   = None                         # [] = every event the parser understands
+CON_MAX_ELEMENTS = None                     # skip a contingency removing more than N elements (0 = no cap)
+CUSTOM_TYPES     = ["3PH"]                  # ["3PH"] | ["SLG"] | ["3PH","SLG"] -- one run per type
+# None -> 6 cy at 345 kV+, 7 cy below
+CUSTOM_CYCLES    = {"3PH": None,
+                    "SLG": 16}     # SPP's stuck-breaker clearing
+CUSTOM_HOPS      = 3                        # how far from the POI to place them
+CUSTOM_KV_MIN    = 100                      # only at or above this bus base kV
+CUSTOM_MAX_BUSES = 4                        # cap, so a dense POI cannot produce hundreds
+CUSTOM_INCLUDE_POI = True                   # True = fault the POI bus itself as well
+
+# ---- CLEARING TIMES AND RECLOSING --------------------------------------------
+NORMAL_CLEAR_CYCLES = None                  # a number = that many cycles at EVERY kV (overrides the 6/7 table ...
+SPP_STUCK_CYCLES    = None                  # P4 stuck-breaker clearing -- SPP say 16
+RECLOSE_WAIT_CYCLES = None                  # SPP say 20
+ENABLE_RECLOSE      = None                  # False = no reclose on any event, whatever SPP say
+SIMULATE_RECLOSE    = True            # False = describe the reclose but do not simulate it
+#   >>> SET False DELIBERATELY. With it on, the study clears the fault, waits
+#   RECLOSE_WAIT_CYCLES (20 = 0.333 s) and RECLOSES INTO THE FAULT, then clears
+#   again -- an UNSUCCESSFUL-RECLOSE duty. That is a far more severe event than
+#   a single clearing, and it produces a SECOND transient at ~0.43 s after the
+#   first, which is where the second cluster of >1.20 pu readings came from.
+#   Turn it back on only for events where SPP asks for the reclose duty.
+RECLOSE_SKIP_IF_ISLANDS = None              # True = apply SPP's rule and drop a reclose that would strand a ...
+
+# ---- SYSTEM ADJUSTMENTS (SPP's "pre-existing issues") ------------------------
+DYR_DISABLE = []                            # dynamic models REMOVED from the deck: ("WTDTA1", 51565) | "@OV_RELAYS"
+DYR_DISABLE_APPLY_TO = "both"               # "both" | "project" | "base" -- a pre-existing fix belongs in BOTH cases
+DYR_DISABLE_STRICT = True                   # True = a disable that matched no record STOPS instead of running on
+FAULT_LINE_MIN_X_PU = 0.0                   # 0 = off. Raise a faulted line's |X| to this floor before the fault
+FAULT_LINE_X_WARN_PU = 0.0001               # name every faulted line whose |X| is under this, changed or not
+SOLVER_RETRY_ON_NONCONV = False             # False = a non-converged event is reported, never re-solved on other settings
+SOLVER_RETRY_MAX_NONCONV = 6                # non-converged steps tolerated before a retry is triggered
+SOLVER_RETRY_RECIPES = [("iterations 200, accel 0.50", 200, 0.50), ("iterations 400, accel 0.30", 400, 0.30), ("iterations 600, accel 0.10", 600, 0.10)]                # None = the study's own ladder; [("label", MAXITER, ACCEL), ...] replaces it
+DELT_CYCLES = 4                             # None = the study's own step (1/4 cycle). 8 = 1/8 cycle: try it when a case
+                                            # runs its flat run cleanly but the FAULT runs go NaN (the network solution
+                                            # loses itself at the switching); the run takes about twice as long
+ADJUSTMENTS_REPORT = True                   # collect every non-project change into SYSTEM_ADJUSTMENTS.txt and the report
+
+
+# ---- THE SPP CRITERIA --------------------------------------------------------
+V_RECOVERY_PU  = 0.70                       # must recover above this after clearing
+V_RECOVERY_S   = 2.5                        # ...within this many seconds
+# V_OVERSHOOT_PU, OVERSHOOT_SPIKE_S -- set in "THE STUDY YOU ARE RUNNING" panel at the top.
+V_SS_LOW       = 0.90                       # post-fault steady-state band
+V_SS_HIGH      = 1.10                       # ...and high
+TRIP_PGEN_DEAD_MW = 10.0                    # a machine that ENDS below this many MW (and below half its pre-fault MW) has TRIPPED
+ANGLE_DEV_DEG  = 16.0                       # rotor-angle deviation judged individually above this
+FLAT_TOL_BY_KIND = {"VOLT": 0.005, "ETERM": 0.005, "ANGLE": 1.0,
+                    "PELEC": 1.0, "QELEC": 2.0, "SPEED": 0.0002}   # flat run: per QUANTITY, own units ({} = one number)
+FLAT_REL       = 0.02                       # ...or this share of the channel's own initial value, whichever is larger
+WORSE_PU_DELTA  = 0.02                      # e.g. overshoot 1.150 -> 1.175 with a 1.20 limit
+WORSE_DEG_DELTA = 2.0                       # e.g. largest swing 12.0 -> 15.0 deg
+ELEMENT_LIST_MAX = 40                       # elements printed per violation before it summarises
+MISMATCH_MVA = 0.04                         # both cases are solved to this total system mismatch
+MISMATCH_PASSES = 20                        # solve passes spent trying; it stops early once it plateaus
+MISMATCH_ABORT = True                       # True = a build that cannot reach it STOPS rather than saving
+
+# ---- SCORING AND WHEN TO RE-SCORE --------------------------------------------
+# OFF, because True re-reads and re-scores every .out in every folder on EVERY
+# launch -- a campaign's worth of scoring repeated to reproduce results already
+# on disk, which is the single largest avoidable cost in a re-run. Nothing is
+# missed by turning it off: RESCORE_STALE_REPORTS above still re-scores a report
+# older than its .out files, auto_remerge_stale_reports() picks up parts that
+# landed after the report, and verify_scoring_coverage() names any .out with no
+# verdict before the comparison runs. Set it True only to deliberately rebuild a
+# folder whose report you have reason to distrust.
+                                           #   fix). The heavy diverged .out files are ~341 MB of floats; with
+                                           #   the 35,785-bus case ALSO in the shard they blow past a 32-bit
+                                           #   process's 2 GB ceiling and the read crashes every launch. Scoring
+                                           #   needs no live case -- bus kV, names, areas, hop distances and the
+                                           #   monitoring radius all come from flags\BUS_MAP.csv, which an earlier
+                                           #   run wrote. So the shard skips psseinit + the case load and the
+                                           #   .out read has the full address space. Honoured only when
+                                           #   BUS_MAP.csv is on disk; otherwise the case is loaded as before.
+                                           #   Set False to go back to loading the case in the scoring shards.
+REPORT_COVERAGE_MIN = 0.90                  # ...and re-score one that scored less than this share of them A ...
+EMPTY_CELL = "n/a"                          # what a cell of the detail sheets shows when there is nothing to put in it. Never a blank: a blank reads as zero, or as fine, or as forgotten, and it is none of those
+STALE_REPORT_TOL_S = 120                    # how much younger the newest .out may be before that fires
+
+# ---- THE COLLECTOR SYSTEM ----------------------------------------------------
+COLLECTOR_ON = True                         # False = leave every collector alone, table or no table
+# the collector branch per project gen -- R, X, B per row
+COLLECTOR_BRANCHES = {
+    "SantaFe": [
+        # gen bus, collector branch,           R,      X,      B
+        (765912, 765913, 765914, "1",       None,   None,   None),
+        (765922, 765923, 765924, "1",       None,   None,   None),
+        (765932, 765933, 765934, "1",       None,   None,   None),
+        (765935, 765936, 765937, "1",       None,   None,   None),
+    ],
+    # The other three projects: fill in their collector branches the same way.
+    # Empty = that project's collector is left as the case has it.
+    "IronStar":      [
+        # gen bus, collector branch,           R,      X,      B
+        (587313, 587312, 587314, "1",       None,   None,   None),
+        (587317, 587316, 587315, "1",       None,   None,   None),],
+    "EastFork":      [
+        # gen bus, collector branch,           R,      X,      B
+        (531620, 531621, 531622, "1",       None,   None,   None),
+        (531607, 531608, 531606, "1",       None,   None,   None),],
+    "EmpirePrairie":[
+        # gen bus, collector branch,           R,      X,      B
+        (761379, 761378, 761377, "1",       None,   None,   None),
+        (761382, 761381, 761380, "1",       None,   None,   None),
+        (761400, 761399, 761398, "1",      None,   None,   None),
+        (761403, 761402, 761401, "1",      None,   None,   None),
+    ]
+}
+COLLECTOR_SCALE = {}
+COLLECTOR_ALL = None                        # row in the table above, whatever that row says -- so four ...
+COLLECTOR_BY_PROJECT = {}                   # that project is set to it, and a project not named here is left to its own rows
+COLLECTOR_Z_BASE_MVA = None                 # MVA base the R/X/B are on
+COLLECTOR_APPLY_TO = "project"              # "project" | "both" | "base" -- which case gets the change
+
+# ---- BUILDING A NEW FACILITY -------------------------------------------------
+NEW_PLANT_RUN      = False                  # True = one extra study per project, new plant built
+NEW_PLANT_PROJECTS = []                     # [] = every project compared
+NEW_PLANT_COMPARE  = True                   # a FULL comparison of that run too, in its own folder
+# {} = leave the study script's own NEW_PLANT alone
+NEW_PLANT = {
+    # >>> BUILD IT IN THE ORDINARY RUN? This is the switch most people are
+    #     looking for, and it is NOT NEW_PLANT_RUN above.
+    #
+    #       "enabled": True    the plant is built in the NORMAL project run --
+    #                          results\<proj>_<mode>\ -- so the study, the POI
+    #                          dispatch and the comparison are all about the case
+    #                          WITH the new facility in it.
+    #       NEW_PLANT_RUN      an EXTRA study on top of that, into
+    #                          results\<proj>_<mode>_newplant\, for comparing the
+    #                          new-plant case against the ordinary one. It forces
+    #                          "enabled" on for its own run only.
+    #
+    #     Leave "enabled" out and the study script's own NEW_PLANT["enabled"]
+    #     decides (it ships False).
+    "enabled":      True,
+    # >>> WHY THIS IS TRUE. THE PREMISE CHANGED WITH THE DECK.
+    #
+    # False was right while PROJ_SAV was a deck that ALREADY HELD THE PLANT
+    # (DIS2201-25SP-G03-CQ_EP.sav). build_new_plant() would have found every bus
+    # present and adopted it, and switching it on bought nothing but a duplicate
+    # set of dynamic models appended to a .dyr that already had them.
+    #
+    # THAT IS NO LONGER THE DECK EITHER CASE READS -- whether the two share one
+    # file or each has its own copy, it is the BASE case: it holds none of the
+    # new BESS. Nothing is there to adopt, so with
+    # "enabled": False NO FACILITY IS BUILT. What you get is ENABLE_BESS on its
+    # own, which is a DIFFERENT model of the project:
+    #
+    #   "enabled": False   BESS machines (id 'B') are added AT THE EXISTING
+    #                      FEEDER BUSES -- 761379/761382/761400/761403 for
+    #                      EmpirePrairie. No new buses, no new collector, no GSU,
+    #                      no MPT, no tie. The BESS shares the existing plant's
+    #                      collector system and its interconnection. Correct if
+    #                      the battery is co-located behind the existing POI.
+    #
+    #   "enabled": True    build_new_plant() CREATES the facility in the
+    #                      999xxx block -- unit buses, GSUs, a collector bus,
+    #                      the MPT and the tie to the POI -- with the impedances
+    #                      below. The project's ORIGINAL feeder buses are kept as
+    #                      "feeders_original" and become the EGF that makes up
+    #                      the remainder to POI_P_TARGET_MW, and
+    #                      disable_existing is forced OFF because a new facility
+    #                      ADDS capacity rather than replacing what is there.
+    #                      That is the SGF + EGF split of BP-7250 7.6.
+    #
+    # The duplicate-.dyr objection does not apply here either: the 999xxx buses
+    # are not in the base .dyr, so there is nothing for bess_combined_dyr() to
+    # duplicate. It applied only to the pre-built deck.
+    #
+    # So this is a question about the PROJECT, not about the script: is the BESS
+    # its own facility with its own collector and transformer, or is it behind
+    # the existing one? Set it accordingly. See NEW_GEN_BUS_PREFIX and
+    # POI_P_PROJECT_MW in z4_spp_p_con.py.
+    "units":        None,                   # None = project MW / 200 MW cap, divided EQUALLY
+    "mw_per_unit":  None,                   # None = follows from the above
+    "unit_kv":      0.69,
+    "collector_kv": 34.5,
+    "hv_kv":        None,                   # None = the POI's own base kV
+    "bus_start":    999001,                 # the block of NEW bus numbers; must be free
+    "gsu":       {"r": 0.007662, "x": 0.076618, "sbase": None},   # Z = 7.7 %,  X/R = 10
+    "collector": {"r": 0.000351, "x": 0.000545, "b": 0.0016},
+    "mpt":       {"r": 0.002499, "x": 0.099969, "sbase": None},   # Z = 10.0 %, X/R = 40
+    "tie":       {"r": 0.0000, "x": 0.0005, "b": 0.0},
+}
+
+# ---- THE SURPLUS / EXISTING PAIR AND CAPACITY LEVELS -------------------------
+# SPP's answer to "how is the 600 MW allocated between the existing ...
+SURPLUS_SCENARIOS = [
+    # {"tag": "s1_egfoff", "label": "SGF 100 %, EGF off",
+    #  "egf_off": True,  "poi_mw": None},
+    # {"tag": "s2_poi_is", "label": "SGF 100 %, EGF set so POI = IS (600 MW)",
+    #  "egf_off": False, "poi_mw": 600.0},
+]
+CAPACITY_LEVELS = []                        # [] = off. [0.75, 0.5] = re-run at 75 % and 50 % output
+CAPACITY_FAULTS = "all"                     # "all" every fault at each level | "failing" only the failures
+CAPACITY_COMPARE = True                     # a FULL comparison per level, each in its own folder
+SWEEP_AT_CAPACITY_LEVELS = True             # True = repeat the .dyr sweep AND project-off at EVERY level
+SWEEP_SKIP_DONE = True                      # True = a swept run RESUMES; False = re-simulate it every launch
+
+# ---- DYNAMIC MODEL EDITS AND SWEEPS ------------------------------------------
+# DYR_EDITS, DYR_EDITS_BY_PROJECT, DYR_APPLY_TO and the whole DYR_SWEEP* set are
+# now in "THE STUDY YOU ARE RUNNING" panel at the top of this file. Only the
+# show/compile knobs stay here.
+DYR_SHOW = []                               # Change a dynamic model constant and see what it does
+DYR_SCOPE = "project"                       # machines, and a dict changes several constants of one model at once
+DYR_COMPILE_WHEN = None                     # dyre_new rewrites conec.flx and conet.flx for the model set it just read
+DYR_COMPILE_BATS = ["MyCompile34.bat", "MyCload41.bat"]
+DYR_COMPILE_AFTER_SNAP = True               # Run them again after the .snp is saved, so dsusr.dll on disk ...
+ABORT_ON_MODEL_NOT_ACCESSIBLE = True        # In the init output, among several hundred harmless FLOW1 ...
+INIT_NAN_ABORT = False                      # strt_2 returns ierr=0 and still leaves NaN in a model that ...
+
+# ---- TURNING A PROJECT OFF ---------------------------------------------------
+PROJECT_OFF_RUN = False                     # True = one extra study per project with its machines OFF
+PROJECT_OFF_PROJECTS = []                   # [] = every project compared
+PROJECT_OFF_COMPARE = False                 # a FULL comparison of that run too, in its own folder
+
+# ---- WHAT GETS WRITTEN -------------------------------------------------------
+# WRITE_CSV = False -- the comparison writes .txt and .xlsx only. The .csv
+# companions duplicated what the workbook already holds, sheet for sheet, and
+# doubled the file count in every comparison folder.
+#
+# WHAT THIS DOES NOT TOUCH. The STUDY's data files -- SPP_MEASURE_VOLTS.csv,
+# SPP_MEASURE_ANGLES.csv, SPP_CRITERIA_REPORT.csv and the rest -- are written by
+# the engine, which has its own WRITE_CSV, and the measurement files are written
+# unconditionally because they are DATA, not a report companion: the comparison
+# reads them for every base and project value. Turning this off cannot empty a
+# base column.
+#
+# The one file that was .csv only, 01_PROJECT_CAUSED_ELEMENTS.csv, is now the
+# workbook's "2 Project introduces" sheet -- same rows, fewer columns, area and
+# hop distances beside each -- so nothing is lost by switching this off.
+WRITE_CSV       = False                     # False = .txt + .xlsx only (see above)
+WRITE_XLSX      = True                      # .xlsx with a coloured header + filters
+ONE_REPORT      = True                      # one COMPARISON_REPORT instead of 8 files
+
+# ---- HOW MUCH TO WRITE -------------------------------------------------------
+# The comparison had grown to about twenty files per project, most of them
+# written for a question nobody was asking that day, and finding the one that
+# answers "what did the project break" meant knowing which of the twenty it was.
+#
+# True = write only what a reader opens:
+#
+#     00_COMPARISON_REPORT.xlsx / .txt     the comparison -- 5 tabs
+#     detail\DYR_SWEEP_MEASURED*           base | project | each swept value
+#     detail\POI_P_MEASURED*               base | project | each POI level
+#     detail\ALL_VARIANTS_MEASURED*        base | project | every variant
+#     detail\DYR_SWEEP_*                   the PASS/FAIL matrix per value
+#     comparison\<proj>\<variant>\           a full comparison per swept value
+#
+# and skip the rest: CHANNELS (a 900 kB list of .out channel numbers, for
+# checking a reading by hand), COMPARISON_RUNTIMES, BEST_CASE, MATRIX and
+# ALL_RUNS. None of them is an input to anything -- they are all reports -- so
+# turning them off costs nothing but the report itself, and any one of them can
+# be had again by setting this False.
+SIMPLE_OUTPUT   = False
+
+PLOT_RISKY_ISOLATED = True                  # a .out the plot pass refuses is retried in its OWN process
+PLOT_ISOLATED_S = 1800                      # seconds one such isolated plot may take (0 = no limit)
+ELEM_LINES      = 0                         # buses/machines listed per violation (0 = every one)
+CAUSE_BUSES_MAX = 0                         # buses named in the Summary/Action cause column (0 = every one)
+COMPARE_BY_PROJECT = True                   # comparison\<project>\ instead of one folder for all
+KEEP_PREVIOUS_RUNS = True                   # rename the last run aside instead of writing over it
+COMPARE_ALL_RUNS = True                     # one table over every run still on disk, same base case
+COMPARE_RUNS = None                         # Not project-against-base -- run-against-run
+SWEEP_PLAN_FILE  = "SWEEP_PLAN.txt"         # every run of the campaign, done and to-do ("" = off)
+SWEEP_PLAN_EVERY = 60                       # seconds between refreshes of it (0 = only at the phase boundaries)
+LIVE_COMPARE_EVERY = 300                    # seconds between live comparison refreshes (0 = only at the end)
+
+
+def _script_dir():
+    """The folder this file is in, however it was started."""
+    try:
+        return os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
+    except NameError:                     # exec'd without a __file__
+        return os.getcwd()
+
+
+STUDY_ROOT  = ROOT or _script_dir()
+
+
+def _case_dir(name, default):
+    """One case folder, from the panel.
+
+       "Base" and "Project" were written into these two lines, so a study whose
+       folders are called anything else -- SantaFe, CQ, 2025SP -- could not be
+       pointed at without editing the code. They are BASE_FOLDER and
+       PROJ_FOLDER in the panel now.
+
+       An ABSOLUTE path is taken as it stands, so the two cases do not have to
+       live under one root or even on one drive. A bare name is joined to
+       STUDY_ROOT, which is what it has always been."""
+    raw = str(name or "").strip()
+    # ABSOLUTE, JUDGED WITHOUT ASKING THE INTERPRETER'S PLATFORM.
+    # os.path.isabs() only recognises "D:\..." when Python is running ON
+    # Windows, so a drive-letter path checked on any other platform comes back
+    # relative and gets joined to STUDY_ROOT -- producing C:\ENGIE\D:\Other,
+    # which is not a path anywhere. A drive letter, a UNC share and a leading
+    # slash are absolute wherever this happens to run.
+    if raw and (os.path.isabs(raw) or raw[:2] in ("\\\\", "//")
+                or re.match(r"^[A-Za-z]:[\\/]", raw)):
+        return raw
+    nm = (raw or str(default)).strip().strip("\\/") or str(default)
+    # A name with a separator in it -- "cases\\Base" -- is a relative path and
+    # is joined as one, not treated as a single folder called "cases\Base".
+    parts = [q for q in re.split(r"[\\/]+", nm) if q]
+    return os.path.join(STUDY_ROOT, *parts) if parts else STUDY_ROOT
+
+
+BASE_DIR    = _case_dir(BASE_FOLDER, "Base")       # the base case -- projects NOT modelled
+TEST_DIR    = _case_dir(PROJ_FOLDER, "Project")    # the case with the projects added
+# The comparison output. Deliberately OUTSIDE both case folders -- it belongs
+# to neither, and putting it inside one invites it to be deleted with that
+# case's results. Same rule as the two above: a bare name hangs off STUDY_ROOT,
+# an absolute path is taken as it stands.
+COMPARE_DIR = _case_dir(CMP_FOLDER, "comparison")
+
+# ---- SHARED_DECK, RESOLVED ---------------------------------------------------
+# Done here because it needs STUDY_ROOT, and stated out loud because "both cases
+# read the same file" is the kind of thing that must never be inferred from a
+# log line six screens later. A named deck that is not there STOPS the run:
+# falling back to each case's own would compare two different networks.
+if SHARED_DECK:
+    _sd_dir = _case_dir(SHARED_DECK, "Projects")
+    _sd_sav = os.path.join(_sd_dir, SHARED_DECK_SAV)
+    _sd_dyr = os.path.join(_sd_dir, SHARED_DECK_DYR)
+    _missing = [q for q in (_sd_sav, _sd_dyr) if not os.path.isfile(q)]
+    if _missing:
+        # A MISSING DECK STOPS A RUN THAT WOULD SIMULATE, and only warns one that
+        # would not. "compare" and "missing" read .out files already on disk and
+        # never open the deck, so refusing there would block reporting on results
+        # that are already finished -- but simulating without it would study the
+        # wrong network, or nothing at all.
+        _msg = ("SHARED_DECK names a deck that is not there:\n    %s\n"
+                "Put the base case in %s, or set SHARED_DECK = \"\" and name the "
+                "two decks with BASE_SAV / PROJ_SAV."
+                % ("\n    ".join(_missing), _sd_dir))
+        if str(PIPELINE).strip().lower() in ("all", "missing"):
+            raise SystemExit(_msg)
+        print("[compare] *** %s ***" % _msg.replace("\n", " "))
+        print("[compare] PIPELINE = %r reads files on disk, so this run continues."
+              % PIPELINE)
+    BASE_SAV = PROJ_SAV = _sd_sav
+    BASE_DYR = PROJ_DYR = _sd_dyr
+    print("[compare] ONE DECK, BOTH CASES: %s" % _sd_sav)
+    print("[compare]   base    reads it as the system WITHOUT the projects "
+          "(ENABLE_BESS off -- no .sav is written)")
+    print("[compare]   project reads it and adds ONE BESS per run, saving "
+          "<deck>_BESS_<project>_<MW>MW.sav beside it")
+else:
+    # ---- NO SHARED DECK: EACH CASE READS ITS OWN, IN ITS OWN FOLDER ---------
+    #
+    # CHECKED HERE, not in the study script. A bare name is resolved against
+    # each case's OWN folder, so a base folder that holds only its two scripts
+    # -- which is what the SHARED_DECK layout leaves behind -- names a deck that
+    # is not there. The study script does raise on it, but by then it is one
+    # line in one worker's log among four, and what the panel shows is a case
+    # whose workers all died at once. Said once, here, before anything starts.
+    _dm = []
+    for _lbl, _fld, _dir, _nm in (("BASE_SAV", BASE_FOLDER, BASE_DIR, BASE_SAV),
+                                  ("BASE_DYR", BASE_FOLDER, BASE_DIR, BASE_DYR),
+                                  ("PROJ_SAV", PROJ_FOLDER, TEST_DIR, PROJ_SAV),
+                                  ("PROJ_DYR", PROJ_FOLDER, TEST_DIR, PROJ_DYR)):
+        if not _nm:
+            continue                        # None = the study script's own
+        _p = _nm if (os.path.isabs(str(_nm)) or str(_nm)[:2] in ("\\\\", "//")
+                     or re.match(r"^[A-Za-z]:[\\/]", str(_nm))) \
+            else os.path.join(_dir, str(_nm))
+        if not os.path.isfile(_p):
+            _dm.append("    %-8s -> %s" % (_lbl, _p))
+    if _dm:
+        _msg = ("SHARED_DECK is off, so each case reads its own deck -- and "
+                "these are not there:\n%s\n"
+                "Give each folder its own copy:\n"
+                "    %s z4_split_cases.py --copy\n"
+                "or set SHARED_DECK = %r to go back to one deck for both."
+                % ("\n".join(_dm), os.path.basename(sys.executable), "Projects"))
+        if str(PIPELINE).strip().lower() in ("all", "missing"):
+            raise SystemExit(_msg)
+        print("[compare] *** %s ***" % _msg.replace("\n", " "))
+        print("[compare] PIPELINE = %r reads files on disk, so this run continues."
+              % PIPELINE)
+    else:
+        print("[compare] NO SHARED FILES: each case reads its own deck")
+        print("[compare]   base    %s" % os.path.join(BASE_DIR, str(BASE_SAV)))
+        print("[compare]   project %s" % os.path.join(TEST_DIR, str(PROJ_SAV)))
+                                           #   spp    generate the set from the topology
+                                           #   con    import SPP's .con      (FAULTS_CON)
+                                           #   table  import SPP's cluster
+                                           #          fault table            (FAULTS_TABLE)
+                                           # con/table are imported ONCE and shared, so
+                                           # both cases run the identical events. Results
+                                           # go to results\<project>_<mode>, so a con run
+                                           # does not mix with an spp one.
+
+
+
+# ---- WHY THESE TWO ARE NOT [] AND 0 ANY MORE --------------------------------
+#
+# [] and 0 mean "a panel for every signal, no cap". With ~7,900 channels that is
+# a ~7,900-panel PDF per scenario, and it was measured on this study: the FLAT
+# run, whose .out is 11.3 MB, drew a 21 MB PDF. The fault .out files are 111.7
+# MB -- ten times the samples -- so the same panel set would be a PDF of a few
+# hundred MB, built in memory by the pure-Python writer, on top of the ~580 MB
+# the 29.1 million channel values already cost as Python floats.
+#
+# That is past what a 32-bit process can hold, and it is exactly what happened:
+# FLAT_RUN_plots.pdf was drawn, and then every one of the 284 fault files killed
+# its plotter with 0xC0000005 -- 12 restarts, nothing drawn, in 30 minutes.
+#
+# The SPP set is what the criteria are judged on: the project machines, the POI,
+# the faulted bus, and the generators. A panel for every signal in the case is a
+# document nobody reads and a PDF that cannot be produced.
+#
+# THE KEYWORD FILTER IS THE LEVER; PLOT_MAX_PANELS IS NOT, AND IS BACK AT 0.
+# INDIVIDUAL_KEYWORDS chooses signals BY WHAT THEY ARE, so what it keeps is the
+# whole SPP set and nothing else. A numeric cap on top of that is a blunt
+# truncation of an already-correct list, and the two places it is applied do
+# not behave the same: the main panel builder raises the cap to cover every
+# panel that broke a limit, so a violation is never cut -- but the other path
+# is a plain ordered[:cap], which will drop a monitored bus off the end of a
+# compliance plot without the criteria knowing. For a study whose output is a
+# compliance finding, that is not a trade worth making for a smaller PDF.
+#
+# ---- WHY THIS RUN SIMULATES AGAIN, AND WHAT WAS AND WAS NOT DECIDED ---------
+# Reading one 111 MB .out costs about twenty minutes -- measured with a single
+# reader and nothing else running, on the scoring pass, which draws nothing at
+# all. 284 of them is days, and no worker count changes it: 1, 2, 3, 4 and 6
+# were each tried and the per-file cost never moved. The size of the file is
+# the only thing that does.
+#
+# AREA_KV_MIN WAS RAISED TO 200 AND PUT BACK. MISO monitors from 100 kV, so
+# 200 would have filed a study that did not look at buses the requirement
+# covers -- a smaller file bought by not answering the question. The monitored
+# set is fixed by the requirement and is not available as a size lever, and
+# neither is STUDY_AREAS for the same reason.
+#
+# WHICH LEAVES TWO THINGS THAT ARE NOT SCOPE:
+#
+#   RUN_NPLT   how OFTEN the channels are written, not WHICH ones. See the note
+#              beside it further down -- it argues for keeping it at 2, and that
+#              argument is about resolution, so it is a judgement for whoever
+#              reads the results, not a performance setting.
+#   the reader itself. Twenty minutes for 111 MB is not a law of nature; it is
+#              what dyntools does. That file is plain Python and can be read.
+#
+# PIPELINE is back to "compare" and FRESH_START to False: with the monitored
+# set unchanged, a re-run would spend nine hours producing files the same size
+# as the ones already on disk.
+#
+# ---- THE PLOT PASS GETS 6, THE SCORING PASS GETS 1 --------------------------
+# They are different passes and they do not run together, so they are sized
+# separately: PLOT_TOTAL_MAX = 6 (3 per case x 2 folders) for drawing, and
+# REPORT_WORKERS = 1 for scoring.
+#
+# WHAT SIX PLOTTERS COSTS. A plotter reads the whole .out before it draws
+# anything -- INDIVIDUAL_KEYWORDS decides how much is DRAWN, not how much is
+# READ -- so each one still holds 29.1 million channel values as Python floats:
+# ~580 MB at rest and around 1.5 GB at its peak. Six of those is roughly 9 GB
+# of live objects at once. On a machine with 32 GB that is comfortable; on 16 GB
+# it is tight; on 8 GB it is the same paging that made four scoring shards take
+# twenty-three minutes on one file and then die at 0xC0000005.
+#
+# PLOT_ROUNDS_MAX halves the fleet on each retry (6 -> 3 -> 1), so a pass that
+# is too wide for this machine corrects itself rather than failing outright --
+# but it spends the wall-clock finding that out. If the plotters die at six,
+# set PLOT_TOTAL_MAX = 3 rather than waiting for the rounds to walk it down.
+#
+# THE TWO PASSES DO NOT OVERLAP. Six plotters started while the scoring shard
+# is still reading is seven readers on one machine, which is the arrangement
+# that already failed. Let the report finish first.
+#
+# ---- ONE READER AT A TIME, AND WHY -----------------------------------------
+# Four scoring shards -- two cases x two shards -- each spent TWENTY-THREE
+# MINUTES on a single .out and then died with 0xC0000005, three relaunches
+# each, about two scenarios scored in an hour. A 111 MB .out is 29.1 million
+# channel values, and dyntools materialises all of them as Python floats:
+# roughly 580 MB of live objects at rest and considerably more while it is
+# building them, in a 32-bit process with a 2 GB ceiling.
+#
+# Four of those at once do not each get their own machine. They get their own
+# 2 GB of ADDRESS SPACE but share the RAM, and the 23 minutes is what a read
+# looks like when the machine is paging: it is not slow arithmetic, it is disk.
+# Then the peak allocation fails and the process dies where it stands.
+#
+# So: RUN_IN_PARALLEL off (one case at a time) and REPORT_WORKERS 1 (one shard).
+# One 32-bit reader on the machine, no paging, and a read that takes the few
+# minutes it should. It is not obviously slower overall -- four readers that
+# thrash and die finish nothing at all.
+#
+# PLOT_MISSING_OUTS is off for the same reason: the plot pass reads every .out
+# in full as well, so asking for both doubles the reading. Reports first, then
+# turn it back on for a second pass.
+#
+# ---- HOW MANY CORES, AND HOW THEY ARE SHARED -------------------------------
+# "auto" = size it from the machine, splitting between the cases that are
+# actually being simulated. A number = that many PSS/E sessions PER CASE, as
+# before.
+#
+# "auto" leaves CORES_SPARE cores for the operating system, this script and the
+# two launchers, then divides what is left between the running cases. With both
+# cases running it is HALF each, because N_WORKERS is per case and the licence
+# and the RAM see the total.
+                                           # set it to your PSS/E licence count
+
+# REPORT_WORKERS -- how many processes SCORE the results, per case.
+#
+#   "auto"  the same share the workers got: the machine's cores less
+#           CORES_SPARE, capped by CORES_MAX, split between the running cases
+#   4       exactly four shards per case (still capped, see below)
+#   1       one process, no sharding
+#
+# Two ceilings apply on top, and the run says when either bites:
+#   * CORES_MAX, as for the workers. With CORES_MAX_INCLUDES_REPORTS = True the
+#     shards may not exceed the workers' share either, since they share it.
+#   * the number of scenarios there are to score -- eight shards over three
+#     .out files is five processes that start PSS/E and find nothing to do.
+#
+# Scoring is READING .out files, not simulating: it is quick, and more shards
+# past a handful buy little. The reason it is sharded at all is that a report
+# over hundreds of scenarios was taking hours in one process.
+
+# CORES_MAX_INCLUDES_REPORTS -- does the ceiling cover the scoring as well?
+#
+# It did not, and the difference showed up as 10 sessions with CORES_MAX = 8.
+# The report phase is PSS/E sessions too, and the launcher starts a project's
+# report IN THE BACKGROUND so it can move on to the next project's workers.
+# With two projects queued that is one project's workers plus the previous
+# project's report shards at the same moment, and only the workers were counted.
+#
+# True  = CORES_MAX is the ceiling on EVERYTHING. The report runs in the
+#         foreground, between studies, and its shards are clamped to the same
+#         share the workers had -- so the peak is that share, never the sum.
+#         Costs the overlap: the next project's workers wait for the scoring.
+# False = the previous behaviour, overlap kept, peak up to
+#         workers + REPORT_WORKERS x REPORT_MAX_BG.
+
+# LIVE_STATUS_ALL -- both cases' live table in ONE file, in this script's
+# folder. Each case still writes its own under its results folder; this is the
+# one to keep open in a second window. Rewritten every LIVE_STATUS_EVERY
+# seconds, each block stamped with when that case last wrote it.
+
+# ---- ONE SHARED QUEUE, NOT FIXED SLICES ------------------------------------
+# Work used to be DEALT: worker 0 got faults[0::4], worker 1 faults[1::4], and
+# so on, decided before anything ran. Scenarios are not equal -- a P4 with a
+# stuck breaker and a reclose takes several times a plain P1.2, and a 28 MB .out
+# takes several times a small one to score -- so the worker holding the slow
+# ones ran for an hour after the others had finished and gone idle. The study
+# took as long as its unluckiest worker.
+#
+# With this on, every worker sees the WHOLE list and takes the next scenario
+# nobody has claimed, in BOTH phases: the runs and the scoring. A worker that
+# finishes early picks up more work immediately, so the run takes as long as the
+# work divided by the cores rather than as long as the worst share.
+#
+# The claim is a file created with O_CREAT|O_EXCL, which is atomic: of two
+# workers reaching for the same scenario at the same instant, exactly one gets
+# it. No lock server and no coordination between what are, deliberately,
+# separate PSS/E processes.
+# A claim untouched for this long belongs to a worker that died, and the
+# scenario goes back in the queue. The claim is touched as a scenario runs, so a
+# slow one is never taken from a worker that is still on it.
+
+# ---- CAPACITY HEADROOM ------------------------------------------------------
+# [] = off. A list of scale factors = after the normal run, take the faults that
+# FAILED with the projects and run them again at reduced project output, to find
+# the highest output at which each one is compliant:
+#
+#     CAPACITY_LEVELS = [0.75, 0.50, 0.25]
+#
+# Only the PROJECT case is re-run -- the base case does not model the projects,
+# so their output cannot change anything in it. Each level gets its own results
+# folder (results\<proj>_spp_cap75) and its own snapshot, because the reduced
+# dispatch is a different power flow and everything downstream of it differs.
+#
+# COST: one full build plus the failing faults, PER LEVEL. Three levels over
+# twelve failing faults is thirty-six scenarios and three builds, not a whole
+# study -- but it is not free either, which is why it is off by default and
+# runs only the faults that actually failed.
+# WHICH faults the sweep re-runs.
+#   "all"      every fault in the list, at every level. What you want when the
+#              question is "what does the system do at 50 % output", and the
+#              only way to see a fault that PASSES at full output and fails at
+#              a reduced one -- which happens: less injection is not uniformly
+#              easier, and an IBR plant contributes to voltage support as well
+#              as to the disturbance.
+#   "failing"  only the faults that FAIL with the projects at full output.
+#              Cheaper, and enough when the question is only "how far down do
+#              we have to go before this violation clears".
+# A COMPARISON PER CAPACITY LEVEL. The headroom table says pass or fail at each
+# level; this writes the FULL comparison -- base against the projects at that
+# output -- into its own folder, so "what exactly is still violating at 50 %"
+# has the same report, plots and spreadsheet as the main study.
+#   comparison\SantaFe\            the study at full output
+#   comparison\SantaFe\cap50\     the same comparison at 50 %
+
+# ---- ONE COMPARISON FOLDER PER PROJECT -------------------------------------
+# comparison\<project>\ instead of everything in one folder. Two projects
+# write files with the same names, so without this the second overwrites the
+# first and the folder ends up holding one project's report under a name that
+# does not say which.
+
+# ---- KEEP EVERY RUN, AND COMPARE THEM ALL -----------------------------------
+# A new run writes into the SAME results folder as the last one, so on disk the
+# earlier study stops existing the moment this one starts. With this True the
+# folder is renamed out of the way first --
+#
+#   results\SantaFe_spp            <- the run about to start
+#   results\SantaFe_spp__run3      <- the one before it, kept whole
+#   results\SantaFe_spp__run2      <- and the one before that
+#
+# -- so "run a new one" no longer means "lose the old one". Nothing is deleted
+# and nothing is overwritten: a rename, once, before any simulation.
+#
+# Capacity levels already keep their own folders (..._cap50), so they are part
+# of this whether or not it is on.
+
+# Every run that survives on disk -- this one, the archived ones, and each
+# capacity level -- scored against the SAME base case and put in one table, so
+# the whole history reads at a glance instead of one report per folder:
+#
+#   comparison\SantaFe\ALL_RUNS_SantaFe_spp.txt / .csv
+#
+# The base case is the current one for every row. The projects are not modelled
+# in it, so it does not move when their output does; if the BASE case itself is
+# re-run against a different system model, rows from before that are being
+# judged against a different base and the table says so per row (the base
+# folder's timestamp is printed).
+
+# ---- COLLECTOR-SYSTEM IMPEDANCE ---------------------------------------------
+# THE ONE PLACE TO CHANGE IT. What is set here goes to BOTH cases, which is the
+# point: a collector impedance changed in one case only is not a comparison, and
+# nothing in the report would say the two were run on different networks.
+#
+# The existing interconnections were sized for WIND. The surplus study puts a
+# BESS at the same POI, and a BESS collector is usually shorter and stiffer --
+# lower R and X, less charging -- so the voltage rise from the machines to the
+# POI is not the one the case was built with. Change it here, re-run, and read
+# the over-voltage in the comparison.
+#
+#     (gen bus, from bus, to bus, ckt,  R,      X,      B)
+#
+# Leave a value None to keep whatever the case has for it, so a row can change
+# X on its own. None everywhere and no multiplier = nothing is touched.
+#
+# COLLECTOR_BRANCHES = None leaves the study scripts' own table alone.
+
+# MULTIPLIERS instead of absolute values, per project: (R x, X x, B x). They
+# apply only where the row above leaves a value None, so the two mix freely.
+# Use this when the BESS collector data is not in hand yet and the question is
+# "what if it were half the impedance of the wind collector":
+#     COLLECTOR_SCALE = {"SantaFe": (0.5, 0.5, 1.0)}
+
+# A BARE NUMBER is accepted too, and means every project, all three quantities:
+#     COLLECTOR_SCALE = 0.2        same as {"<each project>": (0.2, 0.2, 0.2)}
+# which is the "one fifth of the wind collector" question in one number.
+#
+# NOT a set: COLLECTOR_SCALE = {0.2} is Python for a SET containing 0.2, not a
+# scale factor and not a dict, and it is checked for below rather than left to
+# fail somewhere less obvious.
+
+
+def _norm_collector_scale(v):
+    """Whatever COLLECTOR_SCALE was written as -> {project: (r, x, b)}."""
+    if not v:
+        return {}
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        f = float(v)
+        print("[compare] COLLECTOR_SCALE = %s -> every project, R x %s, X x %s, B x %s"
+              % (f, f, f, f))
+        return dict((k, (f, f, f)) for k in (COLLECTOR_BRANCHES or {}))
+    if isinstance(v, set):
+        # THE MISTAKE THIS CATCHES: {0.2} looks like a setting and is a set.
+        # Left alone it raises 'set has no attribute get' inside the study,
+        # hours later, with nothing pointing back here.
+        one = list(v)[0] if len(v) == 1 else None
+        print("")
+        print("[compare] *** COLLECTOR_SCALE is a SET, not a scale ***")
+        print("[compare]     {%s} in Python is a set containing %s."
+              % (", ".join(repr(x) for x in v), "one value" if one is not None
+                 else "those values"))
+        if isinstance(one, (int, float)):
+            print("[compare]     You almost certainly meant one of:")
+            print("[compare]         COLLECTOR_SCALE = %s" % one)
+            print("[compare]             every project, R x %s, X x %s, B x %s"
+                  % (one, one, one))
+            print("[compare]         COLLECTOR_SCALE = {\"SantaFe\": (%s, %s, 1.0)}"
+                  % (one, one))
+            print("[compare]             SantaFe only, R and X scaled, charging left alone")
+        print("[compare]     Nothing has run. Fix the line and start again.")
+        print("")
+        raise SystemExit(2)
+    if not isinstance(v, dict):
+        print("[compare] *** COLLECTOR_SCALE must be a number or {project: (r, x, b)} "
+              "-- got %r ***" % type(v).__name__)
+        raise SystemExit(2)
+    out = {}
+    for k, val in v.items():
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            out[k] = (float(val), float(val), float(val))
+            continue
+        try:
+            out[k] = (float(val[0]), float(val[1]), float(val[2]))
+        except Exception:
+            print("[compare] *** COLLECTOR_SCALE[%r] must be (r, x, b) or one number "
+                  "-- got %r ***" % (k, val))
+            raise SystemExit(2)
+    return out
+
+# The MVA base the R/X/B above are written on. None = the system base, used as
+# given. A number converts them (Z_system = Z x SBASE / this, B the other way).
+# Collector data usually arrives on the PLANT base -- 100 MVA numbers dropped
+# into a 100 MVA system case happen to be right, and into any other case are
+# wrong by that ratio with nothing anywhere to say so.
+
+# False = leave every collector branch alone, table or no table. The honest way
+# to run the "before" case without emptying the table you just filled in.
+
+# WHICH CASE THE CHANGE GOES INTO.
+#
+#   "project"  the Project case only. The base case keeps the collector it has.
+#   "both"     both cases -- only meaningful where the branch exists in both,
+#              i.e. an EXISTING plant's collector that the base already models.
+#   "base"     the base case only (a check, rarely what you want).
+#
+# WHICH ONE IS RIGHT DEPENDS ON WHAT THE BRANCH IS:
+#
+#   A collector that comes IN with the project -- new buses, not in the base
+#   case at all -- can only be changed in the project case. "both" and
+#   "project" do the same thing, and the base case reports the branch as absent.
+#
+#   A collector that ALREADY EXISTS, belonging to the wind plant at that POI:
+#   here the choice matters. "project" says "the base system is what it is
+#   today, and the plant being added rebuilds its collector" -- the comparison
+#   then measures the BESS and its new collector together, which is the real
+#   question when the BESS is what pays for the rebuild. "both" says "the
+#   collector is being rebuilt either way" and isolates the BESS alone against
+#   an already-rebuilt system.
+#
+# "project" is the default because it is the interconnection study's question.
+# Whichever you pick, the run prints which case it went into, and the two cases
+# cannot silently disagree.
+
+COLLECTOR_SCALE = _norm_collector_scale(COLLECTOR_SCALE)
+
+
+
+def _cpu_count():
+    try:
+        import multiprocessing
+        return max(1, int(multiprocessing.cpu_count()))
+    except Exception:
+        return 4
+
+
+def _sim_core_budget():
+    """The ceiling on SIMULATION sessions: CORES_MAX less the reservation.
+
+       Returns 0 when CORES_MAX is 0, which means "no ceiling" as before. Never
+       returns less than 1 when CORES_MAX is set -- reserving more than the
+       machine has would leave nothing running."""
+    if not CORES_MAX:
+        return 0
+    return max(1, int(CORES_MAX) - max(0, int(CORES_FOR_REPORTS or 0)))
+
+
+def _plot_core_budget():
+    """How many plot/score processes may run at once, ACROSS EVERY FOLDER.
+
+       Bounded by CORES_MAX -- the absolute ceiling on concurrent PSS/E
+       processes -- so the plot fleet can never push the machine past it."""
+    if CORES_FOR_REPORTS:
+        b = max(1, int(CORES_FOR_REPORTS))
+    else:
+        b = int(PLOT_TOTAL_MAX or 0) or max(1, int(PLOT_WORKERS or 1)) * 2
+    # PLOT_TOTAL_MAX IS A CAP, NOT A FALLBACK. With CORES_FOR_REPORTS = 18 it
+    # was ignored, and "PLOT_TOTAL_MAX = 1" still started eight plotters.
+    if PLOT_TOTAL_MAX:
+        b = min(b, max(1, int(PLOT_TOTAL_MAX)))
+    if CORES_MAX:
+        b = min(b, int(CORES_MAX))
+    return max(1, b)
+
+
+def _total_sessions(setting, n_cases):
+    """How many PSS/E sessions to run AT ONCE, across every case together."""
+    n_cases = max(1, int(n_cases))
+    cap = _sim_core_budget()
+    if isinstance(setting, str) and setting.strip().lower() == "auto":
+        usable = _cpu_count() - max(0, int(CORES_SPARE))
+        if cap:
+            usable = min(usable, cap)
+        return max(n_cases, usable)
+    try:
+        n = max(1, int(setting))
+    except Exception:
+        n = 4
+    total = n * n_cases
+    if cap:
+        total = min(total, cap)
+    return max(n_cases, total)
+
+
+def _split_sessions(total, n_cases):
+    """Divide the sessions between the cases, SPENDING THE REMAINDER.
+
+       An odd budget used to be divided and the remainder thrown away: 7 across
+       two cases gave 3 and 3, and the seventh licence sat unused for the whole
+       study. It now gives 4 and 3.
+
+       The extra goes to the PROJECT case. The two run the same fault list, so
+       neither has more work by count -- but the project case carries the
+       machines and their dynamic models, so its scenarios are the slower ones,
+       and it is the side whose results are under scrutiny."""
+    total, n_cases = max(1, int(total)), max(1, int(n_cases))
+    base, rem = total // n_cases, total % n_cases
+    return [base + (1 if k < rem else 0) for k in range(n_cases)]
+
+
+# The order the split is dealt in: the project case first, so an odd session
+# goes to the slower side.
+_SPLIT_ORDER = ["PROJ", "BASE"]
+
+
+def _report_workers_for(case_key, n_cases, why=None):
+    """How many scoring shards this case gets, and why that number.
+
+       ONE resolver for the banner and for the environment. They were computing
+       it separately -- the banner clamping for CORES_MAX_INCLUDES_REPORTS and
+       the environment doing it again -- which is how a printed number comes to
+       differ from the one that is actually sent."""
+    # CORES_FOR_REPORTS IS THE HARD CAP ON SCORING SHARDS.
+    #
+    # The total number of report shards across all cases never exceeds
+    # CORES_FOR_REPORTS, whether or not simulations are running -- it is the
+    # reserve set aside for scoring, and scoring is not allowed past it. It is
+    # also bounded by the machine (usable = cores - CORES_SPARE), so it never
+    # launches more shards than there are cores.
+    #
+    # This deliberately does NOT route through _workers_for()/_total_sessions(),
+    # which cap at the SIMULATION budget (CORES_MAX - CORES_FOR_REPORTS): that
+    # ceiling is for simulations, and applying it to scoring left 12 reserved
+    # cores producing only 2 shards a case.
+    _usable = max(1, _cpu_count() - max(0, int(CORES_SPARE)))
+    if CORES_FOR_REPORTS:
+        _pool = min(int(CORES_FOR_REPORTS), _usable)
+        # CORES_MAX IS THE ABSOLUTE CEILING -- nothing runs more than this many
+        # PSS/E processes at once, under any pipeline. (0 = no ceiling.)
+        if CORES_MAX:
+            _pool = min(_pool, int(CORES_MAX))
+        cap = max(1, _pool // max(1, int(n_cases)))
+        if isinstance(REPORT_WORKERS, str) and REPORT_WORKERS.strip().lower() == "auto":
+            n = cap
+            if why is not None:
+                why.append("report shards auto: CORES_FOR_REPORTS %d (usable %d) "
+                           "-> %d per case x %d case(s)"
+                           % (CORES_FOR_REPORTS, _usable, n, n_cases))
+        else:
+            try:
+                _want = max(1, int(REPORT_WORKERS))
+            except Exception:
+                _want = 4
+            n = min(_want, cap)
+            if why is not None and n < _want:
+                why.append("report shards cut from %d to %d: capped by "
+                           "CORES_FOR_REPORTS = %d (usable %d), split across "
+                           "%d case(s)" % (_want, n, CORES_FOR_REPORTS, _usable,
+                                           n_cases))
+        return max(1, n)
+    n = _workers_for(case_key, REPORT_WORKERS, n_cases)
+    if CORES_MAX_INCLUDES_REPORTS:
+        w = _workers_for(case_key, N_WORKERS, n_cases)
+        if n > w:
+            if why is not None:
+                why.append("report shards cut from %d to %d: with "
+                           "CORES_MAX_INCLUDES_REPORTS the scoring shares the "
+                           "workers' %d session(s), it does not add to them"
+                           % (n, w, w))
+            n = w
+    return max(1, n)
+
+
+def _workers_for(case_key, setting, n_cases, why=None):
+    """This case's share of the sessions."""
+    n_cases = max(1, int(n_cases))
+    total = _total_sessions(setting, n_cases)
+    shares = _split_sessions(total, n_cases)
+    order = [k for k in _SPLIT_ORDER if k] + []
+    try:
+        idx = order.index(str(case_key).upper())
+    except ValueError:
+        idx = 0
+    idx = min(idx, n_cases - 1)
+    n = max(1, shares[idx])
+    if why is not None:
+        if isinstance(setting, str) and setting.strip().lower() == "auto":
+            why.append("auto: %d core(s) - %d spare%s -> %d session(s), split %s"
+                       % (_cpu_count(), CORES_SPARE,
+                          (", capped at %d" % CORES_MAX) if CORES_MAX else "",
+                          total, " + ".join(str(x) for x in shares)))
+        else:
+            why.append("%s per case x %d case(s)%s -> %d session(s), split %s"
+                       % (setting, n_cases,
+                          (", capped at CORES_MAX = %d" % CORES_MAX) if CORES_MAX else "",
+                          total, " + ".join(str(x) for x in shares)))
+        why.append("the odd one goes to %s" % (order[0] if total % n_cases else "nobody"))
+    return n
+
+
+def _auto_workers(setting, n_cases, floor=1, why=None):
+    """Kept for callers that do not care which case: the smaller share."""
+    total = _total_sessions(setting, n_cases)
+    return max(floor, min(_split_sessions(total, max(1, int(n_cases)))))
+
+
+# ---- RE-SCORE A REPORT THAT IS OLDER THAN ITS RESULTS -----------------------
+# Phase 2 gives a criteria report to any folder that has .out files and none.
+# With this on it ALSO re-scores a folder whose report is older than its newest
+# .out -- which is what a partial re-run leaves behind: the report is not
+# missing, it simply describes the previous run of those scenarios, and the
+# comparison would read it and report verdicts from before your change without
+# anything saying so.
+#
+# It costs no simulation: scoring reads the .out files already on disk.
+
+# How much younger the newest .out may be before the report counts as stale.
+# Not cosmetic: the study rewrites its report after every scenario (LIVE_REPORT),
+# so the last .out of a run is normally a few seconds younger than the report
+# through no fault of anyone. 120 s clears that and still catches a re-run.
+
+# ---- POWER-FLOW MISMATCH ----------------------------------------------------
+# HOW WELL SOLVED IS "SOLVED". A case can report convergence and still carry a
+# mismatch of several MVA: the solver stops on its own tolerance, not on yours.
+# That residual is frozen into the .cnv and the snapshot, and comes back as
+# initial-condition error in EVERY dynamic run built from them -- drift in the
+# flat run, machines that will not initialise, scenarios that crash and get
+# given up. None of that says "mismatch" when you read it.
+#
+# So the build iterates -- FDNS and full Newton alternately, they fail
+# differently -- until the total system mismatch is under this, and says the
+# number it reached.
+#
+# Set here so BOTH cases are held to the same standard. A base case solved to
+# 0.04 MVA compared against a project case solved to 3 MVA is a comparison of
+# two different qualities of solution, and the difference would be read as the
+# projects' doing.
+
+# How many solve passes to spend trying. It stops early when the mismatch stops
+# improving, so this is a ceiling rather than a cost.
+
+# True  = a build that cannot reach it STOPS, and says so, instead of freezing
+#         the residual into everything downstream.
+# False = save it anyway and print the number.
+
+# ---- WHAT KIND OF STUDY: THE FAULT SET ITSELF -------------------------------
+# None = leave the study scripts' own value alone. Anything set here goes to
+# BOTH cases, which is the whole point: a fault set built one way in one case
+# and another way in the other is not a comparison.
+#
+# WHERE THE EVENTS COME FROM is MODES at the top:
+#   "spp"     GENERATE them from the topology       <- these settings
+#   "custom"  simple 3PH/SLG faults near the POI    <- the CUSTOM_* block
+#   "con"     import SPP's .con                     <- FAULTS_CON
+#   "table"   import SPP's cluster fault table      <- FAULTS_TABLE
+
+# GENERATE, or READ A LIST THAT ALREADY EXISTS.
+#   True   walk the topology and build the fault set (then both cases share it)
+#   False  read the shared SPP_FAULTS_<project>.csv
+# Leave it None and the study scripts decide -- which for a compared run means
+# False, because MAKE_FAULT_LIST above builds the shared list once and both
+# cases read it. Set True only when you want the set rebuilt from the case.
+
+# WHEN TO REWRITE THE FAULT FILES: "if-missing" | "always" | "never".
+
+# ---- "spp" mode: how far out, and what counts ------------------------------
+
+# WHICH PLANNING EVENTS TO BUILD. None = the study's own set.
+#   ["P1.2","P1.3","P4.2"]   the usual interconnection set
+#   ["P1.2"]                 3ph line faults only
+# P6 is the expensive one -- it needs its own .cnv/.snp per fault, because the
+# prior outage must be solved into the case before the fault is applied.
+
+# HOW FAR OUT EACH EVENT REACHES, per planning event. None = the study's own
+# table. A dict overrides only the events named:
+#     SPP_EVENT_HOPS = {"P1.2": 4, "P4.2": 2}
+
+# ---- "custom" mode: plain faults near the POI -------------------------------
+# Not a planning standard -- a fault is applied at a bus, held, and cleared.
+# What you want when the question is how the plant rides through a disturbance
+# rather than whether it meets TPL.
+
+# ---- FAULT CREATION ---------------------------------------------------------
+# None = leave the study scripts' own value alone. A value here sets it for
+# BOTH cases, which is the point of having it here: a fault list built one way
+# in one case and another way in the other is not a comparison, and nothing in
+# the report would say the two were judged on different events.
+#
+# WHERE THE EVENTS COME FROM is MODES, above: "spp" generates them from the
+# topology, "con" imports SPP's .con, "table" imports SPP's cluster fault table.
+# The settings below that mention generation are ignored when importing, and
+# the ones that mention importing are ignored when generating.
+
+# -- importing SPP's own list ------------------------------------------------
+                         #   limit; "any_element" = keep it if ANY tripped element
+                         #   is inside the radius
+
+# -- generating them from the topology ---------------------------------------
+
+# How many elements one stuck breaker takes with it. The station's breaker
+# layout is not in a PSS/E case, so this is an assumption -- see SPP_P4_GROUP in
+# the study scripts for what each value means and which SPP events it matches.
+
+# -- clearing times and the reclose ------------------------------------------
+                             # (SPP's reports differ: GEN-2018-003 and -2017-239
+                             #  use 6 at 345 kV and 7 below, -2017-164 uses 7
+                             #  everywhere, -2017-220 uses 6 everywhere)
+
+# ---- WHAT EACH RUN DOES -----------------------------------------------------
+# None = the study scripts' own value.
+
+# ---- THE SPP LIMITS THE STUDY SCORES AGAINST --------------------------------
+# These decide PASS and FAIL. Set here so both cases are judged identically --
+# two studies scored against different thresholds produce a comparison whose
+# differences are the thresholds, and nothing would say so.
+
+# ---- SIMULATION LENGTHS (seconds of SIMULATED time) -------------------------
+# None = leave each study script's own value alone. A number sets it for BOTH
+# cases, which is the point of having it here: a fault run to 10 s in one case
+# and 20 s in the other is not a comparison, and nothing in the report would say
+# the two were judged over different windows.
+
+
+# ---- EVERYTHING ELSE A RUN CHANGES -----------------------------------------
+# Below this line are the settings that used to sit further down beside the
+# code that reads them. That is the right place for an EXPLANATION and the
+# wrong place for a SWITCH: deciding what a run does meant finding eight
+# lines spread over three hundred, and the one that was missed was the one
+# that mattered. The explanations stay where they were, with a pointer up
+# here.
+
+# what to run
+
+# where to look for results
+def _parent_dir(p):
+    """The folder one level up. Splits on the separator rather than going
+       through os.path.abspath(), which prepends the working directory when the
+       path's platform is not the interpreter's."""
+    p = str(p).rstrip("\\/")
+    i = max(p.rfind("\\"), p.rfind("/"))
+    return p[:i] if i > 0 else p
+
+
+SEARCH_ROOT = STUDY_ROOT                   # the folder the cases sit in
+
+# the shared fault list
+# {root} = the folder the cases sit in (the parent of BASE_DIR), {project} = the
+# project name. Beside the cases, not inside one: both cases read this file, and
+# a file inside one case folder would be retired with that case's results.
+
+# while the studies run
+
+# what counts as WORSE within limits
+
+# the SPP limits, for the exceedance columns
+
+# ---- what the launchers do with these --------------------------------------
+# PROJECTS, MODES        -> SPP_RUN_PROJECTS, SPP_RUN_MODES
+# ONLY_EVENTS            -> SPP_ONLY_EVENTS      (run, score AND compare)
+# ONLY_FAULTS            -> SPP_ONLY_FAULTS, SPP_REPORT_FAULTS
+# SKIP_DONE              -> SPP_SKIP_DONE
+# FRESH_START            -> SPP_FRESH_START
+# Each is printed by the launcher as it takes effect, so the log says which
+# settings were actually in force rather than which ones this file holds now.
+# ============================================================================
+# ==========================  END CONTROL PANEL  =============================
+# ============================================================================
+
+
+
+# ============================================================================
+# PART 1 -- WHAT TO COMPARE
+# ============================================================================
+
+# The two studies. "base" is the reference; "test" is the one under scrutiny.
+# Order matters only for wording: results are always reported as base -> test.
+#
+#   dir      the folder holding the study script, the launcher and results\
+#   script   the LAUNCHER in that folder (not the study script)
+#   label    what to call it in the report -- write something a reviewer
+#            understands without opening this file
+CASE_BASE = {
+    "key":    "BASE",
+    "dir":    BASE_DIR,
+    "script": "z4_lch_b_con.py",
+    "label":  "base case -- projects NOT modelled",
+}
+CASE_TEST = {
+    "key":    "PROJ",
+    "dir":    TEST_DIR,
+    "script": "z4_lch_p_con.py",
+    "label":  "one BESS project added to the base case, one project at a time",
+}
+
+# ============================================================================
+# PART 2 -- RUNNING THE STUDIES FIRST (optional)
+# ============================================================================
+
+# ---- THE ONE SETTING THAT DECIDES WHAT THIS RUN DOES ------------------------
+#
+#   "compare"  read what is on disk and compare it. Seconds. The normal setting:
+#              you will re-run the comparison far more often than the studies.
+#
+#   "missing"  run only what is absent -- the case/project pairs that exist on
+#              one side and not the other -- then compare. Simulates only what
+#              has to be simulated.
+#
+#   "all"      the whole pipeline from nothing: SIMULATE both cases, report both,
+#              compare, summarise. This is the one to use when the results
+#              folders are empty. It takes as long as two full studies.
+#
+# Whatever it does, it finishes by writing the comparison. A study that fails
+# part way does not stop the comparison of what did finish -- it is reported as
+# scored on one side only, which is the truth.
+# PIPELINE -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# Kept for compatibility with the earlier settings; PIPELINE wins if both are set
+# to something. RUN_STUDIES = True is the same as PIPELINE = "all".
+# RUN_STUDIES -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# True  = both studies at once. Each is a full launcher, so this is 2 x
+#         N_WORKERS concurrent PSS/E sessions -- check your licence count and
+#         RAM before turning it on.
+# False = base first, then test.
+# RUN_IN_PARALLEL -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# True  = before comparing, work out which (project, mode) pairs have results in
+#         only ONE case and run the MISSING side for exactly those. This is what
+#         makes "compare EastFork" work when EastFork was only ever run with the
+#         projects: it runs the base case for EastFork alone rather than
+#         re-running everything.
+#
+#         It drives each launcher through SPP_RUN_PROJECTS, so neither launcher
+#         file is edited. Editing a launcher to run one project and editing it
+#         back is exactly how two studies end up having run different sets.
+#
+# A pair present on both sides is never re-run.
+# Same as PIPELINE = "missing".
+# RUN_MISSING -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# Where the comparison output goes. Deliberately OUTSIDE both study folders --
+# it belongs to neither, and putting it in one of them invites it to be deleted
+# with that study's results.
+# COMPARE_DIR -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# Which projects to compare. [] = every project folder present in BOTH cases,
+# discovered from results\<project>_<mode>\. Naming one or more restricts it.
+# PROJECTS -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# ---- RUN / COMPARE ONLY SOME FAULTS ----------------------------------------
+# [] = every fault. Non-empty = only these, in ALL THREE places at once:
+#
+#   * the simulation      both launchers get RUN_ONLY_FAULTS = this
+#   * the scoring         both launchers get REPORT_FAULTS   = this
+#   * the comparison      only these faults appear in the comparison files
+#
+# One setting for all three IS THE POINT. The comparison is only meaningful if
+# both cases ran the same events; a per-case selection made by editing two
+# launchers separately is one forgotten edit away from a fault that exists on
+# one side only -- which this script would then, correctly and uselessly,
+# report as "introduced by the projects".
+#
+# Ids and ranges:
+#     ONLY_FAULTS = ["F03", "F07", "F19"]
+#     ONLY_FAULTS = ["F19-F24"]
+#     ONLY_FAULTS = ["F01-F20", "F27"]
+#
+# The launchers' keywords (FAIL, NOTDONE, CRASHED, NONCONV) also pass through to
+# the studies, but they resolve to DIFFERENT ids in each case -- the base case
+# and the project case do not fail the same faults -- so the comparison is left
+# unfiltered when one is used, and says so rather than silently comparing two
+# different selections.
+# ONLY_FAULTS -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+_envof = (os.environ.get("SPP_ONLY_FAULTS") or "").strip()
+if _envof:
+    ONLY_FAULTS = [x.strip() for x in _envof.split(",") if x.strip()]
+    print("[compare] ONLY_FAULTS from the environment: %s" % ", ".join(ONLY_FAULTS))
+
+
+def _id_selected(fid):
+    """Is this fault id in ONLY_FAULTS? Whole id, or its leading token.
+
+       Same rule the study uses, so the three places that filter -- the runs,
+       the scoring and this comparison -- agree. "C01" selects
+       "C01_3PH_765911_10cy"; "F03" selects "F03" and nothing else."""
+    if not ONLY_IDS:
+        return True
+    sid = str(fid).strip().upper()
+    if sid in ONLY_IDS:
+        return True
+    head = sid.split("_", 1)[0]
+    return bool(head) and head != sid and head in ONLY_IDS
+
+
+def _expand_only(spec):
+    """(set of ids, keyword list). None ids = 'cannot be resolved here'.
+
+       F19-F24 expands the way the launchers expand it, so the three places
+       that read this setting agree on what it means."""
+    if not spec:
+        return None, []
+    ids, words = set(), []
+    toks = []
+    for raw in spec:
+        # "," and ";" inside one entry are separators, because the launchers'
+        # expander treats them that way and the two must agree.
+        toks += str(raw).replace(";", ",").split(",")
+    for raw in toks:
+        t = raw.strip().upper()
+        if not t:
+            continue
+        m = re.match(r"^([A-Z_]*?)(\d+)\s*-\s*([A-Z_]*?)(\d+)$", t)
+        if m and (not m.group(3) or m.group(1) == m.group(3)):
+            pre, a, b = m.group(1), int(m.group(2)), int(m.group(4))
+            w = len(m.group(2))
+            if a <= b:
+                for i in range(a, b + 1):
+                    ids.add("%s%0*d" % (pre, w, i))
+                continue
+        if re.match(r"^[A-Z]+\d+$", t) or t == "FLAT_RUN":
+            ids.add(t)
+        else:
+            words.append(t)
+    return (ids or None), words
+
+
+# ---- ...OR BY PLANNING EVENT ------------------------------------------------
+# [] = every event. Non-empty = only the faults whose planning event matches,
+# in all three places ONLY_FAULTS reaches:
+#     ONLY_EVENTS = ["P1.2"]              only the 3ph line faults
+#     ONLY_EVENTS = ["P1.2", "P1.3"]
+#     ONLY_EVENTS = ["P1"]                every P1 sub-event
+#
+# Unlike ONLY_FAULTS' keywords this DOES filter the comparison, because a
+# planning event means the same thing in both cases -- P1.2 is P1.2 whether or
+# not the projects are modelled -- so the two sides stay the same set.
+#
+# Combines with ONLY_FAULTS by intersection.
+# ONLY_EVENTS -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+_envoe = (os.environ.get("SPP_ONLY_EVENTS") or "").strip()
+if _envoe:
+    ONLY_EVENTS = [x.strip() for x in _envoe.split(",") if x.strip()]
+    print("[compare] ONLY_EVENTS from the environment: %s" % ", ".join(ONLY_EVENTS))
+
+
+# ---- RUN ONLY WHAT HAS NOT RUN YET ------------------------------------------
+# True  = each study drops the scenarios that already have a .done marker and a
+#         .out before dealing the work out, so a re-run of this pipeline
+#         continues where the last one stopped rather than repeating finished
+#         simulations. Both cases get the same instruction, from here.
+# False = leave each launcher's own SKIP_DONE setting alone.
+#
+# This restricts what is SIMULATED, never what is compared: the comparison reads
+# the reports, which cover every .out in the folder whatever produced it. A
+# resumed run and a run done in one go compare identically.
+# SKIP_DONE -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+_envsd = (os.environ.get("SPP_SKIP_DONE") or "").strip().lower()
+if _envsd in ("1", "true", "yes", "on"):
+    SKIP_DONE = True
+elif _envsd in ("0", "false", "no", "off"):
+    SKIP_DONE = False
+
+
+# ---- START OVER, OR CARRY ON ------------------------------------------------
+# False = RESUME. The .done markers are left alone, so both studies carry on
+#         from wherever they stopped. With SKIP_DONE this is what makes a
+#         re-run cost only the scenarios that have not finished.
+# True  = START OVER. Every .done/.attempts marker and every ALL_DONE flag is
+#         cleared in BOTH cases first, so every scenario is simulated again.
+#         Use it when the case, the dynamics data or the fault list changed and
+#         the results on disk no longer describe what you are studying.
+#
+# This OVERRIDES FRESH_START in both launchers. It has to: one case starting
+# fresh while the other resumes is not a comparison of two cases, it is a
+# comparison of two different amounts of work, and nothing in the output would
+# say so.
+#
+# NOTE: NEW_FAULT_LIST = True starts over regardless -- a new list renumbers the
+# faults, so the results on disk cannot be carried forward whatever this says.
+# FRESH_START -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+_envfs = (os.environ.get("SPP_FRESH_START") or "").strip().lower()
+if _envfs in ("1", "true", "yes", "on"):
+    FRESH_START = True
+elif _envfs in ("0", "false", "no", "off"):
+    FRESH_START = False
+
+
+def _event_selected(ev):
+    """P1 selects P1.2. Unknown/blank events are NOT selected."""
+    if not ONLY_EVENTS:
+        return True
+    e = (ev or "").strip().upper()
+    for t in [str(x).strip().upper() for x in ONLY_EVENTS]:
+        if e == t or e.startswith(t + "."):
+            return True
+    return False
+
+
+ONLY_IDS, ONLY_WORDS = _expand_only(ONLY_FAULTS)
+if ONLY_WORDS:
+    print("[compare] %s resolve(s) per case, so the comparison is NOT filtered "
+          "by them: %s" % ("keyword" if len(ONLY_WORDS) == 1 else "keywords",
+                           ", ".join(ONLY_WORDS)))
+    ONLY_IDS = None
+
+# When a case's results are not where CASE_BASE/CASE_TEST say, this folder is
+# searched for them so the report can say WHERE THEY ARE instead of only that
+# they are absent. Results move: folders get renamed, a study gets pointed at a
+# new deck, work gets tidied into a subfolder. Read-only, and only ever
+# consulted when a case comes up empty.
+# SEARCH_ROOT -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# SEARCH_DEPTH -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# ---- THE FAULT LIST BOTH STUDIES RUN ----------------------------------------
+# THE COMPARISON IS ONLY VALID IF BOTH CASES RUN THE SAME EVENTS. F27 has to be
+# the same fault on both sides or the classification is comparing two different
+# things under one name -- and nothing downstream can detect that.
+#
+# So the study scripts are set to AUTO_SPP_FAULTS = False with FAULTS_CSV
+# pointing at one shared file. The generator is topology-driven: left on, the
+# base case and the project case walk DIFFERENT networks and produce different
+# sets, silently.
+#
+# MAKE_FAULT_LIST decides what happens when that shared file does not exist yet:
+#   True   generate it ONCE, from the case named in FAULT_LIST_FROM, by running
+#          that study's BUILD role (loads the case, walks the topology, writes
+#          the fault set -- no dynamics), then copy it to SHARED_FAULTS_CSV so
+#          both studies read the same file from then on.
+#   False  stop and say so, rather than launching hours of simulation that will
+#          die on the first fault lookup.
+# MAKE_FAULT_LIST -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# FAULT_LIST_FROM -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# SHARED_FAULTS_CSV -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# ---- START AGAIN WITH A BRAND-NEW FAULT SET ---------------------------------
+# True = regenerate the shared list even though one already exists, then run
+#        BOTH studies against it. Use this when the fault set itself should
+#        change -- a different hop count, a new POI, a revised case.
+#
+# The old list is kept alongside with a timestamp, never deleted: it is the only
+# record of what earlier results were run against.
+#
+# IT INVALIDATES EVERY EXISTING RESULT. A new list renumbers the faults, so the
+# F27 in results already on disk is not the F27 in the new list -- and the ids
+# collide, so nothing would look wrong. Existing results are therefore cleared
+# out of the way first (moved aside, not deleted) and both studies re-run from
+# scratch. That is the honest cost of changing the fault set, and doing it any
+# other way produces a comparison of two different things under one name.
+# NEW_FAULT_LIST -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# MODES -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+
+
+# ---- THE COMPARISON, WHILE THE STUDIES ARE STILL RUNNING -------------------
+# Phase 3 runs after BOTH studies finish, so on a run of any size there is
+# nothing to read for hours -- and the whole point of the exercise is a question
+# you want answered as early as possible: are the failures the projects' fault?
+#
+# Both studies already rewrite their criteria report after every scenario
+# (LIVE_REPORT in the study script). So the comparison can be rebuilt from what
+# has been scored so far, as often as you like: it reads text files, opens no
+# .out, and takes about a second.
+#
+# Seconds between refreshes. 0 = off, and the comparison appears only at the end.
+# It writes the same files phase 3 does, so COMPARISON_SUMMARY.txt is always the
+# newest picture -- of however many scenarios both sides have finished.
+# LIVE_COMPARE_EVERY -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# Kill a study that has run this long (seconds). 0 = wait for ever.
+# STUDY_TIMEOUT_S -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# The interpreter for the launchers. sys.executable is the one running THIS
+# file, which is what you want when you start it the same way you start them.
+PYTHON = sys.executable
+
+# ============================================================================
+# PART 3 -- WHAT COUNTS AS A DIFFERENCE
+# ============================================================================
+
+# A fault that passes on both sides is still worth flagging if it moved a long
+# way towards its limit. These are the movements that earn a mention.
+#   voltage in pu, angle in degrees.
+# WORSE_PU_DELTA -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# WORSE_DEG_DELTA -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# How many element names to print per fault per violation type before
+# summarising. The full list always goes to the CSV.
+# ELEMENT_LIST_MAX -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# ---- THE LIMITS, so the report can say BY HOW MUCH --------------------------
+# "530555 = 1.243 pu" is a number. "530555 = 1.243 pu, 0.043 OVER the 1.20
+# limit" is a finding you can size a mitigation against, and it sorts by
+# severity so the worst element is the first one you read.
+#
+# These MUST match the study that produced the results. They are read out of the
+# SPP_VIOLATIONS header when it carries them -- it prints its own limits -- and
+# these are the fallback. A mismatch is reported rather than silently applied:
+# exceedances measured against the wrong limit are worse than none at all.
+# V_RECOVERY_PU -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# V_OVERSHOOT_PU -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# V_SS_LOW -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# V_SS_HIGH -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+# ANGLE_DEV_DEG -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# .csv companions on/off. The .txt is always written.
+# WRITE_CSV -- SET IN THE CONTROL PANEL AT THE TOP OF THIS FILE.
+
+# ============================================================================
+# PART 4 -- py2 / py3 PLUMBING
+# ============================================================================
+
+PY2 = sys.version_info[0] == 2
+
+
+def _u(x):
+    """Anything -> text, on either interpreter."""
+    if isinstance(x, bytes):
+        return x.decode("utf-8", "replace")
+    if PY2 and not isinstance(x, unicode):        # noqa: F821  (py2 only)
+        return unicode(str(x), "utf-8", "replace")  # noqa: F821
+    return x if isinstance(x, str) or not PY2 else x
+
+
+def _csv_row(row):
+    """py2's csv module cannot write unicode -- encode each field. py3 passes
+       straight through. Without this a report carrying one replacement
+       character takes the CSV down with it."""
+    if not PY2:
+        return row
+    out = []
+    for f in row:
+        if isinstance(f, unicode):                # noqa: F821  (py2 only)
+            out.append(f.encode("utf-8", "replace"))
+        else:
+            out.append(f)
+    return out
+
+
+def csv_open(path, mode="r"):
+    """csv needs binary+no-newline-translation on py2 and text+newline='' on py3.
+       One helper so every call site stops caring which interpreter this is.
+       py3 gets an explicit utf-8 + replace so a stray byte in a study report
+       cannot kill the write (see _write)."""
+    if PY2:
+        return open(path, mode + "b")
+    return io.open(path, mode, newline="", encoding="utf-8", errors="replace")
+
+
+def _read_text(path):
+    """Read a report file without dying on a stray byte. Report text is written
+       by PSS/E-adjacent code and occasionally carries something that is not
+       clean ASCII; losing the whole comparison to one character would be
+       absurd."""
+    if PY2:
+        with open(path, "r") as fh:
+            return fh.read().decode("utf-8", "replace")
+    with open(path, "r", errors="replace") as fh:
+        return fh.read()
+
+
+def _fmt_hms(sec):
+    sec = int(sec)
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+    if h:
+        return "%dh %02dm %02ds" % (h, m, s)
+    if m:
+        return "%dm %02ds" % (m, s)
+    return "%ds" % s
+
+
+def _banner(msg):
+    print("")
+    print("=" * 78)
+    print(" [compare] %s" % msg)
+    print("=" * 78)
+
+
+# ============================================================================
+# PART 5 -- FINDING THE REPORT FILES
+# ============================================================================
+# The study writes SPP_CRITERIA_REPORT_EastFork.txt when NAME_FILES_BY_PROJECT
+# is on and SPP_CRITERIA_REPORT.txt when it is not, and result folders written
+# before that setting existed hold the un-suffixed name. Every reader below has
+# to accept all of them, so the choice lives in ONE place.
+
+_ROOT_HEADS = {"LIVE_STATUS": "00_STATUS",
+               "RUN_PLAN": "01_PLAN",
+               "SPP_VIOLATIONS": "02_VIOLATIONS",
+               "SPP_MEASUREMENTS": "03_MEASUREMENTS",
+               "RUN_SUMMARY": "04_RUN_SUMMARY"}
+
+
+# The report stems that may fall back to their _SELECTED variant even when this
+# comparison is not itself restricted -- see the note in rfile(). Only per-bus
+# reference measurements, never criteria or violations.
+_MEAS_FALLBACK_STEMS = ("SPP_MEASURE_VOLTS", "SPP_MEASURE_ANGLES")
+
+
+def rfile(rdir, stem, ext, proj=None):
+    """Path of one report file in rdir, or "" if nothing matching exists.
+
+       A _SELECTED report covers only some faults. It is NOT the full report and
+       must never be mistaken for one: comparing a 12-fault selection against a
+       142-fault study would report 130 faults as "ran on one side only". So it
+       is ignored -- UNLESS THIS COMPARISON IS RESTRICTED TO THE SAME SELECTION.
+
+       ONLY_EVENTS and ONLY_FAULTS are passed down to both studies, so both wrote
+       _SELECTED reports covering exactly the faults being compared. Refusing to
+       read them left a run finding twenty .out files, "*** NOT WRITTEN ***", and
+       nothing to compare. The rule guards against a PARTIAL report standing in
+       for a FULL one; when the comparison is partial too, they match.
+
+       Tagged FIRST when restricted, because the tagged file is the one THIS run
+       produced and an untagged one beside it may be older than the fault list."""
+    # reports\ FIRST, then the root of the folder. The study writes its reports
+    # to the subfolder now and wrote them to the root before, and a comparison
+    # that reads only one of the two places finds nothing on one side and calls
+    # every fault "ran on one side only".
+    dirs = [os.path.join(rdir, "reports"), rdir]
+
+    def _first(names):
+        for d in dirs:
+            for n in names:
+                if not n:
+                    continue
+                f = os.path.join(d, n)
+                if os.path.isfile(f):
+                    return f
+        return ""
+
+    # WITH the case kind in the name and without it, because a folder written
+    # before RUN_KIND existed carries the plain name.
+    kinds = ["_PROJ", "_BASE", ""]
+    tagged, plain = [], []
+    for k in kinds:
+        if proj:
+            tagged.append("%s_SELECTED%s_%s.%s" % (stem, k, proj, ext))
+            plain.append("%s%s_%s.%s" % (stem, k, proj, ext))
+    tagged.append("%s_SELECTED.%s" % (stem, ext))
+    plain.append("%s.%s" % (stem, ext))
+    if _sel_tag():
+        order = tagged + plain
+    elif stem in _MEAS_FALLBACK_STEMS:
+        # MEASUREMENTS ARE REFERENCE DATA, NOT VERDICTS. The strict rule below
+        # refuses a _SELECTED file when this comparison is not itself
+        # restricted, so a 12-fault partial is never read as a 142-fault full
+        # one -- right for criteria and violations, where a fault the partial
+        # omits would read as "ran on one side". But SPP_MEASURE_VOLTS /
+        # _ANGLES only supply per-bus base and project values; a partial one
+        # cannot mislabel anything, it can only fill fewer cells. A study
+        # scored with a selection writes ONLY _SELECTED reports, and refusing
+        # them here left EVERY base value blank for every bus that did not
+        # itself violate -- the bus was measured (e.g. 1.164 pu), the number
+        # was on disk, and the comparison could not see it. Prefer the full
+        # file; fall back to the selected one.
+        order = plain + tagged
+    else:
+        order = plain
+    # THE NUMBERED ROOT REPORTS. A few reports are written to the ROOT of the
+    # results folder under a numbered name so they sort to the top and are the
+    # first thing seen -- 02_VIOLATIONS, 03_MEASUREMENTS, 04_RUN_SUMMARY. Asked
+    # for "RUN_SUMMARY", this would not find the file that is actually there and
+    # would report the study as having written nothing.
+    _head = _ROOT_HEADS.get(stem)
+    if _head:
+        # THE TAG GOES LAST FOR A ROOT REPORT. report_path() in the study script
+        # writes subdir reports as "<stem>_SELECTED_<KIND>_<proj>.ext" but ROOT
+        # reports as "<head>_<KIND>_<proj>_SELECTED.ext" -- the tag moves. This
+        # rebuilt the root name from the subdir spelling, producing
+        # 02_VIOLATIONS_SELECTED_PROJ_x.txt while the study had written
+        # 02_VIOLATIONS_PROJ_x_SELECTED.txt, so a RESTRICTED run's root reports
+        # were never found and the comparison read a stale full report or none.
+        _root = []
+        for _k in kinds:
+            if proj:
+                _root.append("%s_%s%s_%s.%s"
+                             % (_head, _k.lstrip("_"), "_" + proj if proj else "",
+                                "SELECTED", ext) if _k else "")
+        _root = [x for x in _root if x]
+        for _k in kinds:
+            if proj and _k:
+                _root.append("%s%s_%s_SELECTED.%s" % (_head, _k, proj, ext))
+                _root.append("%s%s_%s.%s" % (_head, _k, proj, ext))
+        _root.append("%s_SELECTED.%s" % (_head, ext))
+        _root.append("%s.%s" % (_head, ext))
+        order = _root + [_head + n[len(stem):] for n in order] + order
+    hit = _first(order)
+    if hit:
+        return hit
+
+    # Nothing under an expected name: fall back to a glob, for folders written
+    # for a project this script was not told about.
+    _stems = [stem] + ([_head] if _head else [])
+    hits = []
+    for _st in _stems:
+        hits += glob.glob(os.path.join(rdir, "reports", "%s_*.%s" % (_st, ext)))
+        hits += glob.glob(os.path.join(rdir, "%s_*.%s" % (_st, ext)))
+    hits = sorted(set(hits))
+    full = [h for h in hits if "_SELECTED" not in os.path.basename(h)]
+    sel = [h for h in hits if "_SELECTED" in os.path.basename(h)]
+    if _sel_tag() and sel:
+        return sel[0]
+    if full:
+        return full[0]
+    # ONLY _SELECTED FILES ON DISK, AND THIS COMPARISON IS NOT RESTRICTED.
+    #
+    # The exact-name path above already allows this for the measurement stems
+    # (see _MEAS_FALLBACK_STEMS): measurements are reference data, so a partial
+    # file can only fill fewer cells, never mislabel one. The glob path did not,
+    # and returned "" instead -- so a folder whose reports are all _SELECTED
+    # produced NO measurements at all, and every base and project cell in the
+    # sweep tables read "-" while the numbers sat on disk.
+    if sel and stem in _MEAS_FALLBACK_STEMS:
+        return sel[0]
+    return ""
+
+
+
+# ---- WHICH CASE'S RESULTS FOLDER --------------------------------------------
+# Base and Projects each hold a "results" folder, so two windows open side by
+# side look identical and a path pasted into a message says nothing about which
+# case it came from. With this on the folder is named for its case:
+#
+#     Base\results_base\SantaFe_spp\      Projects\results_proj\SantaFe_spp\
+#
+# BACKWARD COMPATIBLE ON PURPOSE. A study already on disk lives in "results",
+# and renaming it out from under a half-finished run would orphan every .out,
+# part and report in it. So: use results_<kind> when it exists, or when there is
+# no plain "results" to use; otherwise keep using the one that is there. To
+# adopt the new names on an existing study, rename the folder once --
+# Base\results -> Base\results_base, Projects\results -> Projects\results_proj
+# -- and everything picks it up with no other change.
+#
+# THE ENGINES AND LAUNCHERS APPLY THE IDENTICAL RULE from their own copy of it,
+# so the folder this reads is always the folder they wrote.
+RESULTS_FOLDER_BY_CASE = True
+
+
+def _res_root(case):
+    """<case dir>\results_base | results_proj, or the plain "results" that is
+       already on disk. Every results path in this file goes through it."""
+    d = case["dir"]
+    if not RESULTS_FOLDER_BY_CASE:
+        return os.path.join(d, "results")
+    _new = os.path.join(d, "results_%s" % str(case.get("key") or "").lower())
+    _old = os.path.join(d, "results")
+    if os.path.isdir(_new) or not os.path.isdir(_old):
+        return _new
+    return _old
+
+
+def results_dir(case, proj, mode):
+    return os.path.join(_res_root(case), "%s_%s" % (proj, mode))
+
+
+def discover_projects(mode):
+    """Project names that have a results folder in BOTH cases.
+
+       Both sides must have run it: a project present in one case only cannot be
+       compared, and silently dropping it would understate the study. Anything
+       one-sided is named in the summary rather than ignored."""
+    def _names(case):
+        out = set()
+        for d in glob.glob(os.path.join(_res_root(case), "*_%s" % mode)):
+            if os.path.isdir(d):
+                nm = os.path.basename(d)
+                out.add(nm[:-(len(mode) + 1)])
+        return out
+    a, b = _names(CASE_BASE), _names(CASE_TEST)
+    return sorted(a & b), sorted(a - b), sorted(b - a)
+
+
+def inventory(case):
+    """Everything under this case's results\\, and how complete each folder is.
+
+       "no project has spp results in BOTH studies" is a true statement and a
+       useless one: it does not say which folders exist, which mode they are, or
+       whether the report ever ran. Every one of those is a different problem
+       with a different fix, and the answer is sitting on disk. So print it.
+
+       Returns [(folder, project, mode, has_report, n_out, when)]."""
+    out = []
+    base = _res_root(case)
+    if not os.path.isdir(base):
+        return out
+    for d in sorted(glob.glob(os.path.join(base, "*"))):
+        if not os.path.isdir(d):
+            continue
+        nm = os.path.basename(d)
+        proj, _sep, mode = nm.rpartition("_")
+        if not proj:
+            proj, mode = nm, ""
+        rep = rfile(d, "SPP_CRITERIA_REPORT", "txt", proj)
+        try:
+            n_out = len(glob.glob(os.path.join(d, "outs", "*.out")))
+        except Exception:
+            n_out = 0
+        when = ""
+        if rep:
+            try:
+                when = time.strftime("%Y-%m-%d %H:%M",
+                                     time.localtime(os.path.getmtime(rep)))
+            except Exception:
+                pass
+        out.append((nm, proj, mode, bool(rep), n_out, when))
+    return out
+
+
+def find_stray_results(root, depth=None):
+    """Look for study results ANYWHERE under root.
+
+       A case folder with no results is one of two very different situations:
+       the study never ran, or its results are somewhere else. Only the second
+       is recoverable, and only if someone finds them -- so look, rather than
+       leaving it as an exercise. Read-only: it globs, opens nothing, and
+       changes nothing.
+
+       Returns [(folder, report_path_or_"", n_out, when)] sorted newest first."""
+    depth = SEARCH_DEPTH if depth is None else depth
+    if not root or not os.path.isdir(root):
+        return []
+    seen, hits = set(), []
+    pats = []
+    for d in range(1, depth + 1):
+        pats.append(os.path.join(root, *(["*"] * d)) + os.sep + "SPP_CRITERIA_REPORT*.txt")
+        pats.append(os.path.join(root, *(["*"] * d)) + os.sep + "outs")
+    for pat in pats:
+        try:
+            found = glob.glob(pat)
+        except Exception:
+            continue
+        for f in found:
+            folder = os.path.dirname(f)
+            if folder in seen:
+                continue
+            seen.add(folder)
+            rep = ""
+            for g in sorted(glob.glob(os.path.join(folder, "SPP_CRITERIA_REPORT*.txt"))):
+                rep = g
+                break
+            try:
+                n_out = len(glob.glob(os.path.join(folder, "outs", "*.out")))
+            except Exception:
+                n_out = 0
+            if not rep and not n_out:
+                continue
+            when, mt = "", 0
+            try:
+                mt = os.path.getmtime(rep or folder)
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(mt))
+            except Exception:
+                pass
+            hits.append((mt, folder, rep, n_out, when))
+    hits.sort(reverse=True)
+    return [(f, r, n, w) for _m, f, r, n, w in hits]
+
+
+def print_inventory():
+    """What is actually on disk, both sides, with the reason each folder cannot
+       be used. Printed whenever the comparison finds nothing to do."""
+    for case in (CASE_BASE, CASE_TEST):
+        print("")
+        print("[compare] %s  --  %s" % (case["key"], case["dir"]))
+        base = _res_root(case)
+        if not os.path.isdir(base):
+            print("[compare]    *** no results\\ folder here ***")
+            _empty = True
+        else:
+            inv = inventory(case)
+            _empty = not inv
+            if _empty:
+                print("[compare]    *** results\\ exists but is empty ***")
+        if _empty:
+            hits = find_stray_results(SEARCH_ROOT)
+            if hits:
+                print("[compare]    but results DO exist elsewhere under %s :" % SEARCH_ROOT)
+                for folder, rep, n_out, when in hits[:12]:
+                    print("[compare]       %-58s %3d .out  %s"
+                          % (folder, n_out,
+                             ("report %s" % when) if rep else "no report"))
+                if len(hits) > 12:
+                    print("[compare]       ... and %d more" % (len(hits) - 12))
+                print("[compare]    If one of those is this case, point its \"dir\" at the")
+                print("[compare]    folder TWO levels above it (the one containing results\\).")
+            else:
+                print("[compare]    and nothing resembling study results was found anywhere")
+                print("[compare]    under %s -- this study has not run, or ran elsewhere."
+                      % SEARCH_ROOT)
+            continue
+        print("[compare]    %-24s %-12s %-8s %-6s %s"
+              % ("folder", "project", "mode", ".out", "criteria report"))
+        for nm, proj, mode, rep, n_out, when in inv:
+            print("[compare]    %-24s %-12s %-8s %-6d %s"
+                  % (nm, proj, mode or "(none)", n_out,
+                     ("yes  %s" % when) if rep else "*** NOT WRITTEN ***"))
+
+
+# ============================================================================
+# PART 6 -- READING ONE STUDY'S RESULTS
+# ============================================================================
+
+_CRIT_TXT_CASE = re.compile(r"^CASE:\s+(\S+)\s+RESULT:\s+(\S+)")
+_CRIT_TXT_ROW  = re.compile(r"^\s+\[(\w+)\s*\]\s+(.+?)\s+:\s+(.*)$")
+
+
+def read_criteria(rdir, proj):
+    """{fault: {"verdict": .., "rows": [(criterion, result, detail), ..]}}
+
+       CSV first -- it is the same data with no parsing risk. The .txt is parsed
+       only when WRITE_CSV was off in the study, which is a supported setting, so
+       the comparison must not require the CSV to exist.
+
+       Returns (data, source) so the report can state where the numbers came
+       from."""
+    out = {}
+    csvp = rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj)
+    if csvp:
+        try:
+            with csv_open(csvp) as fh:
+                for r in csv.DictReader(fh):
+                    case = (r.get("Case") or "").strip()
+                    if not case:
+                        continue
+                    e = out.setdefault(case, {"verdict": None, "rows": []})
+                    e["rows"].append(((r.get("Criterion") or "").strip(),
+                                      (r.get("Result") or "").strip().upper(),
+                                      (r.get("Detail") or "").strip()))
+            # The CSV has no per-case verdict -- it is the AND of the rows, which
+            # is exactly how the study computes it.
+            for case in out:
+                # Anything not FAIL passes: INFO rows record, they do not
+                # judge. Matches evaluate_case() in the study scripts.
+                out[case]["verdict"] = ("PASS" if all(x[1] != "FAIL"
+                                                      for x in out[case]["rows"])
+                                        else "FAIL")
+            if out:
+                return out, os.path.basename(csvp)
+        except Exception as e:
+            print("[compare] could not read %s (%s) -- falling back to the .txt"
+                  % (csvp, e))
+            out = {}
+
+    txtp = rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj)
+    if not txtp:
+        return {}, ""
+    cur = None
+    for line in _read_text(txtp).splitlines():
+        m = _CRIT_TXT_CASE.match(line)
+        if m:
+            cur = m.group(1)
+            out[cur] = {"verdict": m.group(2).strip().upper(), "rows": [],
+                        "stated": m.group(2).strip().upper()}
+            continue
+        if cur:
+            m = _CRIT_TXT_ROW.match(line)
+            if m:
+                out[cur]["rows"].append((m.group(2).strip(),
+                                         m.group(1).strip().upper(),
+                                         m.group(3).strip()))
+    # RECOVER A VERDICT THE STUDY FAILED TO STATE.
+    # "RESULT: ?" means the report phase lost the verdict, not that the scenario
+    # is unjudgeable -- the criterion rows are right there, and the study's own
+    # verdict is their AND. Recompute it and say so, rather than discarding a
+    # scenario that was scored perfectly well.
+    for case in out:
+        if norm_verdict(out[case]["verdict"]) is None and out[case]["rows"]:
+            out[case]["verdict"] = ("PASS" if all(r[1] == "PASS"
+                                                  for r in out[case]["rows"])
+                                    else "FAIL")
+            out[case]["recovered"] = True
+    return out, os.path.basename(txtp)
+
+
+_VIO_TITLES = [
+    ("BUS VOLTAGE did not recover", "recovery"),
+    ("BUS VOLTAGE swung above",     "overshoot"),
+    ("POST-FAULT STEADY-STATE",     "steady"),
+    ("GENERATION TRIPPED",          "tripped"),
+    ("ROTOR ANGLE not damped",      "undamped"),
+    ("BELOW",                       "review"),
+]
+# The header may carry the faulted bus after the verdict --
+#     FAULT F01                             FAIL      faulted bus 765911 -- 534 SUNC
+# -- and a pattern anchored to exactly two tokens matched NONE of them, so the
+# element level came out empty and the report fell back to the criterion
+# wording, which names only the first VIOLATION_LIST_MAX (20) buses. Anything
+# after the verdict is ignored here.
+_VIO_TXT_FAULT = re.compile(r"^FAULT\s+(\S+)\s+(PASS|FAIL|\S+)(?:\s.*)?$")
+# The element LABEL CAN CONTAIN SPACES -- "POI 765911" is a real label the study
+# writes. A \S+ pattern captures "POI" as the element and 765911 as the value: a
+# bus that does not exist, at 765911 pu, while the POI's actual violation
+# disappears. The producer writes "%-16s %8.3f", so label and number are always
+# separated by two or more spaces; splitting on that is what makes a label with a
+# space work.
+_VIO_TXT_ITEM  = re.compile(r"^ {6}(\S.*?)\s{2,}(-?[\d.]+)\s*(pu|deg|MW)\b")
+
+
+# WHERE EACH VIOLATING ELEMENT SITS -- {fault: {element: (area, name, hops,
+# fault_bus)}} -- filled by read_violations from the study's own CSV columns.
+# A module-level map rather than a return value, so nothing that already unpacks
+# read_violations' two results has to change.
+_WHERE = {}
+
+# WHEN AND FOR HOW LONG, PER SIDE -- {side key: {(fault, kind, element):
+# (time_s, above_limit_s)}}. Filled by read_violations from the study CSV's
+# time_s and above_limit_s columns. Per side, because the same bus in the same
+# fault has one duration in the base study and another with the projects.
+_VIO_EXTRA = {}
+
+
+def _side_key(rdir):
+    """One key per results folder, so base and project entries stay apart."""
+    return os.path.normcase(os.path.normpath(str(rdir)))
+
+
+def where_of(fid, element):
+    """'area 534 SPP-NORTH, 2 hops from fault' for one element, or ''."""
+    got = (_WHERE.get(fid) or {}).get(str(element).strip())
+    if not got:
+        return ""
+    ar, nm, hp, fb = got
+    bits = []
+    if ar:
+        bits.append("area %s%s" % (ar, (" %s" % nm) if nm else ""))
+    if hp != "":
+        try:
+            h = int(float(hp))
+            bits.append("at the fault bus" if h == 0 else
+                        "%d hop%s from fault%s" % (h, "" if h == 1 else "s",
+                                                   (" bus %s" % fb) if fb else ""))
+        except (TypeError, ValueError):
+            pass
+    return ", ".join(bits)
+
+
+def where_short(fid, element):
+    """'534 / 2h' -- the same thing as a table cell."""
+    got = (_WHERE.get(fid) or {}).get(str(element).strip())
+    if not got:
+        return ""
+    ar, _nm, hp, _fb = got
+    try:
+        h = "%dh" % int(float(hp)) if hp != "" else ""
+    except (TypeError, ValueError):
+        h = ""
+    return ("%s / %s" % (ar or "", h)).strip(" /")
+
+
+def read_violations(rdir, proj):
+    """{fault: {kind: {element: value}}} -- who violated what, and by how much.
+
+       This is the element level, and it is what turns "F27 fails overshoot in
+       both cases" into "the same 3 buses, plus 312 more that only appear with
+       the projects".
+
+       CSV first, .txt second. If neither exists the element level is skipped and
+       the report says so -- inventing it from the truncated element lists inside
+       the criteria Detail strings would produce confident, wrong answers about
+       which buses are new."""
+    out = {}
+    csvp = rfile(rdir, "SPP_VIOLATIONS", "csv", proj)
+    if csvp:
+        try:
+            with csv_open(csvp) as fh:
+                for r in csv.DictReader(fh):
+                    fid  = (r.get("fault_id") or "").strip()
+                    kind = (r.get("violation") or "").strip()
+                    el   = (r.get("element") or "").strip()
+                    if not (fid and kind and el):
+                        continue
+                    try:
+                        val = float(r.get("value") or "nan")
+                    except ValueError:
+                        val = float("nan")
+                    out.setdefault(fid, {}).setdefault(kind, {})[el] = val
+                    # WHERE THE ELEMENT IS, kept beside the value.
+                    #
+                    # The study writes the area and the hop distance from the
+                    # faulted bus into the violations CSV; without carrying them
+                    # here the comparison can say a bus is new with the projects
+                    # in but not whether it is next to the fault in the project's
+                    # own area or four areas away. Kept in a parallel map so the
+                    # existing {element: value} shape -- which several callers
+                    # index directly -- is untouched.
+                    _ar = (r.get("area") or "").strip()
+                    _hp = (r.get("hops_from_fault") or "").strip()
+                    if _ar or _hp:
+                        _WHERE.setdefault(fid, {})[el] = (
+                            _ar, (r.get("area_name") or "").strip(), _hp,
+                            (r.get("fault_bus") or "").strip())
+                    # WHEN, AND FOR HOW LONG -- per SIDE, because the same bus
+                    # in the same fault has one duration in each study and the
+                    # comparison prints both. Keyed by the folder the file
+                    # came from so base and project never overwrite each other.
+                    _tm = (r.get("time_s") or "").strip()
+                    _ab = (r.get("above_limit_s") or "").strip()
+                    if _tm or _ab:
+                        _VIO_EXTRA.setdefault(_side_key(rdir), {})[(fid, kind, el)] = (
+                            _tm, _ab)
+            if out:
+                return out, os.path.basename(csvp)
+        except Exception as e:
+            print("[compare] could not read %s (%s) -- falling back to the .txt"
+                  % (csvp, e))
+            out = {}
+
+    txtp = rfile(rdir, "SPP_VIOLATIONS", "txt", proj)
+    if not txtp:
+        return {}, ""
+    fid, kind = None, None
+    for line in _read_text(txtp).splitlines():
+        m = _VIO_TXT_FAULT.match(line)
+        if m:
+            fid, kind = m.group(1), None
+            out.setdefault(fid, {})
+            continue
+        if fid is None:
+            continue
+        stripped = line.strip()
+        if stripped and not line.startswith("      "):
+            kind = None
+            for pref, k in _VIO_TITLES:
+                if stripped.startswith(pref):
+                    kind = k
+                    break
+            continue
+        if kind:
+            m = _VIO_TXT_ITEM.match(line)
+            if m:
+                try:
+                    val = float(m.group(2))
+                except ValueError:
+                    val = float("nan")
+                out[fid].setdefault(kind, {})[m.group(1)] = val
+    return out, os.path.basename(txtp)
+
+
+_LIM_RECOV = re.compile(r"(?:recovery|BES bus V) >=\s*([\d.]+)\s*pu")
+_LIM_OVER  = re.compile(r"(?:no swing above|swing\s*\n?\s*above)\s*([\d.]+)\s*pu")
+_LIM_SS    = re.compile(r"steady state\s*([\d.]+)-([\d.]+)\s*pu")
+_LIM_ANG   = re.compile(r"rotor angle deviation >=\s*(\d+)\s*deg")
+
+
+def read_limits(rdir, proj):
+    """The limits the STUDY applied, from its own report header.
+
+       SPP_VIOLATIONS.txt prints the thresholds it judged against:
+
+         Limits: recovery >= 0.70 pu at 2.5s after clearing | no swing above 1.20 pu
+                 post-fault steady state 0.90-1.10 pu | rotor angle SPPR1 <= ...
+
+       Reading them means the exceedances below are measured against the limit
+       the verdict actually used. Hard-coding them here and being one revision
+       out would produce a report where the pass/fail column and the 'over by'
+       column disagree -- and the reader would have no way to tell which was
+       wrong. Falls back to the constants at the top, and the caller says so."""
+    out = {}
+    # BOTH headers. SPP_VIOLATIONS prints the voltage limits; the ANGLE threshold
+    # appears only in SPP_CRITERIA_REPORT ("rotor angle deviation >= 16 deg"),
+    # because the violations header quotes the SPPR ratios instead. Reading one
+    # and not the other left every rotor-angle exceedance measured against this
+    # script's fallback rather than the study's own threshold.
+    head = ""
+    for stem in ("SPP_VIOLATIONS", "SPP_CRITERIA_REPORT"):
+        f = rfile(rdir, stem, "txt", proj)
+        if f:
+            head += "\n".join(_read_text(f).splitlines()[:16]) + "\n"
+    if not head:
+        return out
+    m = _LIM_RECOV.search(head)
+    if m:
+        out["recovery"] = float(m.group(1))
+    m = _LIM_OVER.search(head)
+    if m:
+        out["overshoot"] = float(m.group(1))
+    m = _LIM_SS.search(head)
+    if m:
+        out["ss_low"], out["ss_high"] = float(m.group(1)), float(m.group(2))
+    m = _LIM_ANG.search(head)
+    if m:
+        out["angle"] = float(m.group(1))
+    return out
+
+
+def exceedance(kind, value, lim):
+    """How far past the limit, always positive and always 'worse = bigger'.
+
+       Each criterion is breached in a different direction -- overshoot upwards,
+       recovery downwards, steady state out of a band either way -- so the raw
+       values cannot be compared or sorted against each other. This puts them
+       all on one scale: 0 is at the limit, and bigger is worse, whatever the
+       criterion. Returns (amount, text) or (None, "") when there is no limit to
+       measure against."""
+    if value is None or value != value:            # None or NaN
+        return None, ""
+    if kind == "overshoot":
+        L = lim.get("overshoot", V_OVERSHOOT_PU)
+        return value - L, "%+.3f pu vs the %.2f limit" % (value - L, L)
+    if kind == "recovery":
+        L = lim.get("recovery", V_RECOVERY_PU)
+        return L - value, "%.3f pu BELOW the %.2f floor" % (L - value, L)
+    if kind == "steady":
+        lo = lim.get("ss_low", V_SS_LOW)
+        hi = lim.get("ss_high", V_SS_HIGH)
+        if value < lo:
+            return lo - value, "%.3f pu below the %.2f floor" % (lo - value, lo)
+        if value > hi:
+            return value - hi, "%.3f pu above the %.2f ceiling" % (value - hi, hi)
+        return 0.0, "inside the %.2f-%.2f band" % (lo, hi)
+    if kind in ("undamped", "review"):
+        L = lim.get("angle", ANGLE_DEV_DEG)
+        return value - L, "%+.1f deg vs the %d deg threshold" % (value - L, int(L))
+    if kind == "tripped":
+        return value, "%.1f MW lost" % value
+    return None, ""
+
+
+# ---- WHAT EVERY BUS DID, NOT ONLY THE ONES THAT FAILED -----------------------
+#
+# The violations file names the buses that broke a limit. When a bus breaks it
+# WITH the projects and not without, the comparison used to print an empty
+# base value beside it -- the base study had nothing to say about a bus that
+# passed. The reader then cannot tell 1.19 pu from 0.98 pu in the base, which
+# is the difference between "the projects nudged a marginal bus over" and "the
+# projects created this". The study writes every bus's numbers to
+# SPP_MEASURE_VOLTS / SPP_MEASURE_ANGLES; this reads them back so the base
+# value can be shown for every project-side violation, violation or not.
+_MEAS_CACHE = {}
+
+
+def read_measurements(rdir, proj):
+    """{"volts": {(fault, bus): (rec_min, ov_max, ov_t, settled, above_s)},
+        "angles": {(fault, bus): deviation}, "src": [files]} for one study.
+
+       Bus keys are the bus NUMBER as text. Missing files give empty maps, and
+       a column the study did not write yet (above_s) reads as None."""
+    _k = _side_key(rdir)
+    if _k in _MEAS_CACHE:
+        return _MEAS_CACHE[_k]
+    out = {"volts": {}, "angles": {}, "machines": {}, "area": {}, "src": [], "poi": {}}
+
+    def _f(x):
+        try:
+            v = float(x)
+            return v if v == v else None
+        except (TypeError, ValueError):
+            return None
+
+    vp = rfile(rdir, "SPP_MEASURE_VOLTS", "csv", proj)
+    if vp:
+        try:
+            with csv_open(vp) as fh:
+                rd = csv.reader(fh)
+                hdr = next(rd, None) or []
+                H = dict((h.strip(), i) for i, h in enumerate(hdr))
+                # 'at (s)' appears twice; the overshoot instant is the one
+                # right after the post-clear maximum.
+                i_sc, i_bus = H.get("Scenario"), H.get("Bus")
+                i_rec, i_ov = H.get("Recovery min (pu)"), H.get("Post-clear max (pu)")
+                i_ss = H.get("Settled avg (pu)")
+                i_area = H.get("Area")
+                i_ab = None
+                for h, i in H.items():
+                    if h.startswith("Above ") and h.endswith("total (s)"):
+                        i_ab = i
+                if None not in (i_sc, i_bus, i_ov):
+                    for r in rd:
+                        try:
+                            fid = r[i_sc].strip()
+                            bus = r[i_bus].strip()
+                        except IndexError:
+                            continue
+                        if not fid or not bus:
+                            continue
+                        bus = bus.split(".")[0]
+                        def _g(i):
+                            try:
+                                return _f(r[i]) if i is not None else None
+                            except IndexError:
+                                return None
+                        key = (fid, bus)
+                        rec = (_g(i_rec), _g(i_ov), _g(i_ov + 1), _g(i_ss), _g(i_ab))
+                        # WORST OF THE LABELS. The POI is recorded under two
+                        # labels; keep the higher overshoot for the bus.
+                        old = out["volts"].get(key)
+                        if old is None or ((rec[1] or -1) > (old[1] or -1)):
+                            out["volts"][key] = rec
+                        if i_area is not None and key not in out["area"]:
+                            try:
+                                out["area"][key] = r[i_area].strip()
+                            except IndexError:
+                                pass
+                    out["src"].append(os.path.basename(vp))
+        except Exception as e:
+            print("[compare] could not read %s (%s)" % (vp, e))
+    ap = rfile(rdir, "SPP_MEASURE_ANGLES", "csv", proj)
+    if ap:
+        try:
+            with csv_open(ap) as fh:
+                rd = csv.reader(fh)
+                hdr = next(rd, None) or []
+                H = dict((h.strip(), i) for i, h in enumerate(hdr))
+                i_sc, i_bus, i_dev = H.get("Scenario"), H.get("Bus"), H.get("Deviation (deg)")
+                i_area = H.get("Area")
+                if None not in (i_sc, i_bus, i_dev):
+                    for r in rd:
+                        try:
+                            fid, bus, dev = r[i_sc].strip(), r[i_bus].strip(), _f(r[i_dev])
+                        except IndexError:
+                            continue
+                        if not fid or not bus or dev is None:
+                            continue
+                        bus = bus.split(".")[0]
+                        key = (fid, bus)
+                        if dev > out["angles"].get(key, -1.0):
+                            out["angles"][key] = dev
+                        if i_area is not None and key not in out["area"]:
+                            try:
+                                out["area"][key] = r[i_area].strip()
+                            except IndexError:
+                                pass
+                    out["src"].append(os.path.basename(ap))
+        except Exception as e:
+            print("[compare] could not read %s (%s)" % (ap, e))
+    # THE MACHINES. Written by the study beside the volts and the angles: every
+    # machine's pre-fault MW, final MW, lowest post-clearing MW, terminal
+    # voltage before and after, and whether it was called tripped. This is what
+    # lets a tripping row show the SAME quantity on both sides -- the base
+    # machine's MW and state next to the project's -- instead of a number on
+    # one side and the words "not tripped" on the other.
+    mp = rfile(rdir, "SPP_MEASURE_MACHINES", "csv", proj)
+    if mp:
+        try:
+            with csv_open(mp) as fh:
+                rd = csv.reader(fh)
+                hdr = next(rd, None) or []
+                H = dict((h.strip(), i) for i, h in enumerate(hdr))
+                i_sc, i_bus, i_sig = H.get("Scenario"), H.get("Bus"), H.get("Signal")
+                i_p0, i_pe = H.get("Pre-fault P (MW)"), H.get("Final P (MW)")
+                i_pm = H.get("Min P after clearing (MW)")
+                i_e0, i_ee = H.get("Pre-fault Eterm (pu)"), H.get("Final Eterm (pu)")
+                i_tr, i_ev = H.get("Tripped"), H.get("Evidence")
+                if None not in (i_sc, i_tr):
+                    _nm = 0
+                    for r in rd:
+                        try:
+                            fid = r[i_sc].strip()
+                        except IndexError:
+                            continue
+                        if not fid:
+                            continue
+
+                        def _g(i):
+                            try:
+                                return _f(r[i]) if i is not None else None
+                            except IndexError:
+                                return None
+
+                        def _s(i):
+                            try:
+                                return r[i].strip() if i is not None else ""
+                            except IndexError:
+                                return ""
+                        _tr = _g(i_tr)
+                        rec = {"p0": _g(i_p0), "pend": _g(i_pe), "pmin": _g(i_pm),
+                               "e0": _g(i_e0), "eend": _g(i_ee),
+                               "tripped": bool(_tr is not None and _tr > 0),
+                               "why": _s(i_ev), "label": _s(i_sig)}
+                        keys = []
+                        _b = _s(i_bus).split(".")[0]
+                        if _b:
+                            keys.append((fid, _b))
+                        # PROJ<n> channels carry no bus in the title; the
+                        # label the study resolved does ("PROJ 587313").
+                        _lb = re.search(r"\d{3,}", rec["label"])
+                        if _lb and (fid, _lb.group(0)) not in keys:
+                            keys.append((fid, _lb.group(0)))
+                        for key in keys:
+                            old = out["machines"].get(key)
+                            # THE TRIPPED UNIT OWNS THE BUS; otherwise the biggest.
+                            if (old is None
+                                    or (rec["tripped"] and not old["tripped"])
+                                    or (rec["tripped"] == old["tripped"]
+                                        and abs(rec["p0"] or 0.0) > abs(old["p0"] or 0.0))):
+                                out["machines"][key] = rec
+                        _nm += 1
+                    out["src"].append(os.path.basename(mp))
+        except Exception as e:
+            print("[compare] could not read %s (%s)" % (mp, e))
+    # THE POI POWER. SPP_MEASURE_POI: per scenario, the TOTAL delivered into
+    # the POI (new plant + existing) and its parts, MW and MVAr. Read into
+    # out["poi"][fault][(quantity, component)] = {p0, min, max, end, src}.
+    pp = rfile(rdir, "SPP_MEASURE_POI", "csv", proj)
+    if pp:
+        try:
+            with csv_open(pp) as fh:
+                rd = csv.reader(fh)
+                hdr = next(rd, None) or []
+                H = dict((h.strip(), i) for i, h in enumerate(hdr))
+                i_sc, i_poi, i_q, i_c = H.get("Scenario"), H.get("POI"), H.get("Quantity"), H.get("Component")
+                i_0, i_mn, i_mx, i_e, i_s = (H.get("Pre-fault"), H.get("Min after clearing"),
+                                             H.get("Max after clearing"), H.get("Final"), H.get("Source"))
+                if None not in (i_sc, i_q, i_c):
+                    _np = 0
+                    for r in rd:
+                        try:
+                            fid = r[i_sc].strip()
+                        except IndexError:
+                            continue
+                        if not fid:
+                            continue
+
+                        def _gp(i):
+                            try:
+                                return _f(r[i]) if i is not None else None
+                            except IndexError:
+                                return None
+
+                        def _sp(i):
+                            try:
+                                return r[i].strip() if i is not None else ""
+                            except IndexError:
+                                return ""
+                        out["poi"].setdefault(fid, {})[(_sp(i_q), _sp(i_c))] = {
+                            "poi": _sp(i_poi), "p0": _gp(i_0), "min": _gp(i_mn), "max": _gp(i_mx),
+                            "end": _gp(i_e), "src": _sp(i_s)}
+                        _np += 1
+                    out["src"].append(os.path.basename(pp))
+        except Exception as e:
+            print("[compare] could not read %s (%s)" % (pp, e))
+    if out["src"]:
+        print("[compare] measurements read from %s: %d bus-voltage, %d rotor-angle, "
+              "%d machine record(s) (%s)"
+              % (os.path.basename(rdir), len(out["volts"]), len(out["angles"]),
+                 len(out.get("machines") or {}), ", ".join(out["src"])))
+    else:
+        # SAY IT WHEN THERE IS NOTHING TO READ. Without the measurements a bus
+        # that is over the limit WITH the projects and fine without them has no
+        # base number to show -- every such cell in the report goes blank, and
+        # the run used to say nothing at all about why. Name the folder and the
+        # exact files that were looked for, because the fix is to re-score that
+        # study (the measurements are written by SCORING, not by simulating).
+        print("[compare] *** NO measurements file in %s -- base/project values "
+              "for elements that did NOT violate cannot be filled from it ***"
+              % os.path.basename(rdir))
+        print("[compare]     looked for SPP_MEASURE_VOLTS[_SELECTED][_BASE|_PROJ]"
+              "[_%s].csv in %s\\reports and %s"
+              % (proj or "<project>", os.path.basename(rdir),
+                 os.path.basename(rdir)))
+    # DO NOT CACHE A MISS. The measurements are written by SCORING, and with
+    # PIPELINE = "all" the comparison runs in the SAME PROCESS that ran the
+    # studies -- so anything that reads a folder before its scoring has written
+    # SPP_MEASURE_VOLTS gets an empty result, and caching that empty result made
+    # it permanent for the rest of the run. The files then appeared on disk
+    # minutes later and every base and project cell in the sweep tables still
+    # read "-", because nothing ever looked again. Only a read that actually
+    # found a file is worth keeping; a miss is retried next time it is asked.
+    if out.get("src"):
+        _MEAS_CACHE[_k] = out
+    return out
+
+
+BES_KV_MIN = 100.0      # SPP applies the VOLTAGE criteria to BES buses only
+
+
+def _is_bes_voltage_row(fam, el):
+    """Should this element's VOLTAGE row be reported at all?
+
+       SPP applies the voltage criteria to BES buses (>= 100 kV). A 34.5 kV
+       collector or BESS terminal swinging to 1.40 pu on a fault is normal
+       switching behaviour on a collector, not a criterion violation -- and it
+       was being listed as one, because the study's own BES filter keeps any
+       channel whose bus kV it cannot resolve. The engines no longer channel
+       sub-100 kV buses at all; this also keeps them out of reports built from
+       .out files that were recorded before that change.
+
+       Only voltage families are filtered. A rotor angle is a MACHINE quantity
+       and its bus kV is irrelevant -- a generator terminal is below 100 kV
+       almost by definition, and dropping those would delete the angle test."""
+    if fam not in ("overshoot", "recovery", "steady"):
+        return True
+    b = _bus_of_element(el)
+    if b is None:
+        return True                     # unresolvable -- never narrow silently
+    try:
+        kv = (_cmp_bus_map().get("kv") or {}).get(int(b))
+    except (TypeError, ValueError):
+        return True
+    if not kv:
+        return True                     # not in the map -- keep, as the study does
+    return float(kv) >= BES_KV_MIN
+
+
+_POI_BUS_CACHE = {}
+
+
+def _poi_bus_of(bus_map):
+    """The POI bus number, or None -- it is the bus BUS_DISTANCE.csv records at
+       0 hops from the POI. Lets hops-from-POI be walked over the whole case
+       instead of stopping at the edge of that file's radius."""
+    if not bus_map:
+        return None
+    _k = id(bus_map)
+    if _k in _POI_BUS_CACHE:
+        return _POI_BUS_CACHE[_k]
+    got = None
+    for _b, _v in bus_map.items():
+        try:
+            if int(float(_v[2])) == 0:
+                got = int(_b)
+                break
+        except (TypeError, ValueError, IndexError):
+            continue
+    _POI_BUS_CACHE[_k] = got
+    return got
+
+
+def _why_no_base(base_scored, meas_b, bus=None, fid=None, fam=None):
+    """Short text for a base cell that has no number, saying WHICH reason it is.
+       A blank cell reads as "zero" or "fine"; it is neither.
+
+       THE >=100 kV CASE IS NOT "NOT MONITORED". SPP monitoring is
+       area_volt = every bus at or above AREA_KV_MIN in STUDY_AREAS, and BOTH
+       studies carry the same STUDY_AREAS and AREA_KV_MIN -- so a 100 kV+ study
+       -area bus IS monitored in the base whether or not the project exists.
+       Calling that "not monitored" sent the reader looking for a monitoring
+       gap that is not there; if the base scored the fault, its measurements
+       should hold that bus, and a missing one is an anomaly worth re-scoring."""
+    if not base_scored:
+        return "base not scored for this fault"
+    if not (meas_b or {}).get("src"):
+        return "no base measurements file"
+    # DOES THE FILE COVER THIS FAULT AT ALL? A measurements file written by
+    # a partial pass (an earlier 5-fault selection, or a merge taken while the
+    # shards were still scoring) holds rows for some faults only. Every bus of
+    # a fault it does not hold came out "missing from its measurements", which
+    # pointed at the bus when the gap is the file.
+    if fid is not None:
+        _fs = meas_b.get("_faults")
+        if _fs is None:
+            _fs = set(k[0] for k in (meas_b.get("volts") or {}))
+            _fs |= set(k[0] for k in (meas_b.get("angles") or {}))
+            _fs |= set(k[0] for k in (meas_b.get("machines") or {}))
+            meas_b["_faults"] = _fs
+        if str(fid).strip() not in _fs:
+            return ("base measurements file has no rows for this fault (%s) -- "
+                    "re-run the base report" % ", ".join(meas_b.get("src") or []))
+    if fam == "angle":
+        # A MACHINE. Its terminal is below 100 kV by construction and that has
+        # nothing to do with whether its rotor angle was recorded.
+        return "machine not in the base rotor-angle measurements for this fault"
+    if _project_only_bus(bus):
+        return "bus exists only with the project (new plant) -- NEW by construction"
+    _kv = None
+    try:
+        if bus not in ("", None):
+            _kv = (_cmp_bus_map().get("kv") or {}).get(int(bus))
+    except (TypeError, ValueError):
+        _kv = None
+    if _kv is None:
+        return "bus not in the base case"
+    if _kv >= 100.0:
+        # Monitored by the area_volt spec in both studies, so this should not
+        # happen: the base scored the fault but its measurements have no row.
+        return "base scored but bus missing from its measurements -- re-score base"
+    return "below 100 kV -- monitored only within 5 hops of the POI"
+
+
+def measured_value(meas, fam, fid, element):
+    """The measured value for one element of one fault on one side, by
+       criterion family, from read_measurements() -- or None."""
+    if not meas:
+        return None
+    b = _bus_of_element(element)
+    if b is None:
+        return None
+    key = (str(fid).strip(), str(b))
+    if fam == "angle":
+        return (meas.get("angles") or {}).get(key)
+    if fam == "trip":
+        # THE MACHINE'S PRE-FAULT MW, tripped or not -- the state is separate
+        # (machine_state), so a number here never means "it tripped".
+        m = (meas.get("machines") or {}).get(key)
+        return None if m is None else m.get("p0")
+    v = (meas.get("volts") or {}).get(key)
+    if v is None:
+        return None
+    if fam == "recovery":
+        return v[0]
+    if fam == "overshoot":
+        return v[1]
+    if fam == "steady":
+        return v[3]
+    return None
+
+
+def machine_state(meas, fid, element):
+    """The machines-table record for one element of one fault on one side --
+       {"p0", "pend", "pmin", "e0", "eend", "tripped", "why", "label"} -- or
+       None when that side did not measure it."""
+    if not meas:
+        return None
+    b = _bus_of_element(element)
+    if b is None:
+        return None
+    return (meas.get("machines") or {}).get((str(fid).strip(), str(b)))
+
+
+def _machine_p0_any_fault(meas, element):
+    """(pre-fault MW, fault id) of a machine from ANY fault's row of one side's
+       machines table, or (None, "").
+
+       The pre-fault MW is the case's INITIAL CONDITION -- the same number on
+       every fault of one side, because every fault starts from the same solved
+       case. So when the table has no row for THIS fault yet (a measurements
+       file still being rebuilt), another fault's row gives the same MW, and the
+       cell can hold it instead of nothing. A row that did not trip is preferred,
+       so the MW is the machine running normally."""
+    if not meas:
+        return None, ""
+    b = _bus_of_element(element)
+    if b is None:
+        return None, ""
+    best = None
+    for (fid, bus), rec in (meas.get("machines") or {}).items():
+        if str(bus) != str(b) or rec.get("p0") is None:
+            continue
+        if best is None or (best[1].get("tripped") and not rec.get("tripped")):
+            best = (fid, rec)
+    return (None, "") if best is None else (best[1]["p0"], best[0])
+
+
+def _trip_state_text(rec, listed):
+    """One phrase for the state column of a tripping row:
+           TRIPPED 1.75 -> 0.00 MW
+           connected 1.75 -> 1.74 MW
+       from the machines table, or 'TRIPPED (violation list)' when only the
+       study's trip list names it, or '' when nothing is known."""
+    if rec:
+        p0, pe = rec.get("p0"), rec.get("pend")
+        mw = ("%.2f -> %.2f MW" % (p0, pe)) if (p0 is not None and pe is not None) else ""
+        if rec.get("tripped"):
+            why = rec.get("why") or ""
+            return ("TRIPPED %s" % (mw or why)).strip()
+        return ("connected %s" % mw).strip()
+    if listed is not None:
+        return "TRIPPED (violation list)"
+    return ""
+
+
+def measured_above(meas, fid, element):
+    """Seconds above the overshoot limit for one bus of one fault, or None."""
+    if not meas:
+        return None
+    b = _bus_of_element(element)
+    if b is None:
+        return None
+    v = (meas.get("volts") or {}).get((str(fid).strip(), str(b)))
+    return v[4] if v else None
+
+
+def measured_area(meas, fid, element):
+    """The AREA number of one element's bus, from the study's measurements, or
+       "". Recorded for every monitored bus, so it is filled whenever the case
+       measured that bus -- voltage or angle -- regardless of whether it broke a
+       limit."""
+    if not meas:
+        return ""
+    b = _bus_of_element(element)
+    if b is None:
+        return ""
+    return (meas.get("area") or {}).get((str(fid).strip(), str(b)), "")
+
+
+def write_channel_file(proj, rb, rt):
+    """CHANNELS_<project>.txt -- the PSS/E channel numbers of BOTH studies in
+       one file, so a reading in the comparison can be checked in the .out.
+
+       Each study writes reports\\CHANNELS_<KIND>_<project>.txt from its own
+       .out header; this puts the two side by side. Nothing is invented: a
+       side whose study has not written the file yet says so."""
+    parts = []
+    for tag, rdir in (("BASE", rb), ("PROJ", rt)):
+        f = rfile(rdir, "CHANNELS", "txt", proj)
+        parts.append("#" * 92)
+        parts.append("# %s CASE -- %s" % (tag, rdir))
+        parts.append("#" * 92)
+        if not f:
+            parts.append("(no CHANNELS file in this study's reports\\ yet -- it is written by the")
+            parts.append(" report pass; re-run the report or merge-only pass to produce it)")
+            parts.append("")
+            continue
+        parts.append("# from %s" % f)
+        parts.extend(_read_text(f).splitlines())
+        parts.append("")
+    path = cmp_path("CHANNELS_%s" % proj, "txt")
+    _write(path, parts)
+    return path
+
+
+def read_states(rdir, proj):
+    """{scenario: run_status} -- DONE / GAVE-UP / NOT RUN.
+
+       Needed to tell "this fault passed" from "this fault never produced a
+       result". Both look like an absent FAIL if you only read the criteria
+       report, and calling a crashed scenario a pass would be the worst error
+       this tool could make."""
+    st = {}
+    csvp = rfile(rdir, "RUN_SUMMARY", "csv", proj)
+    if csvp:
+        try:
+            with csv_open(csvp) as fh:
+                for r in csv.DictReader(fh):
+                    sid = (r.get("scenario") or "").strip()
+                    if sid:
+                        st[sid] = (r.get("run_status") or "").strip().upper()
+            if st:
+                return st
+        except Exception:
+            pass
+    txtp = rfile(rdir, "RUN_SUMMARY", "txt", proj)
+    if not txtp:
+        return st
+    # ONLY THE SCENARIO TABLE, AND BY COLUMN.
+    #
+    # Accepting any line starting with an id and splitting on whitespace read
+    # two other things as run states. RUN_SUMMARY.txt repeats every scenario id
+    # in the CRASH SUMMARY and again in the SOLVER RETRIES block, and the last
+    # one seen wins -- so a scenario's status became a solver-recipe label. And
+    # `split()` turns "NOT RUN" into two tokens, so every never-run scenario was
+    # recorded as "NOT", which no later test matches.
+    #
+    # The writer uses "%-12s %-18s %-9d %s" -- and %-12s PADS, it does not
+    # TRUNCATE. Every scenario id longer than twelve characters therefore
+    # shifts the whole row right, and reading the fields by position sliced
+    #
+    #     C01_3PH_531429_7cy DONE               1         FAIL
+    #
+    # into a scenario called "C01_3PH_5314" with a run status of "29_7CY DONE".
+    # The real scenario then had no status at all, so the comparison invented a
+    # phantom fault for every one of them and marked the genuine article NOT
+    # SCORED -- which is how a report of four faults came to list twelve.
+    #
+    # Parsed by STRUCTURE instead: the id is the first token and never contains
+    # a space, the attempt count is the first bare integer after it, and the
+    # status is everything between the two. That reads "NOT RUN" and "GAVE UP"
+    # as one status each, which splitting on whitespace never could.
+    in_table = False
+
+    def _row_fields(text):
+        """(scenario id, run status) from one table row, or (None, None)."""
+        parts = text.split()
+        if len(parts) < 2:
+            return None, None
+        sid, rest = parts[0], parts[1:]
+        words = []
+        for tok in rest:
+            if tok.isdigit():          # the attempts column ends the status
+                break
+            words.append(tok)
+        return sid, " ".join(words).strip().upper()
+
+    for line in _read_text(txtp).splitlines():
+        if not in_table:
+            if line.lstrip().startswith("Scenario") and "Run status" in line:
+                in_table = True
+            continue
+        if line.startswith("=") or not line.strip():
+            if line.startswith("="):
+                break            # the table ends at its closing rule
+            continue
+        if line.startswith("-"):
+            continue
+        sid, status = _row_fields(line)
+        if sid and status:
+            st[sid] = status
+    return st
+
+
+def read_events(rdir, proj):
+    """{fault: planning event} from the compliance table, for the report's
+       P-event column. Absent is fine -- it is context, not a criterion."""
+    ev = {}
+    csvp = rfile(rdir, "SPP_COMPLIANCE_TABLE", "csv", proj)
+    if csvp:
+        try:
+            with csv_open(csvp) as fh:
+                for r in csv.DictReader(fh):
+                    fid = (r.get("Fault ID") or "").strip()
+                    if fid:
+                        ev[fid] = (r.get("Planning Event") or "-").strip()
+            if ev:
+                return ev
+        except Exception:
+            pass
+    # The .txt is always written; the .csv only when WRITE_CSV is on. Without
+    # this the event column reads "-" for every fault in a study that turned the
+    # CSVs off -- which is most of them.
+    txtp = rfile(rdir, "SPP_COMPLIANCE_TABLE", "txt", proj)
+    if not txtp:
+        return ev
+    for line in _read_text(txtp).splitlines():
+        p2 = line.split()
+        if len(p2) >= 2 and re.match(r"^(P\d|-)", p2[1]) and not line.startswith(" "):
+            ev[p2[0]] = p2[1]
+    return ev
+
+
+def read_events_from_faultlist(rdir):
+    """{fault: planning event} from the FAULT LIST the study ran.
+
+       THE COMPLIANCE TABLE IS THE WRONG PLACE TO ASK. It carries the event only
+       for faults it actually scored, so a study whose scoring stopped early --
+       or one scored before the column existed -- answers "-" for most faults,
+       ONLY_EVENTS then matches nothing, and the run ends "nothing was compared"
+       when the truth is "this table does not record events".
+
+       The fault list has the event for every fault by construction: it is what
+       ONLY_EVENTS selected on when the study was launched. Reading it here means
+       the same setting selects the same faults at comparison time."""
+    ev = {}
+    for p in (os.path.join(rdir, "faults", "SPP_FAULTS.csv"),
+              _shared_list_for(_proj_of_results(rdir))):
+        if not p or not os.path.isfile(p):
+            continue
+        try:
+            with csv_open(p) as fh:
+                for r in csv.DictReader(fh):
+                    fid = (r.get("fault_id") or "").strip()
+                    pe = (r.get("planning_event") or "").strip()
+                    if fid and pe and fid not in ev:
+                        ev[fid] = pe
+        except Exception:
+            continue
+        if ev:
+            break
+    return ev
+
+
+def _proj_of_results(rdir):
+    """'SantaFe' out of ...\results\SantaFe_spp -- for the shared fault list."""
+    base = os.path.basename(os.path.normpath(rdir))
+    for m in list(MODES) + ["spp", "con", "table", "custom", "manual"]:
+        suf = "_" + m
+        if base.endswith(suf):
+            return base[:-len(suf)]
+    return base
+
+
+def read_descriptions(rdir, proj):
+    """{fault: SPP contingency text} from faults\\SPP_CONTINGENCIES.csv."""
+    out = {}
+    p = os.path.join(rdir, "faults", "SPP_CONTINGENCIES.csv")
+    if not os.path.isfile(p):
+        return out
+    try:
+        with csv_open(p) as fh:
+            for r in csv.DictReader(fh):
+                fid = (r.get("Fault ID") or "").strip()
+                if fid:
+                    out[fid] = (r.get("Contingency Description") or "").strip()
+    except Exception:
+        pass
+    return out
+
+
+def read_fault_defs(case, proj, mode):
+    """{fault: (bus, kv, type, cycles)} from the fault list the study ran.
+
+       Used ONLY to check that both sides ran the same events. Two studies whose
+       F27 is a different fault produce a comparison that looks perfectly
+       reasonable and means nothing, and nothing else on disk would reveal it."""
+    out = {}
+    p = os.path.join(results_dir(case, proj, mode), "faults", "SPP_FAULTS.csv")
+    if not os.path.isfile(p):
+        return out
+    try:
+        with csv_open(p) as fh:
+            for r in csv.DictReader(fh):
+                fid = (r.get("fault_id") or "").strip()
+                if not fid:
+                    continue
+                out[fid] = ((r.get("fault_bus") or "").strip(),
+                            (r.get("fault_kv") or "").strip(),
+                            (r.get("fault_type") or "").strip().upper(),
+                            (r.get("clear_cycles") or "").strip())
+    except Exception as e:
+        print("[compare] could not read %s: %s" % (p, e))
+    return out
+
+
+# ============================================================================
+# PART 7 -- PULLING THE HEADLINE NUMBER OUT OF A CRITERION
+# ============================================================================
+# Each criterion's Detail carries the measurement that decided it. Extracting it
+# lets the report say "1.150 -> 1.301 pu" instead of "PASS -> FAIL", which is the
+# difference between a result and an argument.
+#
+# These patterns match what the study writes, PASS wording and FAIL wording
+# alike. When nothing matches, the comparison still works -- it just reports the
+# verdicts without a delta. Guessing a number from an unrecognised sentence
+# would be worse than admitting there isn't one.
+
+_NUM = r"(-?\d+(?:\.\d+)?)"
+
+# ---- voltage: overshoot (higher is worse) and recovery (lower is worse) -----
+# FAIL wording:  "35 bus(es) over, worst 1.301 pu (531632 @ 5.19s): ..."
+# PASS wording:  "OK -- highest of 5128 bus(es) from t=5.187s is 1.098 pu (...)"
+#                "OK -- lowest of 5128 bus(es) after t=7.69s is 0.939 pu (...)"
+_V_WORST   = re.compile(r"worst\s+" + _NUM + r"\s*pu")
+_V_HIGHEST = re.compile(r"highest of.*?\bis\s+" + _NUM + r"\s*pu")
+_V_LOWEST  = re.compile(r"lowest of.*?\bis\s+" + _NUM + r"\s*pu")
+
+# ---- rotor angle ------------------------------------------------------------
+# The PASS wording contains the THRESHOLD as well as the measurement:
+#   "5 of 452 rotor angle(s) swung >=16 deg and ALL are damped ...;
+#    largest swing 25.5 deg (531447)"
+# A bare "<number> deg" pattern matches the 16 first and reports the limit as if
+# it were the result -- which is how a machine that swung 12 deg was written up
+# as 16. Always take the NAMED measurement, never the first number.
+_A_LARGEST = re.compile(r"largest (?:swing|post-fault excursion)\s+" + _NUM)
+_A_PAREN   = re.compile(r"\(\s*" + _NUM + r"\s*deg")     # "640014(23deg SPPR1=..."
+_A_REACHED = re.compile(r"reached\s+" + _NUM + r"\s*deg")
+
+# ---- steady state: a BAND, so "worse" is distance outside it ----------------
+# FAIL: "72 bus(es) outside: 530554=0.856, 530555=0.857, ..."
+# PASS: "OK -- last 1.0s average over 5128 bus(es) spans 0.939 (655895) to 1.096"
+_S_SPANS  = re.compile(r"spans\s+" + _NUM + r".*?\bto\s+" + _NUM)
+_S_EQUALS = re.compile(r"=\s*(-?\d+\.\d+)")
+
+
+def _criterion_family(criterion):
+    """Which measurement a criterion is about.
+
+       Matched on words rather than the exact string, so a reworded criterion
+       keeps its delta. Order matters: the 'below 16 deg, evaluate individually'
+       criterion mentions rotor angles but is a REVIEW list, not a damping
+       result, and must not be read as one."""
+    c = criterion.lower()
+    # RECORD ROWS ARE NOT MEASUREMENTS. "Transient voltage: buses exempt ...",
+    # "Transient voltage: which excursions are at the switching instant only",
+    # "Rotor angle: tripped machines excluded ..." and the islanding banner are
+    # INFO rows that describe; they carry the words of a criterion without being
+    # one, and read as one they would hand the overshoot or angle delta a
+    # number that belongs to no limit.
+    if c.startswith(("transient voltage:", "rotor angle:", "***")):
+        return ""
+    if "recovery" in c:
+        return "recovery"
+    if "transient voltage" in c or "swing" in c or "overshoot" in c:
+        return "overshoot"
+    if "steady" in c:
+        return "steady"
+    if "not converging" in c or "individual" in c:
+        return "review"
+    if "relative to the system swing" in c or "measured relative" in c:
+        return ""                       # a yes/no statement, not a measurement
+    if "bus voltage angle" in c:
+        return "busangle"
+    if "rotor" in c or "damping" in c or "sppr" in c:
+        return "angle"
+    if "trip" in c:
+        return "trip"
+    return ""
+
+
+def _f(m, g=1):
+    try:
+        return float(m.group(g))
+    except (AttributeError, ValueError):
+        return None
+
+
+def metric_of(criterion, detail):
+    """(value, unit, direction) for one criterion row, or (None, "", "").
+
+       See metric_tagged(): this is the plain-value wrapper.
+
+       direction says which way is WORSE -- "max" when higher is worse
+       (overshoot, angle), "min" when lower is worse (recovery). The comparison
+       needs it to tell a deterioration from an improvement.
+
+       Returns None rather than a guess when the wording is not recognised. A
+       missing delta costs a line of the report; a wrong one is quoted at SPP."""
+    v, u, d, _tag = metric_tagged(criterion, detail)
+    return v, u, d
+
+
+def metric_tagged(criterion, detail):
+    """As metric_of, plus a TAG naming WHICH quantity was measured.
+
+       The tag is what stops two incomparable numbers being subtracted. The
+       study words the same criterion differently on PASS and FAIL, and the two
+       wordings report DIFFERENT POPULATIONS:
+
+         PASS: "largest swing 25.5 deg (531447)"     -- over ALL machines
+         FAIL: "1 undamped of 7 judged: 640014(23deg" -- over the UNDAMPED ones,
+               truncated to VIOLATION_LIST_MAX and not sorted
+
+       Subtracting one from the other produced "change -2.5 deg" on a fault that
+       had just acquired its first undamped machine -- a new failure printed as
+       an improvement. When the tags differ there is no delta to report, and
+       saying so is the honest answer."""
+    fam = _criterion_family(criterion)
+    if not detail or fam in ("", "trip"):
+        return None, "", "", ""
+
+    if fam == "overshoot":
+        # `a or b` would be wrong here: a measured 0.000 pu is falsy and would
+        # fall through to the other pattern. Every test below is `is None`.
+        # Both wordings report the SAME quantity -- the single most extreme bus
+        # -- so they are comparable and share a tag.
+        v = _f(_V_WORST.search(detail))
+        if v is None:
+            v = _f(_V_HIGHEST.search(detail))
+        return (v, "pu", "max", "extreme") if v is not None else (None, "", "", "")
+
+    if fam == "recovery":
+        v = _f(_V_WORST.search(detail))
+        if v is None:
+            v = _f(_V_LOWEST.search(detail))
+        return (v, "pu", "min", "extreme") if v is not None else (None, "", "", "")
+
+    if fam in ("angle", "busangle", "review"):
+        # "busangle" and "review" are RECORDED, NOT SCORED -- the study emits
+        # both with ok=True unconditionally, bus angles are explicitly "not
+        # scored as rotor angles", and SPP requires the sub-16 deg machines to
+        # be evaluated individually rather than against a threshold. Give them
+        # no direction, so the "moved towards a limit" flag cannot fire on a
+        # criterion that has no limit.
+        _dir = "max" if fam == "angle" else ""
+        v = _f(_A_LARGEST.search(detail))
+        if v is not None:
+            return v, "deg", _dir, "largest-of-all"
+        vals = [float(x) for x in _A_PAREN.findall(detail)]
+        if vals:
+            return max(vals), "deg", _dir, "undamped-sample"
+        v = _f(_A_REACHED.search(detail))
+        return (v, "deg", _dir, "largest-of-all") if v is not None else (None, "", "", "")
+
+    if fam == "steady":
+        # MARGIN TO THE NEAREST BAND EDGE, signed: positive inside, negative
+        # outside, and always smaller = worse. The old form was distance
+        # OUTSIDE the band, which is identically zero for any compliant case --
+        # so the delta was always 0.000 and the "moved towards a limit" flag
+        # could never fire for this criterion at all.
+        #
+        # ONLY from the PASS wording. The FAIL wording lists individual buses,
+        # and that list is truncated to VIOLATION_LIST_MAX in raw channel order
+        # -- neither the worst nor sorted -- so a number derived from it is an
+        # arbitrary sample presented as a measurement. No delta is better than a
+        # fabricated one; the element level carries the complete list.
+        m = _S_SPANS.search(detail)
+        if not m:
+            return None, "", "", ""
+        lo, hi = _f(m, 1), _f(m, 2)
+        if lo is None or hi is None:
+            return None, "", "", ""
+        return min(lo - V_SS_LOW, V_SS_HIGH - hi), "pu", "min", "band-margin"
+
+    return None, "", "", ""
+
+
+# ============================================================================
+# PART 8 -- THE COMPARISON ITSELF
+# ============================================================================
+
+CLS_OK       = "OK"
+CLS_PRE      = "PRE-EXISTING"
+CLS_NEW      = "NEW"
+CLS_RESOLVED = "RESOLVED"
+CLS_ONLY_B   = "BASE ONLY"
+CLS_ONLY_T   = "TEST ONLY"
+CLS_NEITHER  = "NOT SCORED"
+
+# Order used everywhere the classes are listed, worst news first. The whole
+# point of the exercise is the NEW bucket, so it leads.
+CLS_ORDER = [CLS_NEW, CLS_PRE, CLS_RESOLVED, CLS_OK,
+             CLS_ONLY_B, CLS_ONLY_T, CLS_NEITHER]
+
+
+def norm_verdict(v):
+    """PASS, FAIL, or None. Anything else is NOT a verdict.
+
+       run_SPP writes "?" as a real verdict: write_criteria_report emits
+       `verdicts.get(case, "?")`, and a report shard killed between writing its
+       criterion rows and its verdicts leaves exactly that -- rows with no
+       verdict, merged into a report that says RESULT: ? for every case that
+       shard scored. The launcher's watchdog does kill shards, so this is a
+       state the study genuinely produces, not a hypothetical."""
+    v = (v or "").strip().upper()
+    return v if v in ("PASS", "FAIL") else None
+
+
+def classify(vb, vt):
+    """One fault, or one criterion, from the two verdicts. None = no result.
+
+       EVERY PAIR IS MATCHED EXPLICITLY. The last line used to be a bare
+       `return CLS_RESOLVED`, which made RESOLVED the catch-all: any verdict
+       that was not literally PASS or FAIL landed there, and RESOLVED is
+       printed as "failed without, passes with -- the projects improved it".
+       A fault whose overvoltage went from 1.301 pu over 35 buses to 1.402 pu
+       over 312 was reported to SPP as an improvement. Unknown is now unknown."""
+    vb, vt = norm_verdict(vb), norm_verdict(vt)
+    if vb is None and vt is None:
+        return CLS_NEITHER
+    if vb is None:
+        return CLS_ONLY_T
+    if vt is None:
+        return CLS_ONLY_B
+    if vb == "PASS" and vt == "PASS":
+        return CLS_OK
+    if vb == "FAIL" and vt == "FAIL":
+        return CLS_PRE
+    if vb == "PASS" and vt == "FAIL":
+        return CLS_NEW
+    if vb == "FAIL" and vt == "PASS":
+        return CLS_RESOLVED
+    return CLS_NEITHER
+
+
+def _sel_tag():
+    """"_SELECTED" while ONLY_FAULTS is restricting the comparison.
+
+       A comparison of six faults must NOT be written over the file that holds
+       the comparison of all one hundred and forty. The study script tags its
+       partial reports the same way and for the same reason: a partial file with
+       a full file's name is read as a full file, and every fault it leaves out
+       is read as a fault with nothing wrong."""
+    return "_SELECTED" if (ONLY_IDS or ONLY_EVENTS) else ""
+
+
+# The sub-folder the comparison is being written into: the project, and the
+# capacity level when one is being swept. Set around the write, rather than
+# threaded through every writer, because EVERY writer needs it and none of them
+# has anything else to say about it.
+_CMP_SUB = []
+
+
+def cmp_dir():
+    """The folder this comparison's files belong in, created if need be."""
+    parts = [COMPARE_DIR] + [x for x in _CMP_SUB if x]
+    d = os.path.join(*parts)
+    if not os.path.isdir(d):
+        try:
+            os.makedirs(d)
+        except Exception as e:
+            print("[compare] could not create %s (%s) -- writing to %s"
+                  % (d, e, COMPARE_DIR))
+            return COMPARE_DIR
+    return d
+
+
+# THE COMPARISON FOLDER GETS THE SAME TREATMENT AS THE RESULTS FOLDERS.
+#
+# The one file that answers "what did the project change" keeps the root and is
+# numbered so it sorts to the top; every per-project, per-criterion and
+# per-element breakdown behind it goes to detail\. They are all still written
+# and all still named the same -- the difference is that opening the folder now
+# shows you the answer instead of a list to search.
+CMP_ROOT_FILES = ("COMPARISON_REPORT", "COMPARISON_SUMMARY", "COMPARISON_SPP_TABLE",
+                  "PROJECT_CAUSED_ELEMENTS")
+CMP_DETAIL_SUBDIR = "detail"
+CMP_ROOT_NUMBER = {"COMPARISON_REPORT": "00_", "COMPARISON_SUMMARY": "01_",
+                   "PROJECT_CAUSED_ELEMENTS": "01_",
+                   "COMPARISON_SPP_TABLE": "02_"}
+
+
+def _root_named(name):
+    """A study-ROOT filename with the project in it.
+
+       The root of the study holds one file per campaign -- the combined live
+       status, the sweep plan -- and they were named for what they ARE and not
+       for what they are ABOUT: LIVE_STATUS.txt beside LIVE_STATUS.txt.BASE.part
+       and LIVE_STATUS.txt.PROJ.part, with nothing to say which project. Run a
+       second project from the same root, or come back to the folder a week
+       later, and the name is no help at all.
+
+       An empty setting stays empty -- that is how these are turned off."""
+    name = str(name or "")
+    if not name:
+        return ""
+    projs = [str(p).strip() for p in (_panel_projects() or []) if str(p).strip()]
+    if projs:
+        stem, ext = os.path.splitext(name)
+        name = "%s_%s%s" % (stem, "_".join(sorted(set(projs))), ext)
+    return os.path.join(STUDY_ROOT, name)
+
+
+def cmp_detail():
+    """comparison\...\detail -- the per-project breakdowns behind the headline."""
+    d = os.path.join(cmp_dir(), CMP_DETAIL_SUBDIR)
+    try:
+        os.makedirs(d)
+    except Exception:
+        pass
+    return d
+
+
+def cmp_path(stem, ext):
+    d = cmp_dir()
+    if stem in CMP_ROOT_FILES:
+        return os.path.join(d, "%s%s%s.%s"
+                            % (CMP_ROOT_NUMBER.get(stem, ""), stem,
+                               _sel_tag(), ext))
+    d = os.path.join(d, CMP_DETAIL_SUBDIR)
+    try:
+        os.makedirs(d)
+    except Exception:
+        pass
+    return os.path.join(d, "%s%s.%s" % (stem, _sel_tag(), ext))
+
+
+class _cmp_into(object):
+    """with _cmp_into("SantaFe", "cap50"): ... -- everything written inside
+       goes to comparison\SantaFe\cap50."""
+
+    def __init__(self, *parts):
+        self.parts = [p for p in parts if p]
+
+    def __enter__(self):
+        _CMP_SUB.extend(self.parts)
+        return self
+
+    def __exit__(self, *exc):
+        del _CMP_SUB[len(_CMP_SUB) - len(self.parts):]
+        return False
+
+
+@_timed("comparison")
+def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
+    """Everything about one project, both cases, ready to be written out.
+
+       test_suffix names a capacity level's results folder ("_cap50") on the
+       PROJECT side only: the base case does not model the projects, so their
+       output cannot change anything in it and the same base results are the
+       right comparison at every level.
+
+       base_case / base_suffix point the REFERENCE side somewhere else, which is
+       what makes a run-against-run comparison possible: both sides can be the
+       project case, one at ..._ _run1 and one at the run just finished. Every
+       classification then reads relative to THAT reference -- "NEW" means "this
+       run broke it and the other did not" -- which is the same machinery and a
+       different question."""
+    base_case = base_case or CASE_BASE
+    rb = results_dir(base_case, proj, mode) + (base_suffix or "")
+    rt = results_dir(CASE_TEST, proj, mode) + (test_suffix or "")
+    cb, src_cb = read_criteria(rb, proj)
+    ct, src_ct = read_criteria(rt, proj)
+    vb, src_vb = read_violations(rb, proj)
+    vt, src_vt = read_violations(rt, proj)
+    sb, st = read_states(rb, proj), read_states(rt, proj)
+    lim_b, lim_t = read_limits(rb, proj), read_limits(rt, proj)
+    # The two studies judging against DIFFERENT limits would make every
+    # comparison below meaningless in a way no reader could detect.
+    lim_same = (not lim_b or not lim_t or lim_b == lim_t)
+    lim = lim_t or lim_b
+    events = read_events(rt, proj) or read_events(rb, proj)
+    # THE TABLE ONLY KNOWS THE FAULTS IT SCORED. Fill every gap from the fault
+    # list, which knows them all -- otherwise ONLY_EVENTS drops the faults whose
+    # scoring has not caught up yet, which is not a fact about the system.
+    _fl = read_events_from_faultlist(rt) or read_events_from_faultlist(rb)
+    if _fl:
+        _added = 0
+        for _f, _e in _fl.items():
+            if not (events.get(_f) or "").strip() or (events.get(_f) or "").strip() == "-":
+                events[_f] = _e
+                _added += 1
+        if _added:
+            print("[compare] %s %s: planning event taken from the fault list for %d "
+                  "fault(s) the compliance table did not label"
+                  % (proj, mode, _added))
+    # SPP's own contingency text, written beside the fault list by the study.
+    # Read rather than rebuilt: the description a reviewer sees must be the one
+    # the study ran, not this script's idea of what it would have been.
+    descs = read_descriptions(rt, proj) or read_descriptions(rb, proj)
+    fb, ft = (read_fault_defs(base_case, proj, mode),
+              read_fault_defs(CASE_TEST, proj, mode))
+
+    # ---- are these two studies even comparable? ----------------------------
+    # Checked BEFORE anything is compared, and reported at the top of the
+    # output. A mismatched fault set does not make the numbers below wrong so
+    # much as meaningless, and that has to be visible without reading 142 rows.
+    align = {"checked": bool(fb and ft), "same": True, "diffs": [], "missing": []}
+    if fb and ft:
+        for fid in sorted(set(fb) & set(ft)):
+            if fb[fid] != ft[fid]:
+                align["same"] = False
+                align["diffs"].append((fid, fb[fid], ft[fid]))
+        align["missing"] = sorted(set(fb) ^ set(ft))
+
+    # PRESENCE IS NOT COVERAGE.
+    #
+    # The _SELECTED tag protects the criteria report from being mistaken for a
+    # full one, but the study applies that tag ONLY to the criteria report --
+    # write_violations_report overwrites the plain SPP_VIOLATIONS with just the
+    # re-scored subset. A file that exists but covers 12 of 142 faults passes an
+    # existence test, and then every element of the other 130 diffs as "NEW with
+    # the projects": a truncated file reported as 130 faults' worth of new
+    # violations.
+    #
+    # So compare what the violations source COVERS against what the criteria
+    # source scored, on each side.
+    def _coverage(vio, crit):
+        scored = set(k for k in crit if norm_verdict(crit[k].get("verdict")))
+        if not scored:
+            return 1.0, 0, 0
+        seen = set(vio) & scored
+        # A scenario with no violations legitimately has no entry, so only a
+        # LARGE shortfall is evidence of truncation -- and only when the other
+        # side is much better covered.
+        return (float(len(seen)) / len(scored)), len(seen), len(scored)
+
+    cov_b, nb_, tb_ = _coverage(vb, cb)
+    cov_t, nt_, tt_ = _coverage(vt, ct)
+    el_ok = bool(src_vb) and bool(src_vt)
+    el_cov_warn = ""
+    if el_ok and (nb_ or nt_):
+        # One side listing violations for many faults while the other lists them
+        # for very few is truncation, not physics.
+        if nb_ and nt_ and (min(cov_b, cov_t) * 4 < max(cov_b, cov_t)):
+            el_ok = False
+            el_cov_warn = ("violations cover %d of %d scored fault(s) in the base study "
+                           "and %d of %d with the projects -- one of those files was "
+                           "written by a PARTIAL re-score and does not describe the whole "
+                           "study" % (nb_, tb_, nt_, tt_))
+    crit_ok = bool(src_cb) and bool(src_ct)
+    faults = sorted(set(cb) | set(ct) | set(sb) | set(st), key=_fault_key)
+    if ONLY_EVENTS:
+        # The event comes from the study's own compliance table, so a fault the
+        # studies never labelled cannot be matched -- and is dropped rather than
+        # kept, because keeping it would put unselected events in a file whose
+        # header says only P1.2 was compared.
+        _keep = [f for f in faults if _event_selected(events.get(f, ""))]
+        _unlab = [f for f in faults if not (events.get(f) or "").strip()]
+        print("[compare] %s %s: ONLY_EVENTS %s -> %d of %d scored fault(s)"
+              % (proj, mode, ", ".join(ONLY_EVENTS), len(_keep), len(faults)))
+        if _unlab:
+            print("[compare] %s %s: %d of them carry NO planning event: %s%s"
+                  % (proj, mode, len(_unlab), ", ".join(_unlab[:8]),
+                     " ..." if len(_unlab) > 8 else ""))
+        # THE FILTER CANNOT BE APPLIED TO DATA THAT IS NOT THERE.
+        #
+        # The planning event comes from the compliance table, where it is
+        # context rather than a criterion -- a study can legitimately write none
+        # at all, and an older one predating the column writes none. Filtering
+        # on it then drops every fault, and the run continues to "nothing was
+        # compared", which reads as "there are no P1 faults" when what happened
+        # is "this study does not record events".
+        #
+        # Selecting nothing while most faults are unlabelled is that case, and
+        # it is worth stopping for: the answer is one setting away and no
+        # message here was pointing at it.
+        if not _keep and _unlab:
+            print("")
+            print("[compare] *** ONLY_EVENTS cannot be applied to these results ***")
+            print("[compare]     %d of %d fault(s) have no planning event recorded, so"
+                  % (len(_unlab), len(faults)))
+            print("[compare]     matching on the event selects nothing. That is a gap in")
+            print("[compare]     the compliance table, not a finding about the system.")
+            print("[compare]")
+            print("[compare]     Either select by id instead:")
+            print("[compare]         ONLY_EVENTS = []")
+            print("[compare]         ONLY_FAULTS = [\"F01-F20\"]")
+            print("[compare]     or re-score both cases so the event column is written,")
+            print("[compare]     which needs the fault list that produced these .out files.")
+            print("")
+            return None
+        faults = _keep
+    if ONLY_IDS:
+        keep = [f for f in faults if _id_selected(f)]
+        _seen = set()
+        for f in faults:
+            u = f.strip().upper()
+            _seen.add(u)
+            _seen.add(u.split("_", 1)[0])
+        missing = sorted(ONLY_IDS - _seen)
+        # A selected fault that neither case scored is worth SAYING. Silently
+        # comparing four of the six you asked for reads as "the other two were
+        # fine".
+        if missing:
+            print("[compare] %s %s: %d selected fault(s) not scored in either "
+                  "case: %s" % (proj, mode, len(missing), ", ".join(missing)))
+        print("[compare] %s %s: ONLY_FAULTS -> %d of %d scored fault(s)"
+              % (proj, mode, len(keep), len(faults)))
+        # A FILTER THAT SELECTS NOTHING IS NOT A QUIET RESULT.
+        #
+        # ONLY_FAULTS narrows the comparison, and when it names faults this
+        # study does not have, the intersection is empty and the comparison
+        # writes NOTHING -- an empty output folder, no error, and a run that
+        # looks like it failed for some deep reason. It happened with
+        # ONLY_FAULTS = ["F01-F03"] against a SantaFe study whose scored
+        # scenarios are F05..F15: F01/F02 gave up after four attempts so they
+        # have no .out at all, and F03 was never in the selection. The filter
+        # did exactly what it was told; nothing in the output could say so.
+        if faults and not keep:
+            print("")
+            print("[compare] *** ONLY_FAULTS SELECTED NOTHING -- THIS IS WHY THE "
+                  "COMPARISON IS EMPTY ***")
+            print("[compare]     ONLY_FAULTS = %r" % (ONLY_FAULTS,))
+            print("[compare]     asks for : %s"
+                  % (", ".join(sorted(ONLY_IDS)) if ONLY_IDS else "(keywords only)"))
+            print("[compare]     scored   : %s" % ", ".join(sorted(faults)))
+            print("[compare]     None of the ids asked for was scored in this study,")
+            print("[compare]     so there is nothing to compare. Set ONLY_FAULTS = []")
+            print("[compare]     to compare every scored fault, or name ids from the")
+            print("[compare]     'scored' list above. A fault that GAVE UP has no .out")
+            print("[compare]     and can never appear here until it runs.")
+            print("")
+        faults = keep
+    rows = []
+    for fid in faults:
+        vb_ = cb.get(fid, {}).get("verdict")
+        vt_ = ct.get(fid, {}).get("verdict")
+        cls = classify(vb_, vt_)
+
+        # ---- criterion level ------------------------------------------------
+        crit_b = dict((c, (r, d)) for c, r, d in cb.get(fid, {}).get("rows", []))
+        crit_t = dict((c, (r, d)) for c, r, d in ct.get(fid, {}).get("rows", []))
+        crits = []
+        for c in sorted(set(crit_b) | set(crit_t)):
+            rb_ = crit_b.get(c, (None, ""))[0]
+            rt_ = crit_t.get(c, (None, ""))[0]
+            db_ = crit_b.get(c, ("", ""))[1]
+            dt_ = crit_t.get(c, ("", ""))[1]
+            ccls = classify(rb_, rt_)
+            mb, unit_b, direction, tag_b = metric_tagged(c, db_)
+            mt, unit_t, dir_t, tag_t = metric_tagged(c, dt_)
+            direction = direction or dir_t
+            unit = unit_b or unit_t
+            # ONLY SUBTRACT LIKE FROM LIKE. Different tags mean the two sides
+            # reported different quantities, and their difference is not a
+            # change in anything.
+            delta = ((mt - mb) if (mb is not None and mt is not None
+                                   and tag_b == tag_t) else None)
+            same_metric = (tag_b == tag_t and tag_b != "")
+            worse_within = False
+            if (ccls == CLS_OK and delta is not None and direction):
+                # NOT `lim` -- that name already holds this project's criteria
+                # limits in this function, and rebinding it here replaced a dict
+                # with a float for everything downstream.
+                _move = WORSE_PU_DELTA if unit == "pu" else WORSE_DEG_DELTA
+                worse_within = ((direction == "max" and delta >= _move) or
+                                (direction == "min" and -delta >= _move))
+            crits.append({"criterion": c, "base": rb_, "test": rt_, "class": ccls,
+                          "tag_base": tag_b, "tag_test": tag_t,
+                          "same_metric": same_metric,
+                          "mb": mb, "mt": mt, "delta": delta, "unit": unit,
+                          "direction": direction, "worse_within": worse_within,
+                          "detail_base": db_, "detail_test": dt_})
+
+        # A fault that fails on both sides but on DIFFERENT criteria carries a
+        # new problem inside a pre-existing failure. Fault level cannot show it;
+        # this is what makes it visible.
+        new_crit = [c["criterion"] for c in crits if c["class"] == CLS_NEW]
+        hidden_new = bool(new_crit) and cls == CLS_PRE
+
+        # ---- element level --------------------------------------------------
+        # NOT FOR A FAULT SCORED ON ONE SIDE ONLY. With no result on the other
+        # side there is nothing to diff against, so every element it violated
+        # would be branded NEW (or every one RESOLVED) -- a statement about a
+        # scenario that never ran, printed as a finding about the system.
+        _one_sided = (norm_verdict(vb_) is None) != (norm_verdict(vt_) is None)
+
+        # A FAULT THAT FAILS MUST HAVE AT LEAST ONE VIOLATING ELEMENT.
+        #
+        # Every criterion that can FAIL names the buses or machines that failed
+        # it -- recovery, overshoot, steady state, tripping, damping all record
+        # elements. So a side whose verdict is FAIL and whose violations list is
+        # EMPTY has not told us the fault is clean; it has told us its
+        # violations file does not cover this fault. That happens whenever the
+        # report phase was re-run over a SELECTION of faults: the study tags the
+        # criteria report _SELECTED but overwrites SPP_VIOLATIONS with just the
+        # subset.
+        #
+        # Differencing against that absence produced a table asserting the
+        # projects had FIXED every bus of a fault that still fails -- including a
+        # 1.324 pu overvoltage at the POI itself, reported as RESOLVED with no
+        # value beside it. Four BESS plants do not remove 0.124 pu at their own
+        # POI, and a document that says they do is worse than one that says
+        # nothing.
+        _nb = sum(len(x) for x in vb.get(fid, {}).values())
+        _nt = sum(len(x) for x in vt.get(fid, {}).values())
+        # A GAP IS "THE VIOLATIONS FILE SHOULD HAVE ROWS AND HAS NONE". A side
+        # that FAILS only on a criterion the violations file does not carry --
+        # system stability, voltages within scale, record length, a diverged
+        # run -- has no element rows by design. Treating that as a gap threw
+        # away the OTHER side's element rows for the whole fault and rebuilt
+        # everything from the criterion wording: rounded values, and at most
+        # the elements the wording names. F39 came out with 768484 = 2 MW from
+        # "768484(2->0 MW)" while the CSV held 1.750.
+        _elem_fams = ("recovery", "overshoot", "steady", "trip", "angle")
+        def _elem_fail(side):
+            for c in crits:
+                if norm_verdict(c.get(side)) == "FAIL":
+                    try:
+                        if _criterion_family(c["criterion"]) in _elem_fams:
+                            return True
+                    except Exception:
+                        return True
+            return False
+        _vio_gap = ""
+        if norm_verdict(vb_) == "FAIL" and _nb == 0 and _nt and _elem_fail("base"):
+            _vio_gap = "base"
+        elif norm_verdict(vt_) == "FAIL" and _nt == 0 and _nb and _elem_fail("test"):
+            _vio_gap = "project"
+        # ONLY IF BOTH SIDES HAVE AN ELEMENT SOURCE.
+        #
+        # An absent SPP_VIOLATIONS file is not a study with no violations. Diffed
+        # against a side that has one, every element comes back as "new" or
+        # "resolved" -- so a missing file reads as "the projects fixed 315 buses",
+        # which is the most damaging thing this tool could say. Absence of
+        # evidence is reported as exactly that, further down.
+        el = {}
+        if not el_ok or _one_sided or _vio_gap:
+            rows.append({"fault": fid, "event": events.get(fid, "-"),
+                         "vb": vb_, "vt": vt_, "class": cls,
+                         "state_b": sb.get(fid, ""), "state_t": st.get(fid, ""),
+                         "crits": crits, "new_crit": new_crit,
+                         "hidden_new": hidden_new, "elements": {},
+                         "vio_gap": _vio_gap, "one_sided": _one_sided,
+                         "description": descs.get(fid, ""),
+                         "worse_within": any(c["worse_within"] for c in crits)})
+            continue
+        for kind in sorted(set(vb.get(fid, {})) | set(vt.get(fid, {}))):
+            eb = vb.get(fid, {}).get(kind, {})
+            et = vt.get(fid, {}).get(kind, {})
+            el[kind] = {"new":  sorted(set(et) - set(eb), key=_el_key),
+                        "gone": sorted(set(eb) - set(et), key=_el_key),
+                        "both": sorted(set(eb) & set(et), key=_el_key),
+                        "vb": eb, "vt": et}
+
+        rows.append({"fault": fid, "event": events.get(fid, "-"),
+                     "vb": vb_, "vt": vt_, "class": cls,
+                     "state_b": sb.get(fid, ""), "state_t": st.get(fid, ""),
+                     "crits": crits, "new_crit": new_crit,
+                     "hidden_new": hidden_new, "elements": el,
+                     "vio_gap": "", "one_sided": False,
+                     "description": descs.get(fid, ""),
+                     "worse_within": any(c["worse_within"] for c in crits)})
+    # EVERY BUS'S NUMBERS, BOTH SIDES, so a project-side violation can show
+    # what the same bus did in the base study whether or not it violated there.
+    meas_b, meas_t = read_measurements(rb, proj), read_measurements(rt, proj)
+    # THE CHANNEL NUMBERS, both studies in one file, for checking by hand.
+    # CHANNELS_<proj>.txt is ~900 kB of .out channel numbers, for checking a
+    # reading by hand. Useful once; noise in the folder every other time.
+    if not SIMPLE_OUTPUT:
+        try:
+            _chp = write_channel_file(proj, rb, rt)
+            print("[compare] %s %s: channel numbers -> %s" % (proj, mode, _chp))
+        except Exception as _e:
+            print("[compare] %s %s: channel file not written (%s)"
+                  % (proj, mode, _e))
+    return {"project": proj, "mode": mode, "rows": rows, "align": align,
+            "el_ok": el_ok, "crit_ok": crit_ok, "el_cov_warn": el_cov_warn,
+            "limits": lim, "limits_read": bool(lim_b or lim_t),
+            "limits_same": lim_same, "limits_base": lim_b, "limits_test": lim_t,
+            "sources": {"criteria_base": src_cb, "criteria_test": src_ct,
+                        "violations_base": src_vb, "violations_test": src_vt},
+            "dirs": {"base": rb, "test": rt},
+            "meas_b": meas_b, "meas_t": meas_t,
+            "extra_b": _VIO_EXTRA.get(_side_key(rb), {}),
+            "extra_t": _VIO_EXTRA.get(_side_key(rt), {})}
+
+
+def _fault_key(fid):
+    """Sort F1, F2, F10 in that order rather than F1, F10, F2. Fault ids are
+       compared and quoted constantly; a list that reads out of order invites
+       someone to think a fault is missing."""
+    m = re.match(r"^([A-Za-z_]*)(\d+)(.*)$", fid)
+    if m:
+        return (m.group(1), int(m.group(2)), m.group(3))
+    return (fid, 0, "")
+
+
+def _el_key(e):
+    """Bus numbers numerically, names alphabetically, POI labels first."""
+    s = str(e)
+    if s.upper().startswith("POI"):
+        return (0, 0, s)
+    m = re.match(r"^(\d+)", s)
+    if m:
+        return (1, int(m.group(1)), s)
+    return (2, 0, s)
+
+
+# ============================================================================
+# PART 9 -- WRITING IT OUT
+# ============================================================================
+
+def _is_flat(r):
+    """FLAT_RUN is the no-disturbance initialisation check, not a fault. Counting
+       it among the faults makes "1 new fault failure" mean something it does
+       not, and hides the one result that decides whether the study stands up."""
+    return r["fault"].upper().startswith("FLAT")
+
+
+def _tally(rows, faults_only=True):
+    t = dict((c, 0) for c in CLS_ORDER)
+    for r in rows:
+        if faults_only and _is_flat(r):
+            continue
+        t[r["class"]] = t.get(r["class"], 0) + 1
+    return t
+
+
+def _fmt_metric(v, unit):
+    if v is None:
+        return "-"
+    return ("%.3f %s" % (v, unit)) if unit == "pu" else ("%.1f %s" % (v, unit))
+
+
+def write_project_report(res):
+    proj, mode, rows = res["project"], res["mode"], res["rows"]
+    path = cmp_path("COMPARISON_%s_%s" % (proj, mode), "txt")
+    t = _tally(rows)
+    L = []
+    L.append("=" * 104)
+    L.append(" SPP STUDY COMPARISON -- %s (%s faults)" % (proj, mode))
+    L.append(" %-8s %s" % ("BASE:", CASE_BASE["label"]))
+    L.append("          %s" % res["dirs"]["base"])
+    L.append(" %-8s %s" % ("TEST:", CASE_TEST["label"]))
+    L.append("          %s" % res["dirs"]["test"])
+    L.append(" generated %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    L.append("=" * 104)
+    L.append(" Read from:")
+    for k in ("criteria_base", "criteria_test", "violations_base", "violations_test"):
+        L.append("   %-16s %s" % (k, res["sources"][k] or "*** not found ***"))
+    if not res["crit_ok"]:
+        L.append(" *** ONE SIDE HAS NO CRITERIA REPORT ***")
+        L.append("   Every fault below will read as scored on one side only, because it")
+        L.append("   was. Run that study's REPORT phase before drawing any conclusion.")
+    if not res["el_ok"]:
+        L.append(" NOTE: element-level comparison is SUPPRESSED.")
+        if res.get("el_cov_warn"):
+            L.append("   %s." % res["el_cov_warn"])
+            L.append("   Re-run the report phase for the whole study, not a selection.")
+        else:
+            L.append("   SPP_VIOLATIONS is missing on %s side. Diffing a present list"
+                     % ("the base" if not res["sources"]["violations_base"] else "the project"))
+            L.append("   against an absent one would report every element as new or")
+            L.append("   resolved, which would be false.")
+        L.append("   Fault and criterion levels below are unaffected.")
+    L.append("")
+
+    # ---- is this comparison valid at all? ----------------------------------
+    al = res["align"]
+    if not al["checked"]:
+        L.append(" FAULT SET: could not be verified -- faults\\SPP_FAULTS.csv is missing on")
+        L.append("   at least one side. The comparison below assumes both studies ran the")
+        L.append("   same events; nothing on disk confirms it.")
+    elif al["same"] and not al["missing"]:
+        L.append(" FAULT SET: identical on both sides -- every fault id refers to the same")
+        L.append("   bus, type and clearing time. The comparison is like for like.")
+    else:
+        L.append(" *** FAULT SET DIFFERS BETWEEN THE TWO STUDIES ***")
+        if al["diffs"]:
+            L.append("   %d fault id(s) describe a DIFFERENT event in each case. A comparison"
+                     % len(al["diffs"]))
+            L.append("   of these is meaningless -- the same name, two different faults:")
+            for fid, a, b in al["diffs"][:15]:
+                L.append("      %-10s base: bus %s %s kV %s %s cyc" % ((fid,) + a))
+                L.append("      %-10s test: bus %s %s kV %s %s cyc" % (("",) + b))
+            if len(al["diffs"]) > 15:
+                L.append("      ... and %d more" % (len(al["diffs"]) - 15))
+        if al["missing"]:
+            L.append("   %d fault id(s) exist in one study only: %s"
+                     % (len(al["missing"]), ", ".join(al["missing"][:20])
+                        + (" ..." if len(al["missing"]) > 20 else "")))
+        L.append("   Fix: point both studies at ONE SPP_FAULTS.csv with FAULTS_CSV and set")
+        L.append("   AUTO_SPP_FAULTS = False, then re-run. Until then, treat the rows below")
+        L.append("   as indicative only.")
+    L.append("")
+
+    # ---- the headline -------------------------------------------------------
+    L.append("=" * 104)
+    L.append(" HEADLINE")
+    L.append("-" * 104)
+    L.append("   %-16s %4d   passed in both -- nothing to discuss" % (CLS_OK, t[CLS_OK]))
+    L.append("   %-16s %4d   failed in BOTH -- the base system already fails these;"
+             % (CLS_PRE, t[CLS_PRE]))
+    L.append("   %-16s        adding the projects did not cause them" % "")
+    L.append("   %-16s %4d   passed WITHOUT the projects and FAILS WITH them" % (CLS_NEW, t[CLS_NEW]))
+    L.append("   %-16s        >>> these are the ones the projects introduced" % "")
+    L.append("   %-16s %4d   failed without and passes with -- improved by the projects"
+             % (CLS_RESOLVED, t[CLS_RESOLVED]))
+    for k, why in ((CLS_ONLY_B, "scored in the base study only"),
+                   (CLS_ONLY_T, "scored in the project study only"),
+                   (CLS_NEITHER, "scored in neither -- crashed, gave up or never ran")):
+        if t.get(k):
+            L.append("   %-16s %4d   %s" % (k, t[k], why))
+    hidden = [r for r in rows if r["hidden_new"] and not _is_flat(r)]
+    if hidden:
+        L.append("")
+        L.append("   %4d fault(s) counted PRE-EXISTING fail on BOTH sides but for a NEW"
+                 % len(hidden))
+        L.append("        reason -- a new problem hidden inside an old failure. Listed")
+        L.append("        under NEW CRITERIA below, and they deserve the same attention")
+        L.append("        as the %d fault(s) above." % t[CLS_NEW])
+    worse = [r for r in rows if r["class"] == CLS_OK and r["worse_within"]]
+    if worse:
+        L.append("   %4d fault(s) pass in both cases but moved materially towards a limit."
+                 % len(worse))
+    L.append("=" * 104)
+    L.append("")
+
+    # ---- THE FLAT RUN COMES FIRST, WHATEVER ELSE IS IN THE REPORT ----------
+    # FLAT_RUN applies no disturbance. It exists to prove the case HOLDS ITS
+    # INITIAL CONDITIONS -- run the dynamics with nothing happening and nothing
+    # should move. If it fails, the machines did not initialise cleanly, and
+    # every fault result computed on that same initialisation inherits the
+    # problem. Reporting it as "1 new fault failure" alongside 20 real faults
+    # buries the one line that decides whether the rest of the study is worth
+    # reading.
+    flat = [r for r in rows if r["fault"].upper().startswith("FLAT")]
+    if flat and any(r["class"] in (CLS_NEW, CLS_PRE) or r["hidden_new"] for r in flat):
+        fr = flat[0]
+        L.append("*" * 104)
+        L.append(" *** THE FLAT RUN FAILS: %s -> %s ***" % (fr["vb"] or "-", fr["vt"] or "-"))
+        L.append("*" * 104)
+        L.append(" FLAT_RUN applies NO fault. It runs the dynamics with nothing happening,")
+        L.append(" and everything should sit still. It failing means the case did not")
+        L.append(" initialise cleanly -- some machine's states are not consistent with the")
+        L.append(" power flow, so it drifts on its own.")
+        L.append("")
+        L.append(" This matters more than any fault below it: EVERY fault starts from that")
+        L.append(" same initialisation, so drift that is already present with no disturbance")
+        L.append(" is also present in all of them. Fault results computed on a case that")
+        L.append(" does not hold flat are not trustworthy, and a reviewer will say so.")
+        L.append("")
+        for c in fr["crits"]:
+            if c["class"] in (CLS_NEW, CLS_PRE):
+                L.append("   %s" % c["criterion"])
+                L.append("      base: %s" % (c["detail_base"] or "-"))
+                L.append("      with: %s" % (c["detail_test"] or "-"))
+        L.append("")
+        L.append(" Fix the initialisation first, re-run, and re-compare. The fault-level")
+        L.append(" numbers below are reported as measured, but they rest on this.")
+        L.append("*" * 104)
+        L.append("")
+
+    # ---- the answer, in one sentence ---------------------------------------
+    L.append(" ANSWER TO 'DID THE PROJECTS CAUSE THIS?'")
+    L.append("-" * 104)
+    scored = t[CLS_OK] + t[CLS_PRE] + t[CLS_NEW] + t[CLS_RESOLVED]
+    if not scored:
+        L.append("   No fault was scored in both studies, so nothing can be concluded.")
+    elif t[CLS_NEW] == 0 and not hidden:
+        L.append("   NO. Every failure seen with the projects is also a failure without")
+        L.append("   them: %d pre-existing, 0 newly introduced, out of %d fault(s) scored"
+                 % (t[CLS_PRE], scored))
+        L.append("   in both studies.")
+    else:
+        L.append("   PARTLY. Of %d fault(s) scored in both studies:" % scored)
+        L.append("      %d already failed WITHOUT the projects  (pre-existing)" % t[CLS_PRE])
+        L.append("      %d fail ONLY with the projects          (introduced)" % t[CLS_NEW])
+        if hidden:
+            L.append("      %d fail in both but on a NEW criterion   (introduced, hidden)"
+                     % len(hidden))
+        L.append("   The introduced ones are listed first below.")
+    L.append("")
+
+    # ---- fault by fault -----------------------------------------------------
+    L.append("=" * 104)
+    L.append(" FAULT BY FAULT")
+    L.append("-" * 104)
+    L.append(" %-10s %-7s %-8s %-8s %-14s %s"
+             % ("fault", "event", "base", "with", "class", "what changed"))
+    L.append("-" * 104)
+    for cls in CLS_ORDER:
+        part = [r for r in rows if r["class"] == cls]
+        if not part:
+            continue
+        for r in part:
+            note = ""
+            if r["new_crit"]:
+                note = "NEW: " + "; ".join(_short_crit(c) for c in r["new_crit"])
+            elif r["class"] == CLS_OK and r["worse_within"]:
+                note = "passes, but moved towards a limit"
+            elif r["class"] in (CLS_ONLY_B, CLS_ONLY_T, CLS_NEITHER):
+                note = "base=%s  with=%s" % (r["state_b"] or "?", r["state_t"] or "?")
+            elif r.get("vio_gap"):
+                note = ("elements not compared -- the %s study lists none for a FAIL"
+                        % r["vio_gap"])
+            L.append(" %-10s %-7s %-8s %-8s %-14s %s"
+                     % (r["fault"], r["event"], r["vb"] or "-", r["vt"] or "-",
+                        cls + ("*" if r["hidden_new"] else ""), note))
+    L.append("-" * 104)
+    L.append(" * = fails in both cases, but on a criterion that only fails with the projects")
+    L.append("")
+
+    # ---- the detail, for everything that changed ---------------------------
+    changed = [r for r in rows
+               if r["class"] in (CLS_NEW, CLS_RESOLVED) or r["hidden_new"]
+               or (r["class"] == CLS_PRE) or r["worse_within"]]
+    L.append("=" * 104)
+    L.append(" DETAIL -- every fault whose result or measured values changed")
+    L.append("=" * 104)
+    if not changed:
+        L.append(" Nothing changed: every fault gave the same verdict on the same criteria.")
+    for r in changed:
+        L.append("")
+        L.append("FAULT %-12s %-14s   base %-6s -> with projects %-6s   %s"
+                 % (r["fault"], r["event"], r["vb"] or "-", r["vt"] or "-", r["class"]))
+        L.append("-" * 104)
+        for c in r["crits"]:
+            if c["class"] == CLS_OK and not c["worse_within"]:
+                continue
+            mark = {CLS_NEW: ">>>", CLS_PRE: "   ", CLS_RESOLVED: " + ",
+                    CLS_OK: "  ~"}.get(c["class"], "   ")
+            L.append("  %s [%-12s] %s" % (mark, c["class"], c["criterion"]))
+            if c["mb"] is not None or c["mt"] is not None:
+                d = ""
+                if c["delta"] is not None:
+                    d = "   change %+.3f %s" % (c["delta"], c["unit"]) \
+                        if c["unit"] == "pu" else "   change %+.1f %s" % (c["delta"], c["unit"])
+                L.append("        measured   base %-12s ->  with projects %-12s%s"
+                         % (_fmt_metric(c["mb"], c["unit"]),
+                            _fmt_metric(c["mt"], c["unit"]), d))
+                if (c["mb"] is not None and c["mt"] is not None
+                        and c["delta"] is None):
+                    L.append("        (no change quoted -- the two sides report different")
+                    L.append("         quantities: %s vs %s. See the elements below.)"
+                             % (c["tag_base"] or "?", c["tag_test"] or "?"))
+            if c["class"] in (CLS_NEW, CLS_PRE):
+                L.append("        base: %s" % (c["detail_base"] or "(criterion not present)"))
+                L.append("        with: %s" % (c["detail_test"] or "(criterion not present)"))
+        # elements
+        lim = res["limits"]
+        for kind in sorted(r["elements"]):
+            e = r["elements"][kind]
+            if not (e["new"] or e["gone"]):
+                continue
+            L.append("     elements -- %s" % _kind_title(kind))
+            _fam_k = {"undamped": "angle", "tripped": "trip"}.get(kind, kind)
+            _fid_k = r["fault"]
+            if e["both"]:
+                L.append("        %4d already violating without the projects" % len(e["both"]))
+            if e["new"]:
+                # THE BASE VALUE BESIDE EVERY NEW ELEMENT, from the base
+                # study's measurements: "NEW" with nothing beside it does not
+                # say whether the projects nudged 1.19 pu over or made 0.98
+                # pu into 1.27.
+                L.append("        %4d NEW with the projects (project value, base value): %s"
+                         % (len(e["new"]),
+                            _el_list(e["new"], e["vt"], kind, lim,
+                                     other=lambda el: measured_value(
+                                         res.get("meas_b"), _fam_k, _fid_k, el),
+                                     other_tag="base")))
+            if e["gone"]:
+                L.append("        %4d no longer violating (base value, project value):   %s"
+                         % (len(e["gone"]),
+                            _el_list(e["gone"], e["vb"], kind, lim,
+                                     other=lambda el: measured_value(
+                                         res.get("meas_t"), _fam_k, _fid_k, el),
+                                     other_tag="with projects")))
+    L.append("")
+    L.append("=" * 104)
+    _write(path, L)
+    return path, t
+
+
+def _short_crit(c):
+    """Criteria names are long and the table column is not. Shorten by meaning,
+       never by truncation -- a cut-off name is unreadable in a document someone
+       else has to act on."""
+    fam = _criterion_family(c)
+    return {"recovery": "voltage recovery", "overshoot": "transient overvoltage",
+            "steady": "steady-state voltage", "angle": "rotor-angle damping",
+            "trip": "generator tripping"}.get(fam, c[:28])
+
+
+def _kind_title(kind):
+    return {"recovery":  "buses that did not recover",
+            "overshoot": "buses that swung too high",
+            "steady":    "buses outside the steady-state band",
+            "tripped":   "machines that tripped",
+            "undamped":  "machines with undamped rotor angles",
+            "review":    "machines below 16 deg needing individual review"}.get(kind, kind)
+
+
+def _el_lines(els, vals, kind, lim, other=None):
+    """One line per element: value, how far past the limit, and -- when it also
+       violated in the other case -- what it was there.
+
+       Sorted by EXCEEDANCE, not by bus number. 315 buses over 1.20 pu is not a
+       list anyone reads to the end; sorted worst-first, the first three lines
+       are the answer and the rest is evidence."""
+    scored = []
+    for e in els:
+        v = vals.get(e)
+        amt, _txt = exceedance(kind, v, lim)
+        scored.append((-(amt if amt is not None else -1e9), e, v, amt))
+    scored.sort()
+    out = []
+    for _k, e, v, amt in scored[:ELEMENT_LIST_MAX]:
+        bit = "      %-18s %10s" % (e, _v(v))
+        if amt is not None:
+            bit += "   %+9.3f past the limit" % amt
+        if other is not None and e in other:
+            ob = other.get(e)
+            oamt, _ = exceedance(kind, ob, lim)
+            bit += "   (was %s" % _v(ob)
+            if oamt is not None and amt is not None:
+                bit += ", %+.3f" % (amt - oamt)
+            bit += ")"
+        out.append(bit)
+    if len(scored) > ELEMENT_LIST_MAX:
+        out.append("      ... and %d more, worst first -- full list in the CSV"
+                   % (len(scored) - ELEMENT_LIST_MAX))
+    return out
+
+
+def _el_list(els, vals, kind=None, lim=None, other=None, other_tag="base"):
+    """Compact one-line form, for the fault-by-fault report.
+
+       `other` is a callable element -> value on the OTHER side (the base
+       measurement for a NEW element, the project measurement for a RESOLVED
+       one), printed beside each element so "NEW" is never a bare number."""
+    lim = lim or {}
+    scored = []
+    for e in els:
+        v = vals.get(e)
+        amt, _ = exceedance(kind, v, lim) if kind else (None, "")
+        scored.append((-(amt if amt is not None else -1e9), e, v, amt))
+    scored.sort()
+    show = scored[:ELEMENT_LIST_MAX]
+
+    def _oth(e):
+        if other is None:
+            return ""
+        try:
+            ov = other(e)
+        except Exception:
+            ov = None
+        return ", %s %s" % (other_tag, _v(ov) if ov is not None else "not measured")
+    out = ", ".join(("%s(%s%s%s)" % (e, _v(v),
+                                     ", %+.3f over" % amt if amt is not None else "",
+                                     _oth(e)))
+                    for _k, e, v, amt in show)
+    if len(scored) > len(show):
+        out += " ... and %d more (see the CSV)" % (len(scored) - len(show))
+    return out
+
+
+def _v(x):
+    if x is None:
+        return "?"
+    try:
+        return "%.3f" % x
+    except (TypeError, ValueError):
+        return str(x)
+
+
+def _write(path, lines):
+    """Write a report, whatever bytes the study's own reports contained.
+
+       _read_text decodes with errors="replace", which SUBSTITUTES U+FFFD -- a
+       non-ASCII character by construction. Writing that back through a plain
+       open(path, "w") encodes with the platform default: ascii on py2,
+       cp1252 on Windows py3. Neither can represent it, so the report that
+       survived a stray byte on the way in died on the way out."""
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d)
+    body = u"\n".join(_u(x) for x in lines) + u"\n"
+    with io.open(path, "w", encoding="utf-8", errors="replace") as fh:
+        fh.write(body)
+    print("[compare] -> %s" % path)
+
+
+# The five criteria families, in the order the SPP compliance table uses them.
+# One pair of columns per family, so a fault is ONE ROW.
+# THE FAMILY AS A READER NAMES IT. _FAM_COLS carries the same five families
+# with the SPP threshold spelled out, which is the right heading for a wide
+# spreadsheet column and too long for a cell in a table of buses.
+_FAM_LABEL = {
+    "recovery":  "voltage recovery",
+    "overshoot": "transient overvoltage",
+    "steady":    "steady-state voltage",
+    "trip":      "generator tripping",
+    "angle":     "rotor-angle damping",
+    "review":    "individual evaluation",
+}
+
+_FAM_COLS = [
+    ("recovery",  "V recovery >=0.70pu"),
+    ("overshoot", "Transient V <=1.20pu"),
+    ("steady",    "Steady state 0.90-1.10pu"),
+    ("trip",      "Generator tripping"),
+    ("angle",     "Rotor angle damping"),
+]
+
+
+def _fam_of_row(res_row):
+    """{family: criterion dict} for one fault, so the wide layout can look up a
+       family without caring what the criterion is called."""
+    out = {}
+    for c in res_row["crits"]:
+        f = _criterion_family(c["criterion"])
+        if f == "busangle":
+            f = ""                      # recorded, not scored -- no column
+        if f and f not in out:
+            out[f] = c
+    return out
+
+
+def _num(v, unit):
+    if v is None:
+        return ""
+    return ("%.3f" % v) if unit == "pu" else ("%.1f" % v)
+
+
+def write_project_csv(res):
+    """ONE ROW PER FAULT. This is the file that gets opened in Excel, sorted and
+       filtered, so it has to read like the compliance table it sits next to --
+       not like a database dump.
+
+       It used to be one row per (fault x criterion): seven rows for every fault,
+       nineteen columns, two of them full sentences. Sorting it by anything put a
+       fault's rows in seven different places, and the column that says whether
+       the projects caused the failure repeated seven times per fault.
+
+       The per-criterion detail is still written, as _CRITERIA.csv, because the
+       Detail strings are what you quote when someone asks why. Two files, each
+       shaped for one job."""
+    if not WRITE_CSV:
+        return ""
+    proj, mode = res["project"], res["mode"]
+    path = cmp_path("COMPARISON_%s_%s" % (proj, mode), "csv")
+
+    head = ["Project", "Mode", "Fault", "Planning event",
+            "Result base", "Result with projects", "Classification",
+            "Introduced by projects"]
+    for _f, label in _FAM_COLS:
+        head += ["%s base" % label, "%s with projects" % label]
+    head += ["Criteria newly failing", "Criteria failing in both",
+             "Worst measured base", "Worst measured with projects", "Change", "Unit",
+             "Elements new", "Elements in both", "Elements resolved",
+             "Worst new element", "Worst new value", "Past limit",
+             "Run state base", "Run state with projects", "Note"]
+
+    with csv_open(path, "w") as fh:
+        w = csv.writer(fh)
+        w.writerow(_csv_row(head))
+        for r in res["rows"]:
+            fam = _fam_of_row(r)
+            row = [proj, mode, r["fault"], r["event"],
+                   r["vb"] or "", r["vt"] or "", r["class"],
+                   # The answer to the question the study is asking, in one cell.
+                   "YES" if (r["class"] == CLS_NEW or r["hidden_new"]) else "no"]
+            for f, _label in _FAM_COLS:
+                c = fam.get(f)
+                row += [(c["base"] or "") if c else "-",
+                        (c["test"] or "") if c else "-"]
+
+            new_c = [_short_crit(x) for x in r["new_crit"]]
+            both_c = [_short_crit(c["criterion"]) for c in r["crits"]
+                      if c["class"] == CLS_PRE]
+            # The headline measurement: the criterion that decides the fault.
+            # NEW first, then the worst pre-existing one -- what a reader wants
+            # on the row is the number that explains the classification.
+            lead = None
+            for c in r["crits"]:
+                if c["class"] == CLS_NEW:
+                    lead = c
+                    break
+            if lead is None:
+                for c in r["crits"]:
+                    if c["class"] == CLS_PRE and c["mb"] is not None:
+                        lead = c
+                        break
+            row += ["; ".join(new_c), "; ".join(both_c)]
+            if lead:
+                row += [_num(lead["mb"], lead["unit"]), _num(lead["mt"], lead["unit"]),
+                        ("" if lead["delta"] is None
+                         else _num(lead["delta"], lead["unit"])), lead["unit"]]
+            else:
+                row += ["", "", "", ""]
+
+            n_new = sum(len(e["new"]) for e in r["elements"].values())
+            n_both = sum(len(e["both"]) for e in r["elements"].values())
+            n_gone = sum(len(e["gone"]) for e in r["elements"].values())
+            # The single worst NEW element, by how far past its limit it sits --
+            # the one line an engineer acts on.
+            worst, worst_v, worst_amt, worst_lim = "", "", "", ""
+            best = None
+            for kind, e in r["elements"].items():
+                for el in e["new"]:
+                    v = e["vt"].get(el)
+                    amt, _t = exceedance(kind, v, res["limits"])
+                    if amt is not None and (best is None or amt > best[0]):
+                        best = (amt, el, v, kind)
+            if best:
+                worst_amt, worst, worst_v = ("%.3f" % best[0]), best[1], _v(best[2])
+                worst_lim = _limit_text(best[3], res["limits"])
+
+            note = ""
+            if r.get("vio_gap"):
+                note = "elements not compared -- %s study lists none for a FAIL" % r["vio_gap"]
+            elif r.get("one_sided"):
+                note = "scored on one side only"
+            elif r["hidden_new"]:
+                note = "fails in both, but on a criterion that only fails with the projects"
+            elif r["class"] == CLS_OK and r["worse_within"]:
+                note = "passes in both, but moved materially towards a limit"
+            if _is_flat(r):
+                note = ("FLAT RUN -- no fault applied; this is the initial-condition "
+                        "check, not a contingency")
+
+            row += [n_new if r["elements"] else "",
+                    n_both if r["elements"] else "",
+                    n_gone if r["elements"] else "",
+                    worst, worst_v, ("%s past %s" % (worst_amt, worst_lim)) if worst else "",
+                    r["state_b"], r["state_t"], note]
+            w.writerow(_csv_row(row))
+    print("[compare] -> %s" % path)
+
+    # ---- the per-criterion detail, unchanged in content, its own file --------
+    dpath = cmp_path("COMPARISON_%s_%s_CRITERIA" % (proj, mode), "csv")
+    with csv_open(dpath, "w") as fh:
+        w = csv.writer(fh)
+        w.writerow(_csv_row(
+            ["Project", "Mode", "Fault", "Planning event", "Criterion",
+             "Result base", "Result with projects", "Criterion class",
+             "Measured base", "Measured with projects", "Change", "Unit",
+             "Detail base", "Detail with projects"]))
+        for r in res["rows"]:
+            for c in r["crits"]:
+                w.writerow(_csv_row(
+                    [proj, mode, r["fault"], r["event"], c["criterion"],
+                     c["base"] or "", c["test"] or "", c["class"],
+                     _num(c["mb"], c["unit"]), _num(c["mt"], c["unit"]),
+                     ("" if c["delta"] is None else _num(c["delta"], c["unit"])),
+                     c["unit"], c["detail_base"], c["detail_test"]]))
+    print("[compare] -> %s" % dpath)
+    return path
+
+
+def write_elements(res):
+    """Every element, with whether it is new. This is the file an engineer opens
+       when the question stops being 'is it new' and becomes 'which buses'."""
+    proj, mode = res["project"], res["mode"]
+    lines = ["=" * 96,
+             " NON-COMPLIANT ELEMENTS -- %s (%s)   base vs with projects" % (proj, mode),
+             " generated %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+             "=" * 96,
+             " NEW      = violates only with the projects modelled",
+             " BOTH     = already violating in the base case",
+             " RESOLVED = violated in the base case, no longer does",
+             "=" * 96]
+    rows = []
+    lim = res["limits"]
+    if res["limits_read"]:
+        lines.append(" Limits read from the study's own report header: %s"
+                     % ", ".join("%s=%s" % (k, lim[k]) for k in sorted(lim)))
+    else:
+        lines.append(" Limits taken from this script's settings (the study reports did not")
+        lines.append(" carry them): recovery %.2f, overshoot %.2f, band %.2f-%.2f, angle %d deg"
+                     % (V_RECOVERY_PU, V_OVERSHOOT_PU, V_SS_LOW, V_SS_HIGH, int(ANGLE_DEV_DEG)))
+    if not res["limits_same"]:
+        lines.append("")
+        lines.append(" *** THE TWO STUDIES USED DIFFERENT LIMITS ***")
+        lines.append("   base: %s" % res["limits_base"])
+        lines.append("   with: %s" % res["limits_test"])
+        lines.append("   A verdict difference between them may be a difference in the")
+        lines.append("   THRESHOLD rather than in the system. Make them match and re-run.")
+    lines.append("=" * 96)
+    for r in res["rows"]:
+        blocks = []
+        for kind in sorted(r["elements"]):
+            e = r["elements"][kind]
+            for el, status in ([(x, "NEW") for x in e["new"]]
+                               + [(x, "BOTH") for x in e["both"]]
+                               + [(x, "RESOLVED") for x in e["gone"]]):
+                bv = e["vb"].get(el)
+                tv = e["vt"].get(el)
+                ab, _ = exceedance(kind, bv, lim)
+                at, _ = exceedance(kind, tv, lim)
+                rows.append([proj, mode, r["fault"], kind, el, status,
+                             _v(bv) if bv is not None else "",
+                             _v(tv) if tv is not None else "",
+                             "" if ab is None else round(ab, 4),
+                             "" if at is None else round(at, 4),
+                             _limit_text(kind, lim)])
+            if e["new"] or e["gone"] or e["both"]:
+                blocks.append((kind, e))
+        if r.get("vio_gap") or r.get("one_sided"):
+            lines.append("")
+            lines.append("FAULT %-12s  base %-6s -> with projects %-6s   %s"
+                         % (r["fault"], r["vb"] or "-", r["vt"] or "-", r["class"]))
+            lines.append("-" * 96)
+            if r.get("vio_gap"):
+                lines.append("   *** element comparison SKIPPED for this fault ***")
+                lines.append("   The %s study scores it FAIL but lists NO violating element."
+                             % r["vio_gap"])
+                lines.append("   A fault that fails always names the buses or machines that")
+                lines.append("   failed it, so this is a GAP IN THE DATA, not a clean result.")
+                lines.append("   Differencing against it would report every element on the")
+                lines.append("   other side as introduced -- or as fixed by the projects.")
+                lines.append("   Usually means that side's report phase was re-run over a")
+                lines.append("   SELECTION of faults: the study tags the criteria report")
+                lines.append("   _SELECTED but overwrites SPP_VIOLATIONS with just the subset.")
+                lines.append("   Re-run the report for the WHOLE study to get this fault back.")
+            else:
+                lines.append("   *** element comparison SKIPPED -- scored on one side only ***")
+                lines.append("   base=%s  with projects=%s"
+                             % (r["state_b"] or "?", r["state_t"] or "?"))
+            continue
+        if not blocks:
+            continue
+        lines.append("")
+        lines.append("FAULT %-12s  base %-6s -> with projects %-6s   %s"
+                     % (r["fault"], r["vb"] or "-", r["vt"] or "-", r["class"]))
+        lines.append("-" * 96)
+        for kind, e in blocks:
+            lines.append("   %s" % _kind_title(kind))
+            lines.append("      base %d, with projects %d   ->  %d new, %d resolved, %d in both"
+                         % (len(e["vb"]), len(e["vt"]), len(e["new"]),
+                            len(e["gone"]), len(e["both"])))
+            if e["new"]:
+                lines.append("      NEW -- violates only with the projects, worst first:")
+                lines += _el_lines(e["new"], e["vt"], kind, lim)
+            if e["both"]:
+                lines.append("      ALREADY VIOLATING in the base case, and by how much"
+                             " it moved:")
+                lines += _el_lines(e["both"], e["vt"], kind, lim, other=e["vb"])
+            if e["gone"]:
+                lines.append("      RESOLVED -- violated in the base case, no longer does:")
+                lines += _el_lines(e["gone"], e["vb"], kind, lim)
+    if not res["el_ok"]:
+        lines.append("")
+        lines.append(" *** SUPPRESSED -- SPP_VIOLATIONS is missing on one side ***")
+        lines.append("   base:    %s" % (res["sources"]["violations_base"] or "NOT FOUND"))
+        lines.append("   project: %s" % (res["sources"]["violations_test"] or "NOT FOUND"))
+        lines.append("")
+        lines.append(" Diffing one study's element list against a file that does not exist")
+        lines.append(" would report every element as NEW (or every one as RESOLVED), and")
+        lines.append(" that is a conclusion about the missing file, not about the system.")
+        lines.append(" Run the missing study's REPORT phase and re-run this comparison.")
+    elif len(lines) <= 8:
+        lines.append("")
+        lines.append(" No element-level data: neither study recorded any non-compliant")
+        lines.append(" element for any fault.")
+    txt = cmp_path("COMPARISON_ELEMENTS_%s_%s" % (proj, mode), "txt")
+    _write(txt, lines)
+    if WRITE_CSV:
+        p = cmp_path("COMPARISON_ELEMENTS_%s_%s" % (proj, mode), "csv")
+        with csv_open(p, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(["project", "mode", "fault", "violation", "element",
+                        "status", "value_base", "value_with_projects",
+                        "past_limit_base", "past_limit_with_projects",
+                        "limit_applied"])
+            w.writerows([_csv_row(r) for r in rows])
+        print("[compare] -> %s" % p)
+    return txt
+
+
+# ---- SPP's results-appendix layout, for the COMPARISON ----------------------
+# The single-run table is written by the study script (SPP_EVENT_TABLE). This is
+# the same columns with both cases in each cell:
+#
+#     Rotor Angle Stability        Yes
+#     Transient Voltage < 1.2 pu   Yes -> No        <- changed
+#
+# so a reviewer reads one row and sees which criterion the projects moved, in
+# the column headings SPP uses rather than this study's.
+_SPP_COLS = [
+    ("angle_stab", "Rotor Angle Stability"),
+    ("recovery",   "Transient Voltage Response > 0.7 p.u."),
+    ("overshoot",  "Transient Voltage Response < 1.2 p.u."),
+    ("ss_low",     "Post Fault Steady State Voltage > 0.9 p.u."),
+    ("ss_high",    "Post Fault Steady State Voltage < 1.1 p.u."),
+    ("damping",    "Damping Factor > 0.8 %"),
+    ("lvrt",       "Low Voltage Rides Through"),
+]
+
+
+def _spp_cells(res, r, side):
+    """{key: True/False/None} for one fault on one side, in SPP's columns.
+
+       The study judges post-fault steady state as ONE band and SPP splits it
+       into a > 0.9 column and a < 1.1 column. Which side was breached is taken
+       from the recorded element values; with no element data the single verdict
+       is reported in both columns, which is the honest reading of what is
+       known."""
+    fam = {}
+    for c in r["crits"]:
+        f = _criterion_family(c["criterion"])
+        if f and f not in fam:
+            fam[f] = c
+    def ok(key):
+        c = fam.get(key)
+        if c is None:
+            return None
+        v = c["base"] if side == "base" else c["test"]
+        return None if v is None else (v.upper() == "PASS")
+
+    out = {"angle_stab": ok("angle"), "recovery": ok("recovery"),
+           "overshoot": ok("overshoot"), "damping": ok("angle"),
+           "lvrt": ok("trip")}
+    ss = ok("steady")
+    lo = hi = ss
+    e = (r.get("elements") or {}).get("steady")
+    if e is not None and ss is False:
+        vals = (e["vb"] if side == "base" else e["vt"]) or {}
+        below = [v for v in vals.values() if v is not None and v < V_SS_LOW]
+        above = [v for v in vals.values() if v is not None and v > V_SS_HIGH]
+        if below or above:
+            lo = not below
+            hi = not above
+    out["ss_low"], out["ss_high"] = lo, hi
+    return out
+
+
+def _cell(a, b):
+    """'Yes', 'No', or 'Yes -> No' when the two sides differ."""
+    def t(v):
+        return "-" if v is None else ("Yes" if v else "No")
+    return t(a) if a == b else "%s -> %s" % (t(a), t(b))
+
+
+MITIGATION_RULES = {
+    "angle":     "Reduce clearing time to %(faster)d cycles.",
+    "recovery":  "Add dynamic reactive support near %(where)s.",
+    "overshoot": "Review post-fault reactive control / switched shunt at %(where)s.",
+    "ss_low":    "Review post-contingency voltage schedule and reactive reserves "
+                 "near %(where)s.",
+    "ss_high":   "Review switched-shunt and reactive control at %(where)s.",
+    "trip":      "Review ride-through settings on %(where)s against PRC-024.",
+}
+
+
+def _names(labels, limit=3):
+    """'FTPECK4G (652414) and FTPECK5G (652415)'.
+
+       The comparison has no case in memory, so a bare bus number stays a bus
+       number. The study's own reports carry the names; this reads whatever the
+       label already is."""
+    out = [str(x).strip() for x in labels[:limit]]
+    if not out:
+        return ""
+    extra = len(labels) - len(out)
+    txt = out[0] if len(out) == 1 else (", ".join(out[:-1]) + " and " + out[-1])
+    return txt + (" and %d other(s)" % extra if extra > 0 else "")
+
+
+def _els(r, kind, side):
+    """[(label, value)] for one violation kind on one side."""
+    e = (r.get("elements") or {}).get(kind)
+    if not e:
+        return []
+    vals = (e["vb"] if side == "base" else e["vt"]) or {}
+    return sorted(vals.items(), key=lambda kv: kv[1] if kv[1] is not None else 0)
+
+
+def compare_violation_text(r, cells_b, cells_t):
+    """(summary, mitigation) for the comparison table.
+
+       The summary describes what fails WITH the projects, then says whether the
+       base case does the same -- which is the sentence SPP's own appendix
+       carries, and the one this whole comparison exists to justify:
+       "The issue is also observed in the base case ..."."""
+    fb, ft = dict(cells_b), dict(cells_t)
+    sent, mit = [], []
+
+    def failed(k):
+        return ft.get(k) is False
+
+    if failed("angle_stab") or failed("damping"):
+        who = _names([lb for lb, _v in _els(r, "undamped", "test")])
+        sent.append(("%s remain(s) poorly damped following fault clearance."
+                     % who) if who else
+                    "Rotor angles are not adequately damped following fault clearance.")
+        c = None
+        for x in r["crits"]:
+            if _criterion_family(x["criterion"]) == "angle":
+                c = x
+        if c is not None:
+            mit.append(MITIGATION_RULES["angle"] % {"faster": 6})
+    if failed("recovery"):
+        els = _els(r, "recovery", "test")
+        who = _names([lb for lb, _v in els])
+        worst = min([v for _lb, v in els] or [0.0])
+        sent.append("%s do(es) not recover above %.2f pu within %.1f s of clearing "
+                    "(worst %.3f pu)." % (who or "one or more buses",
+                                          V_RECOVERY_PU, 2.5, worst))
+        mit.append(MITIGATION_RULES["recovery"] % {"where": who or "the affected buses"})
+    if failed("overshoot"):
+        els = _els(r, "overshoot", "test")
+        who = _names([lb for lb, _v in els])
+        worst = max([v for _lb, v in els] or [0.0])
+        sent.append("%s exceed(s) %.2f pu after clearing (worst %.3f pu)."
+                    % (who or "one or more buses", V_OVERSHOOT_PU, worst))
+        mit.append(MITIGATION_RULES["overshoot"] % {"where": who or "the affected buses"})
+    if failed("ss_low") or failed("ss_high"):
+        els = _els(r, "steady", "test")
+        lo = [(lb, v) for lb, v in els if v is not None and v < V_SS_LOW]
+        hi = [(lb, v) for lb, v in els if v is not None and v > V_SS_HIGH]
+        if lo:
+            sent.append("%s settle(s) below %.2f pu (worst %.3f pu)."
+                        % (_names([lb for lb, _v in lo]), V_SS_LOW,
+                           min(v for _lb, v in lo)))
+            mit.append(MITIGATION_RULES["ss_low"]
+                       % {"where": _names([lb for lb, _v in lo], 1)})
+        if hi:
+            sent.append("%s settle(s) above %.2f pu (worst %.3f pu)."
+                        % (_names([lb for lb, _v in hi]), V_SS_HIGH,
+                           max(v for _lb, v in hi)))
+            mit.append(MITIGATION_RULES["ss_high"]
+                       % {"where": _names([lb for lb, _v in hi], 1)})
+    if failed("lvrt"):
+        who = _names([lb for lb, _v in _els(r, "tripped", "test")])
+        sent.append("%s trip(s) following the disturbance."
+                    % (who or "one or more machines"))
+        mit.append(MITIGATION_RULES["trip"] % {"where": who or "the affected machines"})
+
+    # ---- THE SENTENCE THIS COMPARISON EXISTS TO WRITE ----------------------
+    if sent:
+        if r["class"] == CLS_NEW:
+            sent.append("The issue is NOT observed in the base case: it appears only "
+                        "with the studied generation modelled.")
+        elif r["hidden_new"]:
+            sent.append("The base case fails this event on other criteria; %s "
+                        "appear(s) only with the studied generation modelled."
+                        % "; ".join(_short_crit(c) for c in r["new_crit"]))
+        elif r["class"] == CLS_PRE:
+            sent.append("The issue is also observed in the base case and the studied "
+                        "generation was not found to introduce it.")
+        elif r["class"] in (CLS_ONLY_B, CLS_ONLY_T, CLS_NEITHER):
+            sent.append("The base case has no result for this event, so whether the "
+                        "studied generation introduced it cannot be said.")
+    seen, uniq = set(), []
+    for m in mit:
+        if m not in seen:
+            seen.add(m)
+            uniq.append(m)
+    return " ".join(sent), " ".join(uniq)
+
+
+def write_spp_event_tables(results):
+    """COMPARISON_SPP_TABLE.csv -- SPP's results appendix, base vs projects."""
+    if not results:
+        return ""
+    path = cmp_path("COMPARISON_SPP_TABLE", "csv")
+    with csv_open(path, "w") as fh:
+        w = csv.writer(fh)
+        w.writerow(_csv_row(
+            ["Event ID", "Event Description", "Event Category"]
+            + [lbl for _k, lbl in _SPP_COLS]
+            + ["Violation Summary", "Primary Mitigation",
+               "Introduced by projects"]))
+        for res in results:
+            for r in res["rows"]:
+                b = _spp_cells(res, r, "base")
+                t = _spp_cells(res, r, "test")
+                intro = "YES" if (r["class"] == CLS_NEW or r["hidden_new"]) else "no"
+                summary, mitigation = compare_violation_text(
+                    r, [(k, b[k]) for k, _l in _SPP_COLS],
+                    [(k, t[k]) for k, _l in _SPP_COLS])
+                w.writerow(_csv_row(
+                    [r["fault"], r.get("description") or r["fault"],
+                     r["event"] if r["event"] != "-" else ""]
+                    + [_cell(b[k], t[k]) for k, _lbl in _SPP_COLS]
+                    + [summary, mitigation, intro]))
+    print("[compare] -> %s" % path)
+    return path
+
+
+def _side_summary(r, side):
+    """What failed on one side, in words, for the Violation Summary column."""
+    bits = []
+    for c in r["crits"]:
+        v = c["base"] if side == "base" else c["test"]
+        if (v or "").upper() != "FAIL":
+            continue
+        m = c["mb"] if side == "base" else c["mt"]
+        bits.append("%s%s" % (_short_crit(c["criterion"]),
+                              "" if m is None else " (%s)" % _fmt_metric(m, c["unit"])))
+    return "; ".join(bits)
+
+
+def read_run_times(rdir, proj):
+    """{scenario: seconds} from RUN_TIMES*.csv, or the per-scenario .secs files.
+
+       The .secs files are the fallback because they exist the moment a scenario
+       finishes -- so run times can be compared while the studies are still
+       going, which is when knowing one case is three times slower is worth
+       something."""
+    out = {}
+    p = rfile(rdir, "RUN_TIMES", "csv", proj)
+    if os.path.isfile(p):
+        try:
+            with csv_open(p) as fh:
+                for r in csv.DictReader(fh):
+                    try:
+                        out[(r.get("scenario") or "").strip()] = float(r.get("seconds"))
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            pass
+    if out:
+        return out
+    for q in sorted(glob.glob(os.path.join(rdir, "outs", "*.secs"))):
+        try:
+            with open(q) as fh:
+                out[os.path.basename(q)[:-len(".secs")]] = float((fh.read() or "").strip())
+        except Exception:
+            continue
+    return out
+
+
+def write_runtime_comparison(proj, mode, test_suffix=""):
+    """COMPARISON_RUNTIMES_<proj>_<mode>.txt/.csv -- how long each case took.
+
+       "The project case is slower" is a statement about the model; "both cases
+       are slower" is a statement about the machine. Only the two side by side
+       tell them apart, which is why this compares rather than just reports.
+
+       test_suffix points the PROJECT side at one run of a sweep -- the base
+       case has no such folder and does not need one, being the same base for
+       every value."""
+    tb = read_run_times(results_dir(CASE_BASE, proj, mode), proj)
+    tt = read_run_times(results_dir(CASE_TEST, proj, mode) + (test_suffix or ""), proj)
+    if not tb and not tt:
+        return ""
+    keys = sorted(set(tb) | set(tt), key=_fault_key)
+    # cmp_dir(), not COMPARE_DIR: this file belongs in the same per-project (and
+    # per-capacity-level) folder as the comparison it describes.
+    path = os.path.join(cmp_detail(), "COMPARISON_RUNTIMES_%s_%s.txt" % (proj, mode))
+    with open(path, "w") as fh:
+        fh.write("RUN TIMES -- %s (%s)\n" % (proj, mode))
+        fh.write("generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("=" * 74 + "\n")
+        fh.write("%-14s %12s %12s %12s\n" % ("scenario", "base", "with proj", "difference"))
+        fh.write("-" * 74 + "\n")
+        for k in keys:
+            b, t = tb.get(k), tt.get(k)
+            d = ("%+.0f%%" % (100.0 * (t - b) / b)) if (b and t and b > 0) else "-"
+            fh.write("%-14s %12s %12s %12s\n"
+                     % (k, _fmt_secs(b), _fmt_secs(t), d))
+        fh.write("-" * 74 + "\n")
+        sb = sum(v for k, v in tb.items() if k != "FLAT_RUN")
+        st = sum(v for k, v in tt.items() if k != "FLAT_RUN")
+        # SUMS OVER WHAT EACH CASE ACTUALLY RAN. They are not comparable as a
+        # ratio unless both ran the same scenarios, so the count is printed
+        # beside each: two totals over different sets is the easiest wrong
+        # number to publish here.
+        fh.write("%-14s %12s %12s\n" % ("total", _fmt_secs(sb), _fmt_secs(st)))
+        fh.write("%-14s %12d %12d\n"
+                 % ("scenarios", len([k for k in tb if k != "FLAT_RUN"]),
+                    len([k for k in tt if k != "FLAT_RUN"])))
+        both = [k for k in keys if k != "FLAT_RUN" and tb.get(k) and tt.get(k)]
+        if both:
+            rb = sum(tb[k] for k in both)
+            rt = sum(tt[k] for k in both)
+            fh.write("%-14s %12s %12s %12s   over the %d scenario(s) both ran\n"
+                     % ("like for like", _fmt_secs(rb), _fmt_secs(rt),
+                        ("%+.0f%%" % (100.0 * (rt - rb) / rb)) if rb > 0 else "-",
+                        len(both)))
+        fh.write("=" * 74 + "\n")
+    print("[compare] -> %s" % path)
+    if WRITE_CSV:
+        cp = path[:-4] + ".csv"
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(["scenario", "base_seconds", "proj_seconds", "pct_change"]))
+            for k in keys:
+                b, t = tb.get(k), tt.get(k)
+                d = ("%.1f" % (100.0 * (t - b) / b)) if (b and t and b > 0) else ""
+                w.writerow(_csv_row([k, "" if b is None else "%.1f" % b,
+                                     "" if t is None else "%.1f" % t, d]))
+        print("[compare] -> %s" % cp)
+    return path
+
+
+def _fmt_secs(v):
+    if v is None:
+        return "-"
+    v = int(v)
+    if v < 60:
+        return "%ds" % v
+    if v < 3600:
+        return "%dm %02ds" % (v // 60, v % 60)
+    return "%dh %02dm" % (v // 3600, (v % 3600) // 60)
+
+
+# ============================================================================
+# THE ONE REPORT
+# ============================================================================
+# Eight files answered eight questions, and the question anyone actually opens
+# the folder to ask is "what breaks, and did we break it". This answers that
+# first, on the first page, and puts the supporting detail underneath in the
+# order someone reads it -- introduced first, then pre-existing, then the rest
+# in one line. The eight files are still available (ONE_REPORT = False); this
+# is what to send someone.
+
+
+# What each SPP criterion MEASURES, and the units it is measured in. The report
+# names the quantity beside every violation, because "F03 fails transient
+# overvoltage" and "bus 530555 reached 1.266 pu against a 1.20 limit" are
+# different amounts of information, and only the second one can be acted on.
+_MEASURE = {
+    "recovery":  ("bus voltage", "pu", "buses"),
+    "overshoot": ("bus voltage", "pu", "buses"),
+    "steady":    ("bus voltage", "pu", "buses"),
+    "angle":     ("rotor angle", "deg", "machines"),
+    "trip":      ("machine pre-fault MW (the state columns say TRIPPED / connected, with the MW before and after)", "MW", "machines"),
+}
+# The element lists are keyed by the violation kind the study writes, which is
+# not the criterion family -- and ROTOR ANGLE IS TWO KINDS, not one:
+#
+#   "undamped"  the SPPR1 ratio test -- the oscillation does not decay
+#   "review"    the angle went past 16 deg and is to be judged individually
+#
+# The damping CRITERION fails on either, so reading only "undamped" left every
+# fault whose finding was an over-16-degree swing with no machine named at all:
+# a value of 29 deg in the table and "(not listed)" beside it. Both are rotor
+# angles in degrees and both belong under the criterion that reported them.
+_EL_KEY = {"recovery": ["recovery"], "overshoot": ["overshoot"],
+           "steady": ["steady"], "angle": ["undamped", "review"],
+           "trip": ["tripped"]}
+
+
+def _limit_text(what, lim):
+    """The limit as SPP states it -- a floor, a ceiling, a band, or a threshold.
+
+       ACCEPTS BOTH VOCABULARIES. Callers hand this either a criterion FAMILY
+       ("angle", "trip") or a violation KIND ("undamped", "review", "tripped"),
+       because the two levels of the report name the same thing differently.
+       There used to be two functions, one for each, with the same name -- so
+       the later one shadowed the earlier and every rotor-angle element row lost
+       its limit: "531447  37.0" with an empty limit column, on the criterion
+       whose whole point is the 16-degree threshold."""
+    if what == "recovery":
+        return "min %.2f pu" % lim.get("recovery", V_RECOVERY_PU)
+    if what == "overshoot":
+        return "max %.2f pu" % lim.get("overshoot", V_OVERSHOOT_PU)
+    if what == "steady":
+        return "%.2f - %.2f pu" % (lim.get("ss_low", V_SS_LOW),
+                                   lim.get("ss_high", V_SS_HIGH))
+    if what in ("angle", "undamped", "review"):
+        return "max %d deg" % int(lim.get("angle", ANGLE_DEV_DEG))
+    if what in ("trip", "tripped"):
+        return "no tripping"
+    return ""
+
+
+# The rotor-angle detail NAMES the machine even when the violations report
+# lists none. The study writes it two ways:
+#
+#   PASS/threshold: "... largest swing 29.0 deg (640014)"
+#   FAIL/undamped:  "1 undamped of 7 judged: 640014(23deg SPPR1=0.98 ...)"
+#
+# A damping criterion can fail on the 16-degree threshold while both violation
+# lists stay empty -- "undamped" needs the SPPR1 ratio to fail and "review"
+# needs the machine to be NOT CONVERGING, and a machine can swing 29 degrees
+# and satisfy neither. The number was reported and the machine that produced it
+# was not, which is what "(not listed)" was telling you.
+# A machine label has no spaces and no colon -- "640014", "FTPECK5G". Allowing
+# them let the list pattern swallow the words in front of it and report a
+# machine called "of 7 judged: 640014".
+_A_LABEL = r"[A-Za-z0-9_.\-]{2,20}"
+# "largest swing 29.0 deg (640014)" -- the label follows the number, and is NOT
+# always at the end of the line: "largest swing 12.4 deg (531447) of 7
+# machine(s)" is the other wording, and anchoring to the end missed it.
+_A_LABEL_PAREN = re.compile(r"deg\s*\(\s*(" + _A_LABEL + r")\s*\)")
+_A_LABEL_LIST = re.compile(r"(" + _A_LABEL + r")\(\s*" + _NUM + r"\s*deg")
+
+
+def _angle_elements_from_detail(detail):
+    """[(label, value)] pulled out of a rotor-angle criterion detail line."""
+    if not detail:
+        return []
+    out = []
+    for m in _A_LABEL_LIST.finditer(detail):          # the undamped list
+        try:
+            out.append((m.group(1).strip(), float(m.group(2))))
+        except (TypeError, ValueError):
+            continue
+    if out:
+        return out
+    # "largest swing 29.0 deg (640014)" -- one machine, the worst of all
+    v = _A_LARGEST.search(detail) or _A_REACHED.search(detail)
+    lab = _A_LABEL_PAREN.search(detail)
+    if v and lab:
+        try:
+            return [(lab.group(1).strip(), float(v.group(1)))]
+        except (TypeError, ValueError):
+            return []
+    return []
+
+
+def _where_values(r, fam, limit_lo=None, limit_hi=None):
+    """[(element, base value, project value)] for one criterion, worst first.
+
+       Both values, because the point of the comparison is the change: a bus at
+       1.19 pu going to 1.27 pu is the project's doing, and the same bus at 1.27
+       in both cases is not."""
+    els = r.get("elements") or {}
+    vt, vb = {}, {}
+    for kind in _EL_KEY.get(fam, [fam]):
+        e = els.get(kind)
+        if not e:
+            continue
+        # LAST ONE WINS PER ELEMENT, and that is what we want: a machine listed
+        # as undamped AND over 16 degrees is one machine with one worst angle,
+        # not two rows.
+        vb.update(e.get("vb") or {})
+        vt.update(e.get("vt") or {})
+    if not vt and not vb:
+        return []
+    out = [(k, vb.get(k), vt.get(k)) for k in (set(vt) | set(vb))]
+
+    def _sev(t):
+        _k, _b, v = t
+        if v is None:
+            return 0.0
+        if fam == "recovery":
+            return -v          # lower is worse
+        return v               # higher is worse
+    return sorted(out, key=_sev, reverse=True)
+
+
+# ---- ELEMENTS NAMED IN THE CRITERION TEXT ----------------------------------
+# The study writes the offending buses and machines into the criterion detail
+# whether or not SPP_VIOLATIONS covers that fault:
+#
+#   6 bus(es) over, worst 1.234 pu (539667 @ 5.29s): 539117=1.203@5.29s, ...
+#   *** PROJECT MACHINE TRIPPED: PROJ 765912(1->0 MW), PROJ 765922(1->0 MW) ***
+#
+# Only rotor angle was being read out of it, so a report could carry a transient
+# overvoltage of 1.234 pu against element "(not listed)" while the bus number
+# sat two columns away in the wording. Every criterion family is read now.
+
+# "539117=1.203@5.29s" and "530554=0.856" -- bus = value, with or without a time
+_D_BUSVAL = re.compile(r"(?<![\d.])(\d{3,})\s*=\s*(-?\d+\.\d+)")
+# "worst 1.234 pu (539667 @ 5.29s)" / "is 1.197 pu (539667 @ 5.29s)" -- the single
+# extreme bus, which is all a PASS wording gives
+_D_WORST = re.compile(r"(?:worst|is)\s+(-?\d+\.\d+)\s*pu\s*\(\s*(\d{3,})")
+# "PROJ 765912(1->0 MW)" / "640014(120.0->0 MW)" -- what a machine was and became
+_D_TRIP = re.compile(r"(\d{3,})\s*\(\s*(-?\d+(?:\.\d+)?)\s*->\s*(-?\d+(?:\.\d+)?)\s*MW")
+
+
+def _volt_elements_from_detail(detail):
+    """[(bus, value)] from a voltage criterion's wording, worst LAST-resort first.
+
+       The explicit list wins; the single worst bus is the fallback, because a
+       PASS wording names only that one and reporting it is better than
+       reporting nothing."""
+    if not detail:
+        return []
+    out = [(m.group(1), float(m.group(2))) for m in _D_BUSVAL.finditer(detail)]
+    if out:
+        return out
+    m = _D_WORST.search(detail)
+    if m:
+        try:
+            return [(m.group(2), float(m.group(1)))]
+        except (TypeError, ValueError):
+            return []
+    return []
+
+
+def _trip_elements_from_detail(detail):
+    """[(machine bus, MW lost)] from a generator-tripping wording.
+
+       The MW lost is what it WAS minus what it became -- "765912(1->0 MW)" is
+       1 MW lost -- because that is the quantity the criterion is about."""
+    if not detail:
+        return []
+    out = []
+    for m in _D_TRIP.finditer(detail):
+        try:
+            was, now = float(m.group(2)), float(m.group(3))
+        except (TypeError, ValueError):
+            continue
+        out.append((m.group(1), max(0.0, was - now)))
+    return out
+
+
+def _from_detail(c, fam):
+    """Elements recovered from the criterion's own detail text, both sides.
+
+       Used when SPP_VIOLATIONS has nothing for this fault -- which happens
+       whenever a report phase was re-run over a selection, and always for a
+       criterion the violations file does not cover. The detail text is then the
+       only place the bus or machine is named, and leaving the column as
+       "(not listed)" throws away information the study already wrote down."""
+    if fam == "angle":
+        pick = _angle_elements_from_detail
+    elif fam in ("recovery", "overshoot", "steady"):
+        pick = _volt_elements_from_detail
+    elif fam == "trip":
+        pick = _trip_elements_from_detail
+    else:
+        return []
+    b = dict(pick(c.get("detail_base")))
+    t = dict(pick(c.get("detail_test")))
+    if not b and not t:
+        return []
+    # Worst first, by the side that failed -- for recovery that is the LOWEST
+    # value, for everything else the highest. Sorting a recovery list the wrong
+    # way puts the healthiest bus at the top of a list of failures.
+    rev = (fam != "recovery")
+
+    def _key(k):
+        v = t.get(k)
+        if v is None:
+            v = b.get(k)
+        return v if v is not None else 0.0
+    keys = sorted(set(b) | set(t), key=_key, reverse=rev)
+    return [(k, b.get(k), t.get(k)) for k in keys]
+
+
+def _failing_crits(r):
+    """Every criterion this fault FAILS with the projects, worst first."""
+    out = []
+    for c in r["crits"]:
+        if (c["test"] or "").upper() == "FAIL":
+            out.append(c)
+    return out
+
+
+def _worst_of(res, r):
+    """(criterion, base value, project value, limit, unit) for the worst failing
+       criterion of a fault -- the one furthest past its limit.
+
+       Furthest PAST THE LIMIT, not largest: 1.24 pu against a 1.20 limit and
+       0.55 pu against a 0.70 limit are both breaches, and only the exceedance
+       puts them on one scale."""
+    got = _worst_crit_of(res, r)
+    if got is None:
+        return None
+    c, fam, _amt = got
+    return (_short_crit(c["criterion"]), c["mb"], c["mt"],
+            _limit_for(fam, res.get("limits") or {}), c["unit"])
+
+
+def _worst_crit_of(res, r):
+    """(criterion dict, family, how far past the limit) for the worst failing
+       criterion, or None.
+
+       Split out of _worst_of() so a caller can have the FAMILY and the RAW
+       criterion string as well as the shortened name. _short_crit() is a
+       one-way trip: it turns the study's wording into "transient overvoltage",
+       which _criterion_family() -- matching on "transient voltage", "swing",
+       "overshoot" -- does not recognise. Feeding the short name back in
+       silently produced no family, so the summary's past-limit column came out
+       blank for every overvoltage in the study."""
+    lim = res.get("limits") or {}
+    best = None
+    for c in r["crits"]:
+        if (c["test"] or "").upper() != "FAIL":
+            continue
+        # exceedance() takes the whole LIMITS DICT and its own kind names --
+        # "undamped" and "tripped" rather than the family's "angle" and "trip".
+        # Passing a single float made it call .get on a number.
+        fam = _criterion_family(c["criterion"])
+        kind = {"angle": "undamped", "trip": "tripped"}.get(fam, fam)
+        amt, _txt = exceedance(kind, c["mt"], lim)
+        key = amt if amt is not None else -1.0
+        if best is None or key > best[0]:
+            best = (key, c, fam, amt)
+    if best is None:
+        return None
+    _k, c, fam, amt = best
+    return (c, fam, amt)
+
+
+def _limit_for(fam, lim):
+    """The single number to print in the 'limit' line, or None when the
+       criterion has no one number (steady state is a band, damping a ratio)."""
+    if fam == "recovery":
+        return lim.get("recovery", V_RECOVERY_PU)
+    if fam == "overshoot":
+        return lim.get("overshoot", V_OVERSHOOT_PU)
+    return None
+
+
+# ============================================================================
+# EXCEL OUTPUT -- written by hand, no third-party library
+# ============================================================================
+# A .xlsx is a zip of XML parts. Writing it directly keeps this dependency-free:
+# the study machine runs PSS/E's Python 3.4, where pip installs are somewhere
+# between awkward and forbidden, and a report that cannot be produced on the
+# machine that has the results is not a report.
+#
+# What it gives that a .csv cannot: a coloured header that stays put while you
+# scroll, a filter on every column, numbers stored AS NUMBERS so sorting by
+# voltage sorts by magnitude and not alphabetically, and the rows the projects
+# introduced picked out in red.
+
+_XL_CT = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>"""
+
+_XL_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"""
+
+_XL_WBRELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"""
+
+_XL_WB = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Comparison" sheetId="1" r:id="rId1"/>
+<sheet name="Key" sheetId="2" r:id="rId2"/></sheets>
+</workbook>"""
+
+# Style 0 default, 1 header (white bold on dark blue), 2 introduced (red bold),
+# 3 pre-existing (amber). fills[0] and fills[1] are fixed by the format: none
+# and gray125, in that order, whether or not anything uses them.
+_XL_STYLES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="6">
+<font><sz val="10"/><name val="Calibri"/></font>
+<font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>
+<font><b/><sz val="10"/><color rgb="FF9C0006"/><name val="Calibri"/></font>
+<font><sz val="10"/><color rgb="FF9C6500"/><name val="Calibri"/></font>
+<font><sz val="10"/><color rgb="FF006100"/><name val="Calibri"/></font>
+<font><i/><sz val="10"/><color rgb="FF808080"/><name val="Calibri"/></font>
+</fonts>
+<fills count="7">
+<fill><patternFill patternType="none"/></fill>
+<fill><patternFill patternType="gray125"/></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FF1F4E79"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFFFEB9C"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFC6EFCE"/><bgColor indexed="64"/></patternFill></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFF2F2F2"/><bgColor indexed="64"/></patternFill></fill>
+</fills>
+<borders count="2">
+<border><left/><right/><top/><bottom/><diagonal/></border>
+<border><left/><right/><top/><bottom style="thin"><color rgb="FF1F4E79"/></bottom><diagonal/></border>
+</borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="7">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+<xf numFmtId="0" fontId="2" fillId="3" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
+<xf numFmtId="0" fontId="3" fillId="4" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
+<xf numFmtId="0" fontId="4" fillId="5" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
+<xf numFmtId="0" fontId="4" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+<xf numFmtId="0" fontId="5" fillId="6" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
+</cellXfs>
+</styleSheet>"""
+
+
+def _xl_esc(v):
+    return (str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def _xl_col(n):
+    """0 -> A, 26 -> AA."""
+    out = ""
+    n += 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _xl_cell(col, row, value, style):
+    ref = "%s%d" % (_xl_col(col), row)
+    st = ' s="%d"' % style if style else ""
+    if value is None or value == "":
+        return '<c r="%s"%s/>' % (ref, st)
+    # NUMBERS AS NUMBERS. Stored as text, a voltage column sorts 1.2 above 1.19
+    # and the filter offers "text filters" rather than "greater than" -- which
+    # is most of the reason to produce a spreadsheet at all.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return '<c r="%s"%s><v>%s</v></c>' % (ref, st, repr(value))
+    return ('<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+            % (ref, st, _xl_esc(value)))
+
+
+def _xl_legend_sheet(legend, title_rows):
+    """The Key sheet: one row per colour, IN that colour.
+
+       Its own sheet rather than a block above the table, because a legend in
+       rows 1-6 pushes the header to row 7 -- and then the frozen pane and the
+       filter, both of which are defined against row 1, describe the legend
+       instead of the data."""
+    xml = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+           '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+           '<cols><col min="1" max="1" width="26" customWidth="1"/>',
+           '<col min="2" max="2" width="62" customWidth="1"/></cols>',
+           '<sheetData>']
+    n = 0
+    for line in title_rows:
+        n += 1
+        xml.append('<row r="%d">%s</row>' % (n, _xl_cell(0, n, line, 1 if n == 1 else 0)))
+    n += 1
+    xml.append('<row r="%d"/>' % n)
+    for style, colour, meaning in legend:
+        n += 1
+        xml.append('<row r="%d">%s%s</row>'
+                   % (n, _xl_cell(0, n, colour, style),
+                      _xl_cell(1, n, meaning, style)))
+    xml.append("</sheetData></worksheet>")
+    return "".join(xml)
+
+
+def _xl_sheet_xml(header, rows, widths=None, style_of=None, first=False):
+    """One worksheet: coloured header, frozen top row, filter on every column."""
+    ncol = len(header)
+    xml = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+           '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+           '<sheetViews><sheetView workbookViewId="0"%s>'
+           % (' tabSelected="1"' if first else ""),
+           '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>',
+           '</sheetView></sheetViews>']
+    if widths:
+        xml.append("<cols>")
+        for i, w in enumerate(widths[:ncol]):
+            xml.append('<col min="%d" max="%d" width="%d" customWidth="1"/>'
+                       % (i + 1, i + 1, w))
+        xml.append("</cols>")
+    xml.append("<sheetData>")
+    xml.append('<row r="1">')
+    for i, h in enumerate(header):
+        xml.append(_xl_cell(i, 1, h, 1))
+    xml.append("</row>")
+    for n, row in enumerate(rows, start=2):
+        st = style_of(row) if style_of else 0
+        xml.append('<row r="%d">' % n)
+        for i in range(ncol):
+            xml.append(_xl_cell(i, n, row[i] if i < len(row) else "", st))
+        xml.append("</row>")
+    xml.append("</sheetData>")
+    xml.append('<autoFilter ref="A1:%s%d"/>' % (_xl_col(ncol - 1), len(rows) + 1))
+    xml.append("</worksheet>")
+    return "".join(xml)
+
+
+def _xl_sheet_name(name):
+    """Excel refuses : \\ / ? * [ ] in a sheet name, and more than 31 characters."""
+    out = "".join(("-" if ch in ":\\/?*[]" else ch) for ch in str(name))
+    return out[:31] or "Sheet"
+
+
+def write_xlsx_multi(path, sheets, legend=None, title_rows=None):
+    """A workbook of several sheets, plus the colour key as the last one.
+
+       sheets: [(name, header, rows, widths, style_of)] -- style_of(row) returns
+       a style index, or None for plain rows. Kept as a callback so the
+       colouring rule lives with the report that knows what the rows mean.
+
+       ONE sheet of 1,600 element-level rows is a data dump: everything is in it
+       and nothing stands out. The same rows split by the question they answer --
+       what must be acted on, what was already broken, what was not compared --
+       is the same data and a report someone can act on."""
+    import zipfile
+
+    parts = []
+    for i, sh in enumerate(sheets):
+        name, header, rows, widths, style_of = (list(sh) + [None, None])[:5]
+        parts.append((_xl_sheet_name(name),
+                      _xl_sheet_xml(header, rows, widths, style_of, first=(i == 0))))
+    parts.append(("Key", _xl_legend_sheet(legend or [], title_rows or [])))
+
+    ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+          '<Default Extension="xml" ContentType="application/xml"/>',
+          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>']
+    wb = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"',
+          ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+          '<sheets>']
+    rels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
+    for i, (name, _xml) in enumerate(parts, start=1):
+        ct.append('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType='
+                  '"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i)
+        wb.append('<sheet name="%s" sheetId="%d" r:id="rId%d"/>'
+                  % (_xl_esc(name), i, i))
+        rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
+                    '/officeDocument/2006/relationships/worksheet" Target="worksheets'
+                    '/sheet%d.xml"/>' % (i, i))
+    ct.append('<Override PartName="/xl/styles.xml" ContentType="application/vnd.'
+              'openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+    wb.append("</sheets></workbook>")
+    rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
+                '/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                % (len(parts) + 1))
+    rels.append("</Relationships>")
+
+    z = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED)
+    try:
+        z.writestr("[Content_Types].xml", "".join(ct))
+        z.writestr("_rels/.rels", _XL_RELS)
+        z.writestr("xl/workbook.xml", "".join(wb))
+        z.writestr("xl/_rels/workbook.xml.rels", "".join(rels))
+        z.writestr("xl/styles.xml", _XL_STYLES)
+        for i, (_name, xml) in enumerate(parts, start=1):
+            z.writestr("xl/worksheets/sheet%d.xml" % i, xml)
+    finally:
+        z.close()
+    return path
+
+
+def write_xlsx(path, header, rows, widths=None, style_of=None, legend=None,
+               title_rows=None):
+    """One data sheet plus the colour key -- the single-sheet form, unchanged.
+
+       Every existing caller writes this shape; it is now one sheet handed to
+       write_xlsx_multi() rather than a second implementation of the same thing."""
+    return write_xlsx_multi(path, [("Comparison", header, rows, widths, style_of)],
+                            legend=legend, title_rows=title_rows)
+
+
+# ============================================================================
+# HOW FAR IS THE VIOLATING ELEMENT FROM THE POI, AND FROM THE FAULT?
+# ============================================================================
+# A bus over the overvoltage limit AT the POI and the same bus over it six hops
+# away are different findings -- one is the project's own terminal behaviour and
+# the other is a system-wide response -- and the report used to name only the
+# bus number, leaving the reader to look each one up. The study writes both
+# distances out (faults\BUS_DISTANCE.csv, faults\FAULT_DISTANCE.csv) from the
+# topology of the case it actually ran; this joins them onto every row.
+#
+# Read from the PROJECT case first and the base case second: they are the same
+# network apart from the projects, and where they differ the project case is the
+# one the violation was measured in.
+
+_DIST_CACHE = {}
+
+
+def read_bus_distance(rdir):
+    """{bus: (name, base_kV, hops_from_POI)} from faults\BUS_DISTANCE.csv."""
+    key = ("bus", rdir)
+    if key in _DIST_CACHE:
+        return _DIST_CACHE[key]
+    out = {}
+    p = os.path.join(rdir, "faults", "BUS_DISTANCE.csv")
+    try:
+        if os.path.isfile(p):
+            with csv_open(p) as fh:
+                for r in csv.DictReader(fh):
+                    try:
+                        out[int(r["bus_number"])] = ((r.get("bus_name") or "").strip(),
+                                                     (r.get("base_kV") or "").strip(),
+                                                     int(r["hops_from_POI"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+    except Exception as e:
+        print("[compare] could not read %s: %s" % (p, e))
+    _DIST_CACHE[key] = out
+    return out
+
+
+def read_fault_distance(rdir):
+    """{fault_id: (fault_bus, {bus: hops_from_that_fault})}."""
+    key = ("flt", rdir)
+    if key in _DIST_CACHE:
+        return _DIST_CACHE[key]
+    out = {}
+    p = os.path.join(rdir, "faults", "FAULT_DISTANCE.csv")
+    try:
+        if os.path.isfile(p):
+            with csv_open(p) as fh:
+                for r in csv.DictReader(fh):
+                    try:
+                        fid = (r["fault_id"] or "").strip()
+                        fb = int(r["fault_bus"])
+                        b = int(r["bus_number"])
+                        h = int(r["hops_from_fault"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if not fid:
+                        continue
+                    if fid not in out:
+                        out[fid] = (fb, {})
+                    out[fid][1][b] = h
+    except Exception as e:
+        print("[compare] could not read %s: %s" % (p, e))
+    _DIST_CACHE[key] = out
+    return out
+
+
+# ---- THE WHOLE CASE'S TOPOLOGY, NOT JUST THE RADIUS THE FAULTS MAPPED -------
+# BUS_DISTANCE.csv and FAULT_DISTANCE.csv are written when the fault list is
+# built, and they cover the fault-generation radius -- 2 hops by default. The
+# MONITORED radius is far wider, so most violating buses fall outside them and
+# the comparison printed "beyond map" for the distance and nothing for the area,
+# including for the project's OWN machines a hop or two from the POI.
+#
+# flags\BUS_MAP.csv is the whole case: every bus with its kV, AREA and name, the
+# area names, and the complete branch list. The study already writes it (it is
+# what SCORE_NO_CASE scores from), so nothing new has to be produced -- it was
+# simply never read on this side. With it, the area is known for every bus and
+# the hop count is a breadth-first walk from whichever bus is asked about.
+_CMP_BMAP = {"tried": False, "kv": {}, "area": {}, "aname": {}, "adj": {}}
+_BMAP_HOPS = {}
+
+
+def _cmp_bus_map():
+    """flags\\BUS_MAP.csv as {'kv','area','aname','adj'}, read once.
+
+       Looked for in the project case first and the base second: they describe
+       the same network for everything outside the project, and the project case
+       is the one that also knows the project's own buses."""
+    if _CMP_BMAP["tried"]:
+        return _CMP_BMAP
+    _CMP_BMAP["tried"] = True
+    for case in (CASE_TEST, CASE_BASE):
+        for mode in (list(MODES) or ["spp"]):
+            for proj in (list(PROJECTS) or [""]):
+                p = os.path.join(results_dir(case, proj, mode), "flags",
+                                 "BUS_MAP.csv")
+                if not os.path.isfile(p):
+                    continue
+                try:
+                    with csv_open(p) as fh:
+                        for r in csv.reader(fh):
+                            if not r:
+                                continue
+                            t = (r[0] or "").strip().upper()
+                            try:
+                                if t == "B" and len(r) >= 4:
+                                    b = int(r[1])
+                                    _CMP_BMAP["kv"][b] = float(r[2])
+                                    _CMP_BMAP["area"][b] = str(r[3]).strip()
+                                elif t == "A" and len(r) >= 2:
+                                    _CMP_BMAP["aname"][str(r[1]).strip()] = \
+                                        (r[2].strip() if len(r) > 2 else "")
+                                elif t == "L" and len(r) >= 3:
+                                    a, b = int(r[1]), int(r[2])
+                                    _CMP_BMAP["adj"].setdefault(a, set()).add(b)
+                                    _CMP_BMAP["adj"].setdefault(b, set()).add(a)
+                            except (TypeError, ValueError):
+                                continue
+                    print("[compare] topology read from %s: %d bus(es), %d link(s)"
+                          % (p, len(_CMP_BMAP["kv"]), len(_CMP_BMAP["adj"])))
+                    return _CMP_BMAP
+                except Exception as e:
+                    print("[compare] could not read %s (%s)" % (p, e))
+    return _CMP_BMAP
+
+
+def _bmap_area_text(bus):
+    """"534 SUNC" for one bus, or "" when the map has nothing for it."""
+    try:
+        a = _cmp_bus_map()["area"].get(int(bus))
+    except (TypeError, ValueError):
+        return ""
+    if not a:
+        return ""
+    try:
+        a = str(int(float(a)))
+    except (TypeError, ValueError):
+        a = str(a).strip()
+    nm = (_cmp_bus_map()["aname"].get(a) or "").strip()
+    return ("%s %s" % (a, nm)).strip()
+
+
+def _bmap_hops_from(src, max_hops=40):
+    """{bus: hops} from one bus, over the whole case. Cached per source."""
+    try:
+        src = int(src)
+    except (TypeError, ValueError):
+        return {}
+    hit = _BMAP_HOPS.get(src)
+    if hit is not None:
+        return hit
+    adj = _cmp_bus_map()["adj"]
+    dist, frontier, d = {src: 0}, [src], 0
+    while frontier and d < max_hops:
+        d += 1
+        nxt = []
+        for b in frontier:
+            for n in adj.get(b, ()):
+                if n not in dist:
+                    dist[n] = d
+                    nxt.append(n)
+        frontier = nxt
+    _BMAP_HOPS[src] = dist
+    return dist
+
+
+def _dist_maps(res):
+    """(bus distance, fault distance) for one project's comparison.
+
+       Whichever case has the files wins; missing files are not an error -- a
+       study run before the distances existed still compares, it just leaves the
+       distance columns blank rather than refusing to write a report."""
+    dirs = res.get("dirs") or {}
+    bus, flt = {}, {}
+    for which in ("test", "base"):
+        d = dirs.get(which)
+        if not d:
+            continue
+        if not bus:
+            bus = read_bus_distance(d)
+        if not flt:
+            flt = read_fault_distance(d)
+    return bus, flt
+
+
+_EL_BUS = re.compile(r"\d{3,}")
+
+
+def _bus_of_element(el):
+    """The bus number inside an element name, or None.
+
+       Elements are written as "530555", "SYNC640014", "PROJ1 765912" and
+       "GEN 640014 [SYNC]" depending on which list they came from; the number is
+       what all of them have in common."""
+    m = _EL_BUS.search(str(el))
+    return int(m.group(0)) if m else None
+
+
+def _distance_cells(el, fid, bus_map, flt_map):
+    """[bus_number, hops_from_fault] for one element of one fault.
+
+       HOW FAR FROM THE FAULT is the question this answers: a bus over the limit
+       at the faulted bus itself and the same bus six levels away are different
+       findings. 0 means the element IS the faulted bus.
+
+       Blank when faults\\FAULT_DISTANCE.csv is not in the results folder -- a
+       study run before that file existed still compares, it just cannot say how
+       far anything was."""
+    fb, fh_map = flt_map.get(str(fid).strip(), (None, {}))
+    b = _bus_of_element(el)
+    if b is None:
+        return ["", ""]
+    if fb is not None:
+        if b == fb:
+            return [b, 0]
+        hf = fh_map.get(b)
+        if hf is not None:
+            return [b, hf]
+    # ---- SECOND SOURCE: the study's own violations CSV --------------------
+    #
+    # faults\\FAULT_DISTANCE.csv is written when the fault set is built, and a
+    # results folder produced by a run that used a shared or custom fault list
+    # may not carry one -- which left the Flt column empty on every row of
+    # every comparison, in reports whose per-project violations file states the
+    # hop count for each of those same buses on its own lines.
+    #
+    # The study puts hops_from_fault in SPP_VIOLATIONS.csv, read_violations
+    # already keeps it, and it is measured on the same topology. Falling back
+    # to it costs nothing and answers "how far from the fault" wherever the
+    # study answered it -- which is the question this column exists for.
+    got = (_WHERE.get(str(fid).strip()) or {}).get(str(el).strip())
+    if got:
+        _hp = got[2]
+        if _hp not in ("", None):
+            try:
+                return [b, int(float(_hp))]
+            except (TypeError, ValueError):
+                pass
+    # ---- THIRD SOURCE: the whole case, from flags\BUS_MAP.csv --------------
+    #
+    # The two above cover the fault-generation radius only, so every bus past
+    # it read "beyond map" -- including the project's own machines, which are a
+    # hop or two from the POI and the first thing anyone looks for. BUS_MAP
+    # carries the complete branch list, so the hop count is a walk from the
+    # faulted bus and is available for EVERY bus the study monitored.
+    # THE FAULTED BUS, WHEN FAULT_DISTANCE.csv IS NOT THERE.
+    #
+    # The walk below needs a bus to walk FROM, and fb came only from
+    # FAULT_DISTANCE.csv -- which a selection or custom-list run often does not
+    # write. So on exactly the runs where the first two sources are weakest, the
+    # third was dead too, and the column went blank although BUS_MAP.csv (the
+    # whole topology) was sitting right there. The study records the faulted bus
+    # on every violation row; _WHERE has kept it all along. Use it.
+    if fb is None:
+        for _e2 in (_WHERE.get(str(fid).strip()) or {}).values():
+            if len(_e2) > 3 and str(_e2[3]).strip():
+                try:
+                    fb = int(float(str(_e2[3]).strip()))
+                    break
+                except (TypeError, ValueError):
+                    continue
+    if fb is not None:
+        if b == fb:
+            return [b, 0]
+        _h = _bmap_hops_from(fb).get(b)
+        if _h is not None:
+            return [b, _h]
+    # NOT REACHED FROM THE FAULTED BUS IN ANY OF THE THREE SOURCES: the bus is
+    # outside the branch list BUS_MAP.csv carries. Said, rather than left empty
+    # beside a row that has a hop count.
+    return [b, "beyond map" if fb is not None else "no faulted bus on record"]
+
+
+# WHICH .dyr CONSTANTS THIS COMPARISON WAS RUN WITH.
+#
+# Every report the sweep writes looks identical apart from the numbers, and the
+# only thing saying which value produced it was the folder name. Opened from a
+# spreadsheet, copied into a mail, or read a week later, that context is gone --
+# so it goes in the rows, one column, the same on every row of that comparison.
+#
+# Set around a swept comparison; empty otherwise, when the panel's own edits are
+# what was run.
+# TWO THINGS VARY INDEPENDENTLY, SO THEY ARE TWO COLUMNS.
+#
+# A capacity level runs with the panel's .dyr edits STILL IN FORCE -- cap75 is
+# "75 % output AND Kqv = 0.8" -- so one column holding whichever was set last
+# reported the level and quietly dropped the constants. Each is now its own
+# column and each says what it is, including when it is the default: "100 %" and
+# the panel's own edits are facts about the run, not blanks.
+#
+#   run_setting      both of them, in one phrase, for reading
+#   dyr_edits        the model constants in force
+#   project_output   100 % | 75 % | OFF
+_RUN_LABEL = [""]        # set by the .dyr sweep: this variant's constants
+_RUN_OUTPUT = [""]       # set by the capacity sweep and the project-off run
+
+
+def _output_label():
+    """"100 %", "75 %" or "OFF" -- what the project machines were doing."""
+    return _RUN_OUTPUT[0] or "100 %"
+
+
+def _run_setting(proj):
+    """One phrase naming everything that was varied for this run."""
+    bits = []
+    _o = _output_label()
+    if _o != "100 %":
+        bits.append("output %s" % _o)
+    _d = _dyr_label(proj)
+    if _d:
+        bits.append(_d)
+    return "; ".join(bits) or "as studied"
+
+
+def _dyr_label(proj):
+    """"REECCU1 Kqv=0.5" for this comparison, or "" when nothing was edited."""
+    if _RUN_LABEL[0]:
+        return _RUN_LABEL[0]
+    rows = []
+    for e in (DYR_EDITS_BY_PROJECT or {}).get(proj) or []:
+        e = list(e)
+        if len(e) == 2 and isinstance(e[1], dict):
+            rows.append((e[0], e[1]))
+    if not rows and DYR_EDITS:
+        try:
+            return "; ".join("%s con%s=%s" % (x[2], x[3], x[4])
+                             for x in _dyr_norm_edits_local(DYR_EDITS))
+        except Exception:
+            return ""
+    return _dyr_edits_text(rows) if rows else ""
+
+
+def _dyr_norm_edits_local(edits):
+    """The 5-field form of whatever the panel wrote, for the label only.
+
+       A deliberately small reader: the study script owns the real normaliser,
+       and duplicating its scope rules here would give two answers to one
+       question. This only has to produce text."""
+    out = []
+    for e in (edits or []):
+        e = list(e)
+        if len(e) == 5:
+            out.append(e)
+        elif len(e) == 3:
+            out.append(["PROJECT", "*", e[0], e[1], e[2]])
+    return out
+
+
+_REPORT_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "planning_event", "project", "verdict_base",
+                "verdict_projects",
+                # TWO CLASSIFICATIONS, NOT ONE. The fault-level class says what
+                # happened to the scenario's verdict; the element-level class
+                # says what happened to THIS bus. They differ constantly -- a
+                # fault that fails on both sides is PRE-EXISTING while ten of
+                # its thirteen overvoltage buses are NEW -- and writing the
+                # fault's class on every element row branded those ten
+                # pre-existing with an empty base value beside them.
+                "fault_classification", "element_classification",
+                "criterion", "measured",
+                "element", "bus_number", "area",
+                "hops_from_fault", "hops_from_poi",
+                # THE VALUE OF THIS ROW'S OWN CRITERION, on both sides: pu for
+                # a voltage, degrees for a rotor angle, MW for a trip. Filled
+                # from the base study's MEASUREMENTS when the base did not
+                # violate, so a bus at 1.164 pu in the base and 1.250 with the
+                # project shows both numbers rather than a blank and a number.
+                "base_value", "project_value",
+                # THE STATE OF A MACHINE ON EACH SIDE, for a tripping row:
+                # "TRIPPED 1.75 -> 0.00 MW" / "connected 1.75 -> 1.74 MW".
+                # Blank for a voltage or an angle. And WHY a base value is
+                # blank when it is -- in its own column, so base_value holds
+                # a number or nothing and sorts as a number.
+                "base_state", "project_state", "base_value_note",
+                # DURATION ABOVE 1.20 pu, base and project, for a transient
+                # overvoltage row (blank for other criteria). Kept; the verbose
+                # study_wording columns that used to sit here are removed.
+                "secs_above_1_20_base", "secs_above_1_20_project", "change",
+                "past_limit", "limit", "unit", "criterion_is_new",
+                "fault_introduced_by_projects", "description"]
+
+_REPORT_WIDTHS = [26, 22, 14, 9, 8, 12, 8, 9, 15, 18, 22, 15, 18, 10,
+                  8, 14, 10,
+                  11, 11, 24, 24, 36, 15, 17, 9, 10, 14, 6, 9, 11,
+                  40]
+
+CLS_EL_UNKNOWN = "UNKNOWN -- base value not available"
+CLS_EL_OK = "within limit on both sides"
+
+
+def _project_only_bus(bus):
+    """True for a bus that exists ONLY in the project case: the new plant's own
+       block (NEW_PLANT bus_start .. +299: units, GSU high sides, collector,
+       HV). The base has no such bus, so 'no base value' there is not a gap in
+       the base measurements -- it is the definition of NEW. 999202 (the
+       SantaFe plant's HV bus) read UNKNOWN on 59 faults for this reason."""
+    try:
+        b = int(bus)
+    except (TypeError, ValueError):
+        return False
+    try:
+        b0 = int((NEW_PLANT or {}).get("bus_start") or 0)
+    except (TypeError, ValueError):
+        b0 = 0
+    return bool(b0 and b0 <= b <= b0 + 299)
+
+
+def _element_class(fam, kind, bv, tv, lim, base_scored=False, new_bus=False):
+    """The classification of ONE element from its two values.
+
+       Judged against the limit on each side, not against presence in the
+       violations list: a bus at 1.19 pu in the base and 1.27 pu with the
+       projects is NEW even though both numbers are known, and a bus whose base
+       value is unknown cannot be called pre-existing on no evidence.
+
+       TRIPPING IS THE EXCEPTION: there is no measured "MW it did not lose".
+       A machine absent from the base trip list of a fault the base SCORED did
+       not trip -- that is a known base result, and the element is NEW, not
+       UNKNOWN (768484 in F02 read UNKNOWN with the base cell saying "not
+       tripped" beside it)."""
+    def _viol(v):
+        if v is None:
+            return None
+        if fam == "trip":
+            return True                 # a machine in the trip list tripped
+        amt, _t = exceedance(kind, v, lim)
+        if amt is None:
+            return None
+        return amt > 0.0
+    t_v, b_v = _viol(tv), _viol(bv)
+    if fam == "trip" and bv is None and base_scored:
+        b_v = False
+    if bv is None and base_scored and new_bus:
+        b_v = False                     # the bus does not exist without the project
+    if t_v and b_v:
+        return CLS_PRE
+    if t_v and b_v is False:
+        return CLS_NEW
+    if t_v and b_v is None:
+        return CLS_EL_UNKNOWN
+    if t_v is False and b_v:
+        return CLS_RESOLVED
+    if t_v is None and b_v:
+        return CLS_RESOLVED
+    return CLS_EL_OK
+
+# Column positions are looked up BY NAME everywhere they are needed. The list
+# above has been added to twice already, and each time a hard-coded index
+# somewhere else quietly started pointing at the wrong column.
+_COL = dict((c, i) for i, c in enumerate(_REPORT_COLS))
+
+
+def _report_rows(results):
+    """The report as one flat table -- fault, criterion, element per row.
+
+       ONE builder for the .csv, the .xlsx and the .txt. Separate builders drift,
+       and a spreadsheet that disagrees with the report beside it is worse than
+       either alone.
+
+       Everything the comparison knows about a row is IN the row: how far past
+       the limit each side was, what changed between them, the worst value the
+       criterion recorded, and the study's own sentence for both cases. A column
+       nobody needs costs a filter click; a column that is missing costs a trip
+       back to the study folder."""
+    out = []
+
+    def _row(**kw):
+        """One report row, filled BY NAME so a column added to _REPORT_COLS
+           can never shift a value into the wrong cell."""
+        d = dict.fromkeys(_REPORT_COLS, "")
+        for k, v in kw.items():
+            d[k] = "" if v is None else v
+        # NO EMPTY CELL LEAVES THIS FUNCTION. Every column has a value or the
+        # word EMPTY_CELL says there is none -- a blank in a numbers column is
+        # read as zero, in a state column as fine, in a note column as
+        # forgotten.
+        return [(EMPTY_CELL if d[c] in ("", None) else d[c]) for c in _REPORT_COLS]
+
+    def _blank(v):
+        """A measured number, or "" -- never None, which csv writes as 'None'."""
+        return "" if v is None else round(v, 4)
+
+    def _sec(x):
+        try:
+            return round(float(x), 4)
+        except (TypeError, ValueError):
+            return ""
+
+    for res in results:
+        lim = res.get("limits") or {}
+        bus_map, flt_map = _dist_maps(res)
+        meas_b, meas_t = res.get("meas_b"), res.get("meas_t")
+        extra_b, extra_t = res.get("extra_b") or {}, res.get("extra_t") or {}
+        _lbl = dict(run_setting=_run_setting(res["project"]),
+                    dyr_edits=_dyr_label(res["project"]),
+                    project_output=_output_label(), project=res["project"])
+        for r in res["rows"]:
+            # "YES" only when the FAULT itself is new with the projects. A fault
+            # that fails in both cases but gained a new criterion (ACT) is not
+            # introduced by them -- criterion_is_new and the action column say
+            # that -- and YES on every element row of such a fault read as
+            # though each pre-existing element were the projects' doing.
+            intro = ("YES" if r["class"] == CLS_NEW else
+                     ("no -- pre-existing fault; the projects add a NEW criterion (ACT)"
+                      if r["hidden_new"] else "no"))
+            ev = r.get("event") if r.get("event") not in (None, "-") else ""
+            desc = (r.get("description") or "").replace("\n", " ").strip()
+            fails = _failing_crits(r)
+            base_scored = bool(norm_verdict(r["vb"]))
+            if not fails:
+                out.append(_row(fault=r["fault"], planning_event=ev,
+                                verdict_base=r["vb"] or "",
+                                verdict_projects=r["vt"] or "",
+                                fault_classification=r["class"],
+                                fault_introduced_by_projects=intro,
+                                description=desc, **_lbl))
+                continue
+            for c in fails:
+                fam = _criterion_family(c["criterion"])
+                what, unit, _noun = _MEASURE.get(fam, ("value", c["unit"], ""))
+                kind = {"angle": "undamped", "trip": "tripped"}.get(fam, fam)
+                vals = (_where_values(r, fam) or _from_detail(c, fam)
+                        or [("(not listed)", c["mb"], c["mt"])])
+                for el, bv, tv in vals:
+                    # SPP: the VOLTAGE criteria apply to BES buses only, so a
+                    # 34.5 kV collector at 1.40 pu is switching behaviour and
+                    # not a violation. See _is_bes_voltage_row.
+                    if not _is_bes_voltage_row(fam, el):
+                        continue
+                    # ---- THE BASE VALUE, WHETHER OR NOT THE BASE VIOLATED --
+                    #
+                    # The violations list only names buses that broke the
+                    # limit, so for a bus that is over WITH the projects and
+                    # clean without them the base side of the row was empty --
+                    # and the row said PRE-EXISTING. The base study measured
+                    # that bus all the same; the number is in its measurements
+                    # file, and it is what decides NEW from PRE-EXISTING.
+                    src = ""
+                    # ---- A TRIPPING ROW: THE SAME QUANTITY ON BOTH SIDES ----
+                    #
+                    # The trip list gives a number for the side that tripped
+                    # and nothing for the other. The machines table the study
+                    # writes gives every machine's pre-fault MW and its state on
+                    # BOTH sides, so base_value / project_value hold the MW in
+                    # each case and base_state / project_state say TRIPPED or
+                    # connected with the MW before and after. The
+                    # classification still rests on WHETHER each side tripped.
+                    b_state = t_state = ""
+                    _mb_rec = _mt_rec = None
+                    bv_show, tv_show = bv, tv
+                    if fam == "trip":
+                        _mb_rec = machine_state(meas_b, r["fault"], el)
+                        _mt_rec = machine_state(meas_t, r["fault"], el)
+                        b_state = _trip_state_text(_mb_rec, bv)
+                        t_state = _trip_state_text(_mt_rec, tv)
+                        if _mb_rec and _mb_rec.get("p0") is not None:
+                            bv_show = _mb_rec["p0"]
+                            if bv is None and _mb_rec.get("tripped"):
+                                bv = _mb_rec["p0"]        # the base DID trip it
+                        if _mt_rec and _mt_rec.get("p0") is not None:
+                            tv_show = _mt_rec["p0"]
+                            if tv is None and _mt_rec.get("tripped"):
+                                tv = _mt_rec["p0"]
+                        # NO ROW FOR THIS FAULT IN A MACHINES TABLE. The MW is
+                        # still known -- it is the case's initial condition, on
+                        # every other fault's row -- and the state is still
+                        # known: a machine the trip list does not name did not
+                        # trip. Both are said; neither cell is left empty.
+                        if _mb_rec is None and not b_state:
+                            _p0b, _fromb = _machine_p0_any_fault(meas_b, el)
+                            if _p0b is not None:
+                                bv_show = _p0b
+                            if base_scored:
+                                b_state = ("connected -- not in the base trip list"
+                                           + ((" (pre-fault MW from the base case's "
+                                               "machines table, row of %s)" % _fromb)
+                                              if _p0b is not None else
+                                              " (base machines table has no row for "
+                                              "this fault yet)"))
+                            else:
+                                b_state = "base not scored for this fault"
+                        if _mt_rec is None and not t_state:
+                            _p0t, _fromt = _machine_p0_any_fault(meas_t, el)
+                            if _p0t is not None:
+                                tv_show = _p0t
+                            if norm_verdict(r["vt"]):
+                                t_state = ("connected -- not in the project trip list"
+                                           + ((" (pre-fault MW from the project case's "
+                                               "machines table, row of %s)" % _fromt)
+                                              if _p0t is not None else
+                                              " (project machines table has no row for "
+                                              "this fault yet)"))
+                            else:
+                                t_state = "project not scored for this fault"
+                    if bv is not None:
+                        src = "base violation list"
+                    elif fam == "trip":
+                        src = (("base machines measurement -- %s" % b_state) if b_state
+                               else ("base scored -- machine not tripped in base"
+                                     if base_scored else "base not scored for this fault"))
+                    else:
+                        mv = measured_value(meas_b, fam, r["fault"], el)
+                        if mv is not None:
+                            bv = mv
+                            bv_show = mv
+                            src = "base measurement (bus within limit in base)"
+                        elif base_scored and _project_only_bus(_bus_of_element(el)):
+                            src = ("bus exists only with the project (new plant) -- "
+                                   "NEW by construction")
+                        elif base_scored:
+                            src = ("base scored -- bus not in base measurements "
+                                   "(not monitored there, or measurements file missing)")
+                        else:
+                            src = "base not scored for this fault"
+                    if tv is None and fam != "trip":
+                        # A RESOLVED element: over in the base, clean with the
+                        # projects. Show what it did with the projects.
+                        mv = measured_value(meas_t, fam, r["fault"], el)
+                        if mv is not None:
+                            tv = mv
+                            tv_show = mv
+                    # HOW FAR PAST THE LIMIT, per element, on the project side.
+                    # The raw value alone does not say whether 1.21 pu is a
+                    # rounding error or a serious breach, and the answer differs
+                    # by criterion.
+                    amt, _txt = exceedance(kind, tv, lim)
+                    chg = (tv - bv) if (isinstance(bv, float)
+                                        and isinstance(tv, float)) else ""
+                    if fam == "trip":
+                        # The two numbers are the machine's PRE-FAULT MW in each
+                        # case, i.e. how much was lost when it tripped there. A
+                        # difference between them is the dispatch (the area hold
+                        # moved it), not a change in the violation.
+                        chg = ""
+                    if r.get("one_sided"):
+                        ecls = r["class"]
+                    else:
+                        ecls = _element_class(fam, kind, bv, tv, lim, base_scored,
+                                              _project_only_bus(_bus_of_element(el)))
+                    # NO MEASUREMENTS FILE ON THE BASE SIDE (a study written
+                    # before it existed), but the base violations list covers
+                    # this fault and does not name the bus: that list is the
+                    # authority on what violated, so the bus did not. NEW,
+                    # with the source saying why the base value is blank.
+                    if (ecls == CLS_EL_UNKNOWN and bv is None and base_scored
+                            and not (meas_b or {}).get("src")
+                            and not r.get("vio_gap")):
+                        ecls = CLS_NEW
+                        src = ("base violation list does not name this bus "
+                               "(base measurements file not available)")
+                    # ---- HOW LONG OVER 1.20 pu, both sides --------------
+                    ab_b = ab_t = ""
+                    if fam == "overshoot":
+                        xb = extra_b.get((r["fault"], "overshoot", str(el)))
+                        xt = extra_t.get((r["fault"], "overshoot", str(el)))
+                        ab_b = _sec(xb[1]) if (xb and xb[1] != "") else \
+                            _sec(measured_above(meas_b, r["fault"], el))
+                        ab_t = _sec(xt[1]) if (xt and xt[1] != "") else \
+                            _sec(measured_above(meas_t, r["fault"], el))
+                    _bn, _hp = _distance_cells(el, r["fault"], bus_map, flt_map)
+                    # HOPS FROM THE POI, from BUS_DISTANCE.csv (bus_map) -- a
+                    # topology fact, so it is filled for every monitored bus
+                    # whether or not that bus ever failed anything.
+                    # SECOND SOURCE, because BUS_DISTANCE.csv only reaches the
+                    # fault-generation radius (and a selection run may not write
+                    # it at all), so this column was blank for most monitored
+                    # buses. The POI is the bus that file puts at 0 hops; from
+                    # it the same BUS_MAP walk that answers hops-from-fault
+                    # answers hops-from-POI, for every bus in the case.
+                    _hpoi = ""
+                    try:
+                        _bd = bus_map.get(int(_bn)) if _bn not in ("", None) else None
+                        if _bd:
+                            _hpoi = _bd[2]
+                        if _hpoi in ("", None) and _bn not in ("", None):
+                            _poi = _poi_bus_of(bus_map)
+                            if _poi is not None:
+                                _h2 = _bmap_hops_from(_poi).get(int(_bn))
+                                if _h2 is not None:
+                                    _hpoi = _h2
+                    except (TypeError, ValueError):
+                        pass
+                    # AREA, from the measurements (every monitored bus carries
+                    # it). Project side first, base as the fallback.
+                    _area = (measured_area(meas_t, r["fault"], el)
+                             or measured_area(meas_b, r["fault"], el)
+                             or (_bmap_area_text(_bn) if _bn not in ("", None)
+                                 else ""))
+                    out.append(_row(
+                        fault=r["fault"], planning_event=ev,
+                        verdict_base=r["vb"] or "", verdict_projects=r["vt"] or "",
+                        fault_classification=r["class"],
+                        element_classification=ecls,
+                        criterion=_short_crit(c["criterion"]), measured=what,
+                        element=str(el), bus_number=_bn, area=_area,
+                        hops_from_fault=_hp, hops_from_poi=_hpoi,
+                        # A BLANK IS NOT AN ANSWER. Where the base measured
+                        # this element the number is above; where the criterion
+                        # is TRIPPING and the base simply did not trip it, that
+                        # IS the base's result and is said in words -- the
+                        # measurements hold volts and angles, never a "MW it did
+                        # not lose".
+                        # NEVER AN EMPTY BASE CELL. A bus at 1.19 pu in the base
+                        # and 1.25 with the projects must show 1.19 -- that is
+                        # the whole comparison -- and it does, from the base
+                        # MEASUREMENTS, whether or not the base violated. When
+                        # there is genuinely no base number the cell says WHICH
+                        # of the three reasons it is, because "blank" reads as
+                        # "zero" or "fine" and is neither.
+                        base_value="" if bv_show is None else bv_show,
+                        # WHERE THE NUMBER CAME FROM when there is one; WHY
+                        # THERE IS NONE when there is not. Never empty.
+                        base_value_note=((src or "measured in the base case")
+                                         if bv_show is not None else
+                                         (b_state or
+                                          # ONLY WHEN THE BASE MACHINES TABLE WAS
+                                          # READ AND SAYS SO. With no table row --
+                                          # a measurements file still being
+                                          # rebuilt -- the reason is the file, and
+                                          # _why_no_base names it.
+                                          ("not tripped in base"
+                                           if (fam == "trip" and base_scored and _mb_rec) else
+                                           ("no numeric value for this criterion -- the "
+                                            "verdict columns carry the result")
+                                           if fam not in ("overshoot", "recovery", "steady",
+                                                          "angle", "trip") else
+                                           _why_no_base(base_scored, meas_b,
+                                                        _bus_of_element(el),
+                                                        r["fault"], fam)))),
+                        base_state=b_state, project_state=t_state,
+                        base_value_source=src,
+                        project_value="" if tv_show is None else tv_show,
+                        secs_above_1_20_base=ab_b, secs_above_1_20_project=ab_t,
+                        change="" if chg == "" else round(chg, 4),
+                        past_limit="" if amt is None else round(amt, 4),
+                        limit=_limit_text(fam, lim), unit=unit,
+                        criterion_is_new="YES" if c["class"] == CLS_NEW else "no",
+                        fault_introduced_by_projects=intro,
+                        worst_base="" if c["mb"] is None else c["mb"],
+                        worst_projects="" if c["mt"] is None else c["mt"],
+                        description=desc, **_lbl))
+    return out
+
+
+def _project_caused_rows(detail_rows):
+    """The element rows the projects are responsible for -- element class NEW
+       -- worst first within each criterion. This is the sheet to act on."""
+    ic, ip, ik = (_COL["element_classification"], _COL["past_limit"],
+                  _COL["criterion"])
+    rows = [r for r in detail_rows if r[ic] == CLS_NEW]
+
+    def _k(r):
+        try:
+            past = -float(r[ip])
+        except (TypeError, ValueError):
+            past = 0.0
+        return (str(r[ik]), past, str(r[_COL["fault"]]))
+    rows.sort(key=_k)
+    return rows
+
+
+def _pre_existing_element_rows(detail_rows):
+    """Per-bus rows the base system ALREADY fails -- element class PRE-EXISTING
+       -- worst first within each criterion. The companion to the project-caused
+       list: same shape, the other half of the answer."""
+    ic, ip, ik = (_COL["element_classification"], _COL["past_limit"],
+                  _COL["criterion"])
+    rows = [r for r in detail_rows if r[ic] == CLS_PRE]
+
+    def _k(r):
+        try:
+            past = -float(r[ip])
+        except (TypeError, ValueError):
+            past = 0.0
+        return (str(r[ik]), past, str(r[_COL["fault"]]))
+    rows.sort(key=_k)
+    return rows
+
+
+# ---- THE READABLE, NARROW VIEW ---------------------------------------------
+# The full detail is 30 columns and the four that a reader wants -- base value,
+# project value, how long over 1.20, who caused it -- are scattered across it.
+# These project the same rows onto a dozen columns in the order they are read,
+# with ONE verdict column instead of three ("criterion_is_new",
+# "fault_introduced_by_projects", "element_classification" each answer a
+# different question and disagree constantly). The full sheet still carries all
+# thirty for the record.
+_COMPACT_COLS = ["project", "fault", "criterion", "element", "bus_number", "area",
+                 "hops_from_fault", "hops_from_poi",
+                 "base_value", "project_value", "change",
+                 "base_state", "project_state", "base_value_note",
+                 "above_1.20_base_s", "above_1.20_project_s",
+                 "limit", "past_limit", "who_caused_it"]
+_COMPACT_WIDTHS = [14, 9, 20, 18, 10, 7, 9, 9, 11, 12, 9, 24, 24, 34, 15, 17, 12, 10, 22]
+
+# The element-level class, said in words a reader does not have to decode.
+_VERDICT_LABEL = {CLS_NEW: "PROJECT introduced",
+                  CLS_PRE: "pre-existing (both cases)",
+                  CLS_RESOLVED: "resolved by project",
+                  CLS_EL_OK: "within limit both sides"}
+
+
+def _compact_view(rows):
+    """One detail row -> the columns of _COMPACT_COLS, verdict in words."""
+    fi, ci, ei = _COL["fault"], _COL["criterion"], _COL["element"]
+    bni, ai = _COL["bus_number"], _COL["area"]
+    hi, hpi = _COL["hops_from_fault"], _COL["hops_from_poi"]
+    bi, pi, chi = _COL["base_value"], _COL["project_value"], _COL["change"]
+    abi, api = _COL["secs_above_1_20_base"], _COL["secs_above_1_20_project"]
+    li, pli, eci = _COL["limit"], _COL["past_limit"], _COL["element_classification"]
+    pji = _COL["project"]
+    bsi, psi, bni_ = _COL["base_state"], _COL["project_state"], _COL["base_value_note"]
+    out = []
+    for r in rows:
+        out.append([r[pji], r[fi], r[ci], r[ei], r[bni], r[ai], r[hi], r[hpi],
+                    r[bi], r[pi], r[chi], r[bsi], r[psi], r[bni_], r[abi], r[api],
+                    r[li], r[pli],
+                    _VERDICT_LABEL.get(r[eci], r[eci])])
+    return out
+
+
+def _xl_style_compact(row):
+    """Colour a compact row by its verdict word -- red introduced, amber
+       pre-existing, green resolved, grey anything else."""
+    w = str(row[-1])
+    if w.startswith("PROJECT"):
+        return 2
+    if w.startswith("pre-existing"):
+        return 3
+    if w.startswith("resolved"):
+        return 4
+    if w.startswith("within limit"):
+        return 5
+    return 6
+
+
+# The colour of a row IS its classification. One mapping, used by the
+# spreadsheet and named in the report's legend, so the two cannot say different
+# things about the same fault.
+#
+#   red     the projects introduced this          act on it
+#   amber   fails in both cases                   pre-existing, still a violation
+#   green   passes in both, or the projects fixed it
+#   grey    scored on one side only               cannot be judged
+_XL_STYLE_OF_CLASS = {
+    CLS_NEW: 2, CLS_PRE: 3, CLS_RESOLVED: 4, CLS_OK: 5,
+    CLS_ONLY_B: 6, CLS_ONLY_T: 6, CLS_NEITHER: 6,
+}
+# (style index, what to call the colour, what it means). The style index is the
+# same one the data rows use, so the key is drawn in the colours it describes --
+# a legend that merely NAMES a colour is one rename away from being wrong.
+# ---- THE POI POWER SHEET ----------------------------------------------------
+# Per project and fault: what the POI meter read on both sides -- the TOTAL
+# delivered into the POI (new plant + existing units) before the fault and at
+# the end, and the project side split into the new plant and the existing
+# units. From SPP_MEASURE_POI, written by both studies' scoring; a fault with
+# no row on a side (not scored there) shows blanks.
+_POI_COLS = ["project", "fault", "POI",
+             "base total P0 (MW)", "base total end (MW)",
+             "project total P0 (MW)", "project total end (MW)",
+             "project new plant P0 (MW)", "project new plant end (MW)",
+             "project existing P0 (MW)", "project existing end (MW)",
+             "base total Q0 (MVAr)", "project total Q0 (MVAr)", "project total Q end (MVAr)",
+             "project min P after clearing (MW)", "how the project total was measured"]
+_POI_WIDTHS = [14, 8, 9, 14, 14, 14, 14, 16, 16, 16, 16, 14, 14, 16, 18, 48]
+
+
+def _xl_style_poi(row):
+    """Red when the project's POI power did not come back: the final total is
+       under 90 % of the pre-fault total."""
+    try:
+        p0, pe = float(row[5]), float(row[6])
+        if p0 > 1.0 and pe < 0.9 * p0:
+            return 2
+    except (TypeError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _poi_power_rows(results):
+    """Rows for the '6 POI power' sheet, one per project x fault."""
+    rows = []
+
+    def _pick(meas, fid, comp, q="MW"):
+        try:
+            d = (meas or {}).get("poi", {}).get(fid) or {}
+        except Exception:
+            return None
+        return d.get((q, comp))
+
+    def _num(rec, key):
+        if not rec:
+            return ""
+        v = rec.get(key)
+        return "" if v is None else round(float(v), 1)
+
+    seen = set()
+    for res in results or []:
+        proj = res.get("project") or ""
+        mb, mt = res.get("meas_b") or {}, res.get("meas_t") or {}
+        fids = set((mb.get("poi") or {}).keys()) | set((mt.get("poi") or {}).keys())
+        # EVERY FAULT THE COMPARISON COVERS, not only the ones with a POI row.
+        # A fault missing from this sheet is invisible; a fault on it with the
+        # last column saying which side has no row is a finding.
+        for _r in (res.get("rows") or []):
+            if _r.get("fault") not in (None, ""):
+                fids.add(str(_r["fault"]).strip())
+        for fid in sorted(fids, key=lambda s: (len(s), s)):
+            if (proj, fid) in seen:
+                continue
+            seen.add((proj, fid))
+            bt, tt = _pick(mb, fid, "TOTAL delivered into the POI"), _pick(mt, fid, "TOTAL delivered into the POI")
+            tn = _pick(mt, fid, "new plant tie(s)")
+            te = _pick(mt, fid, "existing plant tie(s)") or _pick(mt, fid, "existing machines (terminals)")
+            bq, tq = (_pick(mb, fid, "TOTAL delivered into the POI", "MVAr"),
+                      _pick(mt, fid, "TOTAL delivered into the POI", "MVAr"))
+            poi = (tt or bt or tn or {}).get("poi", "")
+            if tt:
+                _how = (tt or {}).get("src", "") or "sum of the plant tie channels"
+            elif bt:
+                _how = "no POI power row on the project side (its measurements do not cover this fault yet)"
+            elif not poi:
+                _how = ("no POI power row on either side (neither case's measurements cover this "
+                        "fault yet -- see sheet 4 if it was not scored)")
+            else:
+                _how = "no POI power row on the base side (its measurements do not cover this fault yet)"
+            _row = [proj, fid, poi,
+                    _num(bt, "p0"), _num(bt, "end"),
+                    _num(tt, "p0"), _num(tt, "end"),
+                    _num(tn, "p0"), _num(tn, "end"),
+                    _num(te, "p0"), _num(te, "end"),
+                    _num(bq, "p0"), _num(tq, "p0"), _num(tq, "end"),
+                    _num(tt, "min"), _how]
+            rows.append([(EMPTY_CELL if v in ("", None) else v) for v in _row])
+    return rows
+
+
+_XL_LEGEND = [(2, "RED", "introduced by the projects -- act on these first"),
+              (3, "AMBER", "fails in BOTH cases -- pre-existing, still a violation"),
+              (4, "GREEN (filled)", "resolved -- fails without the projects, passes with them"),
+              (5, "GREEN (text)", "passes in both cases"),
+              (6, "GREY", "not compared -- sheet 4 says per side: crashed / simulated, not scored / not run"
+                          " (crashed rows are RED there)")]
+
+
+def _xl_style_of(row):
+    """Style index for one report row.
+
+       A fault that fails on a NEW criterion inside a pre-existing failure is
+       red, not amber: the fault-level verdict says PRE-EXISTING and the thing
+       that changed is still the projects' doing."""
+    # RED IS PER ELEMENT. This used to turn a row red when the FAULT carried
+    # the "introduced" flag as well, so every pre-existing bus of a fault that
+    # broke one new criterion was painted red -- 184 red rows in the detail
+    # against 11 in the action sheet, and a reader could not tell the two
+    # apart. The fault-level flag stays in its column; the colour follows what
+    # this element did.
+    _ec = row[_COL["element_classification"]]
+    if _ec == CLS_NEW:
+        return 2
+    if _ec in _XL_STYLE_OF_CLASS:
+        return _XL_STYLE_OF_CLASS[_ec]
+    if _ec == CLS_EL_UNKNOWN:
+        return 6
+    return _XL_STYLE_OF_CLASS.get(row[_COL["fault_classification"]], 0)
+
+
+# ---- THE SHEETS THE READER ACTUALLY OPENS ---------------------------------
+# One flat table of every element of every criterion of every fault is complete
+# and unreadable: 1,600 rows in which the four that matter look exactly like the
+# rest. The detail stays exactly as it was -- nothing is dropped -- and three
+# sheets are put in front of it, each answering one question:
+#
+#   Summary        one line per fault: what happened, how bad, act or not
+#   Action list    only what the projects introduced
+#   Not compared   the faults that were never scored on one side or both
+#
+# "Not compared" is its own sheet because those rows were the loudest complaint
+# about the old report: a fault that never ran appeared beside faults that did,
+# with empty value columns that read like a clean result.
+_SUMMARY_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "project", "planning_event", "verdict_base",
+                 "verdict_projects", "classification", "action",
+                 "worst_criterion", "base_value", "project_value", "limit",
+                 "unit", "past_limit", "elements_over", "new_criteria",
+                 "violating_buses", "cause",
+                 "description"]
+
+_SUMMARY_WIDTHS = [26, 22, 14, 9, 12, 9, 11, 13, 14, 26, 21, 11, 13, 9, 6, 10, 13, 16, 60, 80, 60]
+
+# What the reader is being asked to DO about this fault, in the words of the
+# comparison rather than its jargon. The classification is kept beside it: the
+# two together are what makes a row defensible to a reviewer.
+_ACTION_OF = {
+    CLS_NEW:      "ACT -- introduced by the projects",
+    CLS_PRE:      "pre-existing -- still a violation",
+    CLS_RESOLVED: "improved by the projects",
+    CLS_OK:       "no action -- passes in both",
+    CLS_ONLY_B:   "NOT COMPARED -- no project-side result",
+    CLS_ONLY_T:   "NOT COMPARED -- no base-side result",
+    CLS_NEITHER:  "NOT COMPARED -- neither side scored it",
+}
+
+_NOT_COMPARED = (CLS_ONLY_B, CLS_ONLY_T, CLS_NEITHER)
+
+
+def _n_elements_over(r):
+    """How many distinct elements are over a limit with the projects in."""
+    seen = set()
+    for _kind, d in (r.get("elements") or {}).items():
+        for el in (d.get("vt") or {}):
+            seen.add(el)
+    return len(seen)
+
+
+# What each violation KIND is judged against, for the cause column. The words a
+# reviewer can check against Rev 3.0, not the comparison's internal names.
+_KIND_LIMIT_TXT = {
+    "overshoot": "max 1.20 pu after clearing",
+    "recovery":  "min 0.70 pu by 2.5 s after clearing",
+    "steady":    "0.90-1.10 pu steady state",
+    "undamped":  "SPPR1 <= 0.95 or SPPR5 <= 0.774 at >= 16 deg swing",
+    "tripped":   "no generator tripping",
+}
+
+
+def _violation_cause(res, r):
+    """(violating_buses, cause) for one fault row.
+
+       The Summary and Action list carried a criterion name and two numbers,
+       and the BUSES were four sheets away in Detail -- so "act on this" named
+       nothing to act ON. These two cells close that gap:
+
+         violating_buses   every element over a limit WITH THE PROJECTS IN,
+                           grouped by violation kind, worst first, with its
+                           measured value -- the top few and a count for the
+                           rest (the full list stays in the Detail sheet)
+         cause             one clause per violation kind: how many elements,
+                           against WHICH limit in Rev 3.0's words, the worst
+                           element and its value, and how many of them the
+                           projects introduced versus already-failing
+
+       Built from the same element tables the Detail sheet prints, so the two
+       can never disagree. A fault that is FAIL with NO element list says so
+       explicitly -- that is the signature of a study whose violations CSV
+       was lost, and a blank cell would hide it."""
+    lim = res.get("limits") or {}
+    buses, cause = [], []
+    for kind in ("tripped", "undamped", "overshoot", "recovery", "steady"):
+        e = (r.get("elements") or {}).get(kind)
+        if not e:
+            continue
+        els = sorted(set(list(e.get("new") or []) + list(e.get("both") or [])))
+        if not els:
+            continue
+        vt = e.get("vt") or {}
+        scored = []
+        for el in els:
+            v = vt.get(el)
+            try:
+                amt, _t = exceedance(kind, v, lim)
+            except Exception:
+                amt = None
+            scored.append((-(amt if amt is not None else -1e9), str(el), v))
+        scored.sort()
+        # EVERY BUS, unless a cap is asked for. Six with "+4 more" is the
+        # column that sends you to another sheet to find the other four, and
+        # the buses are the thing the row exists to name.
+        top = scored if not CAUSE_BUSES_MAX else scored[:int(CAUSE_BUSES_MAX)]
+        # EACH BUS WITH WHERE IT IS. "534123=1.42" says a bus is over the limit;
+        # "534123=1.42 [534/2h]" says it is in area 534, two hops from the bus
+        # that was faulted -- which is what decides whether it is the project's
+        # to answer for. The short form keeps the cell readable when a fault has
+        # a hundred of them.
+        def _wsuf(_fid, _el):
+            _w = where_short(_fid, _el)
+            return (" [%s]" % _w) if _w else ""
+        _fid = str(r.get("fault") or r.get("fid") or "").strip()
+        frag = ", ".join("%s=%s%s" % (el, _v(v), _wsuf(_fid, el))
+                         for _k, el, v in top)
+        if len(scored) > len(top):
+            frag += " +%d more" % (len(scored) - len(top))
+        buses.append("%s: %s" % (kind.upper(), frag))
+        _wk, _wel, _wv = scored[0]
+        n_new = len(e.get("new") or [])
+        n_pre = len(e.get("both") or [])
+        _ww = where_of(_fid, _wel)
+        cause.append("%d element(s) past %s -- worst %s = %s%s%s"
+                     % (len(els), _KIND_LIMIT_TXT.get(kind, kind),
+                        _wel, _v(_wv),
+                        (" (%s)" % _ww) if _ww else "",
+                        ("; %d NEW with the projects, %d pre-existing"
+                         % (n_new, n_pre)) if n_new else
+                        ("; all %d pre-existing" % n_pre if n_pre else "")))
+    if not cause and (r.get("vt") or "").upper() == "FAIL":
+        # FAIL with an empty element list is a data problem, not a clean cell.
+        return ("", "FAIL, but no element list reached the comparison -- the "
+                    "study's violations CSV is empty for this fault. Re-score "
+                    "that study (its criteria report has the buses).")
+    return " | ".join(buses), " | ".join(cause)
+
+
+def _summary_rows(results, want=None):
+    """One row per fault. want = a set of classifications to keep, or None."""
+    out = []
+    for res in results:
+        for r in res["rows"]:
+            cls = r["class"]
+            intro = (cls == CLS_NEW or r["hidden_new"])
+            if want is not None and not (cls in want or (intro and CLS_NEW in want)):
+                continue
+            got = _worst_crit_of(res, r)
+            if got:
+                _c, _fam, _amt = got
+                crit = _short_crit(_c["criterion"])
+                bv, tv, unit = _c["mb"], _c["mt"], _c["unit"]
+                shown = _limit_for(_fam, res.get("limits") or {})
+                past = round(_amt, 3) if _amt is not None else ""
+            else:
+                crit = bv = tv = unit = ""
+                shown, past = None, ""
+            act = _ACTION_OF.get(cls, "")
+            if intro and cls != CLS_NEW:
+                # A NEW CRITERION INSIDE A PRE-EXISTING FAILURE. The fault-level
+                # verdict was FAIL either way, so the classification says
+                # PRE-EXISTING -- but something the projects did is what broke
+                # this criterion, and the reader must not have to notice that
+                # from a colour alone.
+                act = "ACT -- new criterion in a pre-existing failure"
+            out.append([_run_setting(res["project"]),
+                        _dyr_label(res["project"]), _output_label(),
+                        r["fault"], res["project"],
+                        (r.get("event") if r.get("event") not in (None, "-") else ""),
+                        r["vb"] or "", r["vt"] or "", cls, act,
+                        crit, bv if bv is not None else "",
+                        tv if tv is not None else "",
+                        shown if shown is not None else "", unit, past,
+                        _n_elements_over(r) or "",
+                        ", ".join(r.get("new_crit") or []),
+                        ] + list(_violation_cause(res, r)) + [
+                        (r.get("description") or "").replace("\n", " ").strip()])
+    return out
+
+
+_NOTRUN_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "project", "planning_event",
+                "base_state", "projects_state", "reason", "crash_hint", "why", "description"]
+_NOTRUN_WIDTHS = [26, 22, 14, 9, 12, 9, 30, 30, 34, 60, 70, 60]
+
+
+_OUT_SET_CACHE = {}
+
+
+def _out_faults_in(rdir):
+    """The fault ids that have an .out file on disk in this folder -- i.e. that
+       were SIMULATED, whether or not they were ever scored. This is the set the
+       LIVE STATUS table calls 'DONE'."""
+    if not rdir:
+        return set()
+    if rdir in _OUT_SET_CACHE:
+        return _OUT_SET_CACHE[rdir]
+    got = set()
+    try:
+        for p in glob.glob(os.path.join(rdir, "outs", "*.out")):
+            got.add(os.path.splitext(os.path.basename(p))[0].strip())
+    except Exception:
+        pass
+    _OUT_SET_CACHE[rdir] = got
+    return got
+
+
+def _side_state(rdir, fid):
+    """What the study folder holds for this fault, as (state, detail):
+         "scored-less"  .out AND .done -- the run finished, only the score is missing
+         "crashed"      .out but NO .done -- the run never finished (partial file;
+                        the launcher gave up after MAX_SCENARIO_ATTEMPTS)
+         "not-run"      no .out at all"""
+    sid = str(fid).strip()
+    if not rdir or sid not in _out_faults_in(rdir):
+        return "not-run", ""
+    od = os.path.join(rdir, "outs")
+    if os.path.isfile(os.path.join(od, sid + ".done")):
+        return "scored-less", ""
+    att = ""
+    try:
+        with open(os.path.join(od, sid + ".attempts")) as fh:
+            att = fh.read().strip().split()[0]
+    except Exception:
+        pass
+    try:
+        mb = os.path.getsize(os.path.join(od, sid + ".out")) / 1048576.0
+    except Exception:
+        mb = 0.0
+    return "crashed", ("%s attempt(s), " % att if att else "") + "%.0f MB partial .out" % mb
+
+
+def _side_state_words(rdir, fid):
+    st, det = _side_state(rdir, fid)
+    if st == "scored-less":
+        return "simulated, not scored"
+    if st == "crashed":
+        return "CRASHED (no .done%s)" % ((": " + det) if det else "")
+    return "not run"
+
+
+def _why_side_missing(side_name, rdir, fid):
+    """Why a side has no verdict for this fault. Three different situations
+       need three different fixes, and the .done marker tells them apart:
+
+         .out + .done  the run finished and was never scored -> SCORE it
+                       (FORCE_RESCORE + PIPELINE="compare"), do not re-run it.
+         .out, no .done  the run CRASHED -- PSS/E stopped part way and the
+                       launcher gave up after MAX_SCENARIO_ATTEMPTS. The .out
+                       is partial. Scoring it would score a truncated run, so
+                       the study excludes it; read logs\FAULT_<id>_strt-prog.txt
+                       and fix the event or its clearing before re-running.
+         no .out       never simulated there.
+
+       The LIVE STATUS table marks a scenario DONE when its .out is written,
+       which is SIMULATION, not scoring -- so 'DONE' there and 'no verdict'
+       here can both be true of the same fault."""
+    st, det = _side_state(rdir, fid)
+    if st == "scored-less":
+        return ("the %s case SIMULATED this fault (.out + .done on disk) but never "
+                "SCORED it -- score it (FORCE_RESCORE = True, PIPELINE = \"compare\"), "
+                "do not re-run it" % side_name)
+    if st == "crashed":
+        return ("the %s case's run of this fault CRASHED -- .out on disk but no .done "
+                "(%s); the launcher gave up after MAX_SCENARIO_ATTEMPTS, so it is not "
+                "scored. See results\\logs\\FAULT_%s_strt-prog.txt; fix the event, then "
+                "PIPELINE = \"missing\" re-runs it" % (side_name, det or "partial", fid))
+    return ("the %s case has no result for this fault -- it was not run there"
+            % side_name)
+
+
+_CRASH_HINT_CACHE = {}
+
+
+def _crash_hint(rdir, fid):
+    """One line on WHY a crashed run stopped, read from the study's own logs:
+       the fault's PSS/E init log (logs\\FAULT_<id>_strt-prog.txt) and the
+       LIVE_STATUS row. Empty when the side did not crash."""
+    key = (rdir, str(fid))
+    if key in _CRASH_HINT_CACHE:
+        return _CRASH_HINT_CACHE[key]
+    hint = ""
+    if rdir:
+        pr = os.path.join(rdir, "logs", "FAULT_%s_strt-prog.txt" % fid)
+        try:
+            txt = open(pr, "r", errors="replace").read()
+        except Exception:
+            txt = None
+        if txt is None:
+            hint = "no init log (logs\\FAULT_%s_strt-prog.txt) -- the worker died before PSS/E initialised this fault, or the logs folder was cleaned" % fid
+        else:
+            up = txt.upper()
+            n_nc = len(re.findall(r"NETWORK NOT CONVERGED", up))
+            if "NOT ACCESSIBLE" in up:
+                hint = "a user-model DLL is NOT ACCESSIBLE at init (see the strt-prog log)"
+            elif "INITIAL CONDITIONS CHECK" in up and ("SUSPECT" in up or "LARGE" in up) and n_nc == 0:
+                hint = "initial-conditions check reported suspect states at init"
+            elif n_nc:
+                m = re.findall(r"Network not converged at TIME\s*=\s*([-\d.E+]+)", txt)
+                hint = ("network not converged %d step(s)%s -- the switching leaves no solution; "
+                        "check the event / clearing" % (n_nc, (" from t=%s" % m[0]) if m else ""))
+            else:
+                tail = [ln.strip() for ln in txt.splitlines() if ln.strip()][-2:]
+                hint = "init log ends: " + " | ".join(tail)[:160]
+        # the LIVE_STATUS row carries the launcher's own note (attempt cap, worker)
+        try:
+            for lp in glob.glob(os.path.join(rdir, "LIVE_STATUS*.txt")):
+                for ln in open(lp, "r", errors="replace"):
+                    m = re.match(r"^\s*(%s)\s+(GAVE-UP|ERROR|FAILED|INCOMPLETE|INTERRUPTED)\s+(\d+)\s+(\S+)\s+\S+ \S+\s*(.*)$"
+                                 % re.escape(str(fid)), ln)
+                    if m:
+                        hint = ("%s after %s attempt(s) on %s%s" % (m.group(2), m.group(3), m.group(4),
+                                ("; " + hint) if hint else ""))
+                        raise StopIteration
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+    _CRASH_HINT_CACHE[key] = hint
+    return hint
+
+
+def _notrun_reason(sb, st, vb, vt):
+    """A short, sortable reason from the two sides' states."""
+    def _k(x, v):
+        if v:
+            return "scored"
+        if x.startswith("CRASHED"):
+            return "crashed"
+        if x.startswith("simulated"):
+            return "not scored"
+        return "not run"
+    kb, kt = _k(sb, vb), _k(st, vt)
+    if kb == kt:
+        return "%s in both cases" % kb
+    if kb == "scored":
+        return "%s in projects" % kt
+    if kt == "scored":
+        return "%s in base" % kb
+    return "base %s / projects %s" % (kb, kt)
+
+
+def _notrun_rows(results):
+    """The faults that cannot be judged, and exactly what is missing."""
+    out = []
+    for res in results:
+        _rb = (res.get("dirs") or {}).get("base")
+        _rt = (res.get("dirs") or {}).get("test")
+        for r in res["rows"]:
+            if r["class"] not in _NOT_COMPARED:
+                continue
+            vb, vt = (r["vb"] or ""), (r["vt"] or "")
+            fid = r["fault"]
+            if r["class"] == CLS_ONLY_B:
+                # scored in base, missing on the project side
+                why = _why_side_missing("project", _rt, fid)
+            elif r["class"] == CLS_ONLY_T:
+                why = _why_side_missing("base", _rb, fid)
+            elif r["class"] == CLS_NEITHER:
+                # NAME EACH SIDE'S STATE SEPARATELY. "Neither scored it" hides
+                # that one side may be simulated-not-scored and the other never
+                # run -- two different fixes on one fault.
+                _b = _side_state_words(_rb, fid)
+                _t = _side_state_words(_rt, fid)
+                why = ("neither case has a verdict -- base: %s; project: %s"
+                       % (_b, _t))
+                if "CRASHED" in _b or "CRASHED" in _t:
+                    why += (". A crashed run is a partial .out with no .done: see "
+                            "logs\\FAULT_%s_strt-prog.txt in that results folder" % fid)
+            else:
+                why = ""
+            _sb = ("scored %s" % vb) if vb else _side_state_words(_rb, fid)
+            _st = ("scored %s" % vt) if vt else _side_state_words(_rt, fid)
+            _hints = []
+            if _sb.startswith("CRASHED"):
+                _hints.append("base: " + (_crash_hint(_rb, fid) or "see logs"))
+            if _st.startswith("CRASHED"):
+                _hints.append("projects: " + (_crash_hint(_rt, fid) or "see logs"))
+            out.append([_run_setting(res["project"]),
+                        _dyr_label(res["project"]), _output_label(),
+                        r["fault"], res["project"],
+                        (r.get("event") if r.get("event") not in (None, "-") else ""),
+                        _sb, _st, _notrun_reason(_sb, _st, vb, vt), " || ".join(_hints), why,
+                        (r.get("description") or "").replace("\n", " ").strip()])
+    return out
+
+
+# BY NAME, NOT BY NUMBER. These read the "action" and "classification" cells,
+# and a column added at the front of the table used to move them silently.
+_SCOL = dict((c, i) for i, c in enumerate(_SUMMARY_COLS))
+
+
+def _xl_style_of_summary(row):
+    if str(row[_SCOL["action"]]).startswith("ACT"):
+        return 2
+    return _XL_STYLE_OF_CLASS.get(row[_SCOL["classification"]], 0)
+
+
+_NCOL = dict((c, i) for i, c in enumerate(_NOTRUN_COLS))
+
+
+def _xl_style_of_notrun(row):
+    try:
+        if "crashed" in str(row[_NCOL["reason"]]):
+            return 2
+    except Exception:
+        pass
+    return 6
+
+
+@_timed("comparison")
+def write_one_report(results, only_base, only_test):
+    """COMPARISON_REPORT.txt (+ .csv) -- the whole comparison in one file."""
+    path = cmp_path("COMPARISON_REPORT", "txt")
+    # WIDE ENOUGH FOR THE WIDEST ROW IN IT. The element table carries the
+    # fault, the criterion, the element, its bus, area and distance from the
+    # fault, both cases' values, the limit and how far past it -- 150 columns
+    # before the NEW tag. A rule shorter than the rows it brackets reads as a
+    # broken table.
+    W = 156
+    L = []
+
+    def rule(ch="="):
+        L.append(ch * W)
+
+    rows_all, flat = [], []
+    for res in results:
+        for r in res["rows"]:
+            # FLAT_RUN IS NOT A CONTINGENCY. It is the no-fault initialisation
+            # check, and listing it among the faults reads as a disturbance the
+            # projects broke. It gets its own line, because a flat run that
+            # fails invalidates every fault beneath it and that is worth saying
+            # loudly rather than burying in a table of events.
+            (flat if r["fault"].upper().startswith("FLAT") else rows_all).append((res, r))
+    new = [(res, r) for res, r in rows_all
+           if r["class"] == CLS_NEW or r["hidden_new"]]
+    pre = [(res, r) for res, r in rows_all
+           if r["class"] == CLS_PRE and not r["hidden_new"]]
+    fixed = [(res, r) for res, r in rows_all if r["class"] == CLS_RESOLVED]
+    onesided = [(res, r) for res, r in rows_all
+                if r["class"] in (CLS_ONLY_B, CLS_ONLY_T, CLS_NEITHER)]
+    ok = [(res, r) for res, r in rows_all if r["class"] == CLS_OK]
+
+    rule()
+    L.append(" SPP DYNAMIC STABILITY -- COMPARISON REPORT")
+    L.append(" %s" % time.strftime("%Y-%m-%d %H:%M"))
+    rule()
+    L.append(" Base case      %-14s %s" % ("(no projects)", CASE_BASE["dir"]))
+    L.append(" Project case   %-14s %s" % ("(projects in)", CASE_TEST["dir"]))
+    L.append(" Projects       %s" % ", ".join(sorted(set(res["project"] for res, _r in rows_all))
+                                              or ["-"]))
+    # WHICH CONSTANTS THIS ONE WAS RUN WITH. One line, not a column: in a
+    # fixed-width table every row would carry the same text, and the thing it
+    # distinguishes is this REPORT from the other values' reports.
+    _labels = sorted(set(x for x in (_dyr_label(res["project"])
+                                     for res, _r in rows_all) if x))
+    if _labels:
+        L.append(" .dyr edits     %s" % "; ".join(_labels))
+    if ONLY_FAULTS or ONLY_EVENTS:
+        L.append(" Scope          PARTIAL -- %s"
+                 % "; ".join([x for x in (", ".join(ONLY_FAULTS),
+                                          ("events " + ", ".join(ONLY_EVENTS))
+                                          if ONLY_EVENTS else "") if x]))
+    L.append("")
+
+    # ---- THE ANSWER --------------------------------------------------------
+    rule("-")
+    L.append(" THE ANSWER")
+    rule("-")
+    # TWO DIFFERENT FINDINGS, COUNTED SEPARATELY.
+    #
+    # `new` holds both a fault that PASSED without the projects and fails with
+    # them, and a fault that FAILED either way but on a criterion the projects
+    # broke. Both need acting on, which is why they share a table -- but they
+    # are not the same claim, and counting them together produced
+    #
+    #     The projects INTRODUCE 4 failure(s).
+    #     0 fault(s) fail in both cases (pre-existing).
+    #
+    # on a report whose own AT A GLANCE table marked all four PRE-EXISTING and
+    # whose element table listed them as failing in the base case too. The
+    # headline said the projects broke four faults that were already broken.
+    _truly_new = [x for x in new if x[1]["class"] == CLS_NEW]
+    _new_crit = [x for x in new if x[1]["class"] != CLS_NEW]
+    if _truly_new:
+        L.append(" The projects INTRODUCE %d failure(s) -- faults that pass "
+                 "without them." % len(_truly_new))
+    else:
+        L.append(" The projects introduce NO new failure -- no fault passes "
+                 "without them and fails with them.")
+    if _new_crit:
+        L.append(" %d fault(s) fail in BOTH cases but break a criterion only "
+                 "with the projects." % len(_new_crit))
+        L.append("   (already failing, so not counted above -- still the "
+                 "projects' to answer for; marked ACT below.)")
+    L.append(" %d fault(s) fail in both cases (pre-existing)."
+             % (len(pre) + len(_new_crit)))
+    if fixed:
+        L.append(" %d fault(s) fail without the projects and pass with them." % len(fixed))
+    L.append(" %d fault(s) pass in both." % len(ok))
+    if onesided:
+        L.append(" %d fault(s) could not be compared -- scored on one side only."
+                 % len(onesided))
+    # ONE LINE PER PROJECT, AND SAY WHICH. With two projects in the report this
+    # printed the same sentence twice with nothing to tell them apart, which
+    # reads as a duplicated line rather than as two results.
+    _multi = len(set(res["project"] for res, _r in rows_all)) > 1
+    for _res, r in flat:
+        bad = "FAIL" in ((r["vb"] or "") + (r["vt"] or "")).upper()
+        L.append("")
+        L.append(" Flat (no-fault) run%s:  base %s   projects %s%s"
+                 % ((" -- %s" % _res["project"]) if _multi else "",
+                    r["vb"] or "-", r["vt"] or "-",
+                    "   *** a failing flat run invalidates every result below ***"
+                    if bad else ""))
+    L.append("")
+
+    # ---- ONE LINE PER FAULT, BEFORE THE ELEMENT TABLES ---------------------
+    # The tables below are per element: one overvoltage at eighty buses is
+    # eighty lines, which is the right level of detail to ACT on and the wrong
+    # one to start from. This says what happened to each fault, worst first, in
+    # the order a reader wants it: is it broken, was it us, how bad, where to
+    # look.
+    # THE FLAT RUN IS NOT A FAULT, so it is not a row in a table of faults.
+    #
+    # It was listed alongside them, once per project, with an "Elements over"
+    # count of 109 taken from a channel comparison that has nothing to do with
+    # a limit -- a no-fault initialisation check reported as the event with the
+    # most violations in the study. Its verdict is stated in THE ANSWER above,
+    # which is where it belongs and where a failing one is impossible to miss.
+    _flat_ids = set(r["fault"] for _res, r in flat)
+    _glance = [x for x in _summary_rows(results)
+               if x[_SCOL["fault"]] not in _flat_ids]
+    if _glance:
+        rule("-")
+        L.append(" AT A GLANCE -- one line per fault   (%d)" % len(_glance))
+        rule("-")
+        _gh = (" %-22s %-9s %-9s %-14s %-22s %-11s %-9s %s"
+               % ("Fault", "Base", "Projects", "Verdict", "Worst criterion",
+                  "Value", "Past lim", "Elements over"))
+        L.append(_gh)
+        L.append(" %s" % ("-" * (W - 2)))
+        # WORST FIRST: what the projects introduced, then what was already
+        # broken, then everything else. A reader who stops after five lines has
+        # then read the five that matter.
+        _order = {CLS_NEW: 0, CLS_PRE: 1, CLS_ONLY_B: 2, CLS_ONLY_T: 2,
+                  CLS_NEITHER: 2, CLS_RESOLVED: 3, CLS_OK: 4}
+        def _gkey(r):
+            _past = r[_SCOL["past_limit"]]
+            return (0 if str(r[_SCOL["action"]]).startswith("ACT") else 1,
+                    _order.get(r[_SCOL["classification"]], 5),
+                    -(_past if isinstance(_past, float) else 0.0),
+                    _fault_key(r[_SCOL["fault"]]))
+        for _r in sorted(_glance, key=_gkey):
+            # NOT `_v`: that is the module-level value formatter, and
+            # rebinding it here shadowed the function for the whole of
+            # write_one_report -- every later _v(...) call raised "'str' object
+            # is not callable", which was caught and reported as "could not
+            # write the summary", losing the entire comparison report.
+            _gv = _r[_SCOL["project_value"]]
+            _lm = _r[_SCOL["limit"]]
+            _u = _r[_SCOL["unit"]] or ""
+            _pl = _r[_SCOL["past_limit"]]
+            _fcell = _r[_SCOL["fault"]]
+            if _multi:
+                _fcell = "%s %s" % (_r[_SCOL["project"]], _fcell)
+            L.append(" %-22s %-9s %-9s %-14s %-22s %-11s %-9s %s"
+                     % (_fcell[:22],
+                        _r[_SCOL["verdict_base"]] or "-",
+                        _r[_SCOL["verdict_projects"]] or "-",
+                        _r[_SCOL["classification"]],
+                        (_r[_SCOL["worst_criterion"]] or "-")[:22],
+                        ("%s %s" % (_gv, _u)).strip() if _gv != "" else "-",
+                        ("+%.3f" % _pl) if isinstance(_pl, float) else "-",
+                        _r[_SCOL["elements_over"]] or ""))
+            # THE BUSES AND THE CAUSE, under every row that demands action.
+            # "ACT" pointing at a fault id alone sends the reader to another
+            # sheet to learn what to act ON; the buses belong on the same page.
+            if str(_r[_SCOL["action"]]).startswith("ACT") or                _r[_SCOL["classification"]] in (CLS_NEW, CLS_PRE):
+                for _cell, _tag in ((_r[_SCOL["cause"]], "cause"),
+                                    (_r[_SCOL["violating_buses"]], "buses")):
+                    if not _cell:
+                        continue
+                    for _seg in str(_cell).split(" | "):
+                        L.append("     %-6s %s" % (_tag + ":", _seg))
+                        _tag = ""
+        L.append("")
+        L.append(" Verdict: %s = the projects broke it. %s = already broken."
+                 % (CLS_NEW, CLS_PRE))
+        L.append("          %s = the projects fixed it. %s = passes both sides."
+                 % (CLS_RESOLVED, CLS_OK))
+        L.append("          %s / %s / %s = one side has no result, so nothing is known."
+                 % (CLS_ONLY_B, CLS_ONLY_T, CLS_NEITHER))
+        L.append(" Past lim: how far the WORST element is past the limit, on the")
+        L.append("          projects' side. The element tables below name every one.")
+        L.append("")
+
+    # ---- THE BUSES, NOT THE ROWS -------------------------------------------
+    #
+    # The element tables below are the record, and they are long: one fault
+    # that puts twenty buses over the limit is twenty lines, four faults is
+    # eighty, and the SAME bus is most of them. Eighty lines is the right level
+    # of detail to act from and the wrong one to decide WHAT to act on.
+    #
+    # This is the other axis: one line per bus, how many faults it fails in,
+    # its worst value and how far past the limit that is, its area and how far
+    # it sits from the fault. A bus over the limit in one fault out of four and
+    # a bus over in all four are eighty identical-looking lines apart in the
+    # tables and one column apart here.
+    def _all_elements(items):
+        """(fault, criterion family, element, base value, project value) for
+           every failing element of every row -- the same extraction the
+           element tables do, over the same helpers."""
+        for _res2, r2 in items:
+            for c2 in _failing_crits(r2):
+                fam2 = _criterion_family(c2["criterion"])
+                for el2, bv2, tv2 in (_where_values(r2, fam2)
+                                      or _from_detail(c2, fam2) or []):
+                    yield _res2, r2, fam2, el2, bv2, tv2
+
+    _bus_roll = {}
+    for _res2, r2, fam2, el2, bv2, tv2 in _all_elements(new + pre):
+        _lim2 = _res2.get("limits") or {}
+        _amt2, _ = exceedance(
+            {"angle": "undamped", "trip": "tripped"}.get(fam2, fam2),
+            tv2, _lim2)
+        _b2 = _bus_of_element(el2)
+        _key = (_b2 if _b2 is not None else str(el2), fam2)
+        _w = _WHERE.get(str(r2["fault"]).strip(), {}).get(str(el2).strip())
+        _bno, _h2 = _distance_cells(el2, r2["fault"], *_dist_maps(_res2))
+        _e = _bus_roll.setdefault(_key, {"faults": set(), "worst": None,
+                                         "amt": None, "area": "", "name": "",
+                                         "hops": [], "new": False,
+                                         "unit": _MEASURE.get(fam2,
+                                                    ("", "", ""))[1]})
+        _e["faults"].add(r2["fault"])
+        if _w:
+            _e["area"] = _e["area"] or _w[0]
+            _e["name"] = _e["name"] or _w[1]
+        # The violations CSV carries the area only for the buses IT lists; every
+        # other bus in this roll-up had an empty Area column. BUS_MAP knows the
+        # area of every bus in the case.
+        if not _e["area"] and _b2 is not None:
+            _e["area"] = _bmap_area_text(_b2)
+        # ONLY A NUMBER CAN BE THE FEWEST HOPS. _distance_cells says "beyond map"
+        # / "no faulted bus on record" for a bus it cannot reach -- right for
+        # the per-row Flt column, wrong here, where min() over this list then
+        # compared that text with the integer hop counts and stopped the whole
+        # report ("unorderable types: int() < str()"). Text means the bus is
+        # past the map, which is exactly the case "beyond map" below prints
+        # when the list is empty -- so it is not appended.
+        if isinstance(_h2, int) and not isinstance(_h2, bool):
+            _e["hops"].append(_h2)
+        # NEW WITH THE PROJECTS. The element lists are keyed by the study's
+        # violation KIND, and one family can map to more than one -- a rotor
+        # angle is both "undamped" and "review" -- so the answer is "new under
+        # any of this family's kinds", not under a single guessed key.
+        for _k2 in _EL_KEY.get(fam2, [fam2]):
+            if el2 in ((r2["elements"].get(_k2) or {}).get("new") or ()):
+                _e["new"] = True
+                break
+        if _amt2 is not None and (_e["amt"] is None or _amt2 > _e["amt"]):
+            _e["amt"], _e["worst"] = _amt2, tv2
+    if _bus_roll:
+        rule("-")
+        L.append(" THE BUSES TO LOOK AT -- one line per bus, worst first   (%d)"
+                 % len(_bus_roll))
+        L.append(" Every element that fails a criterion, rolled up across the faults"
+                 " it fails in.")
+        rule("-")
+        # NO "NAME" COLUMN. The violations CSV carries the AREA name, not the
+        # bus name, and printing it under a heading of "Name" labelled every
+        # bus in area 534 "SUNC" -- which reads as seven buses that share a
+        # name. The area and its name are one fact and go in one column; the
+        # bus name is not in this file and is not invented here.
+        _bf = " %-10s %-14s %-12s %-22s %-11s %-10s %-8s %s"
+        L.append(_bf % ("Bus", "Area", "Nearest", "Criterion", "Worst",
+                        "Past lim", "Faults", "New with the projects"))
+        L.append(" %s" % ("-" * (W - 2)))
+        for (_b2, fam2), _e in sorted(
+                _bus_roll.items(),
+                key=lambda kv: (-(kv[1]["amt"] or 0.0), -len(kv[1]["faults"]),
+                                str(kv[0][0]))):
+            L.append(_bf % (str(_b2)[:10],
+                            ("%s %s" % (_e["area"] or "-",
+                                        _e["name"] or "")).strip()[:14],
+                            # "-" READ AS "UNKNOWN". It is not: the study
+                            # searched out to its mapped depth and this element
+                            # was not inside it, which is a fact about the
+                            # element -- it is FAR from the fault, and that is
+                            # exactly what a reader is looking for here.
+                            (("at fault" if min(_e["hops"]) == 0 else
+                              "%d hop%s" % (min(_e["hops"]),
+                                            "" if min(_e["hops"]) == 1 else "s"))
+                             if _e["hops"] else "beyond map"),
+                            _FAM_LABEL.get(fam2, fam2)[:22],
+                            _fmt_metric(_e["worst"], _e["unit"])[:11],
+                            ("%+.3f" % _e["amt"]) if _e["amt"] is not None else "-",
+                            len(_e["faults"]),
+                            "YES" if _e["new"] else ""))
+        L.append("")
+        L.append(" Nearest = the FEWEST hops from a faulted bus, over the faults this")
+        L.append("           element fails in -- how close it ever is to a fault.")
+        L.append("           \"beyond map\" = further than the study searched, so far")
+        L.append("           from every fault in this report rather than unknown.")
+        L.append(" Faults  = how many of the faults in this report it fails in.")
+        L.append("")
+
+    L.append(" Flt = how many levels (hops) the element is from the FAULTED BUS of")
+    L.append(" that event. 0 = the faulted bus itself, - = beyond the mapped depth or")
+    L.append(" not in the distance file. Measured on the topology of the case that was")
+    L.append(" run (faults\\FAULT_DISTANCE.csv) -- the same measure the plots carry.")
+    L.append("")
+
+    # WHICH CRITERIA OF A FAULT BELONG IN WHICH TABLE.
+    #
+    # A fault is classified once, but it fails on SEVERAL criteria and they do
+    # not all have the same answer. F02 fails in both cases; the projects broke
+    # its rotor-angle damping, so the fault is listed as introduced -- and the
+    # table then printed every one of its failing criteria under that heading,
+    # including twenty transient overvoltages the BASE case fails harder than
+    # the project case does (base 1.286 pu, project 1.278 pu). Those are
+    # pre-existing by the report's own numbers, and putting them under
+    # "INTRODUCED BY THE PROJECTS" says the projects caused them.
+    #
+    # So the split is by CRITERION, not by fault: the introduced table shows
+    # what is new, the pre-existing table shows the rest of the same fault.
+    def _crit_new(r, c):
+        """Is THIS criterion of this fault the projects' doing?"""
+        return r["class"] == CLS_NEW or c["class"] == CLS_NEW
+
+    def _crit_pre(r, c):
+        return not _crit_new(r, c)
+
+    def table(title, items, note="", keep=None):
+        if keep is not None:
+            # Count -- and title -- only the faults that still have a row to
+            # print once the criteria are split. A heading of (3) over a table
+            # holding one fault is the same lie in smaller type.
+            _kept = []
+            for _x in items:
+                _raw = _failing_crits(_x[1])
+                if not _raw or any(keep(_x[1], c) for c in _raw):
+                    _kept.append(_x)
+            items = _kept
+        if not items:
+            return
+        rule("-")
+        L.append(" %s   (%d)" % (title, len(items)))
+        if note:
+            L.append(" %s" % note)
+        rule("-")
+        # THE SAME ROWS AS THE CSV, aligned. One line per fault, criterion and
+        # element, so what you read here and what you sort in Excel are the
+        # same thing -- and a fault that puts fifty buses over the limit reads
+        # as fifty lines rather than one line and a footnote.
+        # EVERY COLUMN IS PADDED **AND** TRUNCATED.
+        #
+        # "%-7s" only pads. A fault id of eighteen characters -- which every id
+        # in a custom fault list is -- pushed the rest of the row seven columns
+        # to the right of its own heading, so the value under "Bus" was the
+        # element name, the value under "Base" was the bus, and the table could
+        # not be read against its header at all. The width now matches the ids
+        # that are actually written, and anything longer is cut rather than
+        # allowed to shift the row.
+        _rowfmt = (" %-22s %-22s %-13s %-16s %-8s %-6s %-5s %-10s %-10s "
+                   "%-12s %-10s%s")
+        L.append(_rowfmt
+                 % ("Fault", "Criterion", "Measured", "Element", "Bus",
+                    "Area", "Flt", "Base", "Projects", "Limit", "Past lim", ""))
+        L.append(" %s" % ("-" * (W - 2)))
+        for _res, r in items:
+            lim = _res.get("limits") or {}
+            bus_map, flt_map = _dist_maps(_res)
+            fails = _failing_crits(r)
+            _fid_cell = (("%s %s" % (_res["project"], r["fault"])) if _multi
+                         else r["fault"])[:22]
+            if not fails:
+                L.append(" %-7s %-22s %s"
+                         % (_fid_cell, "(no criterion detail)",
+                            "%s -> %s" % (r["vb"] or "-", r["vt"] or "-")))
+                continue
+            if keep is not None:
+                fails = [c for c in fails if keep(r, c)]
+                if not fails:
+                    continue
+            for c in fails:
+                fam = _criterion_family(c["criterion"])
+                what, unit, _noun = _MEASURE.get(fam, ("value", c["unit"], ""))
+                vals = _where_values(r, fam) or _from_detail(c, fam)
+                if not vals:
+                    # NO ELEMENT DETAIL ANYWHERE. Neither the violations report
+                    # nor the criterion's own text named anything. Say "not
+                    # listed" rather than leaving a blank that reads as
+                    # "nowhere".
+                    vals = [("(not listed)", c["mb"], c["mt"])]
+                    shown = vals
+                else:
+                    # 0 = LIST THEM ALL. A cap is a summary, and a summary of a
+                    # violation list is the thing this report exists to stop
+                    # being: 84 buses over the limit is 84 buses to look at.
+                    shown = vals if not ELEM_LINES else vals[:ELEM_LINES]
+                for el, bv, tv in shown:
+                    # SPP: voltage criteria apply to BES buses only -- see
+                    # _is_bes_voltage_row.
+                    if not _is_bes_voltage_row(fam, el):
+                        continue
+                    # THE BASE VALUE EVEN WHEN THE BASE DID NOT VIOLATE.
+                    #
+                    # _where_values() reads the VIOLATIONS lists, and those name
+                    # only what broke a limit -- so a bus at 1.203 pu with the
+                    # projects and 1.19 pu without them printed "-" in the Base
+                    # column, which reads as "not measured" rather than "measured
+                    # and fine". The base study measured that bus; the number is
+                    # in its measurements file. Same on the project side for an
+                    # element that violated only in the base.
+                    if bv is None:
+                        bv = measured_value(res.get("meas_b"), fam,
+                                            r["fault"], el)
+                    if tv is None:
+                        tv = measured_value(res.get("meas_t"), fam,
+                                            r["fault"], el)
+                    # WHERE the element is, on the same line as what it did.
+                    # "530555 exceeded 1.20 pu" is a bus number to go and look
+                    # up; "530555 SANTAFE 345 kV, 2 hops from the POI and at the
+                    # faulted bus" is the finding itself.
+                    bno, hflt = _distance_cells(el, r["fault"], bus_map, flt_map)
+                    # HOW FAR PAST THE LIMIT **THIS ELEMENT** IS, on the
+                    # projects' side. The report already said how far past the
+                    # WORST one was, once per fault, in AT A GLANCE; for every
+                    # other element the reader had the measurement and the
+                    # limit in two adjacent columns and was left to subtract.
+                    # For a recovery, a steady state and a damping ratio that
+                    # subtraction goes a different way each time.
+                    # exceedance() speaks the VIOLATION-KIND vocabulary, not
+                    # the family's -- "undamped" and "tripped", not "angle" and
+                    # "trip". The same translation _worst_crit_of does, for the
+                    # same reason: without it the column blanks for every rotor
+                    # angle in the study, which is most of what a stability
+                    # comparison is about.
+                    _amt, _ = exceedance(
+                        {"angle": "undamped", "trip": "tripped"}.get(fam, fam),
+                        tv, lim)
+                    # AREA, filled from whatever knows it. _WHERE comes from the
+                    # violations list, so it is empty for every element that did
+                    # not violate -- which is most of what this table now shows.
+                    # The measurements carry the area of every MONITORED bus,
+                    # and BUS_MAP.csv carries it for every bus in the case.
+                    _area = _WHERE.get(str(r["fault"]).strip(), {}).get(
+                        str(el).strip())
+                    _area = ((_area[0] if _area else "")
+                             or measured_area(res.get("meas_t"), r["fault"], el)
+                             or measured_area(res.get("meas_b"), r["fault"], el)
+                             or (_bmap_area_text(bno) if bno not in ("", None)
+                                 else ""))
+                    L.append(_rowfmt
+                             % (_fid_cell,
+                                _short_crit(c["criterion"])[:22],
+                                what[:13], str(el)[:16], str(bno)[:8],
+                                str(_area)[:6] or "-",
+                                "-" if hflt == "" else hflt,
+                                _fmt_metric(bv, unit), _fmt_metric(tv, unit),
+                                _limit_text(fam, lim),
+                                ("%+.3f" % _amt) if isinstance(_amt, float)
+                                else "-",
+                                "  NEW" if c["class"] == CLS_NEW else ""))
+                if len(vals) > len(shown):
+                    L.append(" %-7s %-22s ... and %d more"
+                             % ("", "", len(vals) - len(shown)))
+        L.append("")
+
+    # The note has to describe what is actually in the table. When the table
+    # holds only already-failing faults whose criterion the projects broke,
+    # "Passed without the projects, fails with them" is false of every row in
+    # it -- and it is the sentence a reader quotes.
+    if _truly_new and _new_crit:
+        _note = ("%d passed without the projects and fail with them; %d already "
+                 "failed, on a different criterion from the one the projects "
+                 "broke. ONLY the criteria the projects broke are listed here -- "
+                 "the rest of the same fault is under PRE-EXISTING."
+                 % (len(_truly_new), len(_new_crit)))
+    elif _new_crit:
+        _note = ("These faults fail in BOTH cases. They are here because the "
+                 "projects broke a criterion that held in the base case -- and "
+                 "ONLY that criterion is listed here. Everything else the same "
+                 "fault fails is under PRE-EXISTING.")
+    else:
+        _note = "Passed without the projects, fails with them."
+    table("INTRODUCED BY THE PROJECTS -- act on these first", new, _note,
+          keep=_crit_new)
+    # THE SAME FAULT CAN APPEAR IN BOTH TABLES, on different criteria. That is
+    # the fact, not a duplicate: F02's rotor angle is the projects' doing and
+    # F02's twenty overvoltages are the base system's, and one of them being
+    # true does not make the other one go away.
+    table("PRE-EXISTING -- the base system already fails these",
+          pre + _new_crit,
+          "Not caused by the projects, but still a violation of the criteria. "
+          "A fault that also appears above is listed there for the criterion "
+          "the projects broke, and here for the ones they did not.",
+          keep=_crit_pre)
+    table("RESOLVED -- fails without the projects, passes with them", fixed)
+
+    if onesided:
+        rule("-")
+        L.append(" NOT COMPARABLE -- no verdict on one side or both")
+        rule("-")
+        L.append("   state per side: scored | simulated, not scored (score it) | "
+                 "CRASHED = .out but no .done, run stopped part way (see")
+        L.append("   logs\\FAULT_<id>_strt-prog.txt in that results folder) | not run")
+        L.append("")
+        for _res, r in onesided:
+            _rb = (_res.get("dirs") or {}).get("base")
+            _rt = (_res.get("dirs") or {}).get("test")
+            _sb = ("scored " + r["vb"]) if r["vb"] else _side_state_words(_rb, r["fault"])
+            _st = ("scored " + r["vt"]) if r["vt"] else _side_state_words(_rt, r["fault"])
+            L.append("   %-8s base: %-44s projects: %s" % (r["fault"], _sb, _st))
+        L.append("")
+        _cr = sorted(set(r["fault"] for _res, r in onesided
+                         if "CRASHED" in _side_state_words((_res.get("dirs") or {}).get("base"), r["fault"])
+                         or "CRASHED" in _side_state_words((_res.get("dirs") or {}).get("test"), r["fault"])),
+                     key=lambda x: (len(x), x))
+        if _cr:
+            L.append("   crashed on at least one side (%d): %s" % (len(_cr), ", ".join(_cr)))
+            L.append("   These will NOT score until the run finishes. Re-simulating them without")
+            L.append("   changing the event usually crashes again -- read the strt-prog file first.")
+            L.append("")
+
+    if ok:
+        rule("-")
+        L.append(" PASSED IN BOTH CASES (%d)" % len(ok))
+        rule("-")
+        L.append("   " + ", ".join(r["fault"] for _res, r in ok))
+        L.append("")
+
+    if only_base or only_test:
+        rule("-")
+        L.append(" PROJECTS PRESENT IN ONE CASE ONLY")
+        rule("-")
+        if only_base:
+            L.append("   base only: %s" % ", ".join(sorted(only_base)))
+        if only_test:
+            L.append("   projects only: %s" % ", ".join(sorted(only_test)))
+        L.append("")
+
+    if WRITE_XLSX:
+        rule("-")
+        L.append(" WHERE TO LOOK IN COMPARISON_REPORT.xlsx")
+        rule("-")
+        L.append("   1 Summary        one line per fault -- verdict both sides, what to")
+        L.append("                    do about it, the worst criterion and how far past")
+        L.append("                    its limit, and how many elements are over")
+        L.append("   2 Action list    only what the projects introduced. An empty sheet")
+        L.append("                    here is the result you want")
+        L.append("   3 Pre-existing   fails in both cases -- real violations, not caused")
+        L.append("                    by these projects")
+        L.append("   4 Not compared   faults never scored on one side or both. They are")
+        L.append("                    NOT passes: nothing is known about them")
+        L.append("   5 Detail         every element of every failing criterion -- the")
+        L.append("                    record behind the four sheets above")
+        L.append("")
+    rule("-")
+    L.append(" COLOUR KEY (in COMPARISON_REPORT.xlsx)")
+    rule("-")
+    for _st, colour, meaning in _XL_LEGEND:
+        L.append("   %-15s %s" % (colour, meaning))
+    # ---- WHICH BUS, WHICH MACHINE, AND WHICH WAY IT MOVED ----------------
+    #
+    # The tables above are counted in FAULTS: how many the projects broke, how
+    # many they fixed. That is the right headline and it is not enough to act
+    # on -- "three faults got worse" does not say whether it is one weak bus in
+    # three scenarios or three separate problems, and those need different
+    # mitigations. The same roll-up the study writes for one case is done here
+    # across both, so the report names the element and says which side it
+    # violates on.
+    _el = {}
+    for res, r in rows_all:
+        for _kind, _e in (r.get("elements") or {}).items():
+            for _st, _lst, _vals in (("NEW", _e.get("new") or [], _e.get("vt") or {}),
+                                     ("BOTH", _e.get("both") or [], _e.get("vt") or {}),
+                                     ("RESOLVED", _e.get("gone") or [], _e.get("vb") or {})):
+                for _x in _lst:
+                    _rec = _el.setdefault((_kind, str(_x)),
+                                          {"NEW": [], "BOTH": [], "RESOLVED": []})
+                    _rec[_st].append((r["fault"], _vals.get(_x)))
+    if _el:
+        L.append("")
+        rule()
+        L.append(" WHAT THE PROJECTS CHANGED, BY ELEMENT")
+        rule()
+        L.append(" NEW      violates only WITH the projects -- these are the")
+        L.append("          projects' own findings and the ones to act on")
+        L.append(" BOTH     violates in both cases -- pre-existing, and the value")
+        L.append("          shown is the one WITH the projects")
+        L.append(" RESOLVED violated in the base case and no longer does")
+        L.append("")
+        for _st in ("NEW", "BOTH", "RESOLVED"):
+            _rows = [(k, v) for k, v in _el.items() if v[_st]]
+            if not _rows:
+                continue
+            _rows.sort(key=lambda kv: (kv[0][0], -len(kv[1][_st])))
+            L.append(" %s" % _st)
+            L.append(" %-14s %-30s %9s   %s"
+                     % ("criterion", "bus / machine", "scenarios", "worst (where)"))
+            L.append(" " + "-" * 92)
+            for (_kind, _x), _rec in _rows[:60]:
+                _hits = _rec[_st]
+                _vals = [(v, fl) for fl, v in _hits if v is not None]
+                if _vals:
+                    _w = (min(_vals) if _kind == "recovery" else max(_vals))
+                    _worst = "%.4g  (%s)" % (_w[0], _w[1])
+                else:
+                    _worst = "(no value recorded)  (%s)" % _hits[0][0]
+                L.append(" %-14s %-30s %9d   %s"
+                         % (_kind, str(_x)[:30], len(_hits), _worst))
+            if len(_rows) > 60:
+                L.append(" ... and %d more element(s) in this class" % (len(_rows) - 60))
+            L.append("")
+
+    L.append("")
+    rule()
+    L.append(" WHERE EVERYTHING ELSE IS")
+    L.append("   this folder      00_COMPARISON_REPORT   the whole comparison")
+    L.append("                    01_COMPARISON_SUMMARY  one line per project")
+    L.append("                    02_COMPARISON_SPP_TABLE  SPP's appendix columns")
+    L.append("   detail\\          per fault, per criterion and per bus, per")
+    L.append("                    project -- COMPARISON_<proj>_<mode>, its")
+    L.append("                    _CRITERIA and _ELEMENTS files, and the")
+    L.append("                    headroom, sweep and matrix reports")
+    L.append("   Set ONE_REPORT = False to write the per-project files as well.")
+    rule()
+
+    with open(path, "w") as fh:
+        fh.write("\n".join(L) + "\n")
+    print("[compare] -> %s" % path)
+
+    if WRITE_XLSX:
+        try:
+            xp = cmp_path("COMPARISON_REPORT", "xlsx")
+            _detail = _report_rows(results)
+            _sum_all = _summary_rows(results)
+            # SPLIT FROM THE SUMMARY ROWS, not rebuilt from the results: two
+            # builders of the same table drift, and a sheet that disagrees with
+            # the summary beside it is worse than either alone. "ACT" covers
+            # CLS_NEW and the new-criterion-inside-a-pre-existing-failure case,
+            # which is exactly what belongs on an action list.
+            _sum_act = [r for r in _sum_all
+                        if str(r[_SCOL["action"]]).startswith("ACT")]
+            _sum_pre = [r for r in _sum_all
+                        if r[_SCOL["classification"]] == CLS_PRE
+                        and not str(r[_SCOL["action"]]).startswith("ACT")]
+            _notrun = _notrun_rows(results)
+            # DETAIL KEEPS EVERY ROW IT EVER HAD, including the not-compared
+            # ones: it is the record, and a record with rows quietly removed is
+            # worse than a long one. The sheets in front of it are what make it
+            # navigable.
+            # ONE READABLE SET OF TABS, in the order the question is asked:
+            #   1 Summary            one line per fault -- the overview
+            #   2 Project introduces the buses/machines the PROJECT pushed over
+            #                        (element class NEW) -- compact, act on these
+            #   3 Pre-existing       the buses the BASE already fails -- compact
+            #   4 Not compared       scored on one side only
+            #   5 All detail         every element, all 30 columns -- the record
+            # The two middle tabs are the per-bus answer to "what did the project
+            # do", each narrow enough to read across without scrolling, with the
+            # base value, the project value and the seconds over 1.20 side by
+            # side and ONE verdict column.
+            _new_el = _compact_view(_project_caused_rows(_detail))
+            _pre_el = _compact_view(_pre_existing_element_rows(_detail))
+            _poi_rows = _poi_power_rows(results)
+            _sheets = [("1 Summary", _SUMMARY_COLS, _sum_all, _SUMMARY_WIDTHS,
+                        _xl_style_of_summary),
+                       ("2 Project introduces", _COMPACT_COLS, _new_el,
+                        _COMPACT_WIDTHS, _xl_style_compact),
+                       ("3 Pre-existing", _COMPACT_COLS, _pre_el,
+                        _COMPACT_WIDTHS, _xl_style_compact),
+                       ("4 Not compared", _NOTRUN_COLS, _notrun,
+                        _NOTRUN_WIDTHS, _xl_style_of_notrun),
+                       ("5 All detail", _REPORT_COLS, _detail,
+                        _REPORT_WIDTHS, _xl_style_of),
+                       ("6 POI power", _POI_COLS, _poi_rows, _POI_WIDTHS, _xl_style_poi)]
+            write_xlsx_multi(xp, _sheets, legend=_XL_LEGEND,
+                       title_rows=["SPP DYNAMIC STABILITY -- COMPARISON REPORT",
+                                   "base %s" % CASE_BASE["dir"],
+                                   "with the projects %s" % CASE_TEST["dir"],
+                                   "generated %s" % time.strftime("%Y-%m-%d %H:%M"),
+                                   ("scope: %s" % "; ".join(
+                                       [x for x in (", ".join(ONLY_FAULTS),
+                                                    ("events " + ", ".join(ONLY_EVENTS))
+                                                    if ONLY_EVENTS else "") if x]))
+                                   if (ONLY_FAULTS or ONLY_EVENTS) else
+                                   "scope: every fault both cases scored"])
+            print("[compare] -> %s" % xp)
+        except Exception as e:
+            print("[compare] could not write the .xlsx (%s) -- the .csv is unaffected" % e)
+    if WRITE_CSV:
+        cp = cmp_path("COMPARISON_REPORT", "csv")
+        _detail_rows = _report_rows(results)
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(_REPORT_COLS))
+            for row in _detail_rows:
+                w.writerow(_csv_row(row))
+        print("[compare] -> %s" % cp)
+        # THE SAME ROWS, FILTERED TO WHAT THE PROJECTS CAUSED, as a file of
+        # its own next to the summary -- the one to open when the question is
+        # "which buses do we have to answer for".
+        try:
+            _pc = _project_caused_rows(_detail_rows)
+            pp = cmp_path("PROJECT_CAUSED_ELEMENTS", "csv")
+            with csv_open(pp, "w") as fh:
+                w = csv.writer(fh)
+                w.writerow(_csv_row(_REPORT_COLS))
+                for row in _pc:
+                    w.writerow(_csv_row(row))
+            print("[compare] -> %s  (%d element row(s) the projects caused)"
+                  % (pp, len(_pc)))
+        except Exception as _e:
+            print("[compare] could not write PROJECT_CAUSED_ELEMENTS (%s)" % _e)
+    return path
+
+
+def _all_faults(proj, mode):
+    """Every fault the project case scored, in fault-id order.
+
+       The whole list, not just the failures: a sweep is asking what the system
+       does at reduced output, and a fault that passes at full output can fail
+       at a lower one. Sweeping only the failures would never show that."""
+    rt = results_dir(CASE_TEST, proj, mode)
+    ct, _src = read_criteria(rt, proj)
+    return sorted(ct, key=_fault_key)
+
+
+def _failing_faults(proj, mode):
+    """The faults that FAIL in the project case -- the only ones worth sweeping.
+
+       Read from the criteria report rather than the comparison, because a fault
+       that fails in both cases still has a capacity at which it stops failing,
+       and that number is worth having even when the projects did not cause it."""
+    rt = results_dir(CASE_TEST, proj, mode)
+    ct, _src = read_criteria(rt, proj)
+    return [fid for fid in sorted(ct, key=_fault_key)
+            if (ct[fid].get("verdict") or "").upper() == "FAIL"]
+
+
+def _crashed_faults(proj, mode):
+    """The faults the as-studied PROJECT run never finished: an .out on disk
+       and no .done -- the launcher gave up on them after MAX_SCENARIO_ATTEMPTS.
+
+       The set a sweep over solver settings or model constants is really asked
+       about: "which of the ones that would not run, run with this". Read from
+       the markers, not the criteria report, because a crashed scenario has no
+       verdict to read."""
+    rt = results_dir(CASE_TEST, proj, mode)
+    out = []
+    for fid in sorted(_out_faults_in(rt), key=_fault_key):
+        if str(fid).upper().startswith("FLAT"):
+            continue
+        st, _det = _side_state(rt, fid)
+        if st == "crashed":
+            out.append(fid)
+    return out
+
+
+# ============================================================================
+# THE CAPACITY LEVEL AS A SECOND AXIS
+# ============================================================================
+# The .dyr sweep and the project-off run used to be one-dimensional: both were
+# launched from the baseline dispatch and nothing crossed them with the
+# capacity levels. So results\ held
+#
+#   SantaFe_custom              baseline, 100 %
+#   SantaFe_custom_cap50        50 %, panel .dyr
+#   SantaFe_custom_dyr_Kqv2     100 %, Kqv = 2
+#
+# and no answer at all to "what does Kqv = 2 do AT 50 % OUTPUT" -- which is the
+# question when the mitigation on the table is a retune and a curtailment
+# together.
+#
+# With SWEEP_AT_CAPACITY_LEVELS the whole set is repeated at every level:
+#
+#   SantaFe_custom_cap50_dyr_Kqv2       50 %, Kqv = 2
+#
+# The launcher already names folders this way -- _study_results_subdir()
+# appends SPP_CAP_TAG and then SPP_RUN_TAG -- so nothing in z_lch_*.py changes.
+#
+# THE PROJECT-OFF RUN IS NOT REPEATED PER LEVEL, and that is deliberate rather
+# than an omission. Its machines are OUT OF SERVICE: scaling an out-of-service
+# machine to 50 % of its dispatch changes nothing at all, so a
+# ..._cap50_proj_off folder would hold a bit-for-bit repeat of ..._proj_off at
+# the cost of a whole study. Project off IS the 0 % row of the capacity axis --
+# the row CAPACITY_LEVELS cannot produce, because 0.0 there scales the dispatch
+# to zero while leaving the machines in service and still regulating.
+#
+# COST IS MULTIPLICATIVE, and that is the whole reason this is a switch rather
+# than the default behaviour. Two projects, three .dyr values and one extra
+# capacity level is SIX further complete studies; the count is printed before
+# any of them starts.
+
+
+def _sweep_resume_env():
+    """SPP_SKIP_DONE / SPP_FRESH_START for a sweep run, from SWEEP_SKIP_DONE.
+
+       EVERY SWEEP RUN USED TO RE-SIMULATE, unconditionally: the three functions
+       that launch one -- run_dyr_sweep, run_capacity_sweep, run_project_off --
+       each wrote SPP_SKIP_DONE = "0" with the comment "a fresh folder per value
+       has no .done markers to skip".
+
+       That was true the first time and false every time after it. A second
+       launch with the same DYR_SWEEP re-runs Kqv = 2 from nothing although
+       results\\<proj>_<mode>_dyr_Kqv2 is sitting there complete -- and at three
+       faults of a quarter-hour each, across two projects and two capacity
+       levels, that is hours spent reproducing verdicts already on disk.
+
+       WHY IT WAS FORCED OFF, and what to watch. The launcher's ALL_DONE_w*.flag
+       sentinels once made a swept value build its snapshot, run the flat run,
+       SKIP EVERY FAULT and score a report containing FLAT_RUN and nothing else
+       -- the column of "?" a sweep table used to show. That was a folder
+       mismatch (the launcher watched the untagged folder while the study wrote
+       the tagged one) and it is fixed; skipping is now safe in the sense that
+       it skips real, finished scenarios.
+
+       WHAT IT STILL CANNOT SEE. The folder name records the SWEPT VALUE and
+       nothing else. It does not record the collector impedance, the fault list,
+       the simulation lengths or the panel's other .dyr edits, so a resumed run
+       reuses scenarios whose OTHER settings may not be this launch's. Each run
+       writes DYR_EDITS.txt and COLLECTOR_IMPEDANCE.txt into its folder and
+       ALL_RUNS_<proj>_<mode>.txt prints both per run -- check them, or set this
+       False, when anything but the swept value has changed."""
+    return {"SPP_SKIP_DONE": "1" if SWEEP_SKIP_DONE else "0",
+            "SPP_FRESH_START": "0"}
+
+
+def _cap_levels():
+    """[(tag, scale)] -- every capacity level a sweep should be repeated at.
+
+       ("", None) is the baseline: full output, no scaling, the folder with no
+       _capNN in its name. It is ALWAYS first, so a run whose extra levels fail
+       still has the ordinary sweep beside it.
+
+       1.0 in CAPACITY_LEVELS is the baseline under another name -- the capacity
+       sweep itself reads it off the main folder rather than re-running it -- so
+       it is not repeated here either."""
+    out = [("", None)]
+    if not (SWEEP_AT_CAPACITY_LEVELS and CAPACITY_LEVELS):
+        return out
+    for lv in sorted(set(float(x) for x in CAPACITY_LEVELS), reverse=True):
+        if abs(lv - 1.0) < 1e-9:
+            continue                       # that IS the baseline row above
+        out.append(("%d" % round(lv * 100), lv))
+    return out
+
+
+def _cap_suffix(cap_tag):
+    """The folder suffix one capacity level contributes: "" or "_cap50"."""
+    return ("_cap%s" % cap_tag) if cap_tag else ""
+
+
+def _cap_env(cap_tag, cap_scale):
+    """The environment a study needs to run at one capacity level."""
+    if not cap_tag:
+        return {}
+    return {"SPP_CAP_SCALE": repr(float(cap_scale)), "SPP_CAP_TAG": str(cap_tag)}
+
+
+def _cap_label(cap_tag):
+    """"100 %" or "50 %" -- what the rows of that run should say."""
+    return ("%s %%" % cap_tag) if cap_tag else "100 %"
+
+
+def _cap_note(cap_tag):
+    """" at 50 % output" for a banner, or "" at full output."""
+    return (" at %s output" % _cap_label(cap_tag)) if cap_tag else ""
+
+
+def surplus_scenarios():
+    """The SURPLUS_SCENARIOS rows, checked, or [] when the feature is off."""
+    out = []
+    for i, sc in enumerate(SURPLUS_SCENARIOS or []):
+        if not isinstance(sc, dict):
+            print("[surplus] SURPLUS_SCENARIOS[%d] is not a table -- skipped" % i)
+            continue
+        tag = str(sc.get("tag") or "").strip()
+        if not tag:
+            print("[surplus] SURPLUS_SCENARIOS[%d] has no tag -- skipped" % i)
+            continue
+        out.append({"tag": tag,
+                    "label": str(sc.get("label") or tag),
+                    "egf_off": bool(sc.get("egf_off")),
+                    "poi_mw": sc.get("poi_mw")})
+    return out
+
+
+def _surplus_env(sc):
+    """The environment one scenario is run under."""
+    env = {"SPP_RUN_TAG": sc["tag"],
+           "SPP_EGF_OFF": "1" if sc["egf_off"] else "0"}
+    if sc.get("poi_mw") is not None:
+        env["SPP_POI_P_TARGET"] = repr(float(sc["poi_mw"]))
+    return env
+
+
+def run_surplus_scenarios(proj, mode):
+    """Run the project case once per SPP surplus scenario.
+
+       BP-7250 7.6 asks for the SGF at 100 % with the EGF OFF, and for the SGF
+       at 100 % with the EGF set so the POI carries the EGF's Interconnection
+       Service amount. They are two systems, not two readings of one, so each
+       gets its own run and its own results folder -- and neither overwrites the
+       main run, which is whatever POI_P_TARGET_MW says on its own."""
+    scs = surplus_scenarios()
+    if not scs:
+        return
+    for sc in scs:
+        _banner("SURPLUS SCENARIO %s -- %s" % (sc["tag"], sc["label"]))
+        env = _surplus_env(sc)
+        env.update(_sweep_resume_env())
+        print("[surplus] %s" % "  ".join("%s=%s" % kv for kv in sorted(env.items())
+                                         if kv[0].startswith("SPP_")))
+        rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
+        if rc not in (0, None):
+            print("[surplus] the %s run ended with rc=%s -- reading whatever it "
+                  "scored" % (sc["tag"], rc))
+
+
+def compare_surplus_scenarios(proj, mode):
+    """One full comparison per surplus scenario, each in its own folder."""
+    for sc in surplus_scenarios():
+        suffix = "_%s" % sc["tag"]
+        rt = results_dir(CASE_TEST, proj, mode) + suffix
+        if not os.path.isdir(rt):
+            print("[surplus] no results for %s (%s) -- no comparison written"
+                  % (sc["tag"], rt))
+            continue
+        try:
+            res = compare_project(proj, mode, test_suffix=suffix)
+        except Exception as e:
+            print("[surplus] could not compare %s (%s)" % (sc["tag"], e))
+            continue
+        with _cmp_into(proj if COMPARE_BY_PROJECT else "", sc["tag"]):
+            _banner("SURPLUS SCENARIO %s -- %s -- %s (%s)"
+                    % (sc["tag"], sc["label"], proj, mode))
+            # WHICH SCENARIO THIS IS, in every row. The two differ by whether
+            # the existing plant is in service, and the folder name is the only
+            # other thing that says so -- gone the moment a sheet is filtered or
+            # a table is pasted into a mail.
+            _RUN_OUTPUT[0] = sc["label"]
+            try:
+                if ONE_REPORT:
+                    write_one_report([res], [], [])
+                else:
+                    write_summary([res], [], [])
+                    write_project_report(res)
+                    write_project_csv(res)
+                    write_elements(res)
+                write_spp_event_tables([res])
+                if not SIMPLE_OUTPUT:
+                    write_runtime_comparison(proj, mode, test_suffix=suffix)
+            except Exception as e:
+                print("[surplus] the %s comparison could not be written (%s)"
+                      % (sc["tag"], e))
+            finally:
+                _RUN_OUTPUT[0] = ""
+
+
+def run_capacity_sweep(proj, mode):
+    """Re-run the failing faults at each CAPACITY_LEVELS scale, and report the
+       highest scale at which each one passes.
+
+       Returns [(fault, {scale: verdict}, highest passing scale or None)]."""
+    if (CAPACITY_FAULTS or "all").strip().lower() == "failing":
+        fails = _failing_faults(proj, mode)
+        what = "failing fault(s)"
+    else:
+        fails = _all_faults(proj, mode)
+        what = "fault(s) (every one, not just the failing ones)"
+    if not fails:
+        print("[capacity] %s %s: nothing to sweep -- the project case scored no fault"
+              % (proj, mode))
+        return []
+    print("[capacity] %s %s: %d %s to sweep: %s"
+          % (proj, mode, len(fails), what, ", ".join(fails[:12])
+             + (" ..." if len(fails) > 12 else "")))
+
+    levels = sorted(set(float(x) for x in CAPACITY_LEVELS), reverse=True)
+    per_level = {}
+    for lv in levels:
+        tag = "%d" % round(lv * 100)
+        # 100 % IS THE STUDY THAT HAS ALREADY RUN. Re-running it costs a full
+        # build and every failing fault to reproduce a verdict already on disk,
+        # and it would not even reproduce it exactly: scaling pins PMAX to the
+        # present dispatch, so a case that would otherwise redispatch the
+        # project machines solves differently. Read instead.
+        if abs(lv - 1.0) < 1e-9:
+            rdir = results_dir(CASE_TEST, proj, mode)
+            ct, _src = read_criteria(rdir, proj)
+            print("[capacity] 100 %% -- taken from the study already run (%s), not re-run"
+                  % rdir)
+            per_level[lv] = dict((f, (ct.get(f, {}).get("verdict") or "?").upper())
+                                 for f in fails)
+            continue
+        _banner("CAPACITY %s%% -- re-running %d failing fault(s)" % (tag, len(fails)))
+        env = {"SPP_CAP_SCALE": repr(lv), "SPP_CAP_TAG": tag}
+        env.update(_sweep_resume_env())
+        if (CAPACITY_FAULTS or "all").strip().lower() == "failing":
+            # Restrict the run to the failing ids. Left unset the study runs its
+            # whole list, which is what "all" means -- and is also why "all" is
+            # not just a filter on the report: the .out files have to exist.
+            env["SPP_ONLY_FAULTS"] = ",".join(fails)
+            env.pop("SPP_REPORT_FAULTS", None)     # see run_dyr_sweep: a subset folder's FULL report is the right one
+        rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
+        if rc not in (0, None):
+            print("[capacity] the %s%% run ended with rc=%s -- reading whatever it scored"
+                  % (tag, rc))
+        rdir = os.path.join(_res_root(CASE_TEST),
+                            "%s_%s_cap%s" % (proj, mode, tag))
+        ct, _src = read_criteria(rdir, proj)
+        if not ct:
+            print("[capacity] *** the %s%% run produced no criteria report (%s)"
+                  % (tag, rdir))
+        per_level[lv] = dict((f, (ct.get(f, {}).get("verdict") or "?").upper())
+                             for f in fails)
+
+    rows = []
+    for f in fails:
+        by = dict((lv, per_level[lv].get(f, "?")) for lv in levels)
+        # THE HIGHEST LEVEL THAT PASSES, not the first: the levels are walked
+        # from the top down, and a fault that passes at 75 % and fails at 50 %
+        # is not a physical impossibility -- it is a sign the sweep is too
+        # coarse or the case is doing something else -- so the answer is the
+        # highest PASS and the whole row is printed beside it.
+        best = None
+        for lv in levels:
+            if by.get(lv) == "PASS":
+                best = lv
+                break
+        rows.append((f, by, best))
+    return rows
+
+
+def _poi_target_for(proj):
+    """This project's own POI total in MW, or None."""
+    t = POI_P_TARGET_MW
+    if isinstance(t, dict):
+        t = t.get(proj)
+    try:
+        return float(t) if t else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _poi_levels(proj=None):
+    """The POI totals this launch runs for `proj`, highest first. [] = off.
+
+       POI_P_LEVELS is absolute MW and applies to every project. POI_P_LEVELS_PCT
+       is a percentage of THIS project's POI_P_TARGET_MW, so one line covers
+       projects whose interconnections differ by a factor of five. Both may be
+       set; the two are merged."""
+    out = []
+    for x in (POI_P_LEVELS or []):
+        try:
+            out.append(float(x))
+        except (TypeError, ValueError):
+            print("[poi-p] POI_P_LEVELS holds %r, which is not a number -- ignored" % x)
+    pcts = list(POI_P_LEVELS_PCT or [])
+    if pcts:
+        base = _poi_target_for(proj)
+        if base is None:
+            # Refusing here rather than guessing: a percentage of an unknown
+            # total is not a number, and silently skipping the level would run
+            # the sweep with fewer points than were asked for and say nothing.
+            print("[poi-p] POI_P_LEVELS_PCT is set but %s has no POI_P_TARGET_MW "
+                  "-- no percentage levels for it" % (proj or "this project"))
+        else:
+            for x in pcts:
+                try:
+                    f = float(x)
+                except (TypeError, ValueError):
+                    print("[poi-p] POI_P_LEVELS_PCT holds %r, which is not a "
+                          "number -- ignored" % x)
+                    continue
+                # 0.2 and 20 both mean 20 %.
+                frac = f / 100.0 if f > 1.0 else f
+                if not (0.0 < frac <= 1.5):
+                    print("[poi-p] POI_P_LEVELS_PCT %r is outside 0..150 %% "
+                          "-- ignored" % x)
+                    continue
+                out.append(base * frac)
+    # Round to whole MW before de-duplicating: the folder name is whole MW
+    # (_poi_tag), so two levels that round to the same MW would be two runs
+    # writing into one folder, the second overwriting the first.
+    return sorted(set(round(v) for v in out), reverse=True)
+
+
+def _poi_is_baseline(proj, mw):
+    """True when this POI level IS the study already run at POI_P_TARGET_MW.
+
+       POI_P_LEVELS_PCT = [100, 30] asks for 100 % of the project's own POI
+       total -- which is the baseline dispatch, exactly. Running it again is a
+       complete second study (97 faults, a build, and the better part of two
+       days for SantaFe) to reproduce verdicts already on disk, and it would not
+       even reproduce them exactly: the level run pins the POI with
+       SPP_POI_P_TARGET, so a case that would otherwise settle elsewhere solves
+       differently.
+
+       The capacity sweep has always skipped its own 1.0 level for this reason
+       and read the baseline folder instead. This is the same rule for the POI
+       sweep, which did not have it."""
+    t = _poi_target_for(proj)
+    if t is None:
+        return False
+    return abs(float(mw) - float(t)) < 0.5      # levels are whole MW
+
+
+def _poi_tag(mw):
+    """"poi1000" -- the results-folder suffix for one POI level."""
+    return "poi%d" % int(round(float(mw)))
+
+
+def run_poi_p_sweep(proj, mode):
+    """One COMPLETE study per POI_P_LEVELS entry, each in its own folder.
+
+       Every level is a full run -- build, flat, every fault -- because the POI
+       total changes the DISPATCH of the whole area, not just the project: the
+       existing machines at the plant move, and every other machine in the area
+       moves with them to hold the area total. Nothing about that can be read
+       off a study run at a different level.
+
+       Returns [(fault, {mw: verdict}, the levels that PASS)]."""
+    levels = _poi_levels(proj)
+    if not levels:
+        return [], []
+    if (POI_P_FAULTS or "all").strip().lower() == "failing":
+        faults = _failing_faults(proj, mode)
+        what = "failing fault(s)"
+    else:
+        faults = _all_faults(proj, mode)
+        what = "fault(s) (every one, not just the failing ones)"
+    if not faults:
+        print("[poi-p] %s %s: nothing to sweep -- the project case scored no fault"
+              % (proj, mode))
+        return [], []
+    print("[poi-p] %s %s: %d POI level(s) x %d %s"
+          % (proj, mode, len(levels), len(faults), what))
+    per_level = {}
+    for mw in levels:
+        tag = _poi_tag(mw)
+        if _poi_is_baseline(proj, mw):
+            rdir = results_dir(CASE_TEST, proj, mode)
+            ct, _src = read_criteria(rdir, proj)
+            print("[poi-p] %.0f MW IS the study already run (POI_P_TARGET_MW) -- "
+                  "read from %s, not re-run" % (mw, rdir))
+            if not ct:
+                print("[poi-p]   *** that folder has no criteria report yet, so this "
+                      "level has no verdicts. It fills in once the baseline run "
+                      "has scored.")
+            per_level[mw] = dict((f, (ct.get(f, {}).get("verdict") or "?").upper())
+                                 for f in faults)
+            continue
+        _banner("POI TOTAL %.0f MW -- %s (area held at its original total)" % (mw, proj))
+        env = {"SPP_POI_P_TARGET": repr(float(mw)),
+               "SPP_RUN_TAG": tag}
+        env.update(_sweep_resume_env())
+        if (POI_P_FAULTS or "all").strip().lower() == "failing":
+            env["SPP_ONLY_FAULTS"] = ",".join(faults)
+            env.pop("SPP_REPORT_FAULTS", None)     # see run_dyr_sweep: a subset folder's FULL report is the right one
+        rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
+        if rc not in (0, None):
+            print("[poi-p] the %.0f MW run ended with rc=%s -- reading whatever it scored"
+                  % (mw, rc))
+        rdir = os.path.join(_res_root(CASE_TEST),
+                            "%s_%s_%s" % (proj, mode, tag))
+        ct, _src = read_criteria(rdir, proj)
+        if not os.path.isdir(rdir):
+            print("[poi-p] *** %.0f MW: no results folder at all (%s) -- the run did "
+                  "not start ***" % (mw, rdir))
+        elif not ct:
+            print("[poi-p] *** the %.0f MW run produced no criteria report (%s) ***"
+                  % (mw, rdir))
+            _tail_log(rdir)
+        per_level[mw] = dict((f, (ct.get(f, {}).get("verdict") or "?").upper())
+                             for f in faults)
+    rows = []
+    for f in faults:
+        by = dict((mw, per_level.get(mw, {}).get(f, "?")) for mw in levels)
+        passing = [mw for mw in levels if by.get(mw) == "PASS"]
+        rows.append((f, by, passing))
+    return rows, levels
+
+
+def _project_mw_levels(proj):
+    """The sizes this project is studied at, lowest first. [] = not a sweep.
+
+       PROJECT_MW names ONE size per project. A list means several, and each is
+       a COMPLETE study -- build, flat, every fault -- because the plant's rating
+       changes the dispatch of the whole area, not just the plant: the existing
+       machines at the POI make up whatever is left of the POI total, and every
+       other machine in the area moves to hold the area where it was. Nothing
+       about the 604 MW study can be read off the 769 MW one."""
+    want = (PROJECT_MW or {}).get(proj)
+    if not isinstance(want, (list, tuple)):
+        return []
+    out = []
+    for x in want:
+        try:
+            out.append(float(x))
+        except (TypeError, ValueError):
+            print("[mw] PROJECT_MW[%r] holds %r, which is not a number -- ignored"
+                  % (proj, x))
+    return sorted(set(out))
+
+
+def _mw_tag(mw):
+    """"mw604" -- the results-folder suffix for one project size."""
+    return "mw%d" % int(round(float(mw)))
+
+
+def run_project_mw_sweep(proj, mode):
+    """One COMPLETE study per size in PROJECT_MW[proj], each in its own folder.
+
+       This is EmpirePrairie's two scenarios: the plant at 604 MW, and the plant
+       at its full 769 MW -- which is also the POI total, so at that size the
+       BESS fills the interconnection on its own and the existing machines sit
+       at zero.
+
+       Returns [(fault, {mw: verdict}, the sizes that PASS)]."""
+    levels = _project_mw_levels(proj)
+    if not levels:
+        return [], []
+    faults = _all_faults(proj, mode)
+    if not faults:
+        print("[mw] %s %s: nothing to sweep -- the project case scored no fault"
+              % (proj, mode))
+        return [], []
+    print("[mw] %s %s: %d size(s) x %d fault(s) -- one complete study per size"
+          % (proj, mode, len(levels), len(faults)))
+    per_level = {}
+    for mw in levels:
+        tag = _mw_tag(mw)
+        _banner("%s AT %.0f MW -- a complete study (area held at its original total)"
+                % (proj, mw))
+        env = {"SPP_ACTIVE_MW": json.dumps({proj: mw}),
+               "SPP_RUN_TAG": tag}
+        env.update(_sweep_resume_env())
+        rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
+        if rc not in (0, None):
+            print("[mw] the %.0f MW run ended with rc=%s -- reading whatever it scored"
+                  % (mw, rc))
+        rdir = os.path.join(_res_root(CASE_TEST),
+                            "%s_%s_%s" % (proj, mode, tag))
+        ct, _src = read_criteria(rdir, proj)
+        if not os.path.isdir(rdir):
+            print("[mw] *** %.0f MW: no results folder at all (%s) -- the run did "
+                  "not start ***" % (mw, rdir))
+        elif not ct:
+            print("[mw] *** the %.0f MW run produced no criteria report (%s) ***"
+                  % (mw, rdir))
+            _tail_log(rdir)
+        per_level[mw] = dict((f, (ct.get(f, {}).get("verdict") or "?").upper())
+                             for f in faults)
+    rows = []
+    for f in faults:
+        by = dict((mw, per_level.get(mw, {}).get(f, "?")) for mw in levels)
+        passing = [mw for mw in levels if by.get(mw) == "PASS"]
+        rows.append((f, by, passing))
+    return rows, levels
+
+
+def write_project_mw_table(proj, mode, rows, levels, path):
+    """PROJECT_MW_LEVELS.txt -- one row per fault, one column per plant size.
+
+       The question this answers is the one the sizes were chosen to ask: which
+       events the plant passes at 604 MW and fails at 769, i.e. what the last
+       165 MW costs."""
+    if not rows:
+        return ""
+    try:
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with open(path, "w") as fh:
+            fh.write("=" * 78 + "\n")
+            fh.write(" %s -- %s : one COMPLETE study per plant size\n" % (proj, mode))
+            fh.write("=" * 78 + "\n\n")
+            fh.write("%-16s %s\n" % ("fault",
+                                     "  ".join("%8s" % ("%d MW" % mw) for mw in levels)))
+            fh.write("-" * 78 + "\n")
+            for f, by, passing in rows:
+                fh.write("%-16s %s\n"
+                         % (f, "  ".join("%8s" % by.get(mw, "?") for mw in levels)))
+            fh.write("\n")
+            _worse = [f for f, by, _p in rows
+                      if by.get(levels[0]) == "PASS" and by.get(levels[-1]) != "PASS"]
+            if _worse:
+                fh.write("PASSES AT %d MW AND NOT AT %d MW -- what the extra %d MW costs:\n"
+                         % (levels[0], levels[-1], levels[-1] - levels[0]))
+                for f in _worse:
+                    fh.write("   %s\n" % f)
+            else:
+                fh.write("Every fault gives the same verdict at every size.\n")
+        print("[mw] %s" % path)
+        return path
+    except Exception as e:
+        print("[mw] could not write %s (%s)" % (path, e))
+        return ""
+
+
+def write_poi_p_table(proj, mode, rows, levels, path):
+    """POI_P_LEVELS.txt -- one row per fault, one column per POI total."""
+    if not rows:
+        return
+    try:
+        with open(path, "w") as fh:
+            fh.write("TOTAL P AT THE POI -- %s %s\n" % (proj, mode))
+            fh.write("written %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            fh.write("the area total is held at its pre-project value at every level,\n")
+            fh.write("so each column differs from the base case by the project alone\n")
+            fh.write("=" * (24 + 12 * len(levels)) + "\n")
+            fh.write("%-22s" % "fault")
+            for mw in levels:
+                fh.write("%11s" % ("%.0f MW" % mw))
+            fh.write("   highest PASS\n")
+            fh.write("-" * (24 + 12 * len(levels)) + "\n")
+            for f, by, passing in rows:
+                fh.write("%-22s" % f)
+                for mw in levels:
+                    fh.write("%11s" % by.get(mw, "?"))
+                fh.write("   %s\n" % (("%.0f MW" % max(passing)) if passing else "none"))
+            fh.write("=" * (24 + 12 * len(levels)) + "\n")
+            fh.write("'?' = no verdict: the run did not happen, or it scored only the "
+                     "flat run.\n")
+        print("[poi-p] %s" % path)
+    except Exception as e:
+        print("[poi-p] could not write %s (%s)" % (path, e))
+
+
+def write_poi_p_comparisons(proj, mode):
+    """A FULL comparison per POI level, each in its own folder.
+
+       The level table answers "does it pass at 1000 MW". This answers "what is
+       still violating, at which bus, how far past the limit" -- the same
+       reports and spreadsheets as the main study, against the same base case.
+
+       Built the same way as write_capacity_comparisons(); the only difference
+       is the folder suffix and the label carried into the rows."""
+    for mw in _poi_levels(proj):
+        if _poi_is_baseline(proj, mw):
+            print("[poi-p] %.0f MW is the baseline dispatch -- the main comparison "
+                  "already covers it, no second copy written" % mw)
+            continue
+        tag = _poi_tag(mw)
+        suffix = "_%s" % tag
+        rt = results_dir(CASE_TEST, proj, mode) + suffix
+        if not os.path.isdir(rt):
+            print("[poi-p] no results at %.0f MW (%s) -- no comparison written"
+                  % (mw, rt))
+            continue
+        try:
+            res = compare_project(proj, mode, test_suffix=suffix)
+        except Exception as e:
+            print("[poi-p] could not compare the %.0f MW run (%s)" % (mw, e))
+            continue
+        with _cmp_into(proj if COMPARE_BY_PROJECT else "", tag):
+            _banner("COMPARISON AT %.0f MW TOTAL AT THE POI -- %s (%s)"
+                    % (mw, proj, mode))
+            # WHICH RUN THIS IS, in the rows -- the folder name is otherwise the
+            # only thing that says 1000 MW, and it is gone the moment a sheet is
+            # filtered or a table is pasted into a mail.
+            _RUN_OUTPUT[0] = "%.0f MW at POI" % mw
+            try:
+                if ONE_REPORT:
+                    write_one_report([res], [], [])
+                else:
+                    write_summary([res], [], [])
+                    write_project_report(res)
+                    write_project_csv(res)
+                    write_elements(res)
+                write_spp_event_tables([res])
+                if not SIMPLE_OUTPUT:
+                    write_runtime_comparison(proj, mode, test_suffix=suffix)
+            except Exception as e:
+                print("[poi-p] the %.0f MW comparison could not be written (%s)"
+                      % (mw, e))
+            finally:
+                _RUN_OUTPUT[0] = ""
+
+
+def write_capacity_comparisons(proj, mode):
+    """A FULL comparison per capacity level, each in its own folder.
+
+       The headroom table answers "does it pass at 50 %". This answers "what is
+       still violating, at which bus, how far past the limit" -- the same report,
+       spreadsheet and element detail as the main study, against the same base
+       case."""
+    for lv in sorted(set(float(x) for x in CAPACITY_LEVELS), reverse=True):
+        tag = "%d" % round(lv * 100)
+        if abs(lv - 1.0) < 1e-9:
+            continue          # that comparison IS the main one, already written
+        suffix = "_cap%s" % tag
+        rt = results_dir(CASE_TEST, proj, mode) + suffix
+        if not os.path.isdir(rt):
+            print("[capacity] no results at %s%% (%s) -- no comparison written"
+                  % (tag, rt))
+            continue
+        try:
+            res = compare_project(proj, mode, test_suffix=suffix)
+        except Exception as e:
+            print("[capacity] could not compare the %s%% run (%s)" % (tag, e))
+            continue
+        with _cmp_into(proj if COMPARE_BY_PROJECT else "", "cap%s" % tag):
+            _banner("COMPARISON AT %s%% PROJECT OUTPUT -- %s (%s)" % (tag, proj, mode))
+            # WHICH RUN THIS IS, in the rows. Every level's report is otherwise
+            # identical apart from the numbers, and the folder name is the only
+            # thing that says 75 % -- gone as soon as a sheet is filtered or a
+            # table is pasted into a mail.
+            _RUN_OUTPUT[0] = "%s %%" % tag
+            try:
+                if ONE_REPORT:
+                    write_one_report([res], [], [])
+                else:
+                    write_summary([res], [], [])
+                    write_project_report(res)
+                    write_project_csv(res)
+                    write_elements(res)
+                # THE SAME REPORTS AS ANY OTHER RUN. A level being considered as
+                # the answer has to be presentable without re-running anything.
+                write_spp_event_tables([res])
+                if not SIMPLE_OUTPUT:
+                    write_runtime_comparison(proj, mode, test_suffix=suffix)
+            except Exception as e:
+                print("[capacity] the %s%% comparison could not be written (%s)" % (tag, e))
+            finally:
+                _RUN_OUTPUT[0] = ""
+
+
+def write_capacity_plot(proj, mode, rows):
+    """CAPACITY_HEADROOM_<proj>_<mode>.pdf -- the headroom table as a picture.
+
+       The table already holds the answer; it is just hard to see in a column of
+       PASS/FAIL. Two views, one page:
+
+         TOP    a grid, one row per fault and one column per output level, green
+                where it complies and red where it does not, with a marker on
+                the HIGHEST level that passes. Reading across a row gives the
+                output at which that fault stops violating; reading down a
+                column gives everything still violating at that output.
+
+         BOTTOM how many faults are still violating at each level. This is the
+                curve that answers "where do the violations stop" for the study
+                as a whole -- and it is the one that shows a fault which passes
+                at full output and FAILS lower down, because the count does not
+                fall monotonically when that happens.
+
+       Nothing here re-reads a .out or re-scores anything: it draws the same
+       rows the table is written from, so the two can never disagree."""
+    if not rows:
+        return ""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        # patches EXPLICITLY. "import matplotlib" does not bring in
+        # matplotlib.patches; it only appears to because matplotlib.figure
+        # imports it as a side effect. Relying on that works until a version
+        # where it does not, and then this raises AttributeError at draw time
+        # rather than at import.
+        from matplotlib.patches import Rectangle
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.backends.backend_pdf import PdfPages
+    except Exception as e:
+        print("[capacity] no matplotlib here (%s) -- the headroom TABLE is still "
+              "written, only the plot is skipped" % e)
+        return ""
+    levels = sorted(set(float(x) for x in CAPACITY_LEVELS), reverse=True)
+    if not levels:
+        return ""
+
+    def _passed(v):
+        """True/False/None from a verdict cell, whatever spelling it uses."""
+        t = str(v or "").strip().upper()
+        if not t or t == "?":
+            return None
+        if t.startswith("PASS") or t in ("OK", "COMPLIANT"):
+            return True
+        if t.startswith("FAIL") or t.startswith("VIOL") or t == "NO":
+            return False
+        return None
+
+    path = os.path.join(cmp_detail(),
+                        "CAPACITY_HEADROOM_%s_%s.pdf" % (proj, mode))
+    tmp = path + ".part"
+    n = len(rows)
+    # One page, however many faults: the grid row height shrinks instead of the
+    # page growing, because a headroom chart nobody can see whole is no use.
+    fig = Figure(figsize=(11.0, 8.5))
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([0.13, 0.34, 0.80, 0.56])
+    ax2 = fig.add_axes([0.13, 0.08, 0.80, 0.17])
+    for yi, (f, by, best) in enumerate(rows):
+        for xi, lv in enumerate(levels):
+            ok = _passed(by.get(lv))
+            col = "#cfe8cf" if ok else ("#f3c6c6" if ok is False else "#e8e8e8")
+            ax.add_patch(Rectangle(
+                (xi - 0.5, yi - 0.5), 1.0, 1.0, facecolor=col,
+                edgecolor="white", linewidth=0.6))
+        if best is not None and float(best) in levels:
+            ax.plot([levels.index(float(best))], [yi], marker="o", markersize=4.5,
+                    markerfacecolor="none", markeredgecolor="#1b7a3d",
+                    markeredgewidth=1.2)
+    ax.set_xlim(-0.5, len(levels) - 0.5)
+    ax.set_ylim(n - 0.5, -0.5)
+    ax.set_xticks(range(len(levels)))
+    ax.set_xticklabels(["%.0f%%" % (lv * 100) for lv in levels], fontsize=8)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels([r[0] for r in rows],
+                       fontsize=max(3.5, min(8.0, 340.0 / max(1, n))))
+    ax.set_xlabel("project output", fontsize=9)
+    ax.set_title("%s (%s) -- compliance at each output level\n"
+                 "green = compliant, red = violating, grey = not tested;  "
+                 "circle = highest compliant output"
+                 % (proj, mode), fontsize=9)
+    ax.tick_params(length=0)
+
+    fails = []
+    for lv in levels:
+        fails.append(sum(1 for _f, by, _b in rows if _passed(by.get(lv)) is False))
+    ax2.plot(range(len(levels)), fails, marker="o", color="#b00020", lw=1.4)
+    for xi, c in enumerate(fails):
+        ax2.annotate("%d" % c, (xi, c), textcoords="offset points",
+                     xytext=(0, 5), ha="center", fontsize=7)
+    ax2.set_xlim(-0.5, len(levels) - 0.5)
+    ax2.set_ylim(-0.5, max(1, max(fails)) * 1.35)
+    ax2.set_xticks(range(len(levels)))
+    ax2.set_xticklabels(["%.0f%%" % (lv * 100) for lv in levels], fontsize=8)
+    ax2.set_ylabel("faults\nviolating", fontsize=8)
+    ax2.set_xlabel("project output", fontsize=9)
+    ax2.grid(True, ls=":", alpha=0.45)
+    ax2.tick_params(labelsize=7)
+    _never = sum(1 for _f, _by, b in rows if b is None)
+    ax2.set_title("how many faults are still violating at each output"
+                  + ("   (%d never comply at any level tested)" % _never
+                     if _never else ""), fontsize=8.5)
+    try:
+        with PdfPages(tmp) as pdf:
+            pdf.savefig(fig)
+        os.replace(tmp, path)          # a PDF that exists is a PDF that finished
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        print("[capacity] the headroom plot could not be written (%s) -- the "
+              "table is unaffected" % e)
+        return ""
+    print("[capacity] -> %s" % path)
+    return path
+
+
+def write_capacity_report(proj, mode, rows):
+    """CAPACITY_HEADROOM_<proj>_<mode>.txt/.csv"""
+    if not rows:
+        return ""
+    levels = sorted(set(float(x) for x in CAPACITY_LEVELS), reverse=True)
+    # cmp_dir(): _cmp_into(project) around the call is what puts this under the
+    # project's folder, and writing to COMPARE_DIR directly would ignore it.
+    path = os.path.join(cmp_detail(), "CAPACITY_HEADROOM_%s_%s.txt" % (proj, mode))
+    with open(path, "w") as fh:
+        fh.write("CAPACITY HEADROOM -- %s (%s)\n" % (proj, mode))
+        fh.write("generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("=" * 96 + "\n")
+        fh.write("%s: the verdict at each output tested, and the highest\n"
+                 % ("Every fault in the list" if (CAPACITY_FAULTS or "all").strip().lower()
+                    != "failing" else "Each fault that FAILS at full project output"))
+        fh.write("output at which it is compliant.\n")
+        fh.write("\n")
+        fh.write("A fault with no passing level fails at every output tested, INCLUDING\n")
+        fh.write("the lowest -- it is not a capacity problem, or the sweep does not go\n")
+        fh.write("low enough. 0 % is the only level that proves the projects are the\n")
+        fh.write("cause, and it is not in the list unless you put it there.\n")
+        fh.write("=" * 96 + "\n")
+        head = "%-10s %s   %s" % ("fault", "  ".join("%5.0f%%" % (lv * 100) for lv in levels),
+                                  "highest compliant")
+        fh.write(head + "\n")
+        fh.write("-" * len(head) + "\n")
+        for f, by, best in rows:
+            fh.write("%-10s %s   %s\n"
+                     % (f, "  ".join("%6s" % by.get(lv, "?") for lv in levels),
+                        ("%.0f %%" % (best * 100)) if best is not None
+                        else "none of the levels tested"))
+        fh.write("=" * 96 + "\n%d fault(s)\n" % len(rows))
+    print("[capacity] -> %s" % path)
+    if WRITE_CSV:
+        cp = path[:-4] + ".csv"
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(["fault"] + ["%.0f%%" % (lv * 100) for lv in levels]
+                                + ["highest_compliant_pct"]))
+            for f, by, best in rows:
+                w.writerow(_csv_row([f] + [by.get(lv, "?") for lv in levels]
+                                    + ["" if best is None else "%.0f" % (best * 100)]))
+        print("[capacity] -> %s" % cp)
+    return path
+
+
+# ============================================================================
+# .dyr PARAMETER SWEEP
+# ============================================================================
+# The capacity sweep asks "how much output can this project run at". This asks
+# "what does this constant do", and the machinery is the same: re-run the
+# project case into a folder of its own, compare it against the same base, and
+# put the verdicts side by side.
+#
+# Kept separate from the capacity sweep rather than folded into it: they vary
+# different things, they can be run in one launch, and a table headed "75 %"
+# beside one headed "Kqv=1.0" is clearer than one table of mixed columns.
+
+
+def _dyr_sweep_for(proj):
+    """The sweep table this project is swept over: its own, or the shared one."""
+    if proj and (DYR_SWEEP_BY_PROJECT or {}).get(proj):
+        return DYR_SWEEP_BY_PROJECT[proj]
+    return DYR_SWEEP or {}
+
+
+def _dyr_sweep_projects(names):
+    """The projects to sweep, out of those this comparison covers."""
+    if not DYR_SWEEP_PROJECTS:
+        return [n for n in names if _dyr_sweep_for(n)]
+    want = set(str(x).strip() for x in DYR_SWEEP_PROJECTS)
+    out = [n for n in names if n in want and _dyr_sweep_for(n)]
+    missing = sorted(want - set(names))
+    if missing:
+        # NAMED BUT NOT THERE. Silently sweeping three of the four asked for is
+        # the kind of omission nobody notices until the table is short.
+        print("[dyr-sweep] *** DYR_SWEEP_PROJECTS names %s, which this comparison "
+              "does not cover -- not swept ***" % ", ".join(missing))
+    return out
+
+
+def _dyr_sweep_variants(proj=None):
+    """[(tag, [(model, {constant: value}), ...]), ...] -- one entry per run.
+
+       Every combination of the values listed. Ordered so the tag reads the same
+       way every time: model, then constant, then value in the order written."""
+    table = _dyr_sweep_for(proj)
+    items = []
+    for model in sorted(table or {}):
+        cons = (table or {}).get(model) or {}
+        for con in sorted(cons):
+            vals = cons[con]
+            if not isinstance(vals, (list, tuple)):
+                vals = [vals]
+            items.append((model, con, list(vals)))
+    if not items:
+        return []
+    out = [("", [])]
+    for model, con, vals in items:
+        nxt = []
+        for tag, edits in out:
+            for v in vals:
+                t = "%s%s%s" % (tag, "_" if tag else "", _dyr_tag_bit(con, v))
+                nxt.append((t, edits + [(model, {con: v})]))
+        out = nxt
+    variants = [("dyr_" + t, e) for t, e in out]
+    # DROP ANY VARIANT THAT IS THE DECK AS IT STANDS. The deck values come from
+    # the engine's BESS_MODEL_TEMPLATE automatically (they are already in
+    # z4_spp_p_con.py), overlaid by DYR_DECK_VALUES and the panel edits -- so no
+    # value need be typed twice. See DYR_DECK_VALUES / DYR_SWEEP_SKIP_DECK.
+    if DYR_SWEEP_SKIP_DECK:
+        kept, dropped = [], []
+        for tag, edits in variants:
+            (dropped if _dyr_variant_equals_deck(edits, proj) else kept).append(
+                (tag, edits))
+        for tag, edits in dropped:
+            print("[dyr-sweep]   SKIP %-22s %s -- identical to the deck "
+                  "(baseline as studied); not re-run"
+                  % (tag, _dyr_edits_text(edits)))
+        if kept:
+            return kept
+        # Everything matched the deck: nothing to sweep. Return empty so the
+        # caller runs no redundant study rather than the whole set.
+        print("[dyr-sweep]   every variant equals the deck -- nothing to sweep")
+        return []
+    return variants
+
+
+_ENGINE_DYR_DEFAULTS = [None]
+
+
+def _engine_dyr_defaults():
+    """{model: {constant name: value}} read from BESS_MODEL_TEMPLATE in the
+       project engine (z4_spp_p_con.py) -- the deck defaults that are ALREADY in the
+       file, so the guard needs no hand-typed DYR_DECK_VALUES.
+
+       The template annotates every record: an "@!/ name name ..." line above a
+       "value value ..." line, aligned one-to-one. Parsing those pairs gives the
+       value each named constant ships with (Kqv 2.0, Khv 0.0, Volim 1.2, ...).
+       A production .dyr with different values is handled by declaring
+       DYR_DECK_VALUES, which always wins over this."""
+    if _ENGINE_DYR_DEFAULTS[0] is not None:
+        return _ENGINE_DYR_DEFAULTS[0]
+    out = {}
+    try:
+        spp = _study_script_for(CASE_TEST)
+        if not spp:
+            for _p in (os.path.join(TEST_DIR, "z4_spp_p_con.py"),
+                       _root_named("z4_spp_p_con.py")):
+                if os.path.isfile(_p):
+                    spp = _p
+                    break
+        txt = ""
+        if spp and os.path.isfile(spp):
+            with io.open(spp, "r", encoding="utf-8", errors="replace") as fh:
+                txt = fh.read()
+        m = re.search(r'BESS_MODEL_TEMPLATE\s*=\s*r?"""(.*?)"""', txt, re.S)
+        if m:
+            body = m.group(1)
+            cur = None            # model whose record we are inside
+            labels = None         # the names from the most recent @!/ line
+            for line in body.splitlines():
+                s = line.strip()
+                # A record header names its model: ... 'USRMDL' .. 'REGCAU1' ..
+                hm = re.search(r"'USRMDL'.*?'([A-Za-z0-9_]+)'", s)
+                if hm:
+                    cur = hm.group(1).upper()
+                    labels = None
+                    out.setdefault(cur, {})
+                    continue
+                if cur is None:
+                    continue
+                if s.startswith("@!/"):
+                    labels = s[3:].split()
+                    continue
+                if labels is not None:
+                    # the value line under those labels; strip a trailing "/"
+                    vals = s.rstrip("/").split()
+                    for nm, vv in zip(labels, vals):
+                        try:
+                            out[cur][nm] = float(vv)
+                        except ValueError:
+                            out[cur][nm] = vv.strip().strip("'")
+                    labels = None
+    except Exception:
+        out = {}
+    _ENGINE_DYR_DEFAULTS[0] = out
+    return out
+
+
+def _deck_values_for(proj):
+    """The project's effective deck values for the guard: the engine template
+       defaults, overlaid by any hand-declared DYR_DECK_VALUES, then by the
+       panel .dyr edits the AS-STUDIED run actually applies (DYR_EDITS +
+       DYR_EDITS_BY_PROJECT) -- because those change what as-studied holds, and
+       it is as-studied a variant must match to be a duplicate."""
+    eff = {}
+    for src in (_engine_dyr_defaults(), DYR_DECK_VALUES or {}):
+        for model, d in (src or {}).items():
+            eff.setdefault(model.upper(), {}).update(
+                dict((str(c), v) for c, v in (d or {}).items()))
+    # the panel edits as-studied runs with
+    _panel = list(DYR_EDITS or [])
+    _panel += list((DYR_EDITS_BY_PROJECT or {}).get(proj) or [])
+    for model, d in _panel:
+        for c, v in (d or {}).items():
+            eff.setdefault(str(model).upper(), {})[str(c)] = v
+    return eff
+
+
+def _dyr_variant_equals_deck(edits, proj=None):
+    """True when this variant forces ONLY values the as-studied deck already has.
+
+       edits is [(model, {constant: value}), ...]. It equals as-studied -- and
+       so would re-run it -- when every constant it sets matches the effective
+       deck value. A constant with no known deck value cannot be confirmed
+       equal, so the variant is NOT dropped (safer to run it than lose a real
+       one)."""
+    deck_all = _deck_values_for(proj)
+    for model, d in edits:
+        deck = deck_all.get(str(model).upper()) or {}
+        for con, val in d.items():
+            if str(con) not in deck:
+                return False
+            try:
+                if abs(float(val) - float(deck[str(con)])) > 1e-9:
+                    return False
+            except (TypeError, ValueError):
+                if str(val).strip() != str(deck[str(con)]).strip():
+                    return False
+    return True
+
+
+def _dyr_tag_bit(con, val):
+    """A folder-safe piece of name for one constant and its value.
+
+       "Kqv=1.0" cannot go in a path and "1.0" alone says nothing, so: Kqv1p0.
+       The decimal point becomes p and a minus becomes m, which keeps the value
+       readable -- Kqvm0p5 is unambiguous once you have seen one of them."""
+    txt = ("%g" % val) if isinstance(val, (int, float)) and not isinstance(val, bool) \
+        else str(val).strip()
+    txt = txt.replace("-", "m").replace(".", "p")
+    keep = "".join(ch for ch in txt if ch.isalnum() or ch == "_")
+    return "%s%s" % (re.sub(r"[^A-Za-z0-9]", "", str(con)), keep)
+
+
+def _dyr_sweep_dir(proj, mode, tag, cap_tag=""):
+    """Where one swept value's results go, at one capacity level.
+
+       The order of the two suffixes is not this function's choice: the study
+       and the launcher both build the name as base + SPP_CAP_TAG +
+       SPP_RUN_TAG, so it has to be _cap50_dyr_Kqv2 and never the reverse. A
+       path assembled the other way round here would look perfectly reasonable
+       and point at a folder nothing ever writes."""
+    return os.path.join(_res_root(CASE_TEST),
+                        "%s_%s%s_%s" % (proj, mode, _cap_suffix(cap_tag), tag))
+
+
+def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
+    """Run the project case once per DYR_SWEEP variant, at ONE capacity level.
+
+       cap_tag "" is full output -- the sweep as it has always been. "50" runs
+       the identical set of values with the project machines scaled to 50 %, into
+       ..._cap50_dyr_<value> folders, so the two axes can be read against each
+       other instead of only against the baseline.
+
+       Returns [(fault, {tag: verdict}, tags that PASS)]."""
+    variants = _dyr_sweep_variants(proj)
+    if not variants:
+        return [], []
+    _scope = (DYR_SWEEP_FAULTS or "all").strip().lower()
+    if _scope == "failing":
+        faults = _failing_faults(proj, mode)
+        what = "failing fault(s)"
+    elif _scope == "crashed":
+        # ONLY WHAT WOULD NOT RUN. Each value gets its own folder holding just
+        # these, so the as-studied results are not touched and the sweep table
+        # answers "does this value get them through" and nothing else.
+        faults = _crashed_faults(proj, mode)
+        what = "crashed / gave-up scenario(s) of the as-studied run"
+        if not faults:
+            print("[dyr-sweep] %s %s: DYR_SWEEP_FAULTS = \"crashed\" and the as-studied "
+                  "project run has no crashed scenario -- nothing to sweep" % (proj, mode))
+            return [], []
+    else:
+        faults = _all_faults(proj, mode)
+        what = "fault(s) (every one, not just the failing ones)"
+    # THE SWEEP'S UNIVERSE IS THE COMPARISON'S UNIVERSE. _all_faults() reads
+    # the project folder's criteria report, and when that folder holds a FULL
+    # report from an earlier, larger run the list came back with every fault
+    # in it -- while each variant, which inherits ONLY_FAULTS through
+    # run_study(), simulated only the selection. The sweep matrix then read
+    # "scored 8 of 100 -- missing: ..." and a column of "?", and the per-value
+    # pass counts had the wrong denominator. Filter here, once, the same way
+    # compare_project() does.
+    faults = [f for f in faults if _id_selected(f)]
+    if not faults:
+        print("[dyr-sweep] %s %s: nothing to sweep -- the project case scored no fault"
+              % (proj, mode))
+        return [], []
+    print("[dyr-sweep] %s %s%s: %d value combination(s) x %d %s"
+          % (proj, mode, _cap_note(cap_tag), len(variants), len(faults), what))
+    for tag, edits in variants:
+        print("[dyr-sweep]   %-22s %s" % (tag, _dyr_edits_text(edits)))
+
+    per_tag = {}
+    for tag, edits in variants:
+        _banner("DYR SWEEP -- %s%s : %s"
+                % (proj, _cap_note(cap_tag), _dyr_edits_text(edits)))
+        # THE SWEPT VALUE REPLACES THE PANEL'S EDIT FOR THIS PROJECT.
+        #
+        # _push_settings() sends DYR_EDITS_BY_PROJECT from the panel, and if the
+        # panel already sets Kqv for this project both would apply -- the study
+        # merges them, and which one won would depend on order. Sending the
+        # whole table with this project's entry replaced removes the question.
+        _tbl = dict((k, [list(x) if isinstance(x, (list, tuple)) else x for x in v])
+                    for k, v in (DYR_EDITS_BY_PROJECT or {}).items())
+        _tbl[proj] = [[m, dict((str(c), v) for c, v in d.items())] for m, d in edits]
+        env = {"SPP_DYR_EDITS_BY_PROJECT": json.dumps(_tbl),
+               "SPP_RUN_TAG": tag}
+        # RESUME OR RE-SIMULATE -- see _sweep_resume_env(). This used to be
+        # "always re-simulate", which on a second launch repeats every value
+        # from nothing.
+        env.update(_sweep_resume_env())
+        # THE CAPACITY LEVEL, WHEN THIS SWEEP IS BEING REPEATED AT ONE. Both
+        # tags reach the study, so the folder carries both and the run really
+        # is this value AT that output rather than one or the other.
+        env.update(_cap_env(cap_tag, cap_scale))
+        if _scope in ("failing", "crashed"):
+            # RUN only the selection. Do NOT restrict the REPORT: a variant
+            # folder holds only the selected .out files, so its full report
+            # covers exactly them -- while a REPORT_FAULTS selection made the
+            # launcher write a _SELECTED report that rfile() refuses to read
+            # from an unrestricted comparison, and every value read "?".
+            env["SPP_ONLY_FAULTS"] = ",".join(faults)
+            env.pop("SPP_REPORT_FAULTS", None)
+        else:
+            # EVERY FAULT, AND NOT THE PANEL'S OWN SELECTION. run_study() sends
+            # ONLY_FAULTS to every launcher it starts, and a keyword such as
+            # CRASHED cannot resolve inside a fresh variant folder -- the
+            # launcher stops with "resolved to NOTHING". An explicit empty
+            # selection here is "run the whole list", which is what "all" means.
+            env["SPP_ONLY_FAULTS"] = ""
+            env.pop("SPP_REPORT_FAULTS", None)
+        rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
+        if rc not in (0, None):
+            print("[dyr-sweep] %s ended with rc=%s -- reading whatever it scored"
+                  % (tag, rc))
+        rdir = _dyr_sweep_dir(proj, mode, tag, cap_tag)
+        ct, _src = read_criteria(rdir, proj)
+        per_tag[tag] = dict((f, (ct.get(f, {}).get("verdict") or "?").upper())
+                            for f in faults)
+        # DID THIS VALUE ACTUALLY RUN THE FAULTS?
+        #
+        # A column of "?" in the table means "no verdict", and the two reasons
+        # for that -- the run never happened, and the run happened but scored
+        # only the flat run -- need completely different fixes. Said here,
+        # while the folder and the log are in hand, instead of leaving a table
+        # of question marks to be interpreted afterwards.
+        _want = [f for f in faults if not str(f).upper().startswith("FLAT")]
+        _got = [f for f in _want if per_tag[tag].get(f, "?") != "?"]
+        if not os.path.isdir(rdir):
+            print("[dyr-sweep] *** %s: no results folder at all (%s) -- the run did "
+                  "not start ***" % (tag, rdir))
+        elif not ct:
+            print("[dyr-sweep] *** %s produced no criteria report (%s) ***" % (tag, rdir))
+        elif _want and not _got:
+            _outs = []
+            try:
+                _outs = [os.path.basename(x) for x in
+                         glob.glob(os.path.join(rdir, "outs", "*.out"))]
+            except Exception:
+                pass
+            print("")
+            print("[dyr-sweep] *** %s scored the FLAT RUN and NO FAULT ***" % tag)
+            print("[dyr-sweep]     folder : %s" % rdir)
+            print("[dyr-sweep]     .out   : %s" % (", ".join(sorted(_outs)) or "(none)"))
+            print("[dyr-sweep]     wanted : %s" % ", ".join(_want))
+            print("[dyr-sweep]     Every fault column for this value will read \"?\".")
+            _tail_log(rdir)
+            print("[dyr-sweep]     A flat-only run usually means the fault list was")
+            print("[dyr-sweep]     empty in this folder, or a selection (ONLY_FAULTS /")
+            print("[dyr-sweep]     ONLY_EVENTS) matched none of its ids.")
+            print("")
+        elif len(_got) < len(_want):
+            print("[dyr-sweep] %s scored %d of %d fault(s) -- missing: %s"
+                  % (tag, len(_got), len(_want),
+                     ", ".join(f for f in _want if f not in _got)))
+
+    rows = []
+    for f in faults:
+        by = dict((t, per_tag.get(t, {}).get(f, "?")) for t, _e in variants)
+        passing = [t for t, _e in variants if by.get(t) == "PASS"]
+        rows.append((f, by, passing))
+    return rows, variants
+
+
+# ============================================================================
+# EVERY .dyr VALUE ON DISK, AGAINST THE BASE, IN ONE WORKBOOK
+# ============================================================================
+# The sweep writes its tables while it runs, under the launch that ran it. A
+# launch that only reads disk (PIPELINE = "compare") skipped all of it, so the
+# question "what did each Kqv do, across the four projects, against the base"
+# had no single answer anywhere: one matrix per project, one comparison folder
+# per value, and a workbook per folder. This discovers the value folders from
+# the results root, compares every one of them with the base -- the same
+# compare_project() the main study uses, so a classification means the same
+# thing here -- and writes ONE workbook over all projects and all values.
+
+DYR_SWEEP_WORKBOOK = "00_DYR_SWEEP_COMPARISON"
+
+
+def _edits_from_folder(rdir, tagbits):
+    """[(model, {constant: value})] for a value folder: the constants from the
+       folder tag (Kqv2 -> Kqv=2.0), the model from the DYR_EDITS.txt the build
+       wrote. The tag is what the folder certainly is; the file says which model
+       carried it."""
+    model = ""
+    try:
+        with open(os.path.join(rdir, "DYR_EDITS.txt")) as fh:
+            for ln in fh:
+                p = ln.split()
+                if ln.startswith("bus ") and len(p) > 4:
+                    model = p[4]
+                    break
+    except Exception:
+        pass
+    d = {}
+    for bit in _dyr_tag_label(tagbits).split(", "):
+        if "=" in bit:
+            k, v = bit.split("=", 1)
+            try:
+                d[k.strip()] = float(v)
+            except ValueError:
+                d[k.strip()] = v.strip()
+    return [(model or "(model per DYR_EDITS.txt)", d)] if d else []
+
+
+def _dyr_variants_on_disk(proj, mode):
+    """[(cap_tag, [(tag, edits), ...]), ...] from the results folders -- full
+       output first, then each capacity level high to low."""
+    by = {}
+    for sfx in _run_suffixes(proj, mode):
+        m = re.match(r"^(?:_cap(\d+))?_dyr_(\w+)$", sfx)
+        if not m:
+            continue
+        cap = m.group(1) or ""
+        tag = "dyr_" + m.group(2)
+        d = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, sfx))
+        by.setdefault(cap, []).append((tag, _edits_from_folder(d, m.group(2))))
+    return sorted(by.items(), key=lambda kv: -(int(kv[0]) if kv[0] else 10 ** 6))
+
+
+def _dyr_sweep_rows_from_disk(proj, mode, variants, cap_tag=""):
+    """[(fault, {tag: verdict}, [tags that PASS])] read from the value folders."""
+    faults = _all_faults(proj, mode)
+    per_tag = {}
+    for tag, _e in variants:
+        ct, _src = read_criteria(_dyr_sweep_dir(proj, mode, tag, cap_tag), proj)
+        per_tag[tag] = dict((f, (ct.get(f, {}).get("verdict") or "?").upper())
+                            for f in faults)
+        faults = sorted(set(faults) | set(ct), key=_fault_key)
+    rows = []
+    for f in faults:
+        if str(f).upper().startswith("FLAT"):
+            continue
+        by = dict((t, per_tag.get(t, {}).get(f, "?")) for t, _e in variants)
+        rows.append((f, by, [t for t, _e in variants if by.get(t) == "PASS"]))
+    return rows
+
+
+def compare_dyr_sweeps_on_disk(results=None, tables=True, quiet=False):
+    """Every .dyr value folder on disk, per project, against the base.
+
+       tables=True writes what the sweep launch would have written -- the
+       PASS/FAIL matrix, the measured table and a comparison folder per value
+       -- from the folders as they are, no simulation. Then, always, the one
+       workbook over every project and every value: write_dyr_sweep_workbook().
+       Returns the workbook path, or ""."""
+    pjs = []
+    for res in (results or []):
+        if (res["project"], res["mode"]) not in pjs:
+            pjs.append((res["project"], res["mode"]))
+    if not pjs:
+        for mode in (list(MODES) or ["spp"]):
+            for proj in (compare_projects() or [""]):
+                pjs.append((proj, mode))
+    found = []
+    for proj, mode in pjs:
+        levels = _dyr_variants_on_disk(proj, mode)
+        if not levels:
+            continue
+        found.append((proj, mode, levels))
+        if not tables:
+            continue
+        for cap_tag, variants in levels:
+            try:
+                rows = _dyr_sweep_rows_from_disk(proj, mode, variants, cap_tag)
+                with _cmp_into(proj if COMPARE_BY_PROJECT else "",
+                               ("cap%s" % cap_tag) if cap_tag else ""):
+                    write_dyr_sweep_report(proj, mode, rows, variants, cap_tag=cap_tag)
+                    write_dyr_sweep_overvoltage(proj, mode, variants, cap_tag=cap_tag)
+                if DYR_SWEEP_COMPARE:
+                    write_dyr_sweep_comparisons(proj, mode, variants, cap_tag=cap_tag)
+            except Exception as e:
+                print("[dyr-sweep] %s%s: the on-disk tables failed (%s) -- the "
+                      "workbook below is unaffected" % (proj, _cap_note(cap_tag), e))
+    if not found:
+        if not quiet:
+            print("[dyr-sweep] no <project>_<mode>_dyr_* results folder on disk -- "
+                  "nothing to compare across values")
+        return ""
+    return write_dyr_sweep_workbook(found)
+
+
+def _as_studied_dyr_label(proj, levels):
+    """"as studied (Kqv=1.0, Ki=10.0)" -- the deck's OWN values of every constant
+       the sweep varies, so the as-studied column says what it was run at rather
+       than only that it was not swept.
+
+       FROM THE RECORD FIRST. A value folder's DYR_EDITS.txt holds "was -> now"
+       for each constant the build changed, and "was" IS the as-studied value
+       of that record. The engine template's defaults (and DYR_DECK_VALUES /
+       the panel's own edits) are the fallback for a constant no record
+       covers."""
+    want = []                                  # (model, constant) in sweep order
+    for _cap, variants in levels:
+        for tag, edits in variants:
+            for model, d in edits:
+                for con in d:
+                    if (model, con) not in want:
+                        want.append((model, con))
+    was = {}
+    for _cap, variants in levels:
+        for tag, _e in variants:
+            d = _dyr_sweep_dir(proj, "spp", tag, _cap)
+            try:
+                with open(os.path.join(d, "DYR_EDITS.txt")) as fh:
+                    for ln in fh:
+                        p = ln.split()
+                        # bus 999001 id B REECCU1 con Kqv 1.0000 -> 2.0
+                        if ln.startswith("bus ") and len(p) >= 9 and p[5] == "con" and p[7] != "->" and p[8] == "->":
+                            was.setdefault((p[4].upper(), p[6]), p[7])
+            except Exception:
+                pass
+    deck = _deck_values_for(proj)
+    bits = []
+    for model, con in want:
+        v = was.get((str(model).upper(), str(con)))
+        if v is None:
+            v = (deck.get(str(model).upper()) or {}).get(str(con))
+        if v is None:
+            bits.append("%s=%s" % (con, "deck value not recorded"))
+        else:
+            try:
+                bits.append("%s=%g" % (con, float(v)))
+            except (TypeError, ValueError):
+                bits.append("%s=%s" % (con, v))
+    return "as studied (%s)" % ", ".join(bits) if bits else "as studied"
+
+
+def write_dyr_sweep_workbook(found):
+    """comparison\\00_DYR_SWEEP_COMPARISON.xlsx -- all projects, all values,
+       each against the base.
+
+       found: [(proj, mode, [(cap_tag, [(tag, edits)])])].
+
+         1 Verdicts   one row per project x fault: base verdict, as studied and
+                      its class, then per value its verdict and its class
+                      against the base
+         2 Counts     one row per project x run: how many faults NEW,
+                      PRE-EXISTING, RESOLVED, OK, not compared -- the headline
+                      per value
+         3 Worst      one row per project x fault x run: the worst failing
+                      criterion, base value, project value, limit, past-limit
+         4 Not run    what each value did not run or did not finish
+       The classifications are compare_project()'s, so NEW here means what it
+       means in 00_COMPARISON_REPORT: over the limit with the project at that
+       value and not in the base."""
+    runs_by = {}                       # (proj, mode) -> [(sfx, label, res)]
+    labels = []                        # value labels in first-seen order
+    for proj, mode, levels in found:
+        lst = []
+        try:
+            res0 = compare_project(proj, mode)
+        except Exception as e:
+            print("[dyr-sweep] %s as studied could not be compared (%s)" % (proj, e))
+            res0 = None
+        _lbl0 = _as_studied_dyr_label(proj, levels)
+        lst.append(("", _lbl0, res0))
+        for cap_tag, variants in levels:
+            for tag, _e in variants:
+                sfx = "%s_%s" % (_cap_suffix(cap_tag), tag)
+                lbl = _run_label(sfx)
+                if lbl not in labels:
+                    labels.append(lbl)
+                try:
+                    res = compare_project(proj, mode, test_suffix=sfx)
+                except Exception as e:
+                    print("[dyr-sweep] %s %s could not be compared (%s)" % (proj, lbl, e))
+                    res = None
+                lst.append((sfx, lbl, res))
+        runs_by[(proj, mode)] = lst
+
+    def _rowmap(res):
+        return dict((r["fault"], r) for r in ((res or {}).get("rows") or [])
+                    if not _is_flat(r))
+
+    def _v(x):
+        return EMPTY_CELL if x in (None, "") else x
+
+    # ---- 1 Verdicts ---------------------------------------------------------
+    h1 = ["project", "fault", "planning_event", "base", "as studied", "as studied dyr values",
+          "as studied vs base"]
+    for lbl in labels:
+        h1 += ["%s" % lbl, "%s vs base" % lbl]
+    rows1 = []
+    for (proj, mode), lst in runs_by.items():
+        maps = [(lbl, _rowmap(res)) for _s, lbl, res in lst]
+        faults = set()
+        for _l, m in maps:
+            faults |= set(m)
+        m0 = maps[0][1]
+        bylbl = dict(maps[1:])
+        for f in sorted(faults, key=_fault_key):
+            r0 = m0.get(f) or {}
+            ev = r0.get("event") if r0.get("event") not in (None, "-") else ""
+            row = [proj, f, _v(ev), _v(r0.get("vb")), _v(r0.get("vt")),
+                   maps[0][0].replace("as studied (", "").rstrip(")") if "(" in maps[0][0] else EMPTY_CELL,
+                   _v(r0.get("class"))]
+            for lbl in labels:
+                r = (bylbl.get(lbl) or {}).get(f) or {}
+                row += [_v(r.get("vt")), _v(r.get("class") or ("not run at this value"
+                                                                if lbl in bylbl else "no such run"))]
+            rows1.append(row)
+
+    def _st1(row):
+        return _XL_STYLE_OF_CLASS.get(row[6], 0)
+
+    # ---- 2 Counts -----------------------------------------------------------
+    h2 = ["project", "run", "dyr edits", "faults compared", "NEW", "PRE-EXISTING",
+          "RESOLVED", "OK", "not compared", "NEW fault ids", "results folder"]
+    rows2 = []
+    for (proj, mode), lst in runs_by.items():
+        for sfx, lbl, res in lst:
+            d = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, sfx))
+            rr = [r for r in ((res or {}).get("rows") or []) if not _is_flat(r)]
+            t = _tally(rr) if rr else {}
+            rows2.append([proj, lbl, _v(_dyr_of(d)), len(rr),
+                          t.get(CLS_NEW, 0), t.get(CLS_PRE, 0), t.get(CLS_RESOLVED, 0),
+                          t.get(CLS_OK, 0),
+                          t.get(CLS_ONLY_B, 0) + t.get(CLS_ONLY_T, 0) + t.get(CLS_NEITHER, 0),
+                          _v(", ".join(sorted([r["fault"] for r in rr if r["class"] == CLS_NEW],
+                                             key=_fault_key))),
+                          os.path.basename(d)])
+
+    def _st2(row):
+        try:
+            return 2 if int(row[4]) > 0 else (4 if int(row[6]) > 0 else 5)
+        except Exception:
+            return 0
+
+    # ---- 3 Worst ------------------------------------------------------------
+    h3 = ["project", "fault", "run", "verdict", "vs base", "worst criterion",
+          "base value", "project value", "limit", "unit", "past limit"]
+    rows3 = []
+    for (proj, mode), lst in runs_by.items():
+        for sfx, lbl, res in lst:
+            for r in sorted(((res or {}).get("rows") or []), key=lambda x: _fault_key(x["fault"])):
+                if _is_flat(r):
+                    continue
+                w = None
+                try:
+                    w = _worst_of(res, r)
+                except Exception:
+                    w = None
+                if w:
+                    crit, mb, mt, lim, unit = w
+                    past = ""
+                    try:
+                        past = round(float(mt) - float(lim), 4) if (mt is not None and lim is not None) else ""
+                    except Exception:
+                        past = ""
+                else:
+                    crit, mb, mt, lim, unit, past = "", None, None, None, "", ""
+                rows3.append([proj, r["fault"], lbl, _v(r.get("vt")), _v(r.get("class")),
+                              _v(crit), _v(mb), _v(mt), _v(lim), _v(unit), _v(past)])
+
+    def _st3(row):
+        return _XL_STYLE_OF_CLASS.get(row[4], 0)
+
+    # ---- 4 Not run ----------------------------------------------------------
+    h4 = ["project", "run", "fault", "project side", "base side"]
+    rows4 = []
+    for (proj, mode), lst in runs_by.items():
+        rb = results_dir(CASE_BASE, proj, mode)
+        allf = set()
+        for _s, _l, res in lst:
+            allf |= set(_rowmap(res))
+        for sfx, lbl, res in lst:
+            rt = results_dir(CASE_TEST, proj, mode) + sfx
+            m = _rowmap(res)
+            for f in sorted(allf, key=_fault_key):
+                r = m.get(f)
+                if r and r.get("vt") and r.get("vb"):
+                    continue
+                rows4.append([proj, lbl, f, _side_state_words(rt, f), _side_state_words(rb, f)])
+
+    # ---- 5 Violations: every element, base value, then one column per value --
+    # THE BASE IS THE SAME FOR EVERY RUN -- it holds no project -- so a
+    # violating element has ONE base value and one project value per run. Side
+    # by side, that is the whole sweep in one row: what the bus did without the
+    # project, and what it did at each constant. Where a run does not list the
+    # element (it stayed inside the limit there), its MEASURED value is read
+    # from that run's measurements, so a cell holds a number rather than
+    # nothing whenever the run measured the bus.
+    _SHORT_FAM = {"transient overvoltage": "overshoot", "voltage recovery": "recovery",
+                  "steady-state voltage": "steady", "rotor-angle damping": "angle",
+                  "generator tripping": "trip"}
+    ic = _COL
+    h5 = ["project", "fault", "criterion", "element", "bus_number", "area",
+          "base value", "limit", "unit"]
+    for lbl in ["as studied"] + labels:
+        h5 += ["%s value" % lbl, "%s element class" % lbl]
+    # the as-studied column of THIS project is keyed by its own label
+    rows5 = []
+    for (proj, mode), lst in runs_by.items():
+        per = {}                                   # lbl -> {(fault, crit, el): detail row}
+        order = []
+        base_of, meta = {}, {}
+        for _s, lbl, res in lst:
+            d = {}
+            if res:
+                try:
+                    for row in _report_rows([res]):
+                        el = row[ic["element"]]
+                        if el in ("", EMPTY_CELL, "(not listed)"):
+                            continue
+                        k = (row[ic["fault"]], row[ic["criterion"]], str(el))
+                        d[k] = row
+                        if k not in meta:
+                            order.append(k)
+                            meta[k] = row
+                        bv = row[ic["base_value"]]
+                        if k not in base_of and bv not in ("", EMPTY_CELL, None):
+                            base_of[k] = bv
+                except Exception as e:
+                    print("[dyr-sweep] %s %s: element rows failed (%s)" % (proj, lbl, e))
+            per["as studied" if lbl.startswith("as studied") else lbl] = (d, res)
+        for k in order:
+            m = meta[k]
+            fam = _SHORT_FAM.get(str(m[ic["criterion"]]), "")
+            row = [proj, k[0], k[1], k[2], m[ic["bus_number"]], m[ic["area"]],
+                   base_of.get(k, m[ic["base_value"]]), m[ic["limit"]], m[ic["unit"]]]
+            for lbl in ["as studied"] + labels:
+                d, res = per.get(lbl, ({}, None))
+                r = d.get(k)
+                if r is not None:
+                    row += [_v(r[ic["project_value"]]), _v(r[ic["element_classification"]])]
+                    continue
+                if res is None:
+                    row += ["no such run", "no such run"]
+                    continue
+                mv = None
+                try:
+                    mv = measured_value(res.get("meas_t"), fam, k[0], k[2]) if fam else None
+                except Exception:
+                    mv = None
+                if mv is not None:
+                    row += [round(float(mv), 4), "within limit at this value"]
+                elif fam == "trip":
+                    row += ["not tripped", "within limit at this value"]
+                else:
+                    row += ["within limit (not in this run's measurements)",
+                            "within limit at this value"]
+            rows5.append(row)
+
+    def _st5(row):
+        # RED if any value leaves the element NEW; GREEN if every value that ran
+        # has it within limit or resolved; else amber.
+        cls = [row[i] for i in range(10, len(row), 2)]
+        if any(c == CLS_NEW for c in cls):
+            return 2
+        if cls and all(c in (CLS_RESOLVED, "within limit at this value", CLS_EL_OK) for c in cls):
+            return 4
+        return 3
+
+    title = ["SPP DYNAMIC STABILITY -- .dyr SWEEP, EVERY VALUE AGAINST THE BASE",
+             "base %s" % CASE_BASE["dir"], "with the projects %s" % CASE_TEST["dir"],
+             "generated %s" % time.strftime("%Y-%m-%d %H:%M"),
+             "values: %s" % (", ".join(labels) or "(none)"),
+             "Each run is the PROJECT case at that value, compared with the same base case; "
+             "NEW / PRE-EXISTING / RESOLVED / OK mean what they mean in 00_COMPARISON_REPORT."]
+    # WHAT AS-STUDIED WAS RUN AT, per project, on the Key sheet as well
+    for (proj, mode), lst in runs_by.items():
+        title.append("%s: %s" % (proj, lst[0][1]))
+    sheets = [("1 Verdicts", h1, rows1, [14, 8, 10, 8, 11, 26, 22] + [12, 22] * len(labels), _st1),
+              ("2 Counts", h2, rows2, [14, 18, 30, 9, 6, 12, 9, 6, 12, 40, 40], _st2),
+              ("3 Worst", h3, rows3, [14, 8, 18, 9, 22, 22, 11, 13, 8, 6, 10], _st3),
+              ("4 Not run", h4, rows4, [14, 18, 8, 40, 40], None),
+              ("5 Violations", h5, rows5,
+               [14, 8, 22, 14, 10, 10, 11, 12, 6] + [14, 26] * (1 + len(labels)), _st5)]
+    path = os.path.join(COMPARE_DIR, DYR_SWEEP_WORKBOOK + ".xlsx")
+    try:
+        write_xlsx_multi(path, sheets, legend=_XL_LEGEND, title_rows=title)
+        print("[dyr-sweep] -> %s   (%d project(s), %d value(s))" % (path, len(runs_by), len(labels)))
+    except Exception as e:
+        print("[dyr-sweep] the sweep workbook could not be written (%s)" % e)
+        return ""
+    try:
+        cp = os.path.join(COMPARE_DIR, DYR_SWEEP_WORKBOOK + ".csv")
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(h1))
+            for row in rows1:
+                w.writerow(_csv_row(row))
+        print("[dyr-sweep] -> %s" % cp)
+    except Exception as e:
+        print("[dyr-sweep] the sweep .csv could not be written (%s)" % e)
+    return path
+
+
+def _dyr_edits_text(edits):
+    """"REECCU1 Kqv=1.0" -- what this variant changed, in one line."""
+    bits = []
+    for model, d in edits:
+        for con in sorted(d, key=str):
+            bits.append("%s %s=%s" % (model, con, d[con]))
+    return ", ".join(bits) or "(nothing)"
+
+
+def write_dyr_sweep_report(proj, mode, rows, variants, cap_tag=""):
+    """DYR_SWEEP_<proj>_<mode>.txt/.csv -- every fault against every value.
+
+       The caller puts this under comparison\\<proj>\\cap50\\ for a level other
+       than full output, so the file name does not have to carry the level and
+       one level's table cannot be written over another's."""
+    if not rows or not variants:
+        return ""
+    tags = [t for t, _e in variants]
+    path = os.path.join(cmp_detail(), "DYR_SWEEP_%s_%s.txt" % (proj, mode))
+    wtag = max([10] + [len(t) for t in tags])
+    with open(path, "w") as fh:
+        fh.write("DYR PARAMETER SWEEP -- %s (%s)%s\n"
+                 % (proj, mode, _cap_note(cap_tag)))
+        fh.write("generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("=" * 96 + "\n")
+        if cap_tag:
+            fh.write("PROJECT OUTPUT %s FOR EVERY COLUMN. This is the same sweep as the\n"
+                     % _cap_label(cap_tag))
+            fh.write("one at full output, run again with the machines scaled, so the two\n")
+            fh.write("tables read against each other say what the constant does AT this\n")
+            fh.write("output rather than only at 100 %.\n")
+            fh.write("=" * 96 + "\n")
+        fh.write("The same project, run once per value, each against the same base\n")
+        fh.write("case. What each column changed:\n\n")
+        for t, e in variants:
+            fh.write("  %-*s  %s\n" % (wtag, t, _dyr_edits_text(e)))
+        fh.write("\n")
+        fh.write("A row that reads PASS in one column and FAIL in another is the\n")
+        fh.write("constant doing something. A row that reads the same everywhere is\n")
+        fh.write("not affected by it -- at these values.\n")
+        fh.write("=" * 96 + "\n")
+        head = "%-10s %s" % ("fault", "  ".join("%*s" % (wtag, t) for t in tags))
+        fh.write(head + "\n")
+        fh.write("-" * len(head) + "\n")
+        for f, by, _passing in rows:
+            fh.write("%-10s %s\n"
+                     % (f, "  ".join("%*s" % (wtag, by.get(t, "?")) for t in tags)))
+        fh.write("=" * 96 + "\n")
+        # WHICH VALUE IS BEST, counted rather than asserted.
+        fh.write("faults passing, per value:\n")
+        for t in tags:
+            n = sum(1 for _f, by, _p in rows if by.get(t) == "PASS")
+            fh.write("  %-*s  %d of %d\n" % (wtag, t, n, len(rows)))
+        _never = [f for f, _by, p in rows if not p]
+        if _never:
+            fh.write("\n%d fault(s) fail at EVERY value tested: %s\n"
+                     % (len(_never), ", ".join(_never[:20])
+                        + (" ..." if len(_never) > 20 else "")))
+            fh.write("Those are not this constant's doing.\n")
+        fh.write("=" * 96 + "\n%d fault(s)\n" % len(rows))
+    print("[dyr-sweep] -> %s" % path)
+    if WRITE_CSV:
+        cp = path[:-4] + ".csv"
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(["fault"] + tags + ["passes_at"]))
+            for f, by, passing in rows:
+                w.writerow(_csv_row([f] + [by.get(t, "?") for t in tags]
+                                    + ["; ".join(passing)]))
+        print("[dyr-sweep] -> %s" % cp)
+    if WRITE_XLSX:
+        try:
+            xp = path[:-4] + ".xlsx"
+            _hdr = ["fault"] + tags + ["passes_at"]
+            _rows = [[f] + [by.get(t, "?") for t in tags] + ["; ".join(p)]
+                     for f, by, p in rows]
+
+            def _st(row):
+                # Red when it fails everywhere, amber when the value matters,
+                # green when it passes throughout -- the same three colours the
+                # comparison uses, meaning the same three things.
+                vs = [str(v).upper() for v in row[1:1 + len(tags)]]
+                if all(v == "PASS" for v in vs):
+                    return 5
+                if any(v == "PASS" for v in vs):
+                    return 3
+                return 2
+            write_xlsx_multi(xp, [("Sweep", _hdr, _rows,
+                                   [10] + [max(10, len(t)) for t in tags] + [30], _st)],
+                             legend=[(2, "RED", "fails at every value tested"),
+                                     (3, "AMBER", "passes at some values and not others "
+                                                  "-- this constant matters here"),
+                                     (5, "GREEN", "passes at every value tested")],
+                             title_rows=["DYR PARAMETER SWEEP -- %s (%s)%s"
+                                         % (proj, mode, _cap_note(cap_tag)),
+                                         "project output: %s" % _cap_label(cap_tag),
+                                         "generated %s"
+                                         % time.strftime("%Y-%m-%d %H:%M")]
+                                        + ["%s = %s" % (t, _dyr_edits_text(e))
+                                           for t, e in variants])
+            print("[dyr-sweep] -> %s" % xp)
+        except Exception as e:
+            print("[dyr-sweep] could not write the .xlsx (%s)" % e)
+    return path
+
+
+def _ov_cell(rec):
+    """One measured cell: peak pu and, when it is over the limit, for how long.
+
+       rec is the volts record (rec_min, ov_max, ov_t, settled, above_s) from
+       read_measurements(), or None. Returns ("", peak_or_None, above_or_None):
+       the display text plus the two numbers, so the caller can both print and
+       sort/colour on them."""
+    if not rec:
+        return ("-", None, None)
+    peak = rec[1]
+    above = rec[4]
+    if peak is None:
+        return ("-", None, None)
+    if peak <= V_OVERSHOOT_PU:
+        # Under the limit -- the whole point of the sweep is to reach here.
+        return ("%.3f" % peak, peak, above)
+    if above is None:
+        return ("%.3f *" % peak, peak, None)
+    kind = "spike" if above <= OVERSHOOT_SPIKE_S else "swing"
+    return ("%.3f / %.2fs %s" % (peak, above, kind), peak, above)
+
+# The criteria this table can put a NUMBER against, in reading order:
+# (family for measured_value, what to call it, kind for exceedance).
+# Tripping is deliberately absent -- a machine either tripped or it did not,
+# there is no continuum to compare across variants, and the violations list
+# rather than the measurements is the authority on it.
+_SWEEP_FAMS = [("overshoot", "transient overvoltage", "overshoot"),
+               ("recovery",  "voltage recovery",      "recovery"),
+               ("steady",    "steady-state voltage",  "steady"),
+               ("angle",     "rotor-angle deviation", "undamped")]
+
+_SWEEP_LIMIT_TXT = {
+    "overshoot": lambda: "max %.2f pu" % V_OVERSHOOT_PU,
+    "recovery":  lambda: "min %.2f pu" % V_RECOVERY_PU,
+    "steady":    lambda: "%.2f-%.2f pu" % (V_SS_LOW, V_SS_HIGH),
+    "angle":     lambda: "max %d deg" % int(ANGLE_DEV_DEG),
+}
+
+
+def _scored_faults_in(rdir, proj):
+    """The faults that run actually SCORED -- {fault id}.
+
+       Lets a blank cell say WHICH kind of blank it is: a fault this run never
+       scored, or a fault it scored in which this element has no value."""
+    try:
+        ct, _src = read_criteria(rdir, proj)
+        return set(str(k).strip() for k, v in (ct or {}).items()
+                   if norm_verdict((v or {}).get("verdict")))
+    except Exception:
+        return set()
+
+
+def _meas_cell(fam, meas, fid, el):
+    """(text, value) for one element, one criterion, one run."""
+    if fam == "overshoot":
+        t, v, _ab = _ov_cell((meas.get("volts") or {}).get((fid, el)))
+        return t, v
+    v = measured_value(meas, fam, fid, el)
+    if v is None:
+        return "-", None
+    return (("%.1f" % v) if fam == "angle" else ("%.3f" % v)), v
+
+
+def write_sweep_measured(proj, mode, variant_cols, stem, title, col_notes,
+                         log, cap_tag="", noun="value"):
+    """<stem>_<proj>_<mode>.txt/.xlsx -- the MEASURED value of EVERY criterion
+       for every element that breaks one, side by side: base, the project as
+       studied, then one column per variant.
+
+       ONE TABLE FOR EVERY SWEEP AND EVERY CRITERION. The question a sweep is
+       run to answer is not "does it pass at Kqv = 1" but "what does each
+       element actually reach, and does any setting bring it inside the limit"
+       -- and that is the same question whether the axis is a .dyr constant,
+       the MW at the POI or the project's own output, and whether the criterion
+       is the overvoltage, the recovery, the steady state or the rotor angle.
+
+       So both are parameters. variant_cols is [(column label, results folder)]
+       and col_notes is [(label, what that column IS)]; the criteria come from
+       _SWEEP_FAMS. exceedance() puts every criterion on one scale -- 0 at the
+       limit, bigger is worse, whichever direction it is breached in -- so
+       rows of different criteria sort against each other honestly and one
+       verdict rule serves them all.
+
+       One row per (fault, element, criterion) that is outside its limit in ANY
+       column."""
+    if not variant_cols:
+        return ""
+    # THE COLUMNS, LEFT TO RIGHT: base, project as studied, then each variant.
+    _bdir, _tdir = (results_dir(CASE_BASE, proj, mode),
+                    results_dir(CASE_TEST, proj, mode))
+    cols = [("base", read_measurements(_bdir, proj), _scored_faults_in(_bdir, proj)),
+            ("project", read_measurements(_tdir, proj), _scored_faults_in(_tdir, proj))]
+    for _lbl, _rdir in variant_cols:
+        cols.append((_lbl, read_measurements(_rdir, proj),
+                     _scored_faults_in(_rdir, proj)))
+    col_names = [c[0] for c in cols]
+
+    def _verdict(proj_past, best_past):
+        """One phrase: did any variant bring this element inside the limit?
+
+           MEASURED AGAINST THE PROJECT AS STUDIED, NOT AGAINST THE BASE. The
+           variants are settings tried ON the project, so the thing they have
+           to improve on is the project's own number. Compared against the base
+           instead, a bus the base never breached -- 12 deg base, 25 deg
+           project, 17 deg with the variant -- reads as "not reduced", when the
+           variant took 8 deg off it and is the best result on the row."""
+        if best_past is None:
+            return "no variant measured this"
+        if best_past <= 0:
+            return "MITIGATED -- a %s brings it inside the limit" % noun
+        if proj_past is None:
+            # NOTHING TO COMPARE AGAINST. The project column has no value for
+            # this element and fault -- that run did not score it -- so whether
+            # a variant improved on it is not a question this table can answer.
+            # Saying "not reduced" would be asserting it.
+            return "still outside the limit (no project value to compare)"
+        if best_past < proj_past - 1e-9:
+            return "reduced but still outside the limit"
+        return "not reduced by any %s tested" % noun
+
+    # EVERY (fault, element, criterion) THAT BREAKS ITS LIMIT ANYWHERE. An
+    # element clean at base and driven out by the project, and one already out
+    # at base that a variant pulls back in, both matter -- so the union across
+    # all columns, kept when at least one of them is past the limit.
+    rows = []
+    try:
+        _poi_b = _poi_bus_of(read_bus_distance(_tdir) or read_bus_distance(_bdir))
+    except Exception:
+        _poi_b = None
+    for _fi, (fam, fam_label, kind) in enumerate(_SWEEP_FAMS):
+        src = "angles" if fam == "angle" else "volts"
+        keys = set()
+        for _nm, meas, _sc in cols:
+            for k in (meas.get(src) or {}):
+                keys.add(k)
+        for (fid, el) in keys:
+            cells, pasts = [], []
+            for _nm, meas, _sc in cols:
+                t, v = _meas_cell(fam, meas, fid, el)
+                if v is None and _sc and str(fid).strip() not in _sc:
+                    # NOT A MEASUREMENT THAT CAME BACK EMPTY -- that run never
+                    # scored this fault, so it has nothing to say about any of
+                    # its elements. Said differently from "-" because the two
+                    # need different fixes: run/score the fault, or look at why
+                    # the element was not monitored.
+                    t = "not run"
+                cells.append(t)
+                _amt, _ = exceedance(kind, v, {})
+                pasts.append(_amt)
+            if not any(a is not None and a > 0 for a in pasts):
+                continue
+            # pasts[0] is base, pasts[1] the project as studied, the rest are
+            # the variants -- and it is the VARIANTS a verdict is about.
+            proj_past = pasts[1] if len(pasts) > 1 else None
+            var_pasts = [a for a in pasts[2:] if a is not None]
+            worst = max([a for a in pasts if a is not None] or [0.0])
+            best = min(var_pasts) if var_pasts else None
+            # THE BEST RUN ON THIS ROW, named. "a variant brings it inside the
+            # limit" does not say WHICH, and with several axes on the page that
+            # is the one thing the reader is after. Smallest exceedance across
+            # EVERY column that measured this element -- base and the project
+            # included, because if the base is the best result that is the
+            # finding. Ties keep the leftmost, so base beats project beats the
+            # variants and the answer is stable run to run.
+            _bi = None
+            for _i, _a in enumerate(pasts):
+                if _a is None:
+                    continue
+                if _bi is None or _a < pasts[_bi] - 1e-12:
+                    _bi = _i
+            _best_run = ("%s %s" % (col_names[_bi], cells[_bi])) if _bi is not None else "-"
+            # WHO CAUSED IT. Base and project are columns 0 and 1; their
+            # exceedances say whether this element was already outside the
+            # limit without the project (pre-existing) or was pushed out by it
+            # (introduced). Said on every row, so the table can be read as
+            # "what the project did" and not only "what each variant did".
+            _pb, _pp = pasts[0], (pasts[1] if len(pasts) > 1 else None)
+            if _pp is None:
+                _cls = "project not measured"
+            elif _pb is None:
+                _cls = "base not measured"
+            elif _pb > 0:
+                _cls = "PRE-EXISTING"
+            elif _pp > 0:
+                _cls = "PROJECT INTRODUCED"
+            else:
+                _cls = "only a variant is outside"
+            # WHERE IT IS. Area, base kV and hops from the POI, so a row can be
+            # judged without opening the case: a 345 kV bus one hop from the
+            # POI and a 115 kV bus six hops out are different findings at the
+            # same pu.
+            _bno = _bus_of_element(el)
+            _ar = _bmap_area_text(_bno) if _bno is not None else ""
+            _kv = ""
+            _hp = ""
+            try:
+                _kvv = (_cmp_bus_map().get("kv") or {}).get(int(_bno)) if _bno is not None else None
+                _kv = ("%g" % _kvv) if _kvv else ""
+                if _poi_b is not None and _bno is not None:
+                    _h = _bmap_hops_from(_poi_b).get(int(_bno))
+                    _hp = "" if _h is None else str(_h)
+            except (TypeError, ValueError):
+                pass
+            rows.append((fid, el, fam_label, _SWEEP_LIMIT_TXT[fam](),
+                         cells, worst, proj_past, best, _fi, _best_run, pasts, _cls,
+                         _ar, _kv, _hp))
+    if not rows:
+        print("%s nothing is outside a limit in base, the project or any swept "
+              "%s -- no table for %s (%s)%s"
+              % (log, noun, proj, mode, _cap_note(cap_tag)))
+        return ""
+    # GROUPED BY CRITERION, IN _SWEEP_FAMS ORDER, worst first inside each.
+    #
+    # Not one global worst-first list. exceedance() makes the criteria
+    # comparable as NUMBERS -- 0 at the limit, bigger is worse -- but they are
+    # not comparable as FINDINGS: a rotor angle 127 deg past a 16 deg threshold
+    # outranks every overvoltage on the page, so a sweep run to answer an
+    # overvoltage question opened on three screens of rotor angles. Each
+    # criterion is its own block, and the overvoltage leads because it is the
+    # first entry in _SWEEP_FAMS.
+    _CLS_ORDER = {"PROJECT INTRODUCED": 0, "PRE-EXISTING": 1,
+                  "only a variant is outside": 2, "base not measured": 3,
+                  "project not measured": 4}
+    rows.sort(key=lambda r: (_CLS_ORDER.get(r[11], 9), r[8], -r[5], str(r[0]),
+                             int(r[1]) if str(r[1]).isdigit() else 0))
+
+    path = os.path.join(cmp_detail(), "%s_%s_%s.txt" % (stem, proj, mode))
+    wtag = max([12] + [len(t) for t in col_names])
+    with open(path, "w") as fh:
+        fh.write("%s -- MEASURED VALUES, SIDE BY SIDE -- %s (%s)%s\n"
+                 % (title, proj, mode, _cap_note(cap_tag)))
+        fh.write("generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("=" * 126 + "\n")
+        if cap_tag:
+            fh.write("PROJECT OUTPUT %s for every project/variant column.\n"
+                     % _cap_label(cap_tag))
+        fh.write("One row per element and criterion that is outside its limit in at\n")
+        fh.write("least one column. The cell is what that run MEASURED; for the\n")
+        fh.write("overvoltage it also shows how long the bus stayed above %.2f pu and\n"
+                 % V_OVERSHOOT_PU)
+        fh.write("whether that is a switching SPIKE (<= %.3f s) or a sustained SWING.\n"
+                 % OVERSHOOT_SPIKE_S)
+        fh.write("'-' = that run has no value for this element and fault: it did\n")
+        fh.write("not score that fault, or did not monitor that element. It does\n")
+        fh.write("NOT mean the element was fine there.\n\n")
+        fh.write("'best run' names the column with the LOWEST value on that row --\n")
+        fh.write("base and project included, because if the base is the best result\n")
+        fh.write("that is the finding. It is the answer to 'which run should I use'.\n\n")
+        fh.write("Columns: base = no project; project = the case as studied; then one\n")
+        fh.write("per variant:\n\n")
+        for t, e in (col_notes or []):
+            fh.write("  %-*s  %s\n" % (wtag, t, e))
+        fh.write("=" * 126 + "\n")
+        _wbest = max([len("best run")]
+                     + [len(r[9]) for r in rows]) if rows else len("best run")
+        head = "%-10s %-10s %-9s %-5s %-4s %-22s %-14s %-20s %s   %-*s   %s" % (
+            "fault", "element", "area", "kV", "hPOI", "criterion", "limit",
+            "who caused it",
+            "  ".join("%*s" % (wtag, n) for n in col_names),
+            _wbest, "best run", "what a variant does")
+        fh.write(head + "\n" + "-" * len(head) + "\n")
+        _last_cls = None
+        for (fid, el, fam_label, lim_txt, cells, _w, bp, best, _fi, brun, _ps, cls,
+             _ar, _kv, _hp) in rows:
+            if cls != _last_cls:
+                fh.write("-- %s (%d) %s\n"
+                         % (cls, sum(1 for r in rows if r[11] == cls),
+                            "-" * max(0, 120 - len(cls))))
+                _last_cls = cls
+            fh.write("%-10s %-10s %-9s %-5s %-4s %-22s %-14s %-20s %s   %-*s   %s\n"
+                     % (fid, el, (_ar or "-")[:9], _kv or "-", _hp or "-",
+                        fam_label, lim_txt, cls,
+                        "  ".join("%*s" % (wtag, c) for c in cells),
+                        _wbest, brun, _verdict(bp, best)))
+        fh.write("=" * 126 + "\n")
+        _fixed = sum(1 for r in rows if r[7] is not None and r[7] <= 0)
+        fh.write("%d element-criterion row(s) outside a limit; %d come back inside "
+                 "at some %s.\n" % (len(rows), _fixed, noun))
+        # ---- ONE LINE PER RUN: THE DECISION TABLE -------------------------
+        # The rows above answer "what does each run do to THIS bus". The
+        # question a sweep is run for is "which run should I submit", and that
+        # is a per-COLUMN roll-up nothing here made. For every column: how many
+        # elements it leaves outside a limit, how many of the project's
+        # breaches it brings back inside, its worst exceedance, and how many
+        # rows it has no value for (coverage -- a column that never scored a
+        # fault cannot be judged, and must not win by absence). Ranked, and the
+        # winner named. Base and project are ranked too, so "do nothing" and
+        # "the base is already better" are answers the table can give.
+        _summ = []
+        for _i, _nm in enumerate(col_names):
+            _vals = [r[10][_i] for r in rows]
+            _over = sum(1 for a in _vals if a is not None and a > 0)
+            _in = sum(1 for r in rows
+                      if r[10][_i] is not None and r[10][_i] <= 0
+                      and r[6] is not None and r[6] > 0)       # project was out
+            _worst = max([a for a in _vals if a is not None] or [0.0])
+            _nov = sum(1 for a in _vals if a is None)
+            _summ.append((_nm, _over, _in, _worst, _nov, len(rows) - _nov))
+        _ranked = sorted(_summ, key=lambda s: (s[1], -s[2], s[3]))
+        fh.write("\n" + "=" * 126 + "\n")
+        fh.write("WHICH RUN TO SUBMIT -- one line per column, best first\n")
+        fh.write("ranked by: fewest elements still outside a limit, then most of the\n")
+        fh.write("project's breaches brought back inside, then smallest worst exceedance.\n")
+        fh.write("A column with low coverage ranks on what it measured -- read its\n")
+        fh.write("'rows measured' before trusting it.\n")
+        fh.write("-" * 126 + "\n")
+        fh.write("%-4s %-*s %14s %18s %14s %14s\n"
+                 % ("rank", wtag, "column", "still outside", "brought inside",
+                    "worst past lim", "rows measured"))
+        for _k, (_nm, _over, _in, _worst, _nov, _meas) in enumerate(_ranked, 1):
+            fh.write("%-4d %-*s %14d %18d %14.3f %8d of %-4d\n"
+                     % (_k, wtag, _nm, _over, _in, _worst, _meas, len(rows)))
+        _n_new = sum(1 for r in rows if r[11] == "PROJECT INTRODUCED")
+        _n_pre = sum(1 for r in rows if r[11] == "PRE-EXISTING")
+        fh.write("\n%d element-criterion row(s) INTRODUCED by the project, %d PRE-EXISTING "
+                 "(base already outside), %d other.\n"
+                 % (_n_new, _n_pre, len(rows) - _n_new - _n_pre))
+        _best_col = _ranked[0] if _ranked else None
+        if _best_col and _n_new:
+            _bi2 = col_names.index(_best_col[0])
+            _fixed_new = sum(1 for r in rows if r[11] == "PROJECT INTRODUCED"
+                             and r[10][_bi2] is not None and r[10][_bi2] <= 0)
+            fh.write("The recommended run brings %d of the %d project-introduced "
+                     "row(s) back inside the limit.\n" % (_fixed_new, _n_new))
+        if _best_col:
+            _bn = _best_col[0]
+            if _bn == "base":
+                fh.write("\nRECOMMENDED: the BASE is the best result -- the project "
+                         "makes every measured element worse or no better.\n")
+            elif _bn == "project":
+                fh.write("\nRECOMMENDED: the project AS STUDIED -- no %s tested "
+                         "improves on it.\n" % noun)
+            else:
+                fh.write("\nRECOMMENDED: %s -- %d element(s) still outside a limit "
+                         "(project as studied: %d), %d of the project's breaches "
+                         "brought inside.\n"
+                         % (_bn, _best_col[1],
+                            next((s[1] for s in _summ if s[0] == "project"), 0),
+                            _best_col[2]))
+            _low = [s[0] for s in _summ if s[5] < 0.5 * len(rows)]
+            if _low:
+                fh.write("CAUTION: %s measured fewer than half the rows -- not "
+                         "comparable until scored in full.\n" % ", ".join(_low))
+    print("%s -> %s" % (log, path))
+
+    _hdr = ["fault", "element", "area", "kV", "hops_from_POI", "criterion", "limit",
+            "who_caused_it"] + col_names + ["best_run", "what_a_variant_does"]
+    _drows = [[fid, el, _ar, _kv, _hp, fam_label, lim_txt, cls] + list(cells)
+              + [brun, _verdict(bp, best)]
+              for (fid, el, fam_label, lim_txt, cells, _w, bp, best, _fi, brun, _ps, cls,
+                   _ar, _kv, _hp) in rows]
+    if WRITE_CSV:
+        cp = path[:-4] + ".csv"
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(_hdr))
+            for r in _drows:
+                w.writerow(_csv_row(r))
+        print("%s -> %s" % (log, cp))
+    if WRITE_XLSX:
+        try:
+            xp = path[:-4] + ".xlsx"
+
+            def _st(row):
+                # Read off the verdict so the colour and the words can never
+                # disagree: green fixed, amber reduced, red nothing helped.
+                v = str(row[-1])
+                if v.startswith("MITIGATED"):
+                    return 5
+                if v.startswith("reduced"):
+                    return 3
+                return 2
+            # 5 leading (fault, element, criterion, limit, who caused it),
+            # one per column, then best_run and the verdict.
+            widths = ([10, 12, 12, 6, 7, 22, 14, 20]
+                      + [max(12, len(n)) for n in col_names] + [24, 46])
+            write_xlsx_multi(
+                xp, [("Measured", _hdr, _drows, widths, _st)],
+                legend=[(5, "GREEN", "a swept %s brings it inside the limit" % noun),
+                        (3, "AMBER", "a %s reduces it but it is still outside" % noun),
+                        (2, "RED", "no %s tested brings it inside" % noun)],
+                title_rows=["%s -- MEASURED VALUES -- %s (%s)%s"
+                            % (title, proj, mode, _cap_note(cap_tag)),
+                            "every criterion, not only the overvoltage",
+                            "generated %s" % time.strftime("%Y-%m-%d %H:%M")]
+                           + ["%s = %s" % (t, e) for t, e in (col_notes or [])])
+            print("%s -> %s" % (log, xp))
+        except Exception as e:
+            print("%s could not write the .xlsx (%s)" % (log, e))
+    return path
+
+
+def write_sweep_overvoltage(proj, mode, variant_cols, stem, title, col_notes,
+                            log, cap_tag="", noun="value"):
+    """Kept as the old name -- the table now covers every criterion."""
+    return write_sweep_measured(proj, mode, variant_cols, stem, title,
+                                col_notes, log, cap_tag=cap_tag, noun=noun)
+
+
+def write_dyr_sweep_overvoltage(proj, mode, variants, cap_tag=""):
+    """The side-by-side overvoltage table for a .dyr sweep -- base, project,
+       then one column per swept constant value."""
+    if not variants:
+        return ""
+    cols = [(t, _dyr_sweep_dir(proj, mode, t, cap_tag)) for t, _e in variants]
+    notes = [(t, _dyr_edits_text(e)) for t, e in variants]
+    return write_sweep_overvoltage(proj, mode, cols, "DYR_SWEEP_MEASURED",
+                                   "DYR SWEEP", notes, "[dyr-sweep]",
+                                   cap_tag=cap_tag, noun="value")
+
+
+def _dyr_swept_constants():
+    """Every constant name this panel sweeps, spelled as _dyr_tag_bit spells it.
+
+       The folder tag is built from these, so they are what splits it back
+       apart unambiguously -- see _variant_note()."""
+    names = set()
+    tables = [DYR_SWEEP]
+    tables += list((DYR_SWEEP_BY_PROJECT or {}).values())
+    for tbl in tables:
+        for _model, cons in (tbl or {}).items():
+            for con in (cons or {}):
+                n = re.sub(r"[^A-Za-z0-9]", "", str(con))
+                if n:
+                    names.add(n)
+    return names
+
+
+def _variant_note(label):
+    """A folder suffix said in English: poi983 -> '983 MW total at the POI'.
+
+       The suffixes are built by the sweeps themselves (_poi_tag, _cap_suffix,
+       _dyr_tag_bit, NEW_PLANT_TAG, PROJECT_OFF_TAG), so this reads them back.
+       An unrecognised one is returned as it stands rather than guessed at -- a
+       new sweep should show up in the table as its own name, not as a wrong
+       description of somebody else's."""
+    s = str(label)
+    m = re.match(r"^poi(\d+)$", s)
+    if m:
+        return "%s MW total at the POI" % m.group(1)
+    m = re.match(r"^cap(\d+)$", s)
+    if m:
+        return "project output at %s %%" % m.group(1)
+    m = re.match(r"^mw(\d+)$", s)
+    if m:
+        return "the plant built at %s MW" % m.group(1)
+    if s.startswith("dyr_"):
+        # dyr_Kqv1p0 -> ".dyr: Kqv = 1.0"   (p is the decimal point, m a minus)
+        bits = []
+        for piece in s[4:].split("_"):
+            # SPLIT ONLY WHEN THE RESULT IS A REAL NUMBER.
+            #
+            # _dyr_tag_bit glues the constant to its value with the decimal
+            # point as p and the minus as m, and neither side is delimited, so
+            # the split is genuinely ambiguous: "Kqvm0p5" is Kqv = -0.5, and
+            # "dbd1m0p03" is dbd1 = -0.03 -- but a name-then-value regex reads
+            # the second as dbd = 1-0.03, which is not a number and not what
+            # was run. So every candidate split is converted back and CHECKED;
+            # anything that does not parse as a float leaves the piece as it
+            # stands. A raw tag is honest, a wrong constant is not.
+            # THE CONSTANT NAMES THIS PANEL ACTUALLY SWEEPS, FIRST.
+            #
+            # _dyr_tag_bit glues constant to value with p for the decimal point
+            # and m for the minus, and neither side is delimited, so the tag
+            # alone is ambiguous: "Volim1p2" reads as Volim = 1.2 or as
+            # Voli = -1.2, and "Kqv1p0" even offers Kqv1p = 0. Guessing prints a
+            # constant that may never have been run.
+            #
+            # But the names ARE known -- they are the keys of DYR_SWEEP -- so
+            # they are tried first, longest first, and the tag is split exactly
+            # where the panel says it was joined. Only a tag from some other
+            # run's settings falls through to the numeric guess, and an
+            # ambiguous one is left as it stands.
+            _pl = None
+            for _kn in sorted(_dyr_swept_constants(), key=len, reverse=True):
+                if piece.startswith(_kn) and len(piece) > len(_kn):
+                    _txt = piece[len(_kn):].replace("p", ".").replace("m", "-")
+                    try:
+                        float(_txt)
+                    except ValueError:
+                        continue
+                    _pl = "%s = %s" % (_kn, _txt)
+                    break
+            if _pl is None:
+                _hits = []
+                for _i in range(1, len(piece)):
+                    _nm, _vl = piece[:_i], piece[_i:]
+                    if not re.match(r"^[A-Za-z][A-Za-z0-9]*$", _nm):
+                        continue
+                    if not re.match(r"^m?\d[0-9pm]*$", _vl):
+                        continue
+                    _txt = _vl.replace("p", ".").replace("m", "-")
+                    try:
+                        float(_txt)
+                    except ValueError:
+                        continue
+                    _hits.append("%s = %s" % (_nm, _txt))
+                _pl = _hits[0] if len(_hits) == 1 else piece
+            bits.append(_pl)
+        return ".dyr: " + ", ".join(bits)
+    if s == NEW_PLANT_TAG:
+        return "a NEW plant built at the POI"
+    if s.startswith("cap") and "_dyr_" in s:
+        return s
+    return s
+
+
+def write_all_variants_overvoltage(proj, mode):
+    """ONE table over EVERY variant of this project that is on disk.
+
+       .dyr sweeps, POI MW levels, POI percentage levels (which resolve to the
+       same poi<MW> folders), capacity levels, the new plant, the project off --
+       base and project first, then a column each, worst bus first.
+
+       DISCOVERED FROM THE FOLDERS, NOT FROM THE SETTINGS. A sweep that ran last
+       week is in the table beside one that ran today, and an axis added to this
+       file later needs nothing here: if it writes results\\<proj>_<mode>_<tag>
+       it appears. That is also why the label is the folder suffix -- it is the
+       one name the run, the folder and this column certainly agree on."""
+    base_name = "%s_%s" % (proj, mode)
+    cols, notes = [], []
+    for rdir in _result_folders_for(CASE_TEST, proj, mode):
+        n = os.path.basename(rdir)
+        if n == base_name:
+            continue                      # that folder IS the "project" column
+        lbl = n[len(base_name) + 1:]
+        if not lbl:
+            continue
+        cols.append((lbl, rdir))
+        notes.append((lbl, _variant_note(lbl)))
+    if not cols:
+        return ""
+    return write_sweep_overvoltage(proj, mode, cols, "ALL_VARIANTS_MEASURED",
+                                   "EVERY VARIANT ON DISK", notes, "[variants]",
+                                   noun="variant")
+
+
+def write_dyr_sweep_comparisons(proj, mode, variants, cap_tag=""):
+    """A FULL comparison per value, each in its own folder.
+
+       The sweep table answers "does it pass at Kqv = 1". This answers "what is
+       still violating, at which bus, how far past the limit" -- the same
+       report, workbook and element detail as the main study.
+
+       EVERY VALUE IS COMPARED AGAINST THE BASE CASE, and against the base at
+       the SAME capacity level, which is the plain base at every level: the base
+       case does not model the project, so neither its .dyr constants nor its
+       output can change anything in it. Kqv = 0 and Kqv = 1 at 100 % output are
+       therefore both measured against base at 100 %, which is base as it
+       stands. That is why test_suffix moves and base_suffix does not.
+
+       Nothing is skipped quietly. A value that produced no comparison is named
+       at the end with the reason, because a missing folder among a row of
+       present ones reads as a value that passed."""
+    _sfx0 = _cap_suffix(cap_tag)
+    _done, _skip = [], []
+    for tag, edits in variants or []:
+        rt = _dyr_sweep_dir(proj, mode, tag, cap_tag)
+        if not os.path.isdir(rt):
+            _skip.append((tag, "the run produced no results folder (%s)"
+                          % os.path.basename(rt)))
+            continue
+        try:
+            res = compare_project(proj, mode, test_suffix="%s_%s" % (_sfx0, tag))
+        except Exception as e:
+            _skip.append((tag, "the comparison raised: %s" % e))
+            continue
+        if res is None:
+            _skip.append((tag, "compare_project refused it -- its own message "
+                               "above says why"))
+            continue
+        if not res.get("rows"):
+            _skip.append((tag, "nothing scored on both sides yet, so there is "
+                               "no fault to compare"))
+            continue
+        _done.append(tag)
+        # comparison\<proj>\cap50\dyr_Kqv2\ -- the level is a folder of its own,
+        # so one level's per-value reports cannot land on another's.
+        with _cmp_into(proj if COMPARE_BY_PROJECT else "",
+                       ("cap%s" % cap_tag) if cap_tag else "", tag):
+            _banner("COMPARISON WITH %s -- %s (%s)%s"
+                    % (_dyr_edits_text(edits), proj, mode, _cap_note(cap_tag)))
+            _RUN_LABEL[0] = _dyr_edits_text(edits)
+            # BOTH AXES IN THE ROWS. The .dyr label alone would report a 50 %
+            # run as though it were at full output, which is the one thing a
+            # reader cannot recover from the numbers.
+            _RUN_OUTPUT[0] = _cap_label(cap_tag) if cap_tag else ""
+            try:
+                if ONE_REPORT:
+                    write_one_report([res], [], [])
+                else:
+                    write_summary([res], [], [])
+                    write_project_report(res)
+                    write_project_csv(res)
+                    write_elements(res)
+                # SPP'S OWN APPENDIX, PER VALUE. Whatever the main comparison
+                # writes for a run, a swept value gets the same: this table is
+                # the form the results are submitted in, and a value being
+                # considered as the answer has to be presentable in it without
+                # re-running anything.
+                write_spp_event_tables([res])
+                if not SIMPLE_OUTPUT:
+                    write_runtime_comparison(proj, mode,
+                                             test_suffix="%s_%s" % (_sfx0, tag))
+            except Exception as e:
+                print("[dyr-sweep] the %s comparison could not be written (%s)"
+                      % (tag, e))
+            finally:
+                # CLEARED WHATEVER HAPPENED. Left set, the next comparison --
+                # including the main one, if a sweep runs before it -- would
+                # carry this value's label over rows it did not produce.
+                _RUN_LABEL[0] = ""
+                _RUN_OUTPUT[0] = ""
+    # WHICH VALUES HAVE A COMPARISON AND WHICH DO NOT, every time.
+    _tot = len(variants or [])
+    print("[dyr-sweep] %d of %d value(s) compared against the base case%s"
+          % (len(_done), _tot, _cap_note(cap_tag)))
+    if _skip:
+        print("[dyr-sweep] NOT compared -- these have no comparison folder, and")
+        print("[dyr-sweep] an absent folder beside present ones reads as a value")
+        print("[dyr-sweep] that passed. It is not:")
+        for _t, _why in _skip:
+            print("[dyr-sweep]    %-22s %s" % (_t, _why))
+        print("[dyr-sweep] Run z4_check.py to see which scenarios each is short.")
+
+
+# ============================================================================
+# THE PROJECT SWITCHED OFF
+# ============================================================================
+# The BASE case answers "what does the system do without this project". This
+# answers a narrower and sharper question: what does THIS case do -- the
+# project's buses, transformers and collectors all still in the network -- with
+# only its machines out of service.
+#
+# A violation that survives with the machines off is not the machines' doing. One
+# that disappears is. Neither case alone can say that, because between base and
+# project everything about the network changed at once; between project-on and
+# project-off, nothing did but the machines.
+
+NEW_PLANT_TAG = "newplant"
+
+
+def _new_plant_dir(proj, mode):
+    return os.path.join(_res_root(CASE_TEST),
+                        "%s_%s_%s" % (proj, mode, NEW_PLANT_TAG))
+
+
+def _new_plant_projects(names):
+    if not NEW_PLANT_PROJECTS:
+        return list(names)
+    want = set(str(x).strip() for x in NEW_PLANT_PROJECTS)
+    missing = sorted(want - set(names))
+    if missing:
+        print("[newplant] *** NEW_PLANT_PROJECTS names %s, which this comparison "
+              "does not cover -- not run ***" % ", ".join(missing))
+    return [n for n in names if n in want]
+
+
+def run_new_plant(proj, mode):
+    """One study with a NEW facility built at the project's POI.
+
+       Returns [(fault, base verdict, new-plant verdict, as-studied verdict)]."""
+    faults = _all_faults(proj, mode)
+    if not faults:
+        print("[newplant] %s %s: nothing to run -- the project case scored no fault"
+              % (proj, mode))
+        return []
+    _banner("NEW PLANT -- %s (%s): new buses, GSU, collector, MPT, tie to the POI"
+            % (proj, mode))
+    env = {"SPP_RUN_TAG": NEW_PLANT_TAG}
+    env.update(_sweep_resume_env())
+    # THE WHOLE EQUIPMENT DESCRIPTION, as JSON. "enabled" is forced on here
+    # rather than read from the panel: this function exists to build the plant,
+    # and a run that quietly did not because a nested flag said so would be
+    # reported as a new-plant study of the ordinary case.
+    _np = dict(NEW_PLANT or {})
+    _np["enabled"] = True
+    env["SPP_NEW_PLANT"] = json.dumps(_np)
+    rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
+    if rc not in (0, None):
+        print("[newplant] the run ended with rc=%s -- reading whatever it scored" % rc)
+    rdir = _new_plant_dir(proj, mode)
+    new, _s1 = read_criteria(rdir, proj)
+    on, _s2 = read_criteria(results_dir(CASE_TEST, proj, mode), proj)
+    base, _s3 = read_criteria(results_dir(CASE_BASE, proj, mode), proj)
+    if not new:
+        print("")
+        print("[newplant] *** THE NEW-PLANT RUN PRODUCED NO CRITERIA REPORT ***")
+        print("[newplant]     folder: %s" % rdir)
+        # THE BUILD IS WHERE THIS ONE FAILS. It creates buses, transformers and
+        # a tie, any of which the case can refuse -- a bus number already taken
+        # is the common one -- and build_new_plant() stops rather than studying
+        # half a plant. The reason is one line of that log.
+        _tail_log(rdir)
+        print("")
+        return []
+    rows = []
+    for f in faults:
+        rows.append((f,
+                     (base.get(f, {}).get("verdict") or "?").upper(),
+                     (new.get(f, {}).get("verdict") or "?").upper(),
+                     (on.get(f, {}).get("verdict") or "?").upper()))
+    return rows
+
+
+def write_new_plant_report(proj, mode, rows):
+    """NEW_PLANT_<proj>_<mode>.txt/.csv -- base, new plant, project as studied."""
+    if not rows:
+        return ""
+    path = os.path.join(cmp_detail(), "NEW_PLANT_%s_%s.txt" % (proj, mode))
+    head = "%-22s %-12s %-14s %-14s %s" % ("fault", "base", "NEW plant",
+                                           "as studied", "what it says")
+    with open(path, "w") as fh:
+        fh.write("NEW PLANT AT THE POI -- %s (%s)\n" % (proj, mode))
+        fh.write("generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("=" * 110 + "\n")
+        fh.write("base        the base case: no project at this POI at all\n")
+        fh.write("NEW plant   a facility BUILT at the POI -- its own unit buses,\n")
+        fh.write("            GSU per unit, collector, main power transformer and\n")
+        fh.write("            tie. Nothing existing is switched off.\n")
+        fh.write("as studied  the project case as it stands: the BESS placed on the\n")
+        fh.write("            EXISTING feeder buses, the existing machines off\n")
+        fh.write("\n")
+        fh.write("The two right-hand columns are the same amount of generation at the\n")
+        fh.write("same POI, reached two ways. Where they differ, the difference is the\n")
+        fh.write("EQUIPMENT -- the GSU, collector and transformer the new plant has and\n")
+        fh.write("the reused interconnection does not.\n")
+        fh.write("=" * 110 + "\n")
+        fh.write(head + "\n" + "-" * len(head) + "\n")
+        for f, b, new, on in rows:
+            fh.write("%-22s %-12s %-14s %-14s %s\n"
+                     % (f, b, new, on, _new_plant_verdict(b, new, on)))
+        fh.write("=" * 110 + "\n%d fault(s)\n" % len(rows))
+    print("[newplant] -> %s" % path)
+    _hdr = ["fault", "base", "new_plant", "as_studied", "what_it_says"]
+    _rows = [[f, b, n, o, _new_plant_verdict(b, n, o)] for f, b, n, o in rows]
+    if WRITE_CSV:
+        cp = path[:-4] + ".csv"
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(_hdr))
+            for r in _rows:
+                w.writerow(_csv_row(r))
+        print("[newplant] -> %s" % cp)
+    if WRITE_XLSX:
+        try:
+            xp = path[:-4] + ".xlsx"
+
+            def _st(row):
+                t = str(row[4])
+                if t.startswith("the equipment"):
+                    return 2
+                if t.startswith("both"):
+                    return 3
+                return 5
+            write_xlsx_multi(xp, [("New plant", _hdr, _rows, [22, 12, 13, 13, 60], _st)],
+                             legend=[(2, "RED", "the two arrangements disagree -- the "
+                                                "equipment is what differs"),
+                                     (3, "AMBER", "both arrangements fail it"),
+                                     (5, "GREEN", "passes")],
+                             title_rows=["NEW PLANT AT THE POI -- %s (%s)" % (proj, mode),
+                                         "generated %s" % time.strftime("%Y-%m-%d %H:%M"),
+                                         "NEW plant = built at the POI: unit buses, GSU, "
+                                         "collector, MPT, tie -- nothing switched off"])
+            print("[newplant] -> %s" % xp)
+        except Exception as e:
+            print("[newplant] could not write the .xlsx (%s)" % e)
+    return path
+
+
+def _new_plant_verdict(b, new, on):
+    """One sentence per fault."""
+    if new == "?" or on == "?":
+        return "cannot tell -- one of the two runs has no verdict for this fault"
+    if new == on:
+        return ("both arrangements fail it" if new == "FAIL"
+                else "both arrangements pass it")
+    return ("the equipment: %s with the new plant, %s as studied"
+            % (new, on))
+
+
+def write_new_plant_comparison(proj, mode):
+    """A FULL comparison of the new-plant run against the base case."""
+    rt = _new_plant_dir(proj, mode)
+    if not os.path.isdir(rt):
+        print("[newplant] no results at %s -- no comparison written" % rt)
+        return
+    try:
+        res = compare_project(proj, mode, test_suffix="_" + NEW_PLANT_TAG)
+    except Exception as e:
+        print("[newplant] could not compare the new-plant run (%s)" % e)
+        return
+    if res is None or not res.get("rows"):
+        return
+    with _cmp_into(proj if COMPARE_BY_PROJECT else "", NEW_PLANT_TAG):
+        _banner("COMPARISON WITH A NEW PLANT BUILT AT THE POI -- %s (%s)" % (proj, mode))
+        _RUN_LABEL[0] = "new plant built at the POI"
+        try:
+            if ONE_REPORT:
+                write_one_report([res], [], [])
+            else:
+                write_summary([res], [], [])
+                write_project_report(res)
+                write_project_csv(res)
+                write_elements(res)
+            write_spp_event_tables([res])
+            write_runtime_comparison(proj, mode, test_suffix="_" + NEW_PLANT_TAG)
+        except Exception as e:
+            print("[newplant] the comparison could not be written (%s)" % e)
+        finally:
+            _RUN_LABEL[0] = ""
+
+
+PROJECT_OFF_TAG = "proj_off"
+
+
+def _project_off_dir(proj, mode):
+    return os.path.join(_res_root(CASE_TEST),
+                        "%s_%s_%s" % (proj, mode, PROJECT_OFF_TAG))
+
+
+def _project_off_projects(names):
+    if not PROJECT_OFF_PROJECTS:
+        return list(names)
+    want = set(str(x).strip() for x in PROJECT_OFF_PROJECTS)
+    missing = sorted(want - set(names))
+    if missing:
+        print("[proj-off] *** PROJECT_OFF_PROJECTS names %s, which this comparison "
+              "does not cover -- not run ***" % ", ".join(missing))
+    return [n for n in names if n in want]
+
+
+def run_project_off(proj, mode):
+    """One study of the project case with the project machines out of service.
+
+       Returns [(fault, base verdict, project OFF verdict, project ON verdict)]."""
+    faults = _all_faults(proj, mode)
+    if not faults:
+        print("[proj-off] %s %s: nothing to run -- the project case scored no fault"
+              % (proj, mode))
+        return []
+    _banner("PROJECT OFF -- %s (%s): the same case, machines out of service" % (proj, mode))
+    env = {"SPP_PROJECT_OFF": "1", "SPP_RUN_TAG": PROJECT_OFF_TAG}
+    env.update(_sweep_resume_env())
+    rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
+    if rc not in (0, None):
+        print("[proj-off] the run ended with rc=%s -- reading whatever it scored" % rc)
+    rdir = _project_off_dir(proj, mode)
+    off, _s1 = read_criteria(rdir, proj)
+    on, _s2 = read_criteria(results_dir(CASE_TEST, proj, mode), proj)
+    base, _s3 = read_criteria(results_dir(CASE_BASE, proj, mode), proj)
+    if not off:
+        print("")
+        print("[proj-off] *** THE PROJECT-OFF RUN PRODUCED NO CRITERIA REPORT ***")
+        print("[proj-off]     folder: %s" % rdir)
+        try:
+            _outs = sorted(os.path.basename(x) for x in
+                           glob.glob(os.path.join(rdir, "outs", "*.out")))
+        except Exception:
+            _outs = []
+        print("[proj-off]     .out  : %s" % (", ".join(_outs) or "(none -- it never "
+                                             "reached a simulation)"))
+        # THE REASON IS ALREADY WRITTEN DOWN. Switching the machines off changes
+        # the dispatch, so the two things that stop this run and not the others
+        # are the power flow failing to reach MISMATCH_MVA and PROJECT_GENS not
+        # matching the case -- and the build log says which.
+        _tail_log(rdir)
+        print("")
+        return []
+    _want = [f for f in faults if not str(f).upper().startswith("FLAT")]
+    _got = [f for f in _want if (off.get(f, {}).get("verdict"))]
+    if _want and not _got:
+        print("")
+        print("[proj-off] *** the project-off run scored the FLAT RUN and NO FAULT ***")
+        print("[proj-off]     folder: %s" % rdir)
+        print("[proj-off]     Read %s"
+              % os.path.join(rdir, "logs", "parallel_console.log"))
+        print("")
+    rows = []
+    for f in faults:
+        rows.append((f,
+                     (base.get(f, {}).get("verdict") or "?").upper(),
+                     (off.get(f, {}).get("verdict") or "?").upper(),
+                     (on.get(f, {}).get("verdict") or "?").upper()))
+    return rows
+
+
+def write_project_off_report(proj, mode, rows):
+    """PROJECT_OFF_<proj>_<mode>.txt/.csv/.xlsx -- base, project off, project on."""
+    if not rows:
+        return ""
+    path = os.path.join(cmp_detail(), "PROJECT_OFF_%s_%s.txt" % (proj, mode))
+    head = "%-22s %-12s %-14s %-13s %s" % ("fault", "base", "project OFF",
+                                           "project ON", "what it says")
+    with open(path, "w") as fh:
+        fh.write("PROJECT OFF -- %s (%s)\n" % (proj, mode))
+        fh.write("generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("=" * 110 + "\n")
+        fh.write("base         the base case: this project is not in the network at all\n")
+        fh.write("project OFF  the project case with its MACHINES out of service --\n")
+        fh.write("             its buses, transformers and collectors are still there\n")
+        fh.write("project ON   the project case as studied\n")
+        fh.write("\n")
+        fh.write("A fault failing with the machines OFF is not the machines' doing.\n")
+        fh.write("One that fails only with them ON is.\n")
+        fh.write("=" * 110 + "\n")
+        fh.write(head + "\n" + "-" * len(head) + "\n")
+        for f, b, off, on in rows:
+            fh.write("%-22s %-12s %-14s %-13s %s\n"
+                     % (f, b, off, on, _project_off_verdict(b, off, on)))
+        fh.write("=" * 110 + "\n%d fault(s)\n" % len(rows))
+    print("[proj-off] -> %s" % path)
+    _hdr = ["fault", "base", "project_off", "project_on", "what_it_says"]
+    _rows = [[f, b, off, on, _project_off_verdict(b, off, on)] for f, b, off, on in rows]
+    if WRITE_CSV:
+        cp = path[:-4] + ".csv"
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(_hdr))
+            for r in _rows:
+                w.writerow(_csv_row(r))
+        print("[proj-off] -> %s" % cp)
+    if WRITE_XLSX:
+        try:
+            xp = path[:-4] + ".xlsx"
+
+            def _st(row):
+                t = str(row[4])
+                if t.startswith("the machines"):
+                    return 2            # red: switching them off fixes it
+                if t.startswith("not the machines"):
+                    return 3            # amber: fails with them off too
+                return 5
+            write_xlsx_multi(xp, [("Project off", _hdr, _rows,
+                                   [22, 12, 13, 12, 46], _st)],
+                             legend=[(2, "RED", "fails with the machines ON and passes "
+                                                "with them OFF -- the machines' doing"),
+                                     (3, "AMBER", "fails with the machines OFF as well "
+                                                  "-- not the machines' doing"),
+                                     (5, "GREEN", "passes with the machines ON")],
+                             title_rows=["PROJECT OFF -- %s (%s)" % (proj, mode),
+                                         "generated %s" % time.strftime("%Y-%m-%d %H:%M"),
+                                         "project OFF = the project case with its "
+                                         "machines out of service"])
+            print("[proj-off] -> %s" % xp)
+        except Exception as e:
+            print("[proj-off] could not write the .xlsx (%s)" % e)
+    return path
+
+
+def _project_off_verdict(b, off, on):
+    """One sentence per fault, in the words the reader needs."""
+    if on != "FAIL":
+        return "passes with the project on"
+    if off == "FAIL":
+        return "not the machines: fails with them out of service too"
+    if off == "PASS":
+        return "the machines: passes with them out of service"
+    return "cannot tell -- the project-off run has no verdict for this fault"
+
+
+def write_project_off_comparison(proj, mode):
+    """A FULL comparison of the project-off run against the base case."""
+    rt = _project_off_dir(proj, mode)
+    if not os.path.isdir(rt):
+        print("[proj-off] no results at %s -- no comparison written" % rt)
+        return
+    try:
+        res = compare_project(proj, mode, test_suffix="_" + PROJECT_OFF_TAG)
+    except Exception as e:
+        print("[proj-off] could not compare the project-off run (%s)" % e)
+        return
+    if res is None or not res.get("rows"):
+        return
+    with _cmp_into(proj if COMPARE_BY_PROJECT else "", PROJECT_OFF_TAG):
+        _banner("COMPARISON WITH THE PROJECT OFF -- %s (%s)" % (proj, mode))
+        _RUN_LABEL[0] = "project machines OUT OF SERVICE"
+        try:
+            if ONE_REPORT:
+                write_one_report([res], [], [])
+            else:
+                write_summary([res], [], [])
+                write_project_report(res)
+                write_project_csv(res)
+                write_elements(res)
+            write_spp_event_tables([res])
+            write_runtime_comparison(proj, mode, test_suffix="_" + PROJECT_OFF_TAG)
+        except Exception as e:
+            print("[proj-off] the comparison could not be written (%s)" % e)
+        finally:
+            _RUN_OUTPUT[0] = ""
+
+
+_RUN_SUFFIX = re.compile(r"^__run(\d+)$")
+
+
+def _run_suffixes(proj, mode):
+    """Every surviving run of one project, newest first, as a folder SUFFIX.
+
+       "" is the run just finished; "__run3" an archived earlier one; "_cap50"
+       a capacity level. All three are ordinary results folders differing only
+       in name, which is what makes one table over all of them possible."""
+    base = os.path.join(_res_root(CASE_TEST), "%s_%s" % (proj, mode))
+    out = []
+    for d in glob.glob(base + "*"):
+        if not os.path.isdir(d):
+            continue
+        sfx = os.path.basename(d)[len("%s_%s" % (proj, mode)):]
+        # A different project whose name starts with this one's: SantaFe_spp
+        # would otherwise swallow SantaFe2_spp, so a suffix has to be one of the
+        # forms this tool produces.
+        #
+        # THE SWEEP AND THE PROJECT-OFF RUNS BELONG HERE TOO. This accepted only
+        # "", __runN and _capNN, so results\SantaFe_custom_dyr_Kqv0p5 and
+        # ..._proj_off -- whole studies, scored the same way -- were left out of
+        # the one table that is supposed to cover every run on disk.
+        # A .dyr value run AT a capacity level carries BOTH: _cap50_dyr_Kqv2.
+        # Without this pattern those folders are whole studies that no table
+        # ever mentions -- which is the same silence the sweep and project-off
+        # folders used to suffer, one level further in.
+        if sfx and not (_RUN_SUFFIX.match(sfx)
+                        or re.match(r"^_cap\d+$", sfx)
+                        or re.match(r"^_dyr_\w+$", sfx)
+                        or re.match(r"^_cap\d+_dyr_\w+$", sfx)
+                        or sfx == "_" + NEW_PLANT_TAG
+                        or sfx == "_" + PROJECT_OFF_TAG):
+            continue
+        out.append(sfx)
+
+    def _order(s):
+        # The current run, then archives newest first, then the capacity levels
+        # high to low, then the .dyr values at full output, then the same values
+        # at each reduced level (highest output first), then the project
+        # switched off -- which is the order they were run in and the order they
+        # are read in.
+        if not s:
+            return (0, 0, "")
+        m = _RUN_SUFFIX.match(s)
+        if m:
+            return (1, -int(m.group(1)), "")
+        if re.match(r"^_cap\d+$", s):
+            return (2, -int(re.sub(r"\D", "", s) or 0), "")
+        if s.startswith("_dyr_"):
+            return (3, 0, s)
+        if s == "_" + NEW_PLANT_TAG:
+            return (5, 0, s)
+        m = re.match(r"^_cap(\d+)_dyr_", s)
+        if m:
+            # Grouped by LEVEL first, so a reader scanning left to right meets
+            # every value at 50 % together rather than interleaved with 75 %.
+            return (4, -int(m.group(1)), s)
+        return (5, 0, s)
+    return sorted(set(out), key=_order)
+
+
+def _dyr_tag_label(t):
+    """"Kqv0p5" -> "Kqv=0.5". The tag is folder-safe, not readable, and a column
+       heading is read far more often than a path is typed."""
+    out = []
+    for bit in t.split("_"):
+        # NAME THEN VALUE, split at the value's first character rather than at
+        # the last letter: the tag writes a minus as a leading "m", so a greedy
+        # name swallows it and "Kqvm0p5" reads as "Kqvm=0.5" instead of
+        # "Kqv=-0.5".
+        m2 = re.match(r"^([A-Za-z]+?)(m?[0-9].*)$", bit)
+        if m2:
+            _v = m2.group(2).replace("p", ".")
+            if _v.startswith("m"):
+                _v = "-" + _v[1:]
+            out.append("%s=%s" % (m2.group(1), _v))
+        else:
+            out.append(bit)
+    return ", ".join(out) or t
+
+
+def _run_label(sfx):
+    """What to call one run in a table that holds all of them."""
+    if not sfx:
+        return "this run (100%)"
+    m = _RUN_SUFFIX.match(sfx)
+    if m:
+        return "earlier run #%s" % m.group(1)
+    if sfx == "_" + PROJECT_OFF_TAG:
+        return "project OFF"
+    if sfx == "_" + NEW_PLANT_TAG:
+        return "NEW plant built"
+    # BOTH AXES IN ONE HEADING. "Kqv=2.0" over a column that was run at half
+    # output is the one label that could be read as the opposite of what it is,
+    # so the level is named before anything else in the cell.
+    m = re.match(r"^_cap(\d+)_dyr_(.+)$", sfx)
+    if m:
+        return "%s%% + %s" % (m.group(1), _dyr_tag_label(m.group(2)))
+    if sfx.startswith("_dyr_"):
+        return _dyr_tag_label(sfx[len("_dyr_"):])
+    if re.match(r"^_cap\d+$", sfx):
+        return "capacity %s%%" % re.sub(r"\D", "", sfx)
+    return sfx.lstrip("_")
+
+
+def _dyr_of(d):
+    """The .dyr constants a results folder was produced with.
+
+       Written by the study at build time (DYR_EDITS.txt), so this is what the
+       run ACTUALLY used rather than what the panel says now -- the two differ
+       the moment a sweep runs, and an archived run's constants are not
+       recoverable from anywhere else."""
+    try:
+        with open(os.path.join(d, "DYR_EDITS.txt")) as fh:
+            out = []
+            for ln in fh:
+                ln = ln.strip()
+                if ln.startswith("bus "):
+                    # "bus 765912  id B    REECCU1  con 6  1.0 -> 0.5"
+                    _p = ln.split()
+                    try:
+                        out.append("%s con%s=%s" % (_p[4], _p[6], _p[-1]))
+                    except IndexError:
+                        out.append(ln)
+            # The same edit at four machines is one setting, not four lines.
+            seen, uniq = set(), []
+            for x in out:
+                if x not in seen:
+                    seen.add(x); uniq.append(x)
+            return "; ".join(uniq)
+    except Exception:
+        return ""
+
+
+def _collector_of(d):
+    """The collector impedance a results folder was produced with.
+
+       Written by the study at build time (COLLECTOR_IMPEDANCE.txt). Empty for a
+       run made before that existed -- which is reported as "not recorded", not
+       as "unchanged": they are different statements and only one of them is
+       known."""
+    try:
+        with open(os.path.join(d, "COLLECTOR_IMPEDANCE.txt")) as fh:
+            return (fh.readline() or "").strip()
+    except Exception:
+        return ""
+
+
+def _folder_time(d):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(d)))
+    except Exception:
+        return "?"
+
+
+def archive_previous_runs():
+    """Rename each project results folder out of the way before a new run.
+
+       A study writes into results\\<proj>_<mode>, so starting a new one is the
+       moment the previous one stops existing. This renames it to
+       ..._ _run<N> first -- no deletion, no copy, one rename -- so every run
+       to date is still on disk and still comparable.
+
+       The BASE case is left alone. It does not model the projects, so it does
+       not change when their output does, and keeping one base is what lets
+       every archived run be scored against the same thing."""
+    if not KEEP_PREVIOUS_RUNS:
+        return []
+    moved = []
+    for mode in MODES:
+        pat = os.path.join(_res_root(CASE_TEST), "*_%s" % mode)
+        for d in sorted(glob.glob(pat)):
+            if not os.path.isdir(d):
+                continue
+            proj = _proj_of_results_dir(d)
+            if _panel_projects() and proj not in _panel_projects():
+                continue
+            # Nothing worth keeping: an empty folder, or one a previous run
+            # created and never wrote to.
+            if not (glob.glob(os.path.join(d, "*.out"))
+                    or glob.glob(os.path.join(d, "*", "*.out"))
+                    or glob.glob(os.path.join(d, "SPP_CRITERIA_REPORT*"))):
+                continue
+            n = 1
+            while os.path.exists("%s__run%d" % (d, n)):
+                n += 1
+            try:
+                os.rename(d, "%s__run%d" % (d, n))
+            except Exception as e:
+                print("[runs] could not set %s aside (%s) -- this run will write "
+                      "over it" % (d, e))
+                continue
+            moved.append(("%s__run%d" % (d, n), proj, mode))
+            print("[runs] kept the previous run as %s__run%d" % (os.path.basename(d), n))
+    if moved:
+        print("[runs] %d earlier run(s) kept. COMPARE_ALL_RUNS puts them in one table "
+              "beside this one." % len(moved))
+    return moved
+
+
+def write_run_vs_run(proj, mode):
+    """A full comparison of two runs of the SAME project.
+
+       The all-runs table says each run's counts against the base. This says
+       what MOVED between two of them, fault by fault and bus by bus -- which is
+       the question when the thing that changed is the collector impedance or a
+       dynamic model parameter, not the presence of the projects."""
+    if not COMPARE_RUNS:
+        return ""
+    try:
+        a_sfx, b_sfx = (list(COMPARE_RUNS) + ["", ""])[:2]
+    except Exception:
+        print("[runs] COMPARE_RUNS must be two folder suffixes, e.g. (\"__run1\", \"\")")
+        return ""
+    a_sfx, b_sfx = (a_sfx or ""), (b_sfx or "")
+    da = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, a_sfx))
+    db = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, b_sfx))
+    for d, sfx in ((da, a_sfx), (db, b_sfx)):
+        if not os.path.isdir(d):
+            print("[runs] COMPARE_RUNS: no results at %r (%s)" % (sfx or "(this run)", d))
+            print("[runs]   runs on disk: %s"
+                  % ", ".join(repr(x) if x else "'' (this run)"
+                              for x in _run_suffixes(proj, mode)))
+            return ""
+    _banner("RUN AGAINST RUN -- %s (%s):  %s  vs  %s"
+            % (proj, mode, _run_label(a_sfx), _run_label(b_sfx)))
+    print("[runs] reference: %s" % da)
+    print("[runs] judged:    %s" % db)
+    print("[runs] collector, reference: %s" % (_collector_of(da) or "(not recorded)"))
+    print("[runs] collector, judged:    %s" % (_collector_of(db) or "(not recorded)"))
+    print("[runs] 'NEW' below means the JUDGED run fails a fault the reference passed.")
+    try:
+        res = compare_project(proj, mode, test_suffix=b_sfx,
+                              base_case=CASE_TEST, base_suffix=a_sfx)
+    except Exception as e:
+        print("[runs] could not compare the two runs (%s)" % e)
+        return ""
+    if not res or not res["rows"]:
+        print("[runs] nothing comparable between those two runs")
+        return ""
+    tag = "vs_%s" % ((a_sfx or "this").lstrip("_") or "this")
+    with _cmp_into(proj if COMPARE_BY_PROJECT else "", tag):
+        try:
+            if ONE_REPORT:
+                return write_one_report([res], [], [])
+            write_summary([res], [], [])
+            write_project_report(res)
+            write_project_csv(res)
+            write_elements(res)
+        except Exception as e:
+            print("[runs] the run-against-run comparison could not be written (%s)" % e)
+    return ""
+
+
+# ============================================================================
+# EVERY RUN, SIDE BY SIDE, ONE ROW PER VIOLATION
+# ============================================================================
+# One launch now produces base, project, capacity levels, .dyr values and the
+# project-off run -- and each writes its own complete report. Answering "what
+# did Kqv actually do to that 1.36 pu at 768281" then means opening six reports
+# and reading one number out of each.
+#
+# This is the same numbers in one table: the violation down the side, the run
+# across the top. Nothing is recomputed -- every column is the comparison that
+# was already written for that folder -- so a cell here and the cell in that
+# run's own report cannot disagree.
+
+
+def _tail_log(rdir, n=25):
+    """Print the end of that run's build log, on the console, now.
+
+       A run that produced no report has its reason written down -- in
+       logs\\DYN_STUDY_build.log, in a folder nobody opens until they are told
+       to. Naming the path was not enough: the answer is twenty lines long and
+       it is already on disk, so put it where the person watching the run will
+       see it."""
+    logs = os.path.join(rdir, "logs")
+    cand = []
+    for pat in ("DYN_STUDY_build.log", "DYN_STUDY_w*.log", "*.log"):
+        cand = sorted(glob.glob(os.path.join(logs, pat)))
+        if cand:
+            break
+    if not cand:
+        print("     (no log in %s either -- the study process never started)" % logs)
+        return
+    p = cand[0]
+    try:
+        lines = [x.rstrip() for x in _read_text(p).splitlines() if x.strip()]
+    except Exception as e:
+        print("     (%s could not be read: %s)" % (p, e))
+        return
+    print("     last %d line(s) of %s:" % (min(n, len(lines)), p))
+    for ln in lines[-n:]:
+        print("       | %s" % ln[:160])
+
+
+def _matrix_runs(proj, mode):
+    """[(label, suffix)] for every run of this project, in reading order."""
+    return [(_run_label(s), s) for s in _run_suffixes(proj, mode)]
+
+
+def write_run_matrix(proj, mode):
+    """MATRIX_<proj>_<mode>.txt/.csv/.xlsx -- runs as columns.
+
+       Two tables: the verdict per fault, and the measured value per violating
+       element. The second is the one to sort: a row whose numbers fall across
+       the columns is a violation the change is fixing, and one that does not
+       move is a violation the change cannot reach."""
+    runs = _matrix_runs(proj, mode)
+    if len(runs) < 2:
+        print("[matrix] %s (%s): only one run on disk -- nothing to put side by side"
+              % (proj, mode))
+        return ""
+    verdict = {}          # fault -> {label: verdict}
+    value = {}            # (fault, criterion, element) -> {label: value}
+    base_v = {}           # (fault, criterion, element) -> the BASE case value
+    limit = {}            # (fault, criterion, element) -> limit text
+    kindof = {}           # ...and how it is judged, so the table can say "over" or not
+    limof = {}
+    faults, keys = [], []
+    # WHY A CELL IS EMPTY -- three different answers, and they were all blank.
+    #
+    # An empty cell in the value table used to mean any of:
+    #
+    #   * that run scored the fault and did NOT name this element for that
+    #     criterion -- normally because it was not violating there. GOOD NEWS,
+    #     and often the finding: bus 530680 over 1.20 pu at Kqv = 2 and absent
+    #     at Kqv = 0.2 is the constant doing exactly what the sweep is asking
+    #     about.
+    #   * that run has no verdict for the fault -- it crashed, gave up, or was
+    #     never run. NOTHING IS KNOWN.
+    #   * that run does not exist at all: no folder, or a folder holding only
+    #     FLAT_RUN. Also nothing known -- and the state every project-off column
+    #     is in right now.
+    #
+    # Reading the second and third as the first says "this change fixed it"
+    # about a study that never produced a number. That is the one mistake this
+    # whole tool exists to prevent, so the three are now written differently and
+    # the legend names them.
+    scored = {}          # label -> the faults that run actually scored
+    ran = set()          # labels that produced any comparable row at all
+    for label, sfx in runs:
+        try:
+            r = compare_project(proj, mode, test_suffix=sfx)
+        except Exception as e:
+            print("[matrix] %s could not be read (%s)" % (label, e))
+            continue
+        if not r or not r.get("rows"):
+            continue
+        ran.add(label)
+        scored.setdefault(label, set())
+        lim = r.get("limits") or {}
+        for row in r["rows"]:
+            fid = row["fault"]
+            if fid not in verdict:
+                verdict[fid] = {}
+                faults.append(fid)
+            verdict[fid][label] = row["vt"] or "-"
+            verdict[fid].setdefault("base", row["vb"] or "-")
+            if norm_verdict(row["vt"]):
+                scored[label].add(fid)
+            for c in row["crits"]:
+                fam = _criterion_family(c["criterion"])
+                if not fam:
+                    continue
+                short = _short_crit(c["criterion"])
+                # THE SAME ELEMENT SOURCE THE REPORTS USE. _where_values reads
+                # the violations file, _from_detail the criterion's own wording
+                # -- in that order, so a fault whose violations were truncated
+                # still contributes the buses its detail line names.
+                vals = _where_values(row, fam) or _from_detail(c, fam)
+                kind = {"angle": "undamped", "trip": "tripped"}.get(fam, fam)
+                for el, bv, tv in vals:
+                    k = (fid, short, str(el))
+                    if k not in value:
+                        value[k] = {}
+                        keys.append(k)
+                        limit[k] = _limit_text(fam, lim)
+                        kindof[k] = kind
+                        limof[k] = lim
+                    if tv is not None:
+                        value[k][label] = tv
+                    if bv is not None and k not in base_v:
+                        base_v[k] = bv
+    if not keys and not faults:
+        print("[matrix] %s (%s): nothing scored in any run" % (proj, mode))
+        return ""
+    labels = [l for l, _s in runs]
+
+    def _cell(k, label):
+        """The measured value, or WHY there is not one. Never a bare blank.
+
+           "not listed" is the only one of the three that is a finding: the run
+           judged that fault and this element was not among the ones it named,
+           which for a violation list means it was not violating. The other two
+           are absences of evidence and say so."""
+        v = value[k].get(label)
+        if v is not None:
+            return v
+        if label not in ran:
+            return "no run"
+        if k[0] not in scored.get(label, ()):
+            return "unscored"
+        return "not listed"
+
+    def _passes_in(f):
+        got = [l for l in labels
+               if str(verdict[f].get(l, "")).upper() == "PASS"]
+        if got:
+            return ", ".join(got)
+        # A fault nothing SCORED is not a fault nothing fixed.
+        if not [l for l in labels
+                if str(verdict[f].get(l, "-")).upper() in ("PASS", "FAIL")]:
+            return "not scored in any run"
+        return "none of the runs tested"
+
+    def _worst_span(k):
+        """(spread across the runs, worst value) -- what makes a row worth reading."""
+        vs = [v for v in value[k].values() if isinstance(v, float)]
+        if not vs:
+            return (0.0, 0.0)
+        return (max(vs) - min(vs), max(vs))
+
+    def _past(k, label):
+        """How far past its limit that element is in that run, or None."""
+        v = value[k].get(label)
+        if v is None:
+            return None
+        amt, _t = exceedance(kindof.get(k, ""), v, limof.get(k) or {})
+        return amt
+
+    def _best(k):
+        """(run, value) -- the run in which this element is least far past its
+           limit. THE POINT OF THE WHOLE TABLE: not which number is smallest,
+           but which change helps this violation most, and by how much."""
+        best = None
+        for l in labels:
+            a = _past(k, l)
+            if a is None:
+                continue
+            if best is None or a < best[0]:
+                best = (a, l, value[k].get(l))
+        return (best[1], best[2], best[0]) if best else ("", "", None)
+
+    keys.sort(key=lambda k: (-_worst_span(k)[0], -_worst_span(k)[1],
+                             _fault_key(k[0]), k[1], _el_key(k[2])))
+    faults.sort(key=_fault_key)
+
+    # PER RUN, ONE LINE: is this change worth anything at all. A run that clears
+    # ten of eighty elements and one that clears none look identical in a table
+    # of numbers until they are counted.
+    per_run = []
+    for l in labels:
+        n_over = n_have = 0
+        worst = None
+        for k in keys:
+            a = _past(k, l)
+            if a is None:
+                continue
+            n_have += 1
+            if a > 0:
+                n_over += 1
+            if worst is None or a > worst:
+                worst = a
+        n_fail = sum(1 for f in faults if str(verdict[f].get(l, "")).upper() == "FAIL")
+        n_v = sum(1 for f in faults if verdict[f].get(l, "-") not in ("-", ""))
+        per_run.append([l, n_fail, n_v, n_over, n_have,
+                        round(worst, 4) if worst is not None else ""])
+
+    path = os.path.join(cmp_detail(), "MATRIX_%s_%s.txt" % (proj, mode))
+    w1 = max([10] + [len(f) for f in faults])
+    wl = max([9] + [len(l) for l in labels])
+    with open(path, "w") as fh:
+        fh.write("=" * 120 + "\n")
+        fh.write(" EVERY RUN SIDE BY SIDE -- %s (%s)\n" % (proj, mode))
+        fh.write(" generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("=" * 120 + "\n")
+        fh.write(" Each column is one complete study of this project, scored the same way.\n")
+        fh.write(" 'base' is the case without the project in it at all.\n\n")
+        for label, sfx in runs:
+            fh.write("   %-*s  results\\%s_%s%s\n" % (wl, label, proj, mode, sfx))
+        fh.write("\n")
+        fh.write("=" * 120 + "\n")
+        fh.write(" IS THIS CHANGE WORTH ANYTHING -- one line per run\n")
+        fh.write("-" * 120 + "\n")
+        fh.write(" %-*s %14s %22s %16s\n"
+                 % (wl, "run", "faults FAIL", "elements over the limit",
+                    "worst exceedance"))
+        fh.write(" " + "-" * 118 + "\n")
+        for l, nf, nv, no, nh, wo in per_run:
+            fh.write(" %-*s %8d of %-3d %14d of %-5d %16s\n"
+                     % (wl, l, nf, nv, no, nh,
+                        ("%+.3f" % wo) if wo != "" else "-"))
+        fh.write("=" * 120 + "\n\n")
+        fh.write(" VERDICT PER FAULT\n")
+        fh.write("-" * 120 + "\n")
+        fh.write(" %-*s %-*s %s   %s\n" % (w1, "fault", wl, "base",
+                                           " ".join("%*s" % (wl, l) for l in labels),
+                                           "passes in"))
+        fh.write(" " + "-" * 118 + "\n")
+        for f in faults:
+            fh.write(" %-*s %-*s %s   %s\n"
+                     % (w1, f, wl, verdict[f].get("base", "-"),
+                        " ".join("%*s" % (wl, verdict[f].get(l, "-")) for l in labels),
+                        _passes_in(f)))
+        fh.write("\n")
+        fh.write(" 'passes in' names every run in which the fault is COMPLIANT. It is\n")
+        fh.write(" the question the sweep is asking, so it is a column rather than nine\n")
+        fh.write(" columns to read across. 'none of the runs tested' is a RESULT: no\n")
+        fh.write(" combination in this campaign clears it, so the mitigation is outside\n")
+        fh.write(" the range that was swept.\n")
+        fh.write("=" * 120 + "\n\n")
+        fh.write(" MEASURED VALUE PER VIOLATING ELEMENT -- widest variation first\n")
+        fh.write("-" * 120 + "\n")
+        # THE FAULT ID IS NOT TRUNCATED. C01_3PH_765911_10cy cut to "C01_3PH_76"
+        # is the same ten characters as C01_3PH_765912_10cy, and this table is
+        # read across the row -- an ambiguous key defeats the whole point of it.
+        _we = max([7] + [len(k[2]) for k in keys])
+        # THE CRITERION AND THE LIMIT ARE NOT TRUNCATED EITHER, for the reason
+        # the fault id is not: "no recovery 0.70 pu" cut to thirteen characters
+        # is "no recovery 0" and the number the row is judged against is gone.
+        # Both columns are sized to their own widest entry, as the element
+        # column already was.
+        _wc = max([9] + [len(str(k[1])) for k in keys])
+        _wl_lim = max([5] + [len(str(limit.get(k, ""))) for k in keys])
+        fh.write(" %-*s %-*s %-*s %-*s %-8s %s %s\n"
+                 % (w1, "fault", _wc, "criterion", _we, "element",
+                    _wl_lim, "limit", "base",
+                    " ".join("%*s" % (wl, l) for l in labels),
+                    "  best run"))
+        fh.write(" " + "-" * 118 + "\n")
+        for k in keys:
+            fid, crit, el = k
+            _br, _bv, _ba = _best(k)
+            fh.write(" %-*s %-*s %-*s %-*s %-8s %s   %s\n"
+                     % (w1, fid, _wc, crit, _we, el,
+                        _wl_lim, limit.get(k, ""),
+                        _mx(base_v.get(k)),
+                        " ".join("%*s" % (wl, _mx(_cell(k, l))) for l in labels),
+                        ("%s (%s%s)" % (_br, _mx(_bv),
+                                        (", %+.3f past" % _ba) if _ba is not None
+                                        else "")) if _br else "-"))
+        fh.write("=" * 120 + "\n")
+        fh.write(" A row whose numbers MOVE across the columns is a violation that change\n")
+        fh.write(" reaches. One that reads the same everywhere is not that change's doing.\n")
+        fh.write("\n")
+        fh.write(" A CELL WITH NO NUMBER is one of three things, and they are NOT the same:\n")
+        fh.write("   not listed  that run scored the fault and did not name this element.\n")
+        fh.write("               For a violation list that means it was NOT VIOLATING\n")
+        fh.write("               there -- so a column of 'not listed' beside columns of\n")
+        fh.write("               numbers is the change working, and is a result.\n")
+        fh.write("   unscored    that run has no verdict for the fault: it crashed, gave\n")
+        fh.write("               up or never ran. Nothing is known about it.\n")
+        fh.write("   no run      that run does not exist, or produced only FLAT_RUN.\n")
+        fh.write("               Nothing is known about it either.\n")
+        fh.write("\n")
+        fh.write(" The BASE column is the base case -- the projects not in the network at\n")
+        fh.write(" all -- and '-' there means it did not name this element for that\n")
+        fh.write(" criterion. A number in every run column and '-' in base is an element\n")
+        fh.write(" the projects brought with them.\n")
+        fh.write("=" * 120 + "\n")
+    print("[matrix] -> %s" % path)
+
+    # WHICH RUNS PASS THIS FAULT -- the question the whole matrix is asked, in
+    # one cell instead of nine columns to scan across. DYR_SWEEP has passes_at
+    # for the .dyr values and CAPACITY_HEADROOM has highest_compliant_pct for
+    # the output levels; neither covers both axes, and the matrix is the only
+    # table that holds all of them at once.
+    #
+    # "none of the runs tested" is written in full rather than left blank,
+    # because an empty cell here reads as "not worked out" when it is in fact
+    # the finding: no combination in this campaign makes the fault compliant,
+    # so the mitigation is outside the range that was swept.
+    v_hdr = ["fault", "base"] + labels + ["passes_in"]
+    v_rows = [[f, verdict[f].get("base", "-")]
+              + [verdict[f].get(l, "-") for l in labels]
+              + [_passes_in(f)] for f in faults]
+    e_hdr = (["fault", "criterion", "element", "limit", "base"] + labels
+             + ["spread", "best_run", "best_value", "best_past_limit"])
+    e_rows = []
+    for k in keys:
+        fid, crit, el = k
+        sp, _w = _worst_span(k)
+        _br, _bv, _ba = _best(k)
+        e_rows.append([fid, crit, el, limit.get(k, ""),
+                       base_v.get(k, "")]
+                      + [_cell(k, l) for l in labels]
+                      + [round(sp, 4) if sp else "", _br, _bv,
+                         round(_ba, 4) if _ba is not None else ""])
+    r_hdr = ["run", "faults_FAIL", "faults_scored", "elements_over_limit",
+             "elements_scored", "worst_past_limit"]
+    if WRITE_CSV:
+        cp = path[:-4] + ".csv"
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(["table"] + e_hdr))
+            for r in e_rows:
+                w.writerow(_csv_row(["violation"] + r))
+            w.writerow([])
+            w.writerow(_csv_row(["table"] + v_hdr))
+            for r in v_rows:
+                w.writerow(_csv_row(["verdict"] + r))
+            w.writerow([])
+            w.writerow(_csv_row(["table"] + r_hdr))
+            for r in per_run:
+                w.writerow(_csv_row(["per_run"] + r))
+        print("[matrix] -> %s" % cp)
+    if WRITE_XLSX:
+        try:
+            xp = path[:-4] + ".xlsx"
+
+            def _st_v(row):
+                # Red when the project run fails it, green when every run passes.
+                # row[-1] is passes_in, which is prose -- including it once made
+                # "none of the runs tested" count as a verdict.
+                vs = [str(x).upper() for x in row[1:-1]]
+                if "FAIL" in vs:
+                    return 2 if vs[0] != "FAIL" else 3
+                return 5
+
+            def _st_e(row):
+                # Amber when the value moves across the runs -- that is the row
+                # the change is acting on. Grey when it does not move at all.
+                sp = row[-1]
+                return 3 if isinstance(sp, float) and sp > 0 else 6
+            write_xlsx_multi(xp,
+                             [("1 Violations", e_hdr, e_rows,
+                               [10, 21, 10, 13, 9] + [11] * len(labels)
+                               + [9, 16, 11, 11], _st_e),
+                              ("2 Verdicts", v_hdr, v_rows,
+                               [22, 9] + [13] * len(labels) + [40], _st_v),
+                              ("3 Per run", r_hdr, per_run,
+                               [18, 12, 14, 20, 16, 16], None)],
+                             legend=[(3, "AMBER", "the value moves across the runs -- "
+                                                  "this change reaches this violation"),
+                                     (6, "GREY", "the value does not move -- not this "
+                                                 "change's doing"),
+                                     (2, "RED", "fails with the project and not without"),
+                                     (5, "GREEN", "passes in every run")],
+                             title_rows=["EVERY RUN SIDE BY SIDE -- %s (%s)" % (proj, mode),
+                                         "generated %s"
+                                         % time.strftime("%Y-%m-%d %H:%M"),
+                                         "",
+                                         "A CELL WITH NO NUMBER says which of three "
+                                         "things happened:",
+                                         "  not listed  that run scored the fault and "
+                                         "did not name this element -- normally because "
+                                         "it was not violating there. This is a result.",
+                                         "  unscored    that run has no verdict for the "
+                                         "fault (it crashed, gave up, or never ran). "
+                                         "Nothing is known.",
+                                         "  no run      that run does not exist, or "
+                                         "produced only FLAT_RUN. Nothing is known.",
+                                         ""]
+                                        + ["%s = results\\%s_%s%s" % (l, proj, mode, s)
+                                           for l, s in runs])
+            print("[matrix] -> %s" % xp)
+        except Exception as e:
+            print("[matrix] could not write the .xlsx (%s)" % e)
+    return path
+
+
+# ============================================================================
+# WHICH RUN IS THE BEST ONE FOR EACH SCENARIO
+# ============================================================================
+# The matrix puts every run beside every violation and leaves the reader to
+# rank them. With ten runs and eighty violating elements per fault that is a
+# judgement made eight hundred cells at a time, and the question being asked is
+# much smaller: FOR THIS FAULT, WHICH RUN WOULD I SUBMIT?
+#
+# THE TRAP THIS IS BUILT AROUND. A run that did not SCORE a fault has no
+# elements past a limit -- not because it is compliant but because there are no
+# results. Ranked on "fewest violations" it wins every time, and the report
+# would recommend the study that failed. Every project-off folder is in exactly
+# that state right now. So an unscored run is not ranked at all, is named as
+# unscored, and cannot be the recommendation.
+#
+# HOW THE RANKING WORKS, and why it is not one number:
+#
+#   1. a run that PASSES the fault wins outright -- there is nothing to weigh
+#   2. otherwise, FEWEST ELEMENTS past a limit
+#   3. tie -> the smaller worst VOLTAGE exceedance (pu)
+#   4. tie -> the smaller worst ROTOR-ANGLE exceedance (deg)
+#
+# Voltage and angle are kept apart deliberately. A single "worst exceedance"
+# over both is a maximum of a pu number and a degree number, and MATRIX's own
+# per-run sheet shows what that does: 32.7 for one run and 0.189 for another,
+# where the first is degrees, the second is pu, and the improvement is really
+# the angle exceedance dropping out of the max. Two columns cannot do that.
+
+_UNIT_OF_FAM = {"recovery": "pu", "overshoot": "pu", "steady": "pu",
+                "angle": "deg", "trip": "MW"}
+
+
+def _run_scorecard(proj, mode, sfx):
+    """{fault: {...}} -- how badly each fault does in ONE run.
+
+       scored=False means that run has no verdict for the fault, and every
+       count below is meaningless for it. The caller must not rank it."""
+    try:
+        r = compare_project(proj, mode, test_suffix=sfx)
+    except Exception as e:
+        print("[best] %s could not be read (%s)" % (sfx or "(baseline)", e))
+        return {}
+    if not r or not r.get("rows"):
+        return {}
+    lim = r.get("limits") or {}
+    out = {}
+    for row in r["rows"]:
+        v = norm_verdict(row["vt"])
+        rec = {"scored": bool(v), "verdict": v or "-", "n_over": 0,
+               "worst": {}, "crits": set()}
+        for c in row["crits"]:
+            fam = _criterion_family(c["criterion"])
+            if not fam or fam not in _UNIT_OF_FAM:
+                continue
+            if (c["test"] or "").upper() == "FAIL":
+                rec["crits"].add(_short_crit(c["criterion"]))
+            kind = {"angle": "undamped", "trip": "tripped"}.get(fam, fam)
+            unit = _UNIT_OF_FAM[fam]
+            for el, _bv, tv in (_where_values(row, fam) or _from_detail(c, fam)):
+                amt, _t = exceedance(kind, tv, lim)
+                if amt is None or amt <= 0:
+                    continue
+                rec["n_over"] += 1
+                if amt > rec["worst"].get(unit, 0.0):
+                    rec["worst"][unit] = amt
+        out[row["fault"]] = rec
+    return out
+
+
+def _rank_key(rec):
+    """Worse = bigger. Only ever applied to a run that SCORED the fault."""
+    return (0 if rec["verdict"] == "PASS" else 1,
+            rec["n_over"],
+            rec["worst"].get("pu", 0.0),
+            rec["worst"].get("deg", 0.0),
+            rec["worst"].get("MW", 0.0))
+
+
+def _fmt_worst(rec):
+    """"1.33 pu, 20.0 deg" -- each unit on its own, never combined."""
+    bits = []
+    for u in ("pu", "deg", "MW"):
+        if u in rec["worst"]:
+            bits.append(("%.3f %s" % (rec["worst"][u], u)) if u == "pu"
+                        else ("%.1f %s" % (rec["worst"][u], u)))
+    return ", ".join(bits) or "-"
+
+
+def write_best_case_report(proj, mode):
+    """BEST_CASE_<proj>_<mode>.txt/.csv/.xlsx -- the run to submit, per fault."""
+    runs = _matrix_runs(proj, mode)
+    if len(runs) < 2:
+        print("[best] %s (%s): only one run on disk -- nothing to choose between"
+              % (proj, mode))
+        return ""
+    cards = {}
+    for label, sfx in runs:
+        c = _run_scorecard(proj, mode, sfx)
+        if c:
+            cards[label] = c
+    if not cards:
+        print("[best] %s (%s): nothing scored in any run" % (proj, mode))
+        return ""
+    faults = sorted(set(f for c in cards.values() for f in c), key=_fault_key)
+    labels = [l for l, _s in runs]
+
+    rows, detail = [], {}
+    for f in faults:
+        ranked = []
+        unscored = []
+        for l in labels:
+            rec = cards.get(l, {}).get(f)
+            if rec is None:
+                # THE RUN EXISTS BUT NOT THIS FAULT. That is the project-off
+                # case exactly: the folder is there, the flat run scored, and
+                # not one fault did. "no run" would blame the wrong thing --
+                # the study did run, and stopped.
+                unscored.append((l, "unscored" if l in cards else "no run"))
+            elif not rec["scored"]:
+                unscored.append((l, "unscored"))
+            else:
+                ranked.append((l, rec))
+        ranked.sort(key=lambda t: _rank_key(t[1]))
+        detail[f] = (ranked, unscored)
+        if not ranked:
+            rows.append([f, "-", "", "NONE -- no run scored this fault", "", "",
+                         "", "nothing can be recommended: no run produced a "
+                         "verdict for it"])
+            continue
+        best_l, best = ranked[0]
+        passes = [l for l, rec in ranked if rec["verdict"] == "PASS"]
+        # AGAINST THE BASELINE, because "best" only means something as a change
+        # from what is being proposed today.
+        base_rec = cards.get("this run (100%)", {}).get(f)
+        if base_rec and base_rec["scored"] and best_l != "this run (100%)":
+            d = base_rec["n_over"] - best["n_over"]
+            vs = ("%d fewer element(s) past a limit than the baseline" % d if d > 0
+                  else ("the same %d element(s) as the baseline" % best["n_over"]
+                        if d == 0 else "%d MORE element(s) than the baseline" % -d))
+        elif best_l == "this run (100%)":
+            vs = "the baseline is already the best of the runs tried"
+        else:
+            vs = "the baseline has no verdict for this fault"
+        if passes:
+            say = "SUBMIT %s -- it PASSES" % passes[0]
+        elif best["n_over"] == 0:
+            say = ("%s has no element past a limit but still fails -- read its "
+                   "criteria report" % best_l)
+        else:
+            say = ("no run passes. %s is the least bad: %d element(s) past a "
+                   "limit, worst %s" % (best_l, best["n_over"], _fmt_worst(best)))
+        rows.append([f, best["verdict"], ", ".join(passes), best_l,
+                     best["n_over"], _fmt_worst(best), vs, say])
+
+    # WHICH RUN WOULD YOU CHOOSE IF YOU HAD TO CHOOSE ONE. A per-fault best is
+    # not a plan: the plant is built once, so the run that is best most often
+    # is the one worth quoting, and the faults it is NOT best for are the
+    # argument against it.
+    tally = {}
+    for f in faults:
+        ranked, _u = detail[f]
+        if ranked:
+            tally[ranked[0][0]] = tally.get(ranked[0][0], 0) + 1
+    overall = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    path = os.path.join(cmp_detail(), "BEST_CASE_%s_%s.txt" % (proj, mode))
+    w1 = max([10] + [len(f) for f in faults])
+    wl = max([12] + [len(l) for l in labels])
+    with open(path, "w") as fh:
+        fh.write("=" * 118 + "\n")
+        fh.write(" BEST CASE PER SCENARIO -- %s (%s)\n" % (proj, mode))
+        fh.write(" generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("=" * 118 + "\n")
+        fh.write(" For each fault, which of the %d run(s) on disk is the one to\n"
+                 % len(labels))
+        fh.write(" submit -- and, when none of them passes, which is least bad.\n\n")
+        fh.write(" HOW THE BEST RUN IS CHOSEN\n")
+        fh.write("   1. a run that PASSES the fault wins outright\n")
+        fh.write("   2. otherwise, FEWEST elements past a limit\n")
+        fh.write("   3. tie -> smaller worst VOLTAGE exceedance (pu)\n")
+        fh.write("   4. tie -> smaller worst ROTOR-ANGLE exceedance (deg)\n\n")
+        fh.write(" Voltage and angle are kept in separate columns on purpose. One\n")
+        fh.write(" 'worst exceedance' over both is a maximum of a pu number and a\n")
+        fh.write(" degree number, and it makes a run look better simply because its\n")
+        fh.write(" angle problem dropped out of the maximum.\n\n")
+        fh.write(" A RUN THAT DID NOT SCORE THE FAULT IS NOT RANKED. It has no\n")
+        fh.write(" elements past a limit because it has no results, and ranking it\n")
+        fh.write(" on that would recommend the study that failed. Those runs are\n")
+        fh.write(" listed per fault as 'unscored' / 'no run'.\n")
+        fh.write("=" * 118 + "\n")
+        fh.write(" %-*s %-8s %-*s %6s %-22s %s\n"
+                 % (w1, "fault", "best is", wl, "best run", "over",
+                    "worst exceedance", "against the baseline"))
+        fh.write("-" * 118 + "\n")
+        for r in rows:
+            fh.write(" %-*s %-8s %-*s %6s %-22s %s\n"
+                     % (w1, r[0], r[1], wl, r[3][:wl], r[4], r[5], r[6]))
+        fh.write("=" * 118 + "\n\n")
+        fh.write(" IF ONE RUN HAD TO BE CHOSEN FOR THE WHOLE PROJECT\n")
+        fh.write("-" * 118 + "\n")
+        if overall:
+            for l, n in overall:
+                fh.write("   %-*s best for %d of %d fault(s)\n"
+                         % (wl, l, n, len(faults)))
+            fh.write("\n   %s is best most often. The fault(s) it is NOT best for are\n"
+                     % overall[0][0])
+            fh.write("   the argument against it, and they are listed above.\n")
+        else:
+            fh.write("   nothing can be chosen: no run scored any fault.\n")
+        fh.write("=" * 118 + "\n\n")
+        fh.write(" EVERY RUN, RANKED, PER FAULT\n")
+        fh.write("=" * 118 + "\n")
+        for f in faults:
+            ranked, unscored = detail[f]
+            fh.write("\n %s\n" % f)
+            fh.write(" %s\n" % ("-" * 116))
+            fh.write("   %-4s %-*s %-7s %6s %-22s %s\n"
+                     % ("", wl, "run", "verdict", "over", "worst exceedance",
+                        "criteria failing"))
+            for i, (l, rec) in enumerate(ranked, start=1):
+                fh.write("   %-4d %-*s %-7s %6d %-22s %s\n"
+                         % (i, wl, l, rec["verdict"], rec["n_over"],
+                            _fmt_worst(rec),
+                            ", ".join(sorted(rec["crits"])) or "-"))
+            for l, why in unscored:
+                fh.write("   %-4s %-*s %-7s %6s %-22s %s\n"
+                         % ("-", wl, l, why, "-", "-",
+                            "not ranked -- nothing is known about this fault here"))
+        fh.write("=" * 118 + "\n")
+    print("[best] -> %s" % path)
+
+    hdr = ["fault", "best_verdict", "passes_in", "best_run",
+           "elements_over_limit", "worst_exceedance", "against_baseline",
+           "recommendation"]
+    if WRITE_CSV:
+        cp = path[:-4] + ".csv"
+        with csv_open(cp, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(_csv_row(hdr))
+            for r in rows:
+                w.writerow(_csv_row(r))
+        print("[best] -> %s" % cp)
+    if WRITE_XLSX:
+        try:
+            xp = path[:-4] + ".xlsx"
+
+            def _st(row):
+                if str(row[1]).upper() == "PASS":
+                    return 5                      # green: a run passes it
+                if str(row[3]).startswith("NONE"):
+                    return 6                      # grey: nothing to recommend
+                return 3                          # amber: least bad, still fails
+            _rank_rows = []
+            for f in faults:
+                ranked, unscored = detail[f]
+                for i, (l, rec) in enumerate(ranked, start=1):
+                    _rank_rows.append([f, i, l, rec["verdict"], rec["n_over"],
+                                       _fmt_worst(rec),
+                                       ", ".join(sorted(rec["crits"]))])
+                for l, why in unscored:
+                    _rank_rows.append([f, "", l, why, "", "",
+                                       "not ranked -- nothing is known here"])
+            write_xlsx_multi(
+                xp,
+                [("1 Best per fault", hdr, rows,
+                  [22, 12, 26, 22, 12, 22, 40, 62], _st),
+                 ("2 Every run ranked",
+                  ["fault", "rank", "run", "verdict", "elements_over_limit",
+                   "worst_exceedance", "criteria_failing"], _rank_rows,
+                  [22, 6, 22, 10, 12, 22, 46], None),
+                 ("3 Best overall",
+                  ["run", "faults_it_is_best_for", "of"],
+                  [[l, n, len(faults)] for l, n in overall], [22, 22, 8], None)],
+                legend=[(5, "GREEN", "a run PASSES this fault -- submit it"),
+                        (3, "AMBER", "no run passes; the named one is least bad"),
+                        (6, "GREY", "no run scored this fault -- nothing to "
+                                    "recommend")],
+                title_rows=["BEST CASE PER SCENARIO -- %s (%s)" % (proj, mode),
+                            "generated %s" % time.strftime("%Y-%m-%d %H:%M"),
+                            "",
+                            "Ranked: a PASS wins; else fewest elements past a "
+                            "limit; else smaller voltage exceedance; else "
+                            "smaller angle exceedance.",
+                            "Voltage and angle are separate columns -- one "
+                            "'worst exceedance' over both compares pu with "
+                            "degrees.",
+                            "A run that did not score the fault is NOT ranked: "
+                            "no violations because there are no results is not "
+                            "compliance.",
+                            ""])
+            print("[best] -> %s" % xp)
+        except Exception as e:
+            print("[best] could not write the .xlsx (%s)" % e)
+    return path
+
+
+def _mx(v):
+    """A measured value in a fixed-width column, or "-" when the run has none."""
+    if v is None or v == "":
+        return "-"
+    try:
+        return "%.3f" % float(v)
+    except (TypeError, ValueError):
+        return str(v)[:8]
+
+
+# ============================================================================
+# THE WHOLE CAMPAIGN, DONE AND TO-DO
+# ============================================================================
+# LIVE_STATUS.txt is written by the LAUNCHER, and a launcher only knows about
+# the study it is running. One launch is now a dozen studies -- baseline, a
+# .dyr value each, those repeated per capacity level, the project switched off
+# -- so that file shows the three scenarios on the machine right now and says
+# nothing about the eleven runs either side of them. Watching it, a sweep looks
+# like it is doing one thing at a time for no stated reason, and there is no
+# way to see what is already finished.
+#
+# THIS script is the only thing that knows the whole plan: it decides the list
+# before the first study starts. So it writes the list, with each run's state
+# read off disk, and refreshes it while the studies run.
+#
+#   COMPLETE    every fault in that folder has a verdict -- with
+#               SWEEP_SKIP_DONE it will be read, not re-run
+#   RUNNING     that folder was written to in the last few minutes
+#   PART DONE   some faults scored, nothing writing -- it stopped early
+#   TO RUN      no folder yet
+#
+# Deliberately NOT merged into LIVE_STATUS.txt: the launcher owns that file and
+# rewrites it whole, and its two blocks are laid out side by side in columns.
+# A twelve-row plan does not belong in a column beside a three-row scenario
+# table, and a file two processes overwrite is a file that loses one of them.
+
+_PLAN_RUNNING_S = 300      # a folder touched this recently is being written to
+
+
+def _plan_runs(projects, modes):
+    """[(project, mode, label, suffix)] -- every run this launch covers.
+
+       Built from the panel exactly as main() builds its loops, so the plan and
+       what actually happens cannot disagree: if this list is wrong the runs are
+       wrong too, which is a better failure than a plan that quietly describes a
+       different campaign."""
+    out = []
+    for proj in projects:
+        for mode in modes:
+            out.append((proj, mode, "baseline (as studied)", ""))
+            # The capacity levels the sweep itself produces.
+            for lv in sorted(set(float(x) for x in (CAPACITY_LEVELS or [])),
+                             reverse=True):
+                if abs(lv - 1.0) < 1e-9:
+                    continue                  # read off the baseline folder
+                out.append((proj, mode, "capacity %d %%" % round(lv * 100),
+                            "_cap%d" % round(lv * 100)))
+            # Every .dyr value, at every level it is repeated at.
+            if _dyr_sweep_for(proj) and proj in _dyr_sweep_projects(projects):
+                for ctag, _cs in _cap_levels():
+                    for tag, edits in _dyr_sweep_variants(proj):
+                        sfx = "%s_%s" % (_cap_suffix(ctag), tag)
+                        out.append((proj, mode,
+                                    "%s%s" % (_dyr_edits_text(edits),
+                                              (" @ %s" % _cap_label(ctag))
+                                              if ctag else ""),
+                                    sfx))
+            # Every POI total, each a complete study of its own.
+            for _mw in _poi_levels(proj):
+                if _poi_is_baseline(proj, _mw):
+                    continue        # that IS the baseline row above
+                out.append((proj, mode, "POI total %.0f MW" % _mw,
+                            "_" + _poi_tag(_mw)))
+            if NEW_PLANT_RUN and proj in _new_plant_projects(projects):
+                out.append((proj, mode, "NEW plant built at the POI",
+                            "_" + NEW_PLANT_TAG))
+            if PROJECT_OFF_RUN and proj in _project_off_projects(projects):
+                out.append((proj, mode, "project machines OFF",
+                            "_" + PROJECT_OFF_TAG))
+    return out
+
+
+# THE SHARED LIST, PER PROJECT, FROM THE PATH THE STUDIES ACTUALLY USE.
+# The template is written once -- FAULTS_CSV in each study script, mirrored by
+# SHARED_FAULTS_CSV here -- and it carries {project}, so four projects have four
+# lists. Resolving it here rather than assuming this panel's copy means a study
+# pointed at a different path is still found, and every project reads its own.
+_SHARED_TMPL = [None]
+
+
+def _shared_template():
+    """The {root}/{project} template both studies read their fault list from."""
+    if _SHARED_TMPL[0] is not None:
+        return _SHARED_TMPL[0]
+    tmpl = ""
+    for _c in (CASE_TEST, CASE_BASE):
+        try:
+            _sp, _auto, _csvp = fault_config(_c)
+        except Exception:
+            continue
+        if _csvp:
+            tmpl = _csvp
+            break
+    _SHARED_TMPL[0] = tmpl or SHARED_FAULTS_CSV
+    return _SHARED_TMPL[0]
+
+
+def _shared_list_for(proj):
+    """That project's own shared fault list, or "" when the name is unknown."""
+    if not proj:
+        return ""
+    try:
+        return shared_faults_path(proj, _shared_template())
+    except Exception:
+        return ""
+
+
+def _plan_expected(d, proj=None):
+    """How many faults that results folder is SUPPOSED to have.
+
+       THE FOLDER'S OWN COPY FIRST, THEN THE SHARED LIST. A run that has not
+       started has no results folder, so the folder copy does not exist -- and
+       reading only that made the plan say "no fault list has been built yet"
+       for the whole of phase 1, with SPP_FAULTS_<project>.csv sitting in the
+       study root where phase 0 had just written it. The count is knowable
+       before the first scenario runs, and that is exactly when it is wanted.
+
+       The two are the same file: each study copies the shared list into its own
+       results folder as the record of what it ran. The folder copy still wins,
+       because a finished run must be measured against the list IT used and not
+       against one that has been regenerated since."""
+    try:
+        p = os.path.join(d, "faults", "SPP_FAULTS.csv")
+        if not os.path.isfile(p):
+            p = _shared_list_for(proj or _proj_of_results_dir(d))
+        if not os.path.isfile(p):
+            return 0
+        n = 0
+        with io.open(p, "r", encoding="utf-8", errors="replace") as fh:
+            for r in csv.DictReader(fh):
+                fid = (r.get("fault_id") or "").strip()
+                if not fid or fid.upper().startswith("FLAT"):
+                    continue
+                # THE SELECTION COUNTS, NOT THE FILE. ONLY_EVENTS = ["P1"] makes
+                # this a P1 study, and the plan said "142 scenario(s)" because it
+                # counted rows in SPP_FAULTS.csv and never applied the filter --
+                # so the campaign total, the percentage and the estimate were all
+                # over 23 P4.2 events the launch is not running.
+                if not _event_selected((r.get("planning_event") or "").strip()):
+                    continue
+                if not _id_selected(fid):
+                    continue
+                n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def _plan_state(proj, mode, sfx):
+    """What is on disk for one run: state, scenario counts, verdicts."""
+    d = os.path.join(_res_root(CASE_TEST),
+                     "%s_%s%s" % (proj, mode, sfx))
+    if not os.path.isdir(d):
+        return {"dir": d, "state": "TO RUN", "n_out": 0, "n_scored": 0,
+                "n_pass": 0, "n_fail": 0, "when": ""}
+    try:
+        n_out = len(glob.glob(os.path.join(d, "outs", "*.out")))
+    except Exception:
+        n_out = 0
+    ct, _src = read_criteria(d, proj)
+    # FAULTS ONLY, because the denominator beside it is the FAULT count. The
+    # flat run is not one of the 119; counting it made a folder that had scored
+    # nothing but the initial-condition check read "1/119 scored, 1 PASS".
+    scored = [f for f in ct if norm_verdict(ct[f].get("verdict"))
+              and not str(f).upper().startswith("FLAT")]
+    n_pass = sum(1 for f in scored
+                 if norm_verdict(ct[f].get("verdict")) == "PASS")
+    n_fail = len(scored) - n_pass
+    # NEWEST ANYTHING IN THE FOLDER. A running study touches its live-status
+    # file, its logs and its .out files constantly; a finished one stops.
+    newest = 0.0
+    for pat in ("*", os.path.join("outs", "*"), os.path.join("logs", "*")):
+        for q in glob.glob(os.path.join(d, pat)):
+            try:
+                t = os.path.getmtime(q)
+            except Exception:
+                continue
+            if t > newest:
+                newest = t
+    live = newest and (time.time() - newest) < _PLAN_RUNNING_S
+    # A FLAT-ONLY FOLDER IS NOT COMPLETE, whatever its report says. That is
+    # exactly what the project-off runs produced, and calling it done is how a
+    # blank column in the matrix goes unexplained.
+    n_faults = len([f for f in scored if not str(f).upper().startswith("FLAT")])
+    # ...AND NEITHER IS A FOLDER WITH ONE FAULT SCORED OUT OF A HUNDRED AND
+    # FORTY-TWO. This read `elif n_faults and n_out`, so a SINGLE scored fault
+    # marked the whole run COMPLETE -- and with SWEEP_SKIP_DONE that run is then
+    # READ instead of re-run, so a campaign that died after one scenario reports
+    # as a campaign that finished. The fault list this folder was built from says
+    # how many there should be; anything short of it is PART DONE.
+    n_want = _plan_expected(d, proj)
+    # A SWEPT VALUE THAT RUNS A SUBSET IS COMPLETE WHEN THE SUBSET IS. With
+    # DYR_SWEEP_FAULTS = "failing" or "crashed" the variant folder is asked
+    # for the failing / crashed scenarios of the as-studied run and nothing
+    # else, so measuring it against the whole list held it at PART DONE for
+    # ever and listed it under NOT READY TO COMPARE.
+    try:
+        _scope = (DYR_SWEEP_FAULTS or "all").strip().lower()
+        if "_dyr_" in str(sfx) and _scope in ("failing", "crashed"):
+            _sel = (_failing_faults(proj, mode) if _scope == "failing"
+                    else _crashed_faults(proj, mode))
+            if _sel:
+                n_want = len(_sel)
+    except Exception:
+        pass
+    if live:
+        state = "RUNNING"
+    elif n_want and n_faults >= n_want:
+        state = "COMPLETE"
+    elif not n_want and n_faults and n_out:
+        state = "COMPLETE"          # no fault list to compare against -- as before
+    elif scored or n_out:
+        state = "PART DONE"
+    else:
+        state = "TO RUN"
+    return {"dir": d, "state": state, "n_out": n_out, "n_scored": len(scored),
+            "n_pass": n_pass, "n_fail": n_fail, "n_faults": n_faults,
+            "n_want": n_want,
+            "when": (time.strftime("%Y-%m-%d %H:%M", time.localtime(newest))
+                     if newest else "")}
+
+
+def _plan_scn_states(rdir, proj):
+    """{fault id: 'PASS' | 'FAIL' | 'sim' | ''} for ONE results folder.
+
+       'sim' = an .out is on disk but no verdict was ever written (SIMULATED,
+       not scored -- the state LIVE STATUS calls DONE). '' = no .out at all.
+       Globs fresh every call, never cached: this feeds a table refreshed every
+       minute while the .out files are still landing."""
+    st = {}
+    try:
+        for p in glob.glob(os.path.join(rdir, "outs", "*.out")):
+            f = os.path.splitext(os.path.basename(p))[0].strip()
+            if not f.upper().startswith("FLAT"):
+                st[f] = "sim"
+    except Exception:
+        pass
+    try:
+        ct, _src = read_criteria(rdir, proj)
+        for k, v in (ct or {}).items():
+            f = str(k).strip()
+            if f.upper().startswith("FLAT"):
+                continue
+            nv = norm_verdict((v or {}).get("verdict"))
+            if nv:
+                st[f] = nv          # a real verdict wins over 'sim'
+    except Exception:
+        pass
+    return st
+
+
+_SCN_GLYPH = {"PASS": "P", "FAIL": "F", "sim": "s", "": "-"}
+
+
+def _plan_expected_ids(proj, mode, rows):
+    """The fault ids this launch is SUPPOSED to run for a project -- so a fault
+       that ran in NO run still gets a row (a full line of '-') rather than
+       vanishing because nothing on disk mentions it.
+
+       Reads the fault list the same way _plan_expected counts it: any run's own
+       faults\\SPP_FAULTS.csv first (they share one list), else the project's
+       shared template. Honours ONLY_FAULTS / ONLY_EVENTS, so the universe is
+       what THIS launch selected, not the whole file."""
+    p = ""
+    for (_p, _m, _l, _s, st) in rows:
+        if _p != proj:
+            continue
+        cand = os.path.join(st["dir"], "faults", "SPP_FAULTS.csv")
+        if os.path.isfile(cand):
+            p = cand
+            break
+    if not p:
+        p = _shared_list_for(proj)
+    ids = set()
+    if not p or not os.path.isfile(p):
+        return ids
+    try:
+        with io.open(p, "r", encoding="utf-8", errors="replace") as fh:
+            for r in csv.DictReader(fh):
+                fid = (r.get("fault_id") or "").strip()
+                if not fid or fid.upper().startswith("FLAT"):
+                    continue
+                if not _event_selected((r.get("planning_event") or "").strip()):
+                    continue
+                if not _id_selected(fid):
+                    continue
+                ids.add(fid)
+    except Exception:
+        pass
+    return ids
+
+
+def _plan_col_label(proj, mode, dir_basename):
+    """A short column heading for one run: 'base', 'as-studied', 'Kqv1_Khv1',
+       'poi492' -- the folder's own suffix, which is what names it everywhere
+       else, rather than the long human sentence."""
+    tag = dir_basename
+    pre = "%s_%s" % (proj, mode)
+    if tag.startswith(pre):
+        tag = tag[len(pre):].lstrip("_")
+    if not tag:
+        return "as-studied"
+    if tag.startswith("dyr_"):
+        tag = tag[len("dyr_"):]
+    return tag
+
+
+def _plan_scenario_matrix(rows):
+    """EVERY SCENARIO OF EVERY RUN, ON ONE PAGE -- base included.
+
+       The live table belongs to the one study running now; this is every run
+       of the launch at once, one row per fault, one column per run, so 'is F04
+       scored anywhere, and where is it still only simulated' is one glance
+       instead of opening a folder per run. Base is the first column because it
+       is the thing everything is compared against and it is a run too."""
+    if not rows:
+        return []
+    L = []
+    projs = []
+    for r in rows:
+        if r[0] not in projs:
+            projs.append(r[0])
+    for p in projs:
+        prows = [r for r in rows if r[0] == p]
+        mode = prows[0][1]
+        # base first, then every project-side run in campaign order.
+        cols = []
+        _bdir = os.path.join(_res_root(CASE_BASE), "%s_%s" % (p, mode))
+        cols.append(("base", _plan_scn_states(_bdir, p)))
+        for (_p, _m, _lbl, _sfx, st) in prows:
+            cols.append((_plan_col_label(p, mode, os.path.basename(st["dir"])),
+                         _plan_scn_states(st["dir"], p)))
+        faults = set()
+        for _lbl, s in cols:
+            faults.update(s)
+        # EVERY PLANNED FAULT, not only the ones some run touched: a scenario
+        # that ran in NO run must still show -- as a full row of '-' -- or "did
+        # it run anywhere" is a question the table silently cannot answer.
+        _expected = _plan_expected_ids(p, mode, rows)
+        faults.update(_expected)
+        faults = sorted(faults, key=_fault_key)
+        if not faults:
+            continue
+        wf = max([5] + [len(f) for f in faults])
+        cw = [max(4, len(lbl)) for lbl, _s in cols]
+        L.append("")
+        L.append(" EVERY SCENARIO OF EVERY RUN -- %s (%s)" % (p, mode))
+        L.append("   P = scored PASS   F = scored FAIL   s = simulated, NOT"
+                 " scored   - = not run")
+        hdr = " %-*s " % (wf, "fault")
+        for (lbl, _s), w in zip(cols, cw):
+            hdr += "%-*s " % (w, lbl)
+        L.append(hdr.rstrip())
+        L.append(" " + "-" * (len(hdr) - 1))
+        for f in faults:
+            line = " %-*s " % (wf, f)
+            for (_lbl, s), w in zip(cols, cw):
+                line += "%-*s " % (w, _SCN_GLYPH.get(s.get(f, ""), "-"))
+            L.append(line.rstrip())
+        # PER-COLUMN TOTALS: scored / simulated-not-scored, so a run that is all
+        # 's' (finished simulating, never scored) is obvious at the foot.
+        tline = " %-*s " % (wf, "scored")
+        sline = " %-*s " % (wf, "sim-only")
+        nline = " %-*s " % (wf, "NOT run")
+        for (_lbl, s), w in zip(cols, cw):
+            nsc = sum(1 for v in s.values() if v in ("PASS", "FAIL"))
+            nsm = sum(1 for v in s.values() if v == "sim")
+            # NOT RUN in THIS column = a planned fault with no .out here. Counted
+            # over the whole planned universe (faults), so base and every run
+            # each say how many of the SAME list they are missing.
+            nnr = sum(1 for f in faults if s.get(f, "") == "")
+            tline += "%-*s " % (w, nsc)
+            sline += "%-*s " % (w, nsm)
+            nline += "%-*s " % (w, nnr)
+        L.append(" " + "-" * (len(hdr) - 1))
+        L.append(tline.rstrip())
+        L.append(sline.rstrip())
+        L.append(nline.rstrip())
+        # RAN NOWHERE, and RAN-BUT-SCORED-NOWHERE, named outright -- the two
+        # answers to "which scenarios still owe me a result" that the reader
+        # would otherwise reconstruct by scanning every row for a line of '-'.
+        _never_out = [f for f in faults
+                      if all(cs.get(f, "") == "" for _cl, cs in cols)]
+        _never_scored = [f for f in faults
+                         if f not in _never_out
+                         and all(cs.get(f, "") in ("", "sim")
+                                 for _cl, cs in cols)]
+        if _never_out:
+            L.append(" NOT RUN in ANY run (no .out anywhere): %s"
+                     % ", ".join(_never_out))
+        if _never_scored:
+            L.append(" simulated but SCORED in NO run: %s"
+                     % ", ".join(_never_scored))
+        if not _never_out and not _never_scored:
+            L.append(" every planned fault ran and scored in at least one run.")
+    return L
+
+
+def _plan_campaign(rows):
+    """The whole launch as one set of numbers: scenarios planned across every
+       run, how many are scored, and when the last of them ends.
+
+       THE LIVE TABLE CANNOT ANSWER THIS. It belongs to the study that is
+       running right now, so with a .dyr sweep at three capacity levels it says
+       142 twelve separate times and never once says 1704. The campaign is this
+       script's to describe, and "how long for all of it" is the question a
+       sweep is actually asked."""
+    if not rows:
+        return []
+    # PER PROJECT, NOT PER LAUNCH. Every run of ONE project walks that project's
+    # own list -- and the lists differ: SantaFe's POI produces 142 events and
+    # EastFork's produces its own number. One `max` across every row totalled a
+    # four-project campaign at four times the biggest project's list.
+    per_proj = {}
+    for r in rows:
+        n = int(r[4].get("n_want") or 0)
+        if n > per_proj.get(r[0], 0):
+            per_proj[r[0]] = n
+    total = sum(per_proj.get(r[0], 0) for r in rows)
+    n_runs = len(rows)
+    per = max(per_proj.values() or [0])          # for the "runs x scenarios" line
+    scored = sum(int(r[4].get("n_scored") or 0) for r in rows)
+
+    # HOW LONG ONE SCENARIO COSTS, measured across every folder of the campaign.
+    # NOT THE FLAT RUN. It is 3 s of simulation with no disturbance and no
+    # fault application; a fault scenario is 30.2 s with a fault, a clearing
+    # and a reclose. Timed together, one flat run at 1m 17s estimated 118 fault
+    # scenarios at a quarter of an hour when they take four to eighteen minutes
+    # EACH. An estimate from the wrong population is worse than none.
+    secs = []
+    for _p, _m, _l, _s, st in rows:
+        try:
+            for q in glob.glob(os.path.join(st["dir"], "outs", "*.secs")):
+                if os.path.basename(q).upper().startswith("FLAT"):
+                    continue
+                with open(q) as fh:
+                    v = float((fh.read() or "0").strip().split()[0])
+                if v > 0:
+                    secs.append(v)
+        except Exception:
+            continue
+
+    L = []
+    L.append("")
+    L.append(" WHOLE CAMPAIGN")
+    if not per:
+        L.append("   the scenario count is not known yet -- no readable fault list in")
+        L.append("   this launch's results folders, nor at:")
+        for _pj in sorted(set(r[0] for r in rows)):
+            L.append("     %-14s %s" % (_pj, _shared_list_for(_pj) or "(path unknown)"))
+        L.append("   It appears once phase 0 writes one.")
+        return L
+    if len(per_proj) > 1:
+        L.append("   %d run(s), %d scenario(s) in total" % (n_runs, total))
+        for _pj in sorted(per_proj):
+            _nr = sum(1 for r in rows if r[0] == _pj)
+            L.append("     %-14s %d run(s) x %d = %d"
+                     % (_pj, _nr, per_proj[_pj], _nr * per_proj[_pj]))
+    else:
+        L.append("   %d run(s) x %d scenario(s) = %d scenario(s) in total"
+                 % (n_runs, per, total))
+    L.append("   %d scored so far  (%.1f%%)"
+             % (scored, 100.0 * scored / total if total else 0.0))
+    if not secs:
+        L.append("   No scenario has finished yet, so there is no rate to estimate from.")
+        return L
+    mean = sum(secs) / len(secs)
+    # HOW MANY RUN AT ONCE: workers per case times the cases being simulated.
+    # "auto" IS A NUMBER ONCE IT IS RESOLVED. int("auto") raised, so the plan
+    # printed "the concurrency is not known here" and gave PSS/E-hours instead
+    # of a finish time -- while _total_sessions() had the answer all along, and
+    # is the same function that decides how many sessions actually start.
+    _ncase = len(_cases_to_run()) if RUN_IN_PARALLEL else 1
+    try:
+        conc = _total_sessions(N_WORKERS, _ncase)
+    except Exception:
+        conc = 0
+    L.append("   %d timed: mean %s per scenario (fastest %s, slowest %s)"
+             % (len(secs), _fmt_hms(mean), _fmt_hms(min(secs)), _fmt_hms(max(secs))))
+    left = max(0, total - scored)
+    if conc:
+        eta = left * mean / float(conc)
+        L.append("   %d left at %d concurrent -> about %s, finishing near %s"
+                 % (left, conc, _fmt_hms(eta),
+                    time.strftime("%Y-%m-%d %H:%M",
+                                  time.localtime(time.time() + eta))))
+    else:
+        L.append("   %d left, %s of PSS/E time -- divide by the sessions you run"
+                 % (left, _fmt_hms(left * mean)))
+        L.append("   (the session count could not be resolved from N_WORKERS = %r)"
+                 % N_WORKERS)
+    if len(secs) < 3:
+        L.append("   (from %d finished run(s) -- a first guess until 3 or more)" % len(secs))
+    return L
+
+
+def _plan_base_counts(proj, mode, sfx):
+    """(.out files, expected faults) for the BASE side of one planned run.
+
+       The plan reads the PROJECT case -- _plan_state() looks only there -- so a
+       base study that never ran, or stopped half way, was invisible in it. A
+       comparison needs BOTH sides of every fault, so a project whose base case
+       is missing is as unfinished as one whose project case is."""
+    d = os.path.join(_res_root(CASE_BASE), "%s_%s%s" % (proj, mode, sfx))
+    n_out = n_want = 0
+    try:
+        n_out = len(glob.glob(os.path.join(d, "outs", "*.out")))
+    except Exception:
+        pass
+    try:
+        fp = os.path.join(d, "faults", "SPP_FAULTS.csv")
+        if os.path.isfile(fp):
+            n_want = max(0, len(_read_text(fp).splitlines()) - 1)
+    except Exception:
+        pass
+    return n_out, n_want
+
+
+def write_sweep_plan(projects=None, modes=None, note=""):
+    """SWEEP_PLAN.txt -- every run of this launch, with what is done already.
+
+       Never raises. It is a view, and a view that can take a run down is worse
+       than no view."""
+    if not SWEEP_PLAN_FILE:
+        return ""
+    try:
+        projects = projects or (compare_projects() or [])
+        modes = modes or MODES
+        runs = _plan_runs(projects, modes)
+        if not runs:
+            return ""
+        rows = [(p, m, lbl, sfx, _plan_state(p, m, sfx)) for p, m, lbl, sfx in runs]
+        n = dict((k, 0) for k in ("COMPLETE", "RUNNING", "PART DONE", "TO RUN"))
+        for _p, _m, _l, _s, st in rows:
+            n[st["state"]] = n.get(st["state"], 0) + 1
+        wl = max([18] + [len(r[2]) for r in rows])
+        wp = max([8] + [len(r[0]) for r in rows])
+        L = []
+        L.append("=" * 118)
+        L.append(" CAMPAIGN PLAN -- every run this launch covers")
+        L.append(" %s%s" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                            ("   %s" % note) if note else ""))
+        if SWEEP_PLAN_EVERY:
+            L.append(" refreshed every %ds while the studies run" % SWEEP_PLAN_EVERY)
+        L.append("=" * 118)
+        L.append(" %d run(s):  %d COMPLETE, %d RUNNING, %d PART DONE, %d TO RUN"
+                 % (len(rows), n["COMPLETE"], n["RUNNING"], n["PART DONE"],
+                    n["TO RUN"]))
+        L.append("")
+        L.append(" COMPLETE   every fault scored%s"
+                 % (" -- READ, not re-run" if SWEEP_SKIP_DONE else
+                    " -- re-run anyway (SWEEP_SKIP_DONE = False)"))
+        L.append(" RUNNING    written to in the last %d min" % (_PLAN_RUNNING_S // 60))
+        L.append(" PART DONE  it stopped early -- the scored column shows how far")
+        L.append(" TO RUN     no results folder yet")
+        L.append(" base       the BASE case's .out files for the same run, and the")
+        L.append("            fault count it is expected to have")
+        L.append("=" * 118)
+        L.append(" %-*s %-*s %-10s %5s %7s %5s %5s %9s  %s"
+                 % (wp, "project", wl, "run", "state", ".out", "scored",
+                    "PASS", "FAIL", "base .out", "last written"))
+        L.append("-" * 118)
+        _last_p = None
+        _incomplete = []
+        for p, m, lbl, sfx, st in rows:
+            # A blank line between projects: twelve rows read as two campaigns
+            # of six far more easily than as one of twelve.
+            if _last_p is not None and p != _last_p:
+                L.append("")
+            _last_p = p
+            # "3" says nothing; "3/142" says the run stopped. The denominator
+            # is the fault list that folder's own build wrote.
+            _sc = ("%d/%d" % (st["n_scored"], st["n_want"])) if st.get("n_want") \
+                else (st["n_scored"] or "-")
+            # THE BASE SIDE, BESIDE THE PROJECT SIDE. Without it a run reads
+            # COMPLETE while the base case it must be compared against has no
+            # results at all -- which is the state a comparison cannot use.
+            _bo, _bw = _plan_base_counts(p, m, sfx)
+            _bcol = ("%d/%d" % (_bo, _bw)) if _bw else (str(_bo) if _bo else "-")
+            if _bo == 0 or (_bw and _bo < _bw):
+                _incomplete.append("%s %s: base %s" % (p, lbl, _bcol))
+            if st["state"] in ("TO RUN", "PART DONE"):
+                _incomplete.append("%s %s: project %s (%s)"
+                                   % (p, lbl, _sc, st["state"]))
+            L.append(" %-*s %-*s %-10s %5s %7s %5s %5s %9s  %s"
+                     % (wp, p, wl, lbl, st["state"],
+                        st["n_out"] or "-", _sc,
+                        st["n_pass"] or "-", st["n_fail"] or "-", _bcol,
+                        st["when"] or "-"))
+        L.append("-" * 118)
+        if _incomplete:
+            L.append(" NOT READY TO COMPARE (%d):" % len(_incomplete))
+            for _w in _incomplete:
+                L.append("   %s" % _w)
+            L.append(" A comparison needs the SAME fault on BOTH sides. Run again --")
+            L.append(" finished scenarios are skipped, so only the missing work is done.")
+            L.append("-" * 118)
+        try:
+            L.extend(_plan_campaign(rows))
+        except Exception as _e:
+            L.append(" (the campaign totals could not be worked out: %s)" % _e)
+        # EVERY SCENARIO OF EVERY RUN, base included -- the per-fault grid the
+        # live table cannot show because it belongs to one study at a time.
+        try:
+            L.extend(_plan_scenario_matrix(rows))
+        except Exception as _e:
+            L.append(" (the scenario matrix could not be worked out: %s)" % _e)
+        L.append("")
+        L.append(" FOLDERS")
+        for p, m, lbl, sfx, st in rows:
+            L.append("   %-*s %-*s %s" % (wp, p, wl, lbl,
+                                          os.path.basename(st["dir"])))
+        L.append("=" * 118)
+        L.append(" Every scenario of every run -- base and all variants -- is in the")
+        L.append(" grid above. The live per-second detail of whatever is running right")
+        L.append(" now is folded in below, so this one root file holds everything.")
+        L.append("=" * 118)
+        # THE LIVE PER-SECOND TABLE, FOLDED IN. The launcher writes the combined
+        # LIVE_STATUS file (base | project, updated every few seconds); this
+        # embeds its current content so the campaign plan is the ONE file to open
+        # -- all runs at a glance above, and the scenario now on each worker
+        # below -- rather than two files in the same folder telling half the
+        # story each. It is only a copy of what the launcher already wrote; if it
+        # is not there yet (no study running), the line just says so.
+        if LIVE_STATUS_ALL:
+            _lsa = _root_named(LIVE_STATUS_ALL)
+            L.append("")
+            L.append(" LIVE NOW -- the study running this moment, per worker")
+            L.append("-" * 118)
+            try:
+                with io.open(_lsa, "r", encoding="utf-8", errors="replace") as _fh:
+                    _live = _fh.read().rstrip("\n")
+                L.append(_live if _live else " (nothing is running right now)")
+            except Exception:
+                L.append(" (no study is running right now -- the live table appears here"
+                         " while one is)")
+            L.append("=" * 118)
+        path = _root_named(SWEEP_PLAN_FILE)
+        with io.open(path, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(u"\n".join(_u(x) for x in L) + u"\n")
+        return path
+    except Exception as e:
+        print("[plan] the campaign plan could not be written (%s) -- the run is "
+              "unaffected" % e)
+        return ""
+
+
+def _sweep_plan_start():
+    """Refresh SWEEP_PLAN.txt on a timer until stopped. Daemon, read-only."""
+    if not (SWEEP_PLAN_FILE and SWEEP_PLAN_EVERY):
+        return None
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(SWEEP_PLAN_EVERY):
+            write_sweep_plan()
+
+    th = threading.Thread(target=_loop)
+    th.daemon = True
+    th.start()
+    return stop.set
+
+
+def write_all_runs_comparison(results):
+    """One table over EVERY run still on disk, all against the same base case.
+
+       Each row is a whole study -- this run, an archived earlier one, a
+       capacity level -- scored the same way as the main comparison, so the
+       question "what has changed across everything I have run" is answered in
+       one place rather than by opening one report per folder."""
+    if not COMPARE_ALL_RUNS or SIMPLE_OUTPUT:
+        return []          # see SIMPLE_OUTPUT
+    done, wrote = set(), []
+    for res in results:
+        proj, mode = res["project"], res["mode"]
+        if (proj, mode) in done:
+            continue
+        done.add((proj, mode))
+        sfxs = _run_suffixes(proj, mode)
+        if len(sfxs) < 2:
+            print("[runs] %s (%s): only one run on disk -- no cross-run table "
+                  "(KEEP_PREVIOUS_RUNS keeps the next one)" % (proj, mode))
+            continue
+        rows = []
+        for sfx in sfxs:
+            d = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, sfx))
+            try:
+                r = res if not sfx else compare_project(proj, mode, test_suffix=sfx)
+            except Exception as e:
+                print("[runs] %s could not be compared (%s)" % (os.path.basename(d), e))
+                continue
+            if not r or not r["rows"]:
+                continue
+            t = _tally(r["rows"])
+            rows.append({
+                "suffix": sfx, "label": _run_label(sfx), "dir": d,
+                "when": _folder_time(d), "n": len(r["rows"]),
+                "new": t[CLS_NEW], "pre": t[CLS_PRE], "res": t[CLS_RESOLVED],
+                "ok": t[CLS_OK],
+                "other": t[CLS_ONLY_B] + t[CLS_ONLY_T] + t[CLS_NEITHER],
+                "hidden": sum(1 for x in r["rows"]
+                              if x["hidden_new"] and not _is_flat(x)),
+                "newids": sorted([x["fault"] for x in r["rows"]
+                                  if x["class"] == CLS_NEW], key=_fault_key),
+                "coll": _collector_of(d),
+                "dyr": _dyr_of(d),
+            })
+        if not rows:
+            continue
+        with _cmp_into(proj if COMPARE_BY_PROJECT else ""):
+            path = os.path.join(cmp_dir(), "ALL_RUNS_%s_%s.txt" % (proj, mode))
+        bdir = results_dir(CASE_BASE, proj, mode)
+        with open(path, "w") as fh:
+            fh.write("=" * 104 + "\n")
+            fh.write(" EVERY RUN ON DISK -- %s (%s)\n" % (proj, mode))
+            fh.write(" generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            fh.write("=" * 104 + "\n")
+            fh.write(" Each row is a COMPLETE run of the project case, scored against the\n")
+            fh.write(" same base case -- the classifications mean exactly what they mean in\n")
+            fh.write(" the main comparison.\n")
+            fh.write("\n")
+            fh.write("   base case   %s\n" % bdir)
+            fh.write("   last written %s\n" % _folder_time(bdir))
+            fh.write("\n")
+            fh.write(" A row written BEFORE that base timestamp was scored against the base\n")
+            fh.write(" results as they are NOW, not as they were when it ran. That is the\n")
+            fh.write(" right comparison when the base case has not changed, and the wrong\n")
+            fh.write(" one when it has -- so if the base was re-run against a new system\n")
+            fh.write(" model, the older rows below are answering a different question.\n")
+            fh.write("=" * 104 + "\n")
+            head = (" %-22s %-16s %6s %6s %6s %6s %6s %6s %8s"
+                    % ("run", "when", "faults", "NEW", "PRE", "RESLVD", "OK", "other",
+                       "hidden"))
+            fh.write(head + "\n")
+            fh.write("-" * len(head) + "\n")
+            for r in rows:
+                fh.write(" %-22s %-16s %6d %6d %6d %6d %6d %6d %8d\n"
+                         % (r["label"], r["when"], r["n"], r["new"], r["pre"],
+                            r["res"], r["ok"], r["other"], r["hidden"]))
+            fh.write("=" * 104 + "\n\n")
+            fh.write(" WHICH FAULTS THE PROJECTS BREAK, PER RUN\n")
+            fh.write(" (NEW = passed without the projects, fails with them)\n")
+            fh.write("-" * 104 + "\n")
+            for r in rows:
+                fh.write(" %-22s %s\n"
+                         % (r["label"], ", ".join(r["newids"]) or "(none)"))
+            fh.write("-" * 104 + "\n\n")
+            # THE COLLECTOR EACH RUN WAS BUILT WITH. Two runs that differ only
+            # in these numbers are the whole point of changing them; two runs
+            # that differ in the results and NOT in these were not caused by
+            # the collector, whatever else changed.
+            # THE MODEL CONSTANTS EACH RUN WAS BUILT WITH. Same reason as the
+            # collector block below it: a table of verdicts across runs is only
+            # readable beside what was different about each run.
+            if any(r["dyr"] for r in rows):
+                fh.write(" .dyr CONSTANTS EACH RUN WAS BUILT WITH\n")
+                fh.write("-" * 104 + "\n")
+                for r in rows:
+                    fh.write(" %-22s %s\n"
+                             % (r["label"], r["dyr"] or "(deck unedited)"))
+                fh.write("-" * 104 + "\n\n")
+            if any(r["coll"] for r in rows):
+                fh.write(" COLLECTOR IMPEDANCE EACH RUN WAS BUILT WITH\n")
+                fh.write("-" * 104 + "\n")
+                for r in rows:
+                    fh.write(" %-22s %s\n"
+                             % (r["label"], r["coll"] or "(not recorded -- run from "
+                                "a version without this setting)"))
+                fh.write("-" * 104 + "\n\n")
+            # WHAT MOVED BETWEEN RUNS. Two runs of the same study should give
+            # the same answer; a fault that is NEW in one and not the other is
+            # either the change being studied or a run that did not finish.
+            if len(rows) > 1:
+                fh.write(" WHAT CHANGED, EACH RUN AGAINST THE ONE BELOW IT\n")
+                fh.write("-" * 104 + "\n")
+                for i in range(len(rows) - 1):
+                    a, b = rows[i], rows[i + 1]
+                    sa, sb = set(a["newids"]), set(b["newids"])
+                    fh.write(" %s  vs  %s\n" % (a["label"], b["label"]))
+                    fh.write("     broken only in %-22s %s\n"
+                             % (a["label"], ", ".join(sorted(sa - sb, key=_fault_key))
+                                or "(none)"))
+                    fh.write("     broken only in %-22s %s\n"
+                             % (b["label"], ", ".join(sorted(sb - sa, key=_fault_key))
+                                or "(none)"))
+                    if a["n"] != b["n"]:
+                        fh.write("     NOTE: %d faults against %d -- the two runs did not\n"
+                                 "           cover the same list, so the difference above\n"
+                                 "           is partly about what was run, not what failed.\n"
+                                 % (a["n"], b["n"]))
+                    fh.write("\n")
+            fh.write("=" * 104 + "\n")
+            for r in rows:
+                fh.write(" %-22s %s\n" % (r["label"], r["dir"]))
+            fh.write("=" * 104 + "\n")
+        print("[runs] -> %s" % path)
+        wrote.append(path)
+        if WRITE_CSV:
+            cp = path[:-4] + ".csv"
+            with csv_open(cp, "w") as fh:
+                w = csv.writer(fh)
+                w.writerow(_csv_row(["run", "when", "faults", "new", "pre_existing",
+                                     "resolved", "ok", "other", "hidden_new",
+                                     "new_fault_ids", "results_folder"]))
+                for r in rows:
+                    w.writerow(_csv_row([r["label"], r["when"], r["n"], r["new"],
+                                         r["pre"], r["res"], r["ok"], r["other"],
+                                         r["hidden"], " ".join(r["newids"]), r["dir"]]))
+            print("[runs] -> %s" % cp)
+            wrote.append(cp)
+    return wrote
+
+
+@_timed("comparison")
+def write_summary(results, only_base, only_test):
+    path = cmp_path("COMPARISON_SUMMARY", "txt")
+    L = []
+    L.append("=" * 104)
+    L.append(" SPP STUDY COMPARISON -- SUMMARY, ALL PROJECTS")
+    L.append(" generated %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    L.append("=" * 104)
+    L.append(" BASE  %-46s %s" % (CASE_BASE["label"], CASE_BASE["dir"]))
+    L.append(" TEST  %-46s %s" % (CASE_TEST["label"], CASE_TEST["dir"]))
+    if ONLY_FAULTS or ONLY_EVENTS:
+        # A PARTIAL COMPARISON MUST SAY SO ON ITS FIRST PAGE. "The projects
+        # introduce 1 new failure" is true of the three faults compared and says
+        # nothing about the other hundred and thirty-nine.
+        L.append("=" * 104)
+        L.append(" *** PARTIAL: only the selected faults were compared -- %s"
+                 % "; ".join([x for x in (", ".join(ONLY_FAULTS),
+                                          ("events " + ", ".join(ONLY_EVENTS))
+                                          if ONLY_EVENTS else "") if x]))
+        L.append("     The counts below describe THOSE faults only, not the whole study.")
+    L.append("=" * 104)
+    L.append(" Every fault was run against both cases. Each is classified by comparing")
+    L.append(" its verdict in the two studies:")
+    L.append("")
+    L.append("   NEW           passed WITHOUT the projects, FAILS WITH them")
+    L.append("                 -- the projects introduced it")
+    L.append("   PRE-EXISTING  failed in BOTH -- the base system already fails it")
+    L.append("   RESOLVED      failed without, passes with -- the projects improved it")
+    L.append("   OK            passed in both")
+    L.append("=" * 104)
+    L.append("")
+    L.append(" %-16s %-6s %6s %6s %6s %6s %6s %8s"
+             % ("project", "mode", "NEW", "PRE", "RESLVD", "OK", "other", "hidden"))
+    L.append("-" * 104)
+    tot = dict((c, 0) for c in CLS_ORDER)
+    tot_hidden = 0
+    for res in results:
+        t = _tally(res["rows"])
+        hid = sum(1 for r in res["rows"] if r["hidden_new"] and not _is_flat(r))
+        tot_hidden += hid
+        other = t[CLS_ONLY_B] + t[CLS_ONLY_T] + t[CLS_NEITHER]
+        for c in CLS_ORDER:
+            tot[c] += t[c]
+        L.append(" %-16s %-6s %6d %6d %6d %6d %6d %8d"
+                 % (res["project"], res["mode"], t[CLS_NEW], t[CLS_PRE],
+                    t[CLS_RESOLVED], t[CLS_OK], other, hid))
+    L.append("-" * 104)
+    L.append(" %-16s %-6s %6d %6d %6d %6d %6d %8d"
+             % ("TOTAL", "", tot[CLS_NEW], tot[CLS_PRE], tot[CLS_RESOLVED],
+                tot[CLS_OK],
+                tot[CLS_ONLY_B] + tot[CLS_ONLY_T] + tot[CLS_NEITHER], tot_hidden))
+    L.append("=" * 104)
+    L.append("")
+
+    flat_bad = []
+    for res in results:
+        for r in res["rows"]:
+            if _is_flat(r) and (r["class"] in (CLS_NEW, CLS_PRE) or r["hidden_new"]):
+                flat_bad.append((res["project"], r))
+    if flat_bad:
+        L.append("*" * 104)
+        L.append(" *** THE FLAT RUN FAILS -- READ THIS BEFORE THE FAULT NUMBERS ***")
+        L.append("*" * 104)
+        for proj, r in flat_bad:
+            L.append("   %-16s FLAT_RUN  %s -> %s" % (proj, r["vb"] or "-", r["vt"] or "-"))
+        L.append("")
+        L.append("   FLAT_RUN applies NO fault: the dynamics run with nothing happening and")
+        L.append("   nothing should move. It failing means the case does not hold its initial")
+        L.append("   conditions -- a machine's states are inconsistent with the power flow and")
+        L.append("   it drifts unprompted.")
+        L.append("")
+        L.append("   Every fault starts from that same initialisation, so the drift is in all")
+        L.append("   of them too. Fix this first; the fault counts below are measured honestly")
+        L.append("   but they rest on a case that does not sit still.")
+        L.append("*" * 104)
+        L.append("")
+
+    L.append(" THE ANSWER")
+    L.append("-" * 104)
+    scored = tot[CLS_OK] + tot[CLS_PRE] + tot[CLS_NEW] + tot[CLS_RESOLVED]
+    if not scored:
+        L.append("   Nothing was scored in both studies, so nothing can be concluded.")
+        L.append("   Check that both studies completed their report phase.")
+    elif tot[CLS_NEW] == 0 and tot_hidden == 0:
+        # COUNT FAILURES ON THE TEST SIDE DIRECTLY. CLS_PRE counts only faults
+        # with a verdict on BOTH sides, so quoting it as "every fault that fails
+        # with the projects" silently omits the ones the base study never scored
+        # -- which are failures with the projects too, and unexplained ones.
+        _fail_t = sum(1 for res in results for r in res["rows"]
+                      if not _is_flat(r) and norm_verdict(r["vt"]) == "FAIL")
+        L.append("   Of the faults scored in BOTH studies, the projects introduce NO new")
+        L.append("   criteria failures: %d fail with the projects and every one of them"
+                 % tot[CLS_PRE])
+        L.append("   also fails without them. Those are properties of the base system.")
+        if _fail_t > tot[CLS_PRE]:
+            L.append("")
+            L.append("   BUT %d fault(s) fail with the projects in total -- %d of them were"
+                     % (_fail_t, _fail_t - tot[CLS_PRE]))
+            L.append("   never scored WITHOUT the projects, so nothing here says whether the")
+            L.append("   projects caused them. Run the base case for those before concluding")
+            L.append("   anything; they are listed as scored on one side only.")
+    else:
+        L.append("   The projects introduce %d new fault failure(s)%s."
+                 % (tot[CLS_NEW],
+                    " and %d new criterion failure(s) inside faults that already failed"
+                    % tot_hidden if tot_hidden else ""))
+        L.append("   A further %d fault(s) fail in both cases and are pre-existing."
+                 % (tot[CLS_PRE] - tot_hidden))
+    L.append("")
+
+    # NEW faults, named, across every project. This is the list that gets acted
+    # on, so it goes in the summary rather than only in the per-project files.
+    L.append(" INTRODUCED BY THE PROJECTS -- every fault, every project")
+    L.append("-" * 104)
+    any_new = False
+    for res in results:
+        news = [r for r in res["rows"]
+                if (r["class"] == CLS_NEW or r["hidden_new"]) and not _is_flat(r)]
+        if not news:
+            continue
+        any_new = True
+        L.append("   %s (%s)" % (res["project"], res["mode"]))
+        for r in news:
+            L.append("      %-10s %-8s %-12s %s"
+                     % (r["fault"], r["event"],
+                        "%s -> %s" % (r["vb"] or "-", r["vt"] or "-"),
+                        "; ".join(_short_crit(c) for c in r["new_crit"]) or "(verdict changed)"))
+    if not any_new:
+        L.append("   none")
+    L.append("")
+
+    if only_base or only_test:
+        L.append(" PROJECTS THAT COULD NOT BE COMPARED")
+        L.append("-" * 104)
+        for p in only_base:
+            L.append("   %-16s results exist in the BASE study only" % p)
+        for p in only_test:
+            L.append("   %-16s results exist in the PROJECT study only" % p)
+        L.append("")
+        L.append("   Nothing about these can be classified: with results on one side there")
+        L.append("   is no 'without the projects' to compare against.")
+        L.append("   Set RUN_MISSING = True in run_compare.py and run it again -- it runs")
+        L.append("   exactly the missing side for exactly these projects, then compares.")
+        L.append("   That simulates, so it takes hours; the comparison afterwards is seconds.")
+        L.append("")
+
+    gaps = [(res["project"], r) for res in results for r in res["rows"]
+            if r.get("vio_gap")]
+    if gaps:
+        L.append(" ELEMENT DATA MISSING FOR SOME FAULTS")
+        L.append("-" * 104)
+        L.append("   %d fault(s) FAIL on one side while that side lists no violating"
+                 % len(gaps))
+        L.append("   element. A failing fault always names its elements, so those lists are")
+        L.append("   incomplete -- almost always because the report phase was re-run over a")
+        L.append("   SELECTION of faults, which overwrites SPP_VIOLATIONS with just that")
+        L.append("   subset. Their elements are NOT compared; the verdicts still are.")
+        for proj, r in gaps[:20]:
+            L.append("      %-14s %-10s %s -> %s   (%s study lists none)"
+                     % (proj, r["fault"], r["vb"] or "-", r["vt"] or "-", r["vio_gap"]))
+        if len(gaps) > 20:
+            L.append("      ... and %d more" % (len(gaps) - 20))
+        L.append("   Fix: re-run that study's report over the WHOLE fault set")
+        L.append("        (REPORT_FAULTS = [] in its launcher, REPORT_ONLY = True).")
+        L.append("")
+
+    noel = [res for res in results if not res["el_ok"]]
+    if noel:
+        L.append(" ELEMENT LEVEL SUPPRESSED")
+        L.append("-" * 104)
+        for res in noel:
+            if res.get("el_cov_warn"):
+                L.append("   %-16s %s" % (res["project"], res["el_cov_warn"]))
+            else:
+                L.append("   %-16s SPP_VIOLATIONS missing on %s side"
+                         % (res["project"],
+                            "the base" if not res["sources"]["violations_base"]
+                            else "the project"))
+        L.append("   Fault and criterion classifications above are unaffected.")
+        L.append("")
+
+    bad = [res for res in results
+           if res["align"]["checked"] and (not res["align"]["same"]
+                                           or res["align"]["missing"])]
+    if bad:
+        L.append(" *** FAULT SETS DO NOT MATCH ***")
+        L.append("-" * 104)
+        for res in bad:
+            L.append("   %-16s %d id(s) describe a different event, %d exist on one side only"
+                     % (res["project"], len(res["align"]["diffs"]),
+                        len(res["align"]["missing"])))
+        L.append("   The classifications above are only as good as the assumption that a")
+        L.append("   fault id means the same thing in both studies. Point both studies at")
+        L.append("   ONE SPP_FAULTS.csv (FAULTS_CSV + AUTO_SPP_FAULTS = False) and re-run.")
+        L.append("")
+
+    L.append(" Per-project detail:")
+    for res in results:
+        # The NAMES CARRY THE TAG, so print the names that were actually
+        # written. A summary that points at COMPARISON_SantaFe_spp.txt when the
+        # file on disk is COMPARISON_SantaFe_spp_SELECTED.txt sends the reader
+        # to the previous full run and calls it this one.
+        L.append("   %-38s fault by fault, criterion by criterion"
+                 % os.path.basename(cmp_path("COMPARISON_%s_%s"
+                                             % (res["project"], res["mode"]), "txt")))
+        L.append("   %-38s which buses and machines are new"
+                 % os.path.basename(cmp_path("COMPARISON_ELEMENTS_%s_%s"
+                                             % (res["project"], res["mode"]), "txt")))
+    L.append("=" * 104)
+    _write(path, L)
+
+    if WRITE_CSV:
+        p = cmp_path("COMPARISON_SUMMARY", "csv")
+        with csv_open(p, "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(["project", "mode", "new", "pre_existing", "resolved", "ok",
+                        "base_only", "test_only", "not_scored", "hidden_new",
+                        "fault_sets_match"])
+            for res in results:
+                t = _tally(res["rows"])
+                w.writerow([res["project"], res["mode"], t[CLS_NEW], t[CLS_PRE],
+                            t[CLS_RESOLVED], t[CLS_OK], t[CLS_ONLY_B],
+                            t[CLS_ONLY_T], t[CLS_NEITHER],
+                            sum(1 for r in res["rows"] if r["hidden_new"] and not _is_flat(r)),
+                            ("unknown" if not res["align"]["checked"]
+                             else ("yes" if (res["align"]["same"]
+                                             and not res["align"]["missing"])
+                                   else "no"))])
+        print("[compare] -> %s" % p)
+    return path
+
+
+# ============================================================================
+# PART 10 -- RUNNING THE TWO STUDIES
+# ============================================================================
+
+def _pump(tag, proc):
+    """Drain a child's stdout to this console. MUST NOT STOP DRAINING.
+
+       This thread is the only reader of the child's pipe. If it dies, the pipe
+       fills, and the child BLOCKS on its next write -- for ever, with no error
+       anywhere. That is not a theory: a PJM comment in the case carried an en
+       dash, this thread raised UnicodeEncodeError trying to put it on a cp437
+       console, and the project study stopped mid-build while the base study ran
+       on for half an hour looking perfectly healthy.
+
+       So every write is guarded, and a line that cannot be printed is printed
+       with the offending characters replaced. The loop only ends when the child
+       closes its pipe."""
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    while True:
+        try:
+            line = proc.stdout.readline()
+        except Exception:
+            break
+        if not line:
+            break
+        try:
+            sys.stdout.write("%s %s" % (tag, line))
+        except UnicodeEncodeError:
+            # The console cannot represent something in this line. Replace it
+            # rather than lose the line -- and, far more importantly, rather
+            # than lose the reader.
+            try:
+                safe = line.encode(enc, "replace").decode(enc, "replace")
+                sys.stdout.write("%s %s" % (tag, safe))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
+
+
+
+
+_PUSH_SAID = set()
+
+
+def _push_settings(env, case):
+    """Put everything this panel owns into an environment for a study process.
+
+       ONE function, called from BOTH places that start a study: the simulation
+       run AND the fault-list build. It used to live inside run_study() only --
+       and the fault list is built by make_shared_fault_list(), which assembled
+       its own bare environment. So every fault-creation setting in this panel
+       was applied to the RUNS and ignored by the BUILD that decides what the
+       runs are: CUSTOM_CYCLES = [10] produced a list of 9-cycle faults, and
+       CUSTOM_HOPS = 2 produced one hop, because the build never saw either.
+
+       `case` decides which side of COLLECTOR_APPLY_TO this process is on."""
+    # THE FAULT-CREATION SETTINGS, when this file sets them. Same rule: a None
+    # is not sent, so "leave it alone" really does leave the study scripts'
+    # value in force. Lists go as comma-separated text; the study parses them
+    # back, because an environment variable cannot hold a list.
+    # THE FAULT LIST PATH GOES WITH THE RUN, not with whatever each study
+    # script was last saved with. SHARED_FAULTS_CSV is sent verbatim -- the
+    # study scripts expand {root} (the folder their case sits in) and {project}
+    # themselves, so one string serves every project and both cases. Without
+    # this, a study script's own FAULTS_CSV decided what it read, and the _con
+    # engines still carried the _f set's SPP_FAULTS_{project}.csv: the panel
+    # checked one file and the run read another.
+    if SHARED_FAULTS_CSV:
+        env["SPP_FAULTS_CSV"] = str(SHARED_FAULTS_CSV)
+
+    for _name, _val in (("SPP_AUTO_FAULTS", AUTO_SPP_FAULTS),
+                        ("SPP_REGEN_FAULTS", REGEN_FAULTS),
+                        ("SPP_CUSTOM_HOPS", CUSTOM_HOPS),
+                        ("SPP_CUSTOM_KV_MIN", CUSTOM_KV_MIN),
+                        ("SPP_CUSTOM_MAX_BUSES", CUSTOM_MAX_BUSES),
+                        ("SPP_CUSTOM_INCLUDE_POI", CUSTOM_INCLUDE_POI),
+                        ("SPP_RUN_FLAT", RUN_FLAT),
+                        ("SPP_RUN_FAULTS", RUN_FAULTS),
+                        ("SPP_MAKE_PLOTS", MAKE_PLOTS),
+                        ("SPP_FORCE_REBUILD", FORCE_REBUILD),
+                        ("SPP_MAX_ATTEMPTS", MAX_SCENARIO_ATTEMPTS),
+                        ("SPP_POI_RADIUS_HOPS", POI_RADIUS_HOPS),
+                        # WHAT IS RECORDED -- and so how big every .out is.
+                        # A 111 MB .out is 29.1 million values, and every
+                        # reader downstream has to hold all of them. These two
+                        # are the only things that change that number.
+                        ("SPP_STUDY_AREAS",
+                         ",".join(str(x) for x in STUDY_AREAS)
+                         if STUDY_AREAS else None),
+                        ("SPP_AREA_KV_MIN", AREA_KV_MIN),
+                        ("SPP_V_RECOVERY_PU", V_RECOVERY_PU),
+                        ("SPP_V_RECOVERY_S", V_RECOVERY_S),
+                        ("SPP_V_OVERSHOOT_PU", V_OVERSHOOT_PU),
+                        ("SPP_V_SS_LOW", V_SS_LOW),
+                        ("SPP_V_SS_HIGH", V_SS_HIGH),
+                        ("SPP_ANGLE_DEV_DEG", ANGLE_DEV_DEG),
+                        ("SPP_TRIP_PGEN_DEAD_MW", TRIP_PGEN_DEAD_MW),
+                        ("SPP_MISMATCH_MVA", MISMATCH_MVA),
+                        ("SPP_MISMATCH_PASSES", MISMATCH_PASSES),
+                        ("SPP_MISMATCH_ABORT", MISMATCH_ABORT),
+                        ("SPP_FAULTS_CON", FAULTS_CON),
+                        ("SPP_FAULTS_TABLE", FAULTS_TABLE),
+                        ("SPP_CON_NEAR_BY", CON_NEAR_BY),
+                        ("SPP_CON_MAX_ELEMENTS", CON_MAX_ELEMENTS),
+                        ("SPP_FAULT_HOPS", SPP_FAULT_HOPS),
+                        ("SPP_FAULT_KV_MIN", SPP_FAULT_KV_MIN),
+                        ("SPP_MAX_FAULTS", SPP_MAX_FAULTS),
+                        ("SPP_POI_P_TARGET",
+                         json.dumps(POI_P_TARGET_MW)
+                         if isinstance(POI_P_TARGET_MW, dict) else POI_P_TARGET_MW),
+                        ("SPP_POI_P_AREA", POI_P_AREA),
+                        ("SPP_POI_HOLD_AREA", POI_HOLD_AREA_MW),
+                        ("SPP_POI_P_SHARE", POI_P_SHARE),
+                        ("SPP_POI_P_PROJECT_AT", POI_P_PROJECT_AT),
+                        ("SPP_POI_P_MEASURE", POI_P_MEASURE),
+                        ("SPP_POI_P_METER", POI_P_METER),
+                        ("SPP_POI_P_STRICT", "1" if POI_P_STRICT else "0"),
+                        ("SPP_POI_P_STRICT_TOL", POI_P_STRICT_TOL_MW),
+                        ("SPP_POI_METER_ITERS", POI_P_METER_ITERS),
+                        ("SPP_POI_METER_TOL", POI_P_METER_TOL_MW),
+                        ("SPP_POI_HOLD_TOL", POI_HOLD_AREA_TOL_MW),
+                        ("SPP_POI_HOLD_PASSES", POI_HOLD_AREA_PASSES),
+                        ("SPP_POI_P_EXIST_BUSES",
+                         (json.dumps(POI_P_EXISTING_BUSES)
+                          if isinstance(POI_P_EXISTING_BUSES, dict)
+                          else (",".join(str(int(x)) for x in (POI_P_EXISTING_BUSES or []))
+                                or None))),
+                        ("SPP_P4_MODE", SPP_P4_MODE),
+                        ("SPP_P4_GROUP", SPP_P4_GROUP),
+                        ("SPP_P4_TAP_SEGMENTS", SPP_P4_TAP_SEGMENTS),
+                        ("SPP_NORMAL_CLEAR_CYCLES", NORMAL_CLEAR_CYCLES),
+                        ("SPP_STUCK_CYCLES", SPP_STUCK_CYCLES),
+                        ("SPP_RECLOSE_WAIT", RECLOSE_WAIT_CYCLES),
+                        ("SPP_ENABLE_RECLOSE", ENABLE_RECLOSE),
+                        ("SPP_SIMULATE_RECLOSE", SIMULATE_RECLOSE),
+                        ("SPP_RECLOSE_SKIP_ISLANDS", RECLOSE_SKIP_IF_ISLANDS),
+                        ("SPP_SLG_RETAIN", SPP_SLG_RETAIN_VPU)):
+        if _val is None:
+            continue
+        if isinstance(_val, bool):
+            env[_name] = "1" if _val else "0"
+        else:
+            env[_name] = str(_val)
+    # THE COLLECTOR TABLE, as JSON: an environment variable holds text, and a
+    # table flattened into text by hand is a table that comes back subtly
+    # different on the other side.
+    # WHICH CASE gets it -- see COLLECTOR_APPLY_TO. The table is sent to both
+    # either way and switched OFF on the side that is not meant to change, so
+    # that side still records what it was NOT given: a run whose results folder
+    # says "collector: off" is a run you can tell apart from one that changed.
+    _capp = (COLLECTOR_APPLY_TO or "project").strip().lower()
+    _this = "base" if str(case.get("key", "")).upper().startswith("BASE") else "project"
+    # SAID ONCE PER CASE. This runs for every process the panel starts -- with
+    # one plotter per file that is over a thousand times in a redraw pass, and
+    # the deck banner drowned the progress line. The settings are the same
+    # every time; the banner is printed the first time and skipped after.
+    _quiet = _this in _PUSH_SAID
+    _PUSH_SAID.add(_this)
+    _say = (lambda *a, **k: None) if _quiet else print
+    # THE DECK THIS CASE READS. Per case, because the base case and the project
+    # case are different decks by definition -- one setting for both would be
+    # the bug this is meant to prevent, not the fix.
+    _sav = BASE_SAV if _this == "base" else PROJ_SAV
+    _dyr = BASE_DYR if _this == "base" else PROJ_DYR
+    #
+    # None MEANS "the study script's own", AND IT HAS TO MEAN IT. env starts as
+    # a copy of this process's environment, so an SPP_SOURCE_CASE left over in
+    # the shell -- exported by hand while debugging, or by a previous run --
+    # would be inherited by the case whose setting here is None, and that case
+    # would quietly study the OTHER one's deck. Cleared rather than skipped.
+    if _sav:
+        env["SPP_SOURCE_CASE"] = str(_sav)
+    else:
+        env.pop("SPP_SOURCE_CASE", None)
+    if _dyr:
+        env["SPP_DYR_FILE"] = str(_dyr)
+    else:
+        env.pop("SPP_DYR_FILE", None)
+    # PER-PROJECT DECKS, to the study script as a table: the launcher runs the
+    # projects one after another in ONE environment, so the script picks its
+    # own project's entry by SPP_PROJECT.
+    _sav_tbl = BASE_SAV_BY_PROJECT if _this == "base" else PROJ_SAV_BY_PROJECT
+    _dyr_tbl = BASE_DYR_BY_PROJECT if _this == "base" else PROJ_DYR_BY_PROJECT
+    for _name, _tbl in (("SPP_SOURCE_CASE_BY_PROJECT", _sav_tbl),
+                        ("SPP_DYR_FILE_BY_PROJECT", _dyr_tbl)):
+        _tbl = dict((str(k), str(v)) for k, v in (_tbl or {}).items() if v)
+        if _tbl:
+            env[_name] = json.dumps(_tbl)
+            print("[compare] %s deck per project: %s"
+                  % (_this.upper(), ", ".join("%s -> %s" % kv for kv in sorted(_tbl.items()))))
+        else:
+            env.pop(_name, None)
+    # SAY THAT THIS IS THE INPUT, NOT WHAT GETS SIMULATED.
+    #
+    # With SHARED_DECK -- the shipped arrangement -- BASE_SAV and PROJ_SAV are
+    # THE SAME FILE, on purpose: it is the system without any project, read by
+    # both, overwritten by neither. The base case studies it as it stands; the
+    # project case BUILDS the plant onto a copy and studies
+    # <deck>_BESS_<project>_<MW>MW_NEWPLANT.sav. Printing the shared name under
+    # "PROJ deck" with nothing else said made it look as though the project was
+    # being simulated on the base network, which is the one thing this whole
+    # arrangement exists to avoid.
+    _say("[compare] %-4s deck : %s / %s%s"
+          % (case.get("key", "?"),
+             _sav or "(z4_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
+             _dyr or "(z4_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
+             ("   <- the INPUT deck (no project in it); the plant is built onto "
+              "a copy and that copy is what runs"
+              if _this == "project" and _sav and _sav == BASE_SAV else "")))
+    # THE POI DISPATCH, TO THE PROJECT CASE ONLY.
+    #
+    # The base case is the system WITHOUT the project. There is no plant there to
+    # dispatch, and driving its existing machines to a 1000 MW POI total would
+    # change the very case the comparison measures against -- so every difference
+    # afterwards would be "the project, plus a base case we moved".
+    #
+    # z4_spp_b_con.py implements none of this, so the variables were ignored there in
+    # any case. They are removed rather than left to be ignored: an environment
+    # that carries a setting the process does not honour is a setting somebody
+    # will later believe was applied.
+    if _this == "base":
+        for _k in ("SPP_POI_P_TARGET", "SPP_POI_P_AREA", "SPP_POI_HOLD_AREA",
+                   "SPP_POI_P_SHARE", "SPP_POI_P_PROJECT_AT",
+                   "SPP_POI_P_EXIST_BUSES", "SPP_POI_P_MEASURE", "SPP_POI_P_METER",
+                   "SPP_POI_P_STRICT", "SPP_POI_P_STRICT_TOL",
+                   "SPP_POI_METER_ITERS", "SPP_POI_METER_TOL",
+                   "SPP_POI_HOLD_TOL", "SPP_POI_HOLD_PASSES"):
+            env.pop(_k, None)
+        if POI_P_TARGET_MW is not None:
+            _say("[compare] BASE gets no POI target -- it is the case without the "
+                 "project, and the area it carries is what PROJ is held to")
+    # THE NEW PLANT, TO THE PROJECT CASE ONLY.
+    #
+    # NEW_PLANT was sent only by run_new_plant(), its own extra study -- so
+    # setting "enabled": True in the panel changed nothing about the ORDINARY
+    # run, which is where the POI dispatch and the comparison happen. Sent here
+    # as well, it does.
+    #
+    # NEVER TO THE BASE CASE. The base case is the system WITHOUT the project;
+    # building the plant into it too would make both sides identical and every
+    # fault would compare as no change -- a comparison that cannot fail, and
+    # cannot find anything either.
+    if NEW_PLANT and _this == "project":
+        _npd = dict(NEW_PLANT)
+        if _npd.get("enabled"):
+            env["SPP_NEW_PLANT"] = json.dumps(_npd)
+            _say("[compare] PROJ builds the NEW PLANT at the POI "
+                 "(NEW_PLANT[\"enabled\"] = True)")
+        elif "enabled" in _npd:
+            # Explicitly off. Sent anyway, so the study script's own panel cannot
+            # switch it on behind this file's back.
+            env["SPP_NEW_PLANT"] = json.dumps(_npd)
+    # PROJECT DEFINITIONS, to BOTH cases. A project the base case does not know
+    # about is a project it cannot build a fault list for, and the comparison
+    # would report every one of its faults as scored on one side only.
+    if ADD_PROJECTS:
+        env["SPP_BESS_PROJECTS"] = json.dumps(
+            [dict(p) for p in ADD_PROJECTS if isinstance(p, dict)])
+    # WHICH RATED SIZE -- see PROJECT_MW. To the PROJECT case only: the base case
+    # builds no plant, so a size there is a setting it cannot honour.
+    if PROJECT_MW and _this != "base":
+        # A LIST IS A SWEEP, NOT A SIZE. run_project_mw_sweep() runs one
+        # complete study per entry and sets SPP_ACTIVE_MW itself for each;
+        # sending the list here would hand the study a value that is not a
+        # number, and _project_mw() would fall back to the row's first size
+        # without saying so. Scalars go through as before.
+        _scalar_mw = dict((k, v) for k, v in PROJECT_MW.items()
+                          if not isinstance(v, (list, tuple)))
+        if _scalar_mw:
+            env["SPP_ACTIVE_MW"] = json.dumps(_scalar_mw)
+        else:
+            env.pop("SPP_ACTIVE_MW", None)
+    else:
+        env.pop("SPP_ACTIVE_MW", None)
+    _coll_here = COLLECTOR_ON and (_capp == "both" or _capp == _this)
+    if COLLECTOR_BRANCHES is not None:
+        env["SPP_COLL_BRANCHES"] = json.dumps(
+            dict((k, [list(r) for r in v]) for k, v in COLLECTOR_BRANCHES.items()))
+    if COLLECTOR_SCALE:
+        env["SPP_COLL_SCALE"] = json.dumps(
+            dict((k, list(v)) for k, v in COLLECTOR_SCALE.items()))
+    if COLLECTOR_Z_BASE_MVA is not None:
+        env["SPP_COLL_BASE_MVA"] = repr(float(COLLECTOR_Z_BASE_MVA))
+    if COLLECTOR_ALL is not None:
+        env["SPP_COLL_ALL"] = json.dumps(list(COLLECTOR_ALL))
+    # WHICH CASE THE .dyr EDITS GO INTO -- see DYR_APPLY_TO.
+    _dapp = (DYR_APPLY_TO or "project").strip().lower()
+    _dhere = (_dapp == "both" or _dapp == _this)
+    _dedits = [list(e) for e in (DYR_EDITS or [])] if _dhere else []
+    if _dhere and DYR_EDITS_BY_PROJECT:
+        env["SPP_DYR_EDITS_BY_PROJECT"] = json.dumps(
+            dict((k, [list(e) for e in v]) for k, v in DYR_EDITS_BY_PROJECT.items()))
+    if _dedits:
+        env["SPP_DYR_EDITS"] = json.dumps(_dedits)
+    if (DYR_EDITS or DYR_EDITS_BY_PROJECT):
+        print("[compare] .dyr edits -> %s case: %s"
+              % (_this.upper(), "APPLIED" if _dhere else
+                 "left alone (DYR_APPLY_TO = %r)" % _dapp))
+    if _dhere:
+        env["SPP_DYR_SCOPE"] = str(DYR_SCOPE)
+    # ---- SPP'S SYSTEM ADJUSTMENTS ----------------------------------------
+    #
+    # A MODEL DISABLED IN ONE CASE ONLY IS A FALSE FINDING. These address
+    # PRE-EXISTING problems -- a drive train that will not initialise, a relay
+    # that picks up on a fault it was never meant to see -- and a pre-existing
+    # problem is in the base case too. Disable it on one side and its
+    # oscillation disappears from that side alone; the comparison then reports
+    # the difference as something the project did. DYR_DISABLE_APPLY_TO
+    # defaults to "both" for that reason, and it is worth a very good reason to
+    # change it.
+    _sapp = (DYR_DISABLE_APPLY_TO or "both").strip().lower()
+    _shere = (_sapp == "both" or _sapp == _this)
+    if DYR_DISABLE:
+        print("[compare] models disabled -> %s case: %s"
+              % (_this.upper(), "APPLIED" if _shere else
+                 "left alone (DYR_DISABLE_APPLY_TO = %r)" % _sapp))
+        if not _shere:
+            print("[compare]   *** ONE CASE ONLY. Whatever that model does will "
+                  "show up in the comparison as something the project did. ***")
+    if DYR_DISABLE and _shere:
+        env["SPP_DYR_DISABLE"] = json.dumps(
+            [x if isinstance(x, str) else list(x) for x in DYR_DISABLE])
+        env["SPP_DYR_DISABLE_STRICT"] = "1" if DYR_DISABLE_STRICT else "0"
+    # The faulted-line impedance floor goes to BOTH cases always: it is applied
+    # from the SHARED fault list, so both cases nudge the same lines by the same
+    # amount or the comparison is measuring the nudge.
+    if FAULT_LINE_MIN_X_PU is not None:
+        env["SPP_FAULT_LINE_MIN_X"] = repr(float(FAULT_LINE_MIN_X_PU))
+    if FAULT_LINE_X_WARN_PU is not None:
+        env["SPP_FAULT_LINE_X_WARN"] = repr(float(FAULT_LINE_X_WARN_PU))
+    # RE-SOLVING A HARD EVENT ON DIFFERENT SETTINGS IS A DECISION, so it is sent
+    # explicitly and it is off unless this panel says otherwise. Both cases get
+    # the same answer: a scenario retried in one case and not in the other is
+    # two studies compared as one.
+    env["SPP_SOLVER_RETRY"] = "1" if SOLVER_RETRY_ON_NONCONV else "0"
+    if DELT_CYCLES:
+        env["SPP_DELT_CYCLES"] = str(float(DELT_CYCLES))
+    else:
+        env.pop("SPP_DELT_CYCLES", None)
+    if SOLVER_RETRY_MAX_NONCONV is not None:
+        env["SPP_SOLVER_RETRY_MAX"] = str(int(SOLVER_RETRY_MAX_NONCONV))
+    if SOLVER_RETRY_RECIPES is not None:
+        env["SPP_SOLVER_RETRY_RECIPES"] = json.dumps(
+            [list(r) for r in SOLVER_RETRY_RECIPES])
+    env["SPP_ADJUSTMENTS_REPORT"] = "1" if ADJUSTMENTS_REPORT else "0"
+    # A FORCED RESCORE HAS TO REACH THE SHARDS. Without this they resume from
+    # their saved part files and write the OLD verdicts back out, so the run
+    # produces exactly the report it was asked to replace.
+    env["SPP_FORCE_RESCORE"] = "1" if FORCE_RESCORE else "0"
+    # Report shards score without loading the case (32-bit memory fix). The
+    # engine honours this only in the report role and only when BUS_MAP.csv is
+    # present, so build/worker roles and first-ever runs are unaffected.
+    env["SPP_SCORE_NO_CASE"] = "1" if SCORE_NO_CASE else "0"
+    # EVERY .out GETS A PDF, INCLUDING THE ONES THAT ARE DANGEROUS TO READ.
+    # See PLOT_RISKY_ISOLATED: the refused files are retried one process each,
+    # so a file that kills the reader costs itself and not the pass.
+    env["SPP_PLOT_RISKY_ISOLATED"] = "1" if PLOT_RISKY_ISOLATED else "0"
+    # HOW MUCH IS DRAWN. These lived in the study scripts and could not be set
+    # from here, so trimming the plots meant editing two files by hand and
+    # keeping them in step. With no matplotlib they decide whether a scenario
+    # costs two minutes of drawing or fifty.
+    if INDIVIDUAL_KEYWORDS is not None:
+        env["SPP_INDIVIDUAL_KEYWORDS"] = (",".join(str(x) for x in INDIVIDUAL_KEYWORDS)
+                                          if INDIVIDUAL_KEYWORDS else "ALL")
+    if PLOT_MAX_PANELS is not None:
+        env["SPP_PLOT_MAX_PANELS"] = str(int(PLOT_MAX_PANELS))
+    if PLOT_MAX_POINTS is not None:
+        env["SPP_PLOT_MAX_POINTS"] = str(int(PLOT_MAX_POINTS))
+    env["SPP_PLOT_SCOPE"] = str(PLOT_SCOPE or "compact")
+    env["SPP_PLOT_SKIP_INCOMPLETE"] = "1" if PLOT_SKIP_INCOMPLETE else "0"
+    # REDRAW ON THIS LAUNCH: a PDF older than the launch is treated as missing.
+    # The launch time, not a bare flag, so the plot passes of ONE launch do
+    # not keep redrawing what an earlier pass of the same launch just drew.
+    if FORCE_REPLOT:
+        env["SPP_REPLOT_BEFORE"] = str(_LAUNCH_T0)
+    else:
+        env.pop("SPP_REPLOT_BEFORE", None)
+    env["SPP_PLOT_INRUN"] = str(max(1, int(PLOT_INRUN or 1)))
+    if PER_PAGE is not None:
+        env["SPP_PER_PAGE"] = str(int(PER_PAGE))
+    env["SPP_EXPORT_PDF_PUREPY"] = "1" if EXPORT_PDF_PUREPY else "0"
+    env["SPP_EXPORT_CSV"] = "1" if EXPORT_CSV else "0"
+    env["SPP_EXPORT_SVG"] = "1" if EXPORT_SVG else "0"
+    if PLOT_ISOLATED_S is not None:
+        env["SPP_PLOT_ISOLATED_S"] = repr(float(PLOT_ISOLATED_S))
+    # WHAT "FLAT" MEANS, PER QUANTITY -- see the notes. One tolerance across
+    # channels in pu, degrees, MW and Mvar failed the initialisation test on
+    # channels that start at zero and were never drifting.
+    if FLAT_TOL_BY_KIND is not None:
+        env["SPP_FLAT_TOL_BY_KIND"] = json.dumps(dict(FLAT_TOL_BY_KIND))
+    if FLAT_REL is not None:
+        env["SPP_FLAT_REL"] = repr(float(FLAT_REL))
+    # WHICH CASE PUBLISHES THE SHARED FAULT LIST.
+    #
+    # Both cases have a build role and both resolve the shared list to the SAME
+    # absolute path, so both were re-importing from their own topology and
+    # overwriting each other -- no lock, no temp-and-rename, and a study process
+    # could read a half-written list and run a short fault set without saying
+    # so. The two topologies are not the same: the project buses exist on one
+    # side and not the other, so a hop-limited walk gives two lists that both
+    # look right. FAULT_LIST_FROM already names whose topology defines the set;
+    # it now also decides who writes it.
+    _pub = "project" if (FAULT_LIST_FROM or "").upper() == "TEST" else "base"
+    env["SPP_PUBLISH_SHARED"] = "1" if _this == _pub else "0"
+    if DYR_COMPILE_WHEN is not None:
+        env["SPP_DYR_COMPILE_WHEN"] = str(DYR_COMPILE_WHEN)
+    # ONE BUILD AT A TIME, ACROSS BOTH CASES. The build stays where it belongs
+    # -- after dyre_new -- and the lock file below is what stops the two cases
+    # linking at the same moment. See COMPILE_LOCK in the panel.
+    if COMPILE_LOCK:
+        env["SPP_COMPILE_LOCK"] = os.path.join(STUDY_ROOT, ".compile.lock")
+        env["SPP_COMPILE_LOCK_WAIT"] = str(int(COMPILE_LOCK_WAIT_S))
+    env["SPP_DYR_COMPILE_AFTER_SNAP"] = "1" if DYR_COMPILE_AFTER_SNAP else "0"
+    env["SPP_ABORT_ON_MODEL_NOT_ACCESSIBLE"] = "1" if ABORT_ON_MODEL_NOT_ACCESSIBLE else "0"
+    env["SPP_INIT_NAN_ABORT"] = "1" if INIT_NAN_ABORT else "0"
+    if DYR_COMPILE_BATS is not None:
+        env["SPP_DYR_COMPILE_BATS"] = ",".join(str(x) for x in DYR_COMPILE_BATS)
+    if DYR_SHOW:
+        env["SPP_DYR_SHOW"] = json.dumps(
+            [list(x) if isinstance(x, (list, tuple)) else x for x in DYR_SHOW])
+    if COLLECTOR_BY_PROJECT:
+        env["SPP_COLL_BY_PROJECT"] = json.dumps(
+            dict((k, list(v)) for k, v in COLLECTOR_BY_PROJECT.items()))
+    env["SPP_COLL_ON"] = "1" if _coll_here else "0"
+    if COLLECTOR_ON and COLLECTOR_BRANCHES:
+        _say("[compare] collector impedance -> %s case: %s"
+             % (_this.upper(), "APPLIED" if _coll_here else
+                 "left alone (COLLECTOR_APPLY_TO = %r)" % _capp))
+    for _name, _val in (("SPP_TABLE_GROUPS", TABLE_GROUPS),
+                        ("SPP_CON_EVENTS", CON_EVENTS),
+                        ("SPP_EVENTS_ON", SPP_EVENTS_ON),
+                        ("SPP_CUSTOM_TYPES", CUSTOM_TYPES),
+                        ("SPP_CUSTOM_CYCLES", CUSTOM_CYCLES)):
+        if _val is None:
+            continue
+        # A TABLE GOES AS JSON, A LIST AS A COMMA STRING.
+        # The join below walks whatever it is given, so a dict would arrive as
+        # its KEYS -- "3PH,SLG" -- read as two clearing times of nothing at all,
+        # silently. And json.dumps()ing it first is no better: the join would
+        # then walk the STRING and comma-separate every character.
+        if isinstance(_val, dict):
+            env[_name] = json.dumps(_val)
+        else:
+            env[_name] = ",".join(str(x) for x in _val)
+    # PER-EVENT HOP COUNTS -- a table, so JSON rather than a flattened string.
+    if SPP_EVENT_HOPS:
+        env["SPP_EVENT_HOPS"] = json.dumps(
+            dict((str(k), int(v)) for k, v in SPP_EVENT_HOPS.items()))
+    # EVERY PROJECT AT ONCE. Sent to BOTH cases -- the base has to build the
+    # same fault list and monitor the same buses around every POI -- and the
+    # study script acts on it only in the run whose SPP_PROJECT is TOGETHER_NAME.
+    if str(PROJECTS_RUN or "each").strip().lower() in ("together", "both") and (TOGETHER_PROJECTS or PROJECTS):
+        _mem = {}
+        for _p in (TOGETHER_PROJECTS or PROJECTS):
+            _v = (TOGETHER_MW or {}).get(_p)
+            if _v is None:
+                _v = (PROJECT_MW or {}).get(_p)
+                if isinstance(_v, (list, tuple)):
+                    _v = _v[0] if _v else None
+            _mem[str(_p)] = _v
+        env["SPP_TOGETHER"] = json.dumps({"name": TOGETHER_NAME, "members": _mem,
+                                          "split": bool(TOGETHER_SPLIT)})
+        env["SPP_TOGETHER_MISMATCH"] = str(TOGETHER_STEP_MISMATCH_MVA)
+    else:
+        env.pop("SPP_TOGETHER", None)
+    return env
+
+
+@_timed("simulation + scoring")
+def run_study(case, projects=None, modes=None, extra_env=None, background=False):
+    """Launch one study's launcher and wait. Returns its exit code.
+
+       background=True returns the Popen immediately instead of waiting, and
+       does not tag its output onto this console. Used for the plotter fleet,
+       where several run at once for hours and the caller watches the plots\
+       folder rather than the chatter.
+
+       projects/modes are passed through the ENVIRONMENT rather than by editing
+       the launcher. Editing a launcher to run one project and editing it back is
+       how the two studies end up having run different sets -- and nothing on
+       disk would record that they had.
+
+       Output is tagged, because with RUN_IN_PARALLEL two studies write to this
+       console at once and unlabelled interleaved output is worse than none."""
+    script = os.path.join(case["dir"], case["script"])
+    if not os.path.isfile(script):
+        print("[compare] *** %s not found -- cannot run the %s study ***"
+              % (script, case["key"]))
+        return 2
+    env = dict(os.environ)
+    if projects:
+        env["SPP_RUN_PROJECTS"] = ",".join(projects)
+    if modes:
+        env["SPP_RUN_MODES"] = ",".join(modes)
+    if ONLY_FAULTS:
+        # BOTH launchers, from the ONE setting -- see ONLY_FAULTS.
+        env["SPP_ONLY_FAULTS"] = ",".join(ONLY_FAULTS)
+        env["SPP_REPORT_FAULTS"] = ",".join(ONLY_FAULTS)
+    if ONLY_EVENTS:
+        env["SPP_ONLY_EVENTS"] = ",".join(ONLY_EVENTS)
+    # BOTH cases resume, or neither. One case skipping finished work while the
+    # other repeats it is not wrong in itself -- the results are the same -- but
+    # the two runs then take very different times, and a comparison launched
+    # when the first finishes reads the second one's half-written reports.
+    env["SPP_SKIP_DONE"] = "1" if SKIP_DONE else "0"
+    env["SPP_FRESH_START"] = "1" if FRESH_START else "0"
+    # The simulation lengths, when this file sets them. Sent only when they are
+    # not None, so leaving them alone really does leave the study scripts' own
+    # values in force rather than overwriting them with a default from here.
+    if FLAT_RUN_S is not None:
+        env["SPP_FLAT_RUN_S"] = repr(float(FLAT_RUN_S))
+    if PRE_FAULT_S is not None:
+        env["SPP_PRE_FAULT_S"] = repr(float(PRE_FAULT_S))
+    if SIM_END_S is not None:
+        env["SPP_SIM_END_S"] = repr(float(SIM_END_S))
+    if RUN_NPLT is not None:
+        env["SPP_RUN_NPLT"] = str(int(RUN_NPLT))
+    _push_settings(env, case)
+    # SIZED FROM ONE PLACE, because with RUN_IN_PARALLEL the machine carries
+    # BOTH cases at once: N_WORKERS is per case, so the PSS/E session count is
+    # twice it. Set in two launchers separately, that doubling is invisible
+    # until the licence runs out mid-run.
+    # WHERE THE CASE IS. Sent so the two study scripts do not each need their
+    # own copy of the path: BASE_DIR and TEST_DIR above are the only place the
+    # folders are written down.
+    env["SPP_STUDY_DIR"] = case["dir"]
+    # HOW MANY SESSIONS THIS CASE GETS. Resolved here, from the machine and from
+    # how many cases are running at once -- both cases at N each is 2N sessions,
+    # and that total is what the cores, the RAM and the licence count see.
+    _ncase = len(_cases_to_run()) if RUN_IN_PARALLEL else 1
+    env["SPP_LAUNCH_WORKERS"] = str(_workers_for(case["key"], N_WORKERS, _ncase))
+    if CORES_MAX_INCLUDES_REPORTS:
+        # THE SAME SHARE, NOT A SECOND ONE. The scoring may use every session
+        # this case was given, and not one more -- and it may not run while the
+        # next project's workers are using them.
+        env["SPP_LAUNCH_REPORT_BG"] = "0"
+    env["SPP_LAUNCH_REPORT_WORKERS"] = str(_report_workers_for(case["key"], _ncase))
+    # ONE LIVE-STATUS FILE FOR THE WHOLE LAUNCH, in the study root beside this
+    # script. Each case still writes its own in its results folder; this is the
+    # one to keep open in a second window.
+    if LIVE_STATUS_ALL:
+        env["SPP_LIVE_STATUS_ALL"] = _root_named(LIVE_STATUS_ALL)
+        env["SPP_LIVE_STATUS_KEY"] = case["key"]
+    env["SPP_DYNAMIC_WORK"] = "1" if DYNAMIC_WORK else "0"
+    env["SPP_CLAIM_STALE_S"] = str(float(CLAIM_STALE_S))
+    env["SPP_NEVER_KILL"] = "1" if NEVER_KILL_WORKERS else "0"
+    env["SPP_KILL_GRACE_S"] = str(float(KILL_GRACE_MIN) * 60.0)
+    env["SPP_LAUNCH_STAGGER_S"] = str(float(LAUNCH_STAGGER_S))
+    env["SPP_CLOSE_DIALOGS"] = "1" if CLOSE_PSSE_DIALOGS else "0"
+    env["SPP_LICENCE_BACKOFF_S"] = str(float(LICENCE_BACKOFF_S))
+    env["SPP_STARTUP_SILENT_S"] = str(float(STARTUP_SILENT_MIN) * 60.0)
+    env["SPP_RETRY_GAVE_UP_ROUNDS"] = str(int(RETRY_GAVE_UP_ROUNDS))
+    env["SPP_NEVER_STEAL_LIVE"] = "1" if NEVER_KILL_WORKERS else "0"
+    if extra_env:
+        env.update(extra_env)
+    print("[compare] launching %s : %s%s" % (case["key"], script,
+          ("   projects=%s" % ", ".join(projects)) if projects else ""))
+    if background:
+        # Its own log file: several of these run at once and interleaving them
+        # onto this console would make all of them unreadable.
+        _ld = _res_root(case)
+        try:
+            os.makedirs(_ld)
+        except Exception:
+            pass
+        _slot = (extra_env or {}).get("SPP_PLOT_SLOT", "0")
+        _lp = os.path.join(_ld, "PLOTTER_%s_%s.log" % (case.get("key", "x"), _slot))
+        _kw = {"cwd": case["dir"], "env": env}
+        try:
+            _kw["stdout"] = open(_lp, "a")
+            _kw["stderr"] = subprocess.STDOUT
+        except Exception:
+            pass
+        if os.name == "nt":
+            _kw["creationflags"] = 0x08000000          # CREATE_NO_WINDOW
+        return subprocess.Popen([PYTHON, "-u", script], **_kw)
+    p = subprocess.Popen([PYTHON, "-u", script], cwd=case["dir"], env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         universal_newlines=True, bufsize=1)
+    th = threading.Thread(target=_pump, args=("[%s]" % case["key"], p))
+    th.daemon = True
+    th.start()
+    t0 = time.time()
+    while True:
+        rc = p.poll()
+        if rc is not None:
+            break
+        if STUDY_TIMEOUT_S and (time.time() - t0) > STUDY_TIMEOUT_S:
+            print("[compare] *** %s exceeded STUDY_TIMEOUT_S=%ds -- killing it ***"
+                  % (case["key"], STUDY_TIMEOUT_S))
+            try:
+                p.kill()
+            except Exception:
+                pass
+            rc = -1
+            break
+        time.sleep(2)
+    th.join(timeout=5)
+    print("[compare] %s finished rc=%s after %s"
+          % (case["key"], rc, _fmt_hms(time.time() - t0)))
+    return rc
+
+
+# ============================================================================
+# PART 11 -- MAIN
+# ============================================================================
+
+_RX_AUTO  = re.compile(r'^AUTO_SPP_FAULTS\s*=\s*(True|False)', re.M)
+_RX_FCSV  = re.compile(r'^FAULTS_CSV\s*=\s*r?"([^"]*)"', re.M)
+
+
+def _study_path(case, why=None):
+    """The STUDY script a launcher drives, read out of the launcher itself so
+       this cannot drift from what actually runs.
+
+       why, when given, is a list this appends the REASON to. "not found" with
+       no path named is a dead end: the answer is always one of three things --
+       the launcher is not in the case folder, it cannot be read, or its
+       STUDY_SCRIPT line is not the one this looks for -- and which of the three
+       decides what you do next."""
+    lp = os.path.join(case["dir"], case["script"])
+    if not os.path.isfile(lp):
+        if why is not None:
+            why.append("the launcher is not there: %s" % lp)
+            why.append("   copy %s into %s" % (case["script"], case["dir"]))
+        return ""
+    try:
+        txt = _read_text(lp)
+    except Exception as e:
+        if why is not None:
+            why.append("%s could not be read (%s)" % (lp, e))
+        return ""
+    m = re.search(r'^STUDY_SCRIPT\s*=\s*os\.path\.join\(STUDY_DIR,\s*"([^"]+)"\)',
+                  txt, re.M)
+    if not m:
+        if why is not None:
+            why.append("%s has no STUDY_SCRIPT line this recognises" % lp)
+            why.append("   it must read:  STUDY_SCRIPT = os.path.join(STUDY_DIR, "
+                       "\"<study>.py\")")
+        return ""
+    sp = os.path.join(case["dir"], m.group(1))
+    if not os.path.isfile(sp) and why is not None:
+        why.append("%s drives %s, which is not there: %s"
+                   % (case["script"], m.group(1), sp))
+        why.append("   copy %s into %s" % (m.group(1), case["dir"]))
+    return sp
+
+
+def fault_config(case, why=None):
+    """(study_path, auto_generate, faults_csv) for one case."""
+    sp = _study_path(case, why)
+    if not sp or not os.path.isfile(sp):
+        return "", None, ""
+    txt = _read_text(sp)
+    m = _RX_AUTO.search(txt)
+    auto = (m.group(1) == "True") if m else None
+    m = _RX_FCSV.search(txt)
+    return sp, auto, (m.group(1) if m else "")
+
+
+def shared_faults_path(proj, template=None):
+    """The shared fault list for ONE project.
+
+       {project} in the path is replaced with the project name, so each project
+       gets its own list -- built once, read by BOTH cases. A fault list is
+       centred on a POI; sharing one file across projects would run the first
+       project's events under every project's name, and every id would still
+       look right."""
+    t = (template or SHARED_FAULTS_CSV).replace("{root}", STUDY_ROOT)
+    if "{project}" in t:
+        return t.replace("{project}", proj or "")
+    if not proj:
+        return t
+    # A path without the placeholder is taken as a single shared list, which is
+    # correct for one project and wrong for two. Said once, not silently.
+    return t
+
+
+def _proj_of_results_dir(d):
+    """'SantaFe' from ...\\results\\SantaFe_spp.
+
+       os.path.basename is no help here: this runs on POSIX as well as Windows,
+       where a backslash is an ordinary character and the whole Windows path
+       comes back as one 'filename'. Split on both separators."""
+    name = re.split(r"[\\/]", str(d).rstrip("\\/"))[-1]
+    return name.rsplit("_", 1)[0] if "_" in name else name
+
+
+def compare_projects():
+    """The projects this comparison covers, in a fixed order."""
+    if _panel_projects():
+        return _panel_projects()
+    common, ob, ot = discover_projects(MODES[0])
+    return list(common or ot or ob or [])
+
+
+def make_shared_fault_list(case, dest, proj=None):
+    """Generate the shared fault list once, from one case's topology.
+
+       Runs the STUDY script in its BUILD role with the generator forced on. That
+       loads the power flow, walks out from the POI and writes the fault set --
+       no dynamics, no fault runs, minutes not hours. The file is then copied to
+       `dest`, outside both study folders, so neither study can regenerate or
+       delete it and both read the identical events."""
+    sp, _auto, _csv = fault_config(case)
+    if not sp:
+        print("[compare] cannot find the study script for %s" % case["key"])
+        return False
+    if not proj:
+        proj = (compare_projects() or [""])[0]
+    if not proj:
+        print("[compare] no project name to build the fault list for -- set PROJECTS.")
+        return False
+    _banner("PHASE 0 -- BUILDING THE SHARED FAULT LIST from %s (%s)"
+            % (case["label"], proj))
+    print("[compare] running the BUILD role of %s" % os.path.basename(sp))
+    print("[compare] this loads the power flow and walks the topology -- no snapshot,")
+    print("[compare] no initialisation, no dynamics. A minute or two, not hours.")
+    env = dict(os.environ)
+    # THE SAME SETTINGS THE RUNS GET. The build is what DECIDES the fault set,
+    # so a panel setting that reaches the runs and not the build changes nothing
+    # about what is actually simulated -- it only changes what the runs think
+    # they were asked for.
+    _push_settings(env, case)
+    env["SPP_ROLE"] = "build"
+    env["SPP_STUDY_DIR"] = case["dir"]
+    env["SPP_PROJECT"] = proj
+    env["SPP_FAULT_MODE"] = MODES[0]
+    env["SPP_AUTO_FAULTS"] = "1"          # generate rather than read
+    env["SPP_REGEN_FAULTS"] = "always"    # and write the files
+    env["SPP_FAULTS_ONLY"] = "1"          # ...and stop there: no snapshot, no dynamics
+    env["SPP_N_WORKERS"] = "1"
+    env["SPP_WORKER"] = "0"
+    # WHEN THIS RUN STARTED. The only success test used to be "does the source
+    # file exist", and that file lives in the case's OWN results folder where a
+    # PREVIOUS run leaves it behind. So a build that died -- a licence it could
+    # not get, a raise in the fault generator, the faults-only path exiting 1 --
+    # was reported as a success and last week's list was copied over the shared
+    # one. Nothing downstream could tell: the copy IS the shared list, and every
+    # staleness check compares the results against it.
+    _t_start = time.time()
+    p = subprocess.Popen([PYTHON, "-u", sp], cwd=case["dir"], env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         universal_newlines=True, bufsize=1)
+    th = threading.Thread(target=_pump, args=("[build]", p))
+    th.daemon = True
+    th.start()
+    rc = p.wait()
+    th.join(timeout=5)
+    src = os.path.join(results_dir(case, proj, MODES[0]), "faults", "SPP_FAULTS.csv")
+    if rc not in (0, None):
+        print("[compare] *** the fault-list build for %s exited rc=%s ***"
+              % (proj or case["key"], rc))
+        print("[compare]     Refusing to publish %s -- that file is whatever an" % src)
+        print("[compare]     earlier run left there, and copying it would make a")
+        print("[compare]     stale list the shared one for BOTH cases.")
+        return False
+    if not os.path.isfile(src):
+        print("[compare] *** the build finished rc=%s but wrote no %s ***" % (rc, src))
+        return False
+    # AND DID THIS RUN WRITE IT? A build can exit 0 having taken an early path
+    # that never reached the generator. A source older than the moment this
+    # build started is not this build's output.
+    try:
+        _age = os.path.getmtime(src)
+    except Exception:
+        _age = None
+    if _age is not None and _age < _t_start - 1.0:
+        print("[compare] *** the build for %s exited 0 but did not rewrite %s ***"
+              % (proj or case["key"], os.path.basename(src)))
+        print("[compare]     It is %.0f s older than this build, so it belongs to an"
+              % (_t_start - _age))
+        print("[compare]     earlier run. Refusing to publish it as the shared list.")
+        return False
+    try:
+        d = os.path.dirname(dest)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with open(src) as a:
+            body = a.read()
+        # ASIDE, THEN MOVED. Both cases can reach this for the same project, and
+        # a study process reading a half-written shared list gets a short fault
+        # set and runs it without complaint.
+        _tmp = "%s.tmp%d" % (dest, os.getpid())
+        with open(_tmp, "w") as b:
+            b.write(body)
+        os.replace(_tmp, dest)
+    except Exception as e:
+        print("[compare] *** could not copy the fault list to %s: %s ***" % (dest, e))
+        return False
+    n = max(0, len(body.splitlines()) - 1)
+    print("[compare] shared fault list written: %s  (%d fault(s))" % (dest, n))
+    print("[compare] BOTH studies read this file, so both run the same events.")
+    return True
+
+
+def stale_results(shared):
+    """Result folders produced with a DIFFERENT fault list than the current one.
+
+       This is the safety net behind moving folders aside, and the better of the
+       two: it does not need the filesystem to cooperate. Each study records the
+       list it ran into results\\<project>_<mode>\\faults\\SPP_FAULTS.csv, so a
+       folder whose record does not match the shared list holds results for
+       different events -- whatever the ids say.
+
+       Returns [(folder, why)]."""
+    try:
+        with open(shared) as fh:
+            want = [ln.strip() for ln in fh if ln.strip()]
+    except Exception:
+        return []
+    want_ids = set(ln.split(",")[0] for ln in want[1:])
+    out = []
+    for case in (CASE_BASE, CASE_TEST):
+        base = _res_root(case)
+        if not os.path.isdir(base):
+            continue
+        for d in sorted(glob.glob(os.path.join(base, "*_*"))):
+            if not os.path.isdir(d) or d.endswith(".old"):
+                continue
+            if not glob.glob(os.path.join(d, "outs", "*.out")):
+                continue
+            rec = os.path.join(d, "faults", "SPP_FAULTS.csv")
+            if not os.path.isfile(rec):
+                out.append((d, "no record of the fault list it ran -- produced before "
+                               "the study started recording one"))
+                continue
+            try:
+                with open(rec) as fh:
+                    got = [ln.strip() for ln in fh if ln.strip()]
+            except Exception as e:
+                out.append((d, "its fault-list record could not be read (%s)" % e))
+                continue
+            if got == want:
+                continue
+            got_ids = set(ln.split(",")[0] for ln in got[1:])
+            same = len(got_ids & want_ids)
+            out.append((d, "ran %d fault(s), the current list has %d, %d id(s) in "
+                           "common -- the definitions differ"
+                        % (len(got_ids), len(want_ids), same)))
+    return out
+
+
+def backup_once(path):
+    """Keep a copy of the fault list -- but not a copy per attempt.
+
+       Every backup of an unchanged file is noise, and a folder of identical
+       .bak files makes the one that matters harder to find. If a backup with
+       the same CONTENT already exists, that is the record; say so and move on."""
+    try:
+        with open(path) as fh:
+            body = fh.read()
+    except Exception as e:
+        print("[compare] *** could not read %s (%s) -- stopping rather than" % (path, e))
+        print("[compare]     overwriting the record of the existing results ***")
+        return False
+    for old in sorted(glob.glob(path + ".*.bak")):
+        try:
+            with open(old) as fh:
+                if fh.read() == body:
+                    print("[compare] the existing list is already backed up as %s" % old)
+                    return True
+        except Exception:
+            pass
+    keep = "%s.%s.bak" % (path, time.strftime("%Y%m%d_%H%M%S"))
+    try:
+        with open(keep, "w") as fh:
+            fh.write(body)
+    except Exception as e:
+        print("[compare] *** could not write %s (%s) ***" % (keep, e))
+        return False
+    print("[compare] the existing list is kept as %s" % keep)
+    print("[compare] it is the only record of what current results ran against.")
+    return True
+
+
+def _locked_inside(path, limit=3):
+    """Names of the files inside a locked folder that are themselves locked.
+
+       Windows refuses to move a DIRECTORY when any process holds a handle to
+       anything inside it, and the error names only the directory. Renaming each
+       file to itself is a handle test that changes nothing when it succeeds --
+       so the message can say which .out file the open PSS/E session is on
+       rather than leaving the user to close things until it works."""
+    out = []
+    if not os.path.isdir(path):
+        return out
+    try:
+        names = sorted(os.listdir(path))
+    except Exception:
+        return out
+    for nm in names:
+        p = os.path.join(path, nm)
+        if os.path.isdir(p):
+            continue
+        try:
+            os.rename(p, p)      # no-op on success, raises while held
+        except Exception:
+            out.append(nm)
+            if len(out) >= limit:
+                out.append("... (and possibly more)")
+                break
+    return out
+
+
+def retire_old_results():
+    """Move existing results aside before a new fault set is generated.
+
+       A new list RENUMBERS THE FAULTS. F27 in the results on disk is not F27 in
+       the new list, and because the ids collide nothing downstream would look
+       wrong -- the comparison would run, read convincingly, and be comparing two
+       different events under one name. That is the failure this whole tool
+       exists to prevent, so it cannot be allowed in through the back door.
+
+       Moved, never deleted: hours of simulation are not this script's to throw
+       away, and the old fault list is kept beside them so they stay
+       interpretable."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    moved = []
+    for case in (CASE_BASE, CASE_TEST):
+        base = _res_root(case)
+        if not os.path.isdir(base):
+            continue
+        for d in sorted(glob.glob(os.path.join(base, "*_*"))):
+            if not os.path.isdir(d) or d.endswith(".old"):
+                continue
+            if not (glob.glob(os.path.join(d, "outs", "*.out"))
+                    or rfile(d, "SPP_CRITERIA_REPORT", "txt", None)):
+                continue
+            dest = "%s.%s.old" % (d, stamp)
+            try:
+                os.rename(d, dest)
+                moved.append(dest)
+                continue
+            except Exception as e:
+                first_err = e
+            # RENAMING THE FOLDER FAILED. On Windows that happens when ANY process
+            # holds a handle inside it -- or simply has it as its current
+            # directory. It does not mean every file is locked, so try moving the
+            # CONTENTS instead: usually one .out is open and the other 300 move
+            # perfectly well, which turns "cannot proceed" into "close the one
+            # thing holding F73.out".
+            print("[compare] could not rename %s (%s)" % (d, first_err))
+            print("[compare] trying to move its contents instead...")
+            stuck, done = [], []
+            try:
+                if not os.path.isdir(dest):
+                    os.makedirs(dest)
+                for name in sorted(os.listdir(d)):
+                    try:
+                        os.rename(os.path.join(d, name), os.path.join(dest, name))
+                        done.append(name)
+                    except Exception as e2:
+                        stuck.append((name, e2))
+            except Exception as e2:
+                stuck.append((os.path.basename(d), e2))
+            if not stuck:
+                moved.append(dest)
+                try:
+                    os.rmdir(d)          # now empty; harmless if it will not go
+                except Exception:
+                    pass
+                continue
+
+            # ---- PUT BACK WHAT MOVED ------------------------------------------
+            # The contents-move is all-or-nothing. Two subfolders locked and the
+            # other five moved leaves the reports in <name>.old and the .out
+            # files in the original folder -- a study split across two places,
+            # under a message that ends "Nothing has been changed". That message
+            # has to be TRUE: it is what the user acts on. So undo the part that
+            # worked before saying anything, and if the undo itself fails, say
+            # exactly what is where instead of claiming the folder is intact.
+            back_failed = []
+            for name in done:
+                try:
+                    os.rename(os.path.join(dest, name), os.path.join(d, name))
+                except Exception as e3:
+                    back_failed.append((name, e3))
+            if not back_failed:
+                try:
+                    os.rmdir(dest)
+                except Exception:
+                    pass
+
+            print("")
+            print("[compare] *** %d item(s) in %s are LOCKED ***" % (len(stuck), d))
+            for name, e2 in stuck[:10]:
+                print("[compare]     %-28s %s" % (name, e2))
+                # A locked FOLDER is locked because of a FILE inside it. Naming
+                # the file turns "close something" into "close this".
+                for who in _locked_inside(os.path.join(d, name)):
+                    print("[compare]         holds: %s" % who)
+            if len(stuck) > 10:
+                print("[compare]     ... and %d more" % (len(stuck) - 10))
+            if back_failed:
+                print("[compare]")
+                print("[compare] *** THE FOLDER IS NOW SPLIT ACROSS TWO PLACES ***")
+                print("[compare] %d item(s) moved to the .old folder and could NOT be put"
+                      % len(back_failed))
+                print("[compare] back. Merge these by hand before running anything:")
+                for name, e3 in back_failed[:10]:
+                    print("[compare]     move \"%s\" \"%s\""
+                          % (os.path.join(dest, name), os.path.join(d, name)))
+            elif done:
+                print("[compare]")
+                print("[compare] %d item(s) that DID move were put back -- the folder is as"
+                      % len(done))
+                print("[compare] it was." )
+            print("[compare]")
+            print("[compare] What holds them, in order of likelihood:")
+            print("[compare]   * a PSS/E session with a .out or .sav from this study open")
+            print("[compare]     -- close PSS/E entirely, not just the case")
+            print("[compare]   * Excel with one of the .csv reports open")
+            print("[compare]   * a File Explorer window sitting IN that folder, or a")
+            print("[compare]     terminal whose current directory is inside it")
+            print("[compare]   * a worker from an earlier run that has not exited:")
+            print("[compare]       taskkill /F /IM psse34.exe")
+            print("[compare]       taskkill /F /IM python.exe    (careful -- kills this one too)")
+            print("[compare]")
+            print("[compare] Or move the folder yourself and run again:")
+            print("[compare]     move \"%s\" \"%s\"" % (d, dest))
+            print("[compare]")
+            print("[compare] Stopping: a new fault set run into a folder of results from")
+            print("[compare] the OLD one would mix two different meanings of every fault id.")
+            if back_failed:
+                print("[compare] The fault list is untouched, but SEE THE SPLIT FOLDER ABOVE.")
+            else:
+                print("[compare] Nothing has been changed -- the fault list is untouched.")
+            return False
+    if moved:
+        print("[compare] %d results folder(s) moved aside -- they were produced with the"
+              % len(moved))
+        print("[compare] PREVIOUS fault list and their ids do not mean the same thing:")
+        for d in moved:
+            print("[compare]    %s" % d)
+        print("[compare] Nothing was deleted. Delete them yourself once you are sure.")
+    else:
+        print("[compare] no existing results to move aside.")
+    return True
+
+
+# What each enabled planning event looks like in the fault list. If an event is
+# switched on in the study script and NOTHING in the list looks like it, the list
+# predates that switch.
+_EVENT_SIGNS = [
+    ("P1.2", "3PH line faults",        lambda r: r.get("fault_type") == "3PH"),
+    ("P1.3", "3PH transformer faults", lambda r: r.get("fault_type") == "3PH"),
+    ("P2.1", "OPEN (no-fault switching)", lambda r: r.get("fault_type") == "OPEN"),
+    ("P4.2", "SLG stuck-breaker",      lambda r: r.get("fault_type") == "SLG"),
+    ("P6",   "prior-outage events",    lambda r: bool((r.get("pre_outage") or "").strip())),
+    ("P7",   "double-circuit trips",
+     lambda r: len((r.get("trip_elements") or "").split(";")) > 1),
+]
+
+
+def check_event_coverage(shared, case):
+    """Does the shared list actually CONTAIN the events the study asks for?
+
+       SPP_EVENTS and SPP_EVENT_HOPS drive the GENERATOR. With
+       AUTO_SPP_FAULTS = False the generator does not run, so turning on P4.2 or
+       P6 changes nothing at all: both studies keep reading a list written before
+       those events existed. The settings say one thing, the file says another,
+       and the run proceeds without complaint -- which is how a study meant to
+       cover P1/P2/P4 spent hours running P1 only.
+
+       Compares the events enabled in the study script against what the list
+       holds. Advisory: it does not stop the run, because a hand-supplied list
+       from SPP is a legitimate reason for the two to differ."""
+    sp = _study_path(case)
+    if not sp or not os.path.isfile(sp) or not os.path.isfile(shared):
+        return
+    try:
+        txt = _read_text(sp)
+        i = txt.index("SPP_EVENTS = {")
+        blk = txt[i:txt.index("\n}", i)]
+    except Exception:
+        return
+    on = set(re.findall(r'"(P[\d.]+)":\s*True', blk))
+    if not on:
+        return
+    try:
+        with csv_open(shared) as fh:
+            rows = list(csv.DictReader(fh))
+    except Exception:
+        return
+    if not rows:
+        return
+    missing = []
+    for ev, what, test in _EVENT_SIGNS:
+        if ev not in on:
+            continue
+        if not any(test(r) for r in rows):
+            missing.append((ev, what))
+    # P1.2 and P1.3 share a signature, so only report them when NOTHING is 3PH.
+    missing = [m for m in missing
+               if not (m[0] in ("P1.2", "P1.3")
+                       and any(r.get("fault_type") == "3PH" for r in rows))]
+    if not missing:
+        print("[compare] the list contains every event type the study has enabled.")
+        return
+    print("")
+    print("[compare] *** THE FAULT LIST PREDATES YOUR EVENT SETTINGS ***")
+    print("[compare]     %s has these enabled, and the list holds none of them:"
+          % os.path.basename(sp))
+    for ev, what in missing:
+        print("[compare]        %-5s  %s" % (ev, what))
+    print("[compare]     %d fault(s) in the list, all of them: %s"
+          % (len(rows), ", ".join(sorted(set(r.get("fault_type", "?") for r in rows)))))
+    print("[compare]")
+    print("[compare]     SPP_EVENTS drives the GENERATOR, and with")
+    print("[compare]     AUTO_SPP_FAULTS = False the generator does not run -- both")
+    print("[compare]     studies simply read this file. Turning an event on changes")
+    print("[compare]     nothing until the list is REGENERATED.")
+    print("[compare]")
+    print("[compare]     Set NEW_FAULT_LIST = True and run again to rebuild it.")
+    print("[compare]     Continuing with the list as it is.")
+    print("")
+
+
+def check_fault_lists():
+    """Both cases must run the SAME events. Verified BEFORE any simulation.
+
+       Getting this wrong is not a crash -- it is a comparison that completes,
+       reads convincingly and means nothing, because F27 was one fault in the
+       base case and a different one with the projects. It has to be checked
+       here, because after the studies have run there is no way to tell."""
+    _banner("PHASE 0 -- IS THE FAULT SET THE SAME ON BOTH SIDES?")
+    info = {}
+    trouble = []
+    for case in (CASE_BASE, CASE_TEST):
+        why = []
+        sp, auto, csvp = fault_config(case, why)
+        info[case["key"]] = (sp, auto, csvp)
+        print("[compare] %-5s %s" % (case["key"], sp or "*** NOT FOUND ***"))
+        for w in why:
+            print("[compare]       %s" % w)
+            trouble.append(w)
+        if sp:
+            print("[compare]       AUTO_SPP_FAULTS = %s" % auto)
+            print("[compare]       FAULTS_CSV      = %s" % (csvp or "(none)"))
+    (spb, ab, cb) = info["BASE"]
+    (spt, at, ct) = info["PROJ"]
+    if not spb or not spt:
+        print("")
+        print("[compare] *** cannot read one of the study scripts -- fix the paths first ***")
+        # WHAT IS ACTUALLY IN THE CASE FOLDERS. The reason above says what is
+        # missing; this says what is there instead, which is usually the whole
+        # answer -- a file left in the folder above, or saved under a name the
+        # browser changed.
+        for case in (CASE_BASE, CASE_TEST):
+            print("[compare]")
+            print("[compare]   %s  %s" % (case["key"], case["dir"]))
+            if not os.path.isdir(case["dir"]):
+                print("[compare]     *** that folder does not exist ***")
+                continue
+            got = sorted(os.path.basename(x)
+                         for x in glob.glob(os.path.join(case["dir"], "*.py")))
+            print("[compare]     .py files here: %s" % (", ".join(got) or "(none)"))
+        print("[compare]")
+        print("[compare]   Each case folder needs BOTH of its scripts:")
+        print("[compare]     %s  ->  %s + its study script"
+              % (CASE_BASE["dir"], CASE_BASE["script"]))
+        print("[compare]     %s  ->  %s + its study script"
+              % (CASE_TEST["dir"], CASE_TEST["script"]))
+        print("[compare]   This file (%s) sits in the folder ABOVE them."
+              % os.path.basename(__file__ if "__file__" in dir() else "z4_cmp_all_con.py"))
+        return False
+
+    # BOTH GENERATING = two different fault sets, and nothing later can tell.
+    if ab and at:
+        print("")
+        print("[compare] *** BOTH STUDIES GENERATE THEIR OWN FAULT SET ***")
+        print("[compare]     AUTO_SPP_FAULTS is True on both sides. The generator walks the")
+        print("[compare]     topology of ITS OWN case, and the two cases are different -- so")
+        print("[compare]     F27 will not be the same fault in both, and the comparison would")
+        print("[compare]     be meaningless while looking perfectly reasonable.")
+        print("[compare]     Set AUTO_SPP_FAULTS = False and FAULTS_CSV = %r in BOTH study"
+              % SHARED_FAULTS_CSV)
+        print("[compare]     scripts, or set MAKE_FAULT_LIST = True here to build it for you.")
+        if not MAKE_FAULT_LIST:
+            return False
+    if ab != at:
+        print("")
+        print("[compare] *** THE TWO STUDIES DISAGREE: one generates its fault set and the")
+        print("[compare]     other reads a file. They cannot be compared. ***")
+        return False
+    if cb != ct:
+        print("")
+        print("[compare] *** THE TWO STUDIES READ DIFFERENT FAULT FILES ***")
+        print("[compare]     base: %s" % (cb or "(none)"))
+        print("[compare]     with: %s" % (ct or "(none)"))
+        print("[compare]     Point both at the same path -- ideally %s," % SHARED_FAULTS_CSV)
+        print("[compare]     which is outside both study folders so neither can rewrite it.")
+        return False
+
+    # THE PANEL DECIDES THE PATH, NOT THE STUDY SCRIPT.
+    # This was "cb or SHARED_FAULTS_CSV", so whatever FAULTS_CSV the study
+    # scripts happened to carry won over the setting in this file. The _con
+    # engines shipped with {root}\SPP_FAULTS_{project}.csv -- the _f set's
+    # list -- so phase 0 looked there, never found the DISIS lists that
+    # z4_disis_con.py had written to SPP_FAULTS_CON_<project>.csv, called it
+    # missing, and built a replacement from the Base case. One setting in two
+    # places, and the one nobody was reading won.
+    template = SHARED_FAULTS_CSV or cb
+    if cb and cb != template:
+        print("")
+        print("[compare] fault list: this panel says %s" % template)
+        print("[compare]             the study scripts say %s" % cb)
+        print("[compare]             using the panel's path; SPP_FAULTS_CSV is passed to")
+        print("[compare]             every study process, so their own setting is overridden.")
+    projects = compare_projects() or [""]
+    if "{project}" not in template and len(projects) > 1:
+        print("")
+        print("[compare] *** ONE SHARED FAULT LIST, %d PROJECTS ***" % len(projects))
+        print("[compare]     %s has no {project} in it, so every project would run" % template)
+        print("[compare]     the same list -- and that list is built around ONE POI.")
+        print("[compare]     Put {project} in FAULTS_CSV (study scripts) and in")
+        print("[compare]     SHARED_FAULTS_CSV here, then run again.")
+        return False
+
+    # ---- asked for a fresh set? --------------------------------------------
+    if NEW_FAULT_LIST:
+        src_case = CASE_TEST if (FAULT_LIST_FROM or "").upper() == "TEST" else CASE_BASE
+        _banner("NEW_FAULT_LIST -- building a BRAND-NEW fault set")
+        # THE RESULTS MOVE FIRST, THE BACKUP SECOND.
+        #
+        # It used to back up the fault list and THEN try to move the results. The
+        # move is the step that fails -- a locked folder on Windows -- so every
+        # failed attempt left another SPP_FAULTS.csv.<timestamp>.bak beside the
+        # original. Two attempts, two identical backups, and the folder fills up
+        # with copies of a file that never changed. Nothing is written until the
+        # step that can fail has succeeded.
+        if not retire_old_results():
+            return False
+        for proj in projects:
+            shared = shared_faults_path(proj, template)
+            if os.path.isfile(shared):
+                if not backup_once(shared):
+                    return False
+            if not make_shared_fault_list(src_case, shared, proj):
+                return False
+        return True
+
+    if not ab:
+        src_case = CASE_TEST if (FAULT_LIST_FROM or "").upper() == "TEST" else CASE_BASE
+        for proj in projects:
+            shared = shared_faults_path(proj, template)
+            if os.path.isfile(shared):
+                try:
+                    n = max(0, len(_read_text(shared).splitlines()) - 1)
+                except Exception:
+                    n = -1
+                print("")
+                print("[compare] %-14s both studies read %s" % (proj or "-", shared))
+                print("[compare] %s fault(s). Same file, same events, so the comparison is"
+                      % (n if n >= 0 else "?"))
+                print("[compare] like for like.")
+                # ...but is it the set the study script is currently asking for?
+                check_event_coverage(shared, CASE_BASE)
+                continue
+            print("")
+            print("[compare] *** no shared fault list for %s yet: %s ***"
+                  % (proj or "-", shared))
+            if not MAKE_FAULT_LIST:
+                print("[compare]     Both studies would stop on their first fault lookup,")
+                print("[compare]     after you had waited for them to load the case.")
+                print("[compare]     THE _con SET DOES NOT BUILD THIS FILE. It is the DISIS")
+                print("[compare]     contingency list. Run:")
+                print("[compare]         python z4_disis_con.py")
+                print("[compare]     in %s, which reads the DISIS results" % STUDY_ROOT)
+                print("[compare]     workbook's stability tab and writes one list per project,")
+                print("[compare]     filtered by bus distance from that project's POI.")
+                print("[compare]     Do NOT set MAKE_FAULT_LIST = True to get past this: that")
+                print("[compare]     builds a list from the Base case topology and writes it")
+                print("[compare]     over the path above, and you would be comparing generated")
+                print("[compare]     events while believing they were SPP's.")
+                return False
+            if not make_shared_fault_list(src_case, shared, proj):
+                return False
+    return True
+
+
+def check_feeder_ratings():
+    """Would any project's chosen size break the study script's per-feeder cap?
+
+       WHY THIS EXISTS -- THE PROJECT THAT NEVER RAN.
+
+       EmpirePrairie is listed at [604, 804] MW over four feeder buses, and
+       PROJECT_MW selected 804. The study script splits a project's rating
+       equally across its feeders and ABORTS when a feeder would carry more
+       than FEEDER_MAX_MW:  804 / 4 = 201.0 against a cap of 200.0.
+
+       That check is module-level code in z4_spp_p_con.py, so it raises on IMPORT,
+       before main(). Every process of that project's PROJECT-case pass died the
+       same way -- build, worker, report, plot -- the launcher retried the build
+       three times and gave up, and the pass produced no results folder at all.
+       The BASE case never sees PROJECT_MW, so it ran EmpirePrairie normally and
+       the pair came out scored on one side only. From the outside it looked
+       exactly like "it did not run EmpirePrairie": no error a person would find,
+       because the traceback was in a child process's log for a pass that left
+       nothing behind.
+
+       One MW over a cap should cost one printed line, not a dead pass. This is
+       that line, and it reads the numbers out of the study script itself rather
+       than keeping a second copy of them here -- a copy would be the next thing
+       to disagree."""
+    prob = []
+    for case in (CASE_BASE, CASE_TEST):
+        spp = _study_script_for(case)
+        if not spp:
+            continue
+        try:
+            with open(spp, errors="replace") as fh:
+                tree = ast.parse(fh.read())
+        except Exception as e:
+            print("[compare] could not read %s to check the feeder cap (%s)"
+                  % (os.path.basename(spp), e))
+            continue
+        got = {}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id in ("BESS_PROJECTS",
+                                                        "FEEDER_MAX_MW",
+                                                        "ENABLE_BESS"):
+                    try:
+                        got[t.id] = ast.literal_eval(node.value)
+                    except Exception:
+                        pass
+        # A CASE THAT DOES NOT BUILD THE PLANT CANNOT HIT THE CAP. The base
+        # script has ENABLE_BESS = False and the whole block is skipped there,
+        # which is precisely why this only ever killed one side.
+        if not got.get("ENABLE_BESS"):
+            continue
+        cap = got.get("FEEDER_MAX_MW")
+        rows = got.get("BESS_PROJECTS") or []
+        if not cap or not rows:
+            continue
+        rows = dict((str(r.get("name")), r) for r in rows if isinstance(r, dict))
+        for p in (compare_projects() or []):
+            r = rows.get(p)
+            if not r:
+                continue
+            n = len(r.get("feeders") or [])
+            if not n:
+                continue                     # NEW_PLANT builds its own buses
+            # EVERY SIZE THIS PROJECT WILL BE STUDIED AT HAS TO FIT.
+            #
+            # PROJECT_MW may name one size or a list of them (a list is a sweep
+            # -- one complete study each). With nothing named, _project_mw()
+            # takes the row's FIRST size, so that is the one that runs.
+            _want = (PROJECT_MW or {}).get(p)
+            if _want is None:
+                _row = r.get("mw")
+                _sizes = [_row[0]] if isinstance(_row, (list, tuple)) and _row else [_row]
+            elif isinstance(_want, (list, tuple)):
+                _sizes = list(_want)
+            else:
+                _sizes = [_want]
+            for mw in _sizes:
+                try:
+                    per = float(mw) / n
+                except (TypeError, ValueError):
+                    continue
+                if per > float(cap) + 1e-6:
+                    prob.append((case["key"], p, float(mw), n, per, float(cap)))
+    if not prob:
+        return True
+    print("")
+    print("[compare] " + "=" * 68)
+    print("[compare] A PROJECT'S SIZE DOES NOT FIT ITS FEEDERS")
+    print("[compare] " + "=" * 68)
+    for key, p, mw, n, per, cap in prob:
+        print("[compare]   %-5s %-16s %.0f MW / %d feeder(s) = %.1f MW each, "
+              "cap %.0f" % (key, p, mw, n, per, cap))
+    print("[compare]")
+    print("[compare]   The study script enforces FEEDER_MAX_MW as a hard error at")
+    print("[compare]   IMPORT time, so every process of that project's pass would")
+    print("[compare]   die before main() -- build, workers, report and plots alike.")
+    print("[compare]   The pass would leave no results folder, and the other case")
+    print("[compare]   would run the same project normally, so the comparison would")
+    print("[compare]   have one side and not the other.")
+    print("[compare]")
+    print("[compare]   Three ways out, and they are different studies:")
+    for _k, p, mw, n, _per, cap in prob[:4]:
+        print("[compare]     * give %s more feeder buses: %d would need %d, at "
+              "%.1f MW each" % (p, int(mw), int(-(-mw // cap)),
+                                mw / max(1, int(-(-mw // cap)))))
+        print("[compare]     * raise FEEDER_MAX_MW in BOTH study scripts above %.1f"
+              % _per_ceil(mw, n))
+        print("[compare]     * study %s at a size that fits: PROJECT_MW = {\"%s\": %d}"
+              % (p, p, int(cap * n)))
+    print("[compare] " + "=" * 68)
+    return False
+
+
+def _per_ceil(mw, n):
+    try:
+        return float(mw) / max(1, int(n))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def check_selection_matches(template=None):
+    """Does ONLY_FAULTS / ONLY_EVENTS actually select anything in the list?
+
+       A selection that matches nothing is not an error anywhere downstream: the
+       launchers substitute a placeholder id, every worker starts PSS/E, finds
+       nothing to do, writes its sentinel and exits, and the run ends with a
+       clean exit code, an empty report and "0 DONE, 28 did not finish". Four
+       minutes of process startup to discover a typo.
+
+       The commonest form of it is a MODE MISMATCH: custom faults carry the
+       planning event CUSTOM and ids like C01_3PH_765911_10cy, so ONLY_EVENTS =
+       ["P1"] and ONLY_FAULTS = ["F01-F12"] -- both perfectly correct for an spp
+       run -- select nothing at all here.
+
+       Read from the shared list, which phase 0 has just built or verified, so
+       this costs a file read and happens before any study is launched."""
+    if not (ONLY_IDS or ONLY_EVENTS):
+        return True
+    ok = True
+    for proj in (compare_projects() or [""]):
+        path = shared_faults_path(proj, template)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with csv_open(path) as fh:
+                rows = list(csv.DictReader(fh))
+        except Exception:
+            continue
+        if not rows:
+            continue
+        ids = [(r.get("fault_id") or "").strip() for r in rows]
+        evs = sorted(set((r.get("planning_event") or "").strip() or "(none)"
+                         for r in rows))
+        keep = ids
+        if ONLY_EVENTS:
+            keep = [(r.get("fault_id") or "").strip() for r in rows
+                    if _event_selected((r.get("planning_event") or "").strip())]
+        if ONLY_IDS:
+            keep = [x for x in keep if _id_selected(x)]
+        if keep:
+            print("[compare] %-14s selection matches %d of %d fault(s)"
+                  % (proj or "-", len(keep), len(ids)))
+            continue
+        ok = False
+        print("")
+        print("[compare] *** THE SELECTION MATCHES NOTHING IN THE FAULT LIST ***")
+        print("[compare]     project %s, list %s" % (proj or "-", path))
+        print("[compare]     %d fault(s) in it, planning event(s): %s"
+              % (len(ids), ", ".join(evs)))
+        print("[compare]     ids look like: %s" % ", ".join(ids[:4]))
+        if ONLY_EVENTS:
+            print("[compare]     ONLY_EVENTS = %s" % ONLY_EVENTS)
+        if ONLY_FAULTS:
+            print("[compare]     ONLY_FAULTS = %s" % ONLY_FAULTS)
+        print("[compare]")
+        # NAME THE FIX, in this run's own terms.
+        if "CUSTOM" in [e.upper() for e in evs]:
+            print("[compare]     This is a CUSTOM fault set. Custom faults are not planning")
+            print("[compare]     events -- they carry CUSTOM, not P1 -- and their ids start")
+            print("[compare]     with C, not F. Both settings are written for an spp run.")
+            print("[compare]         ONLY_EVENTS = []")
+            print("[compare]         ONLY_FAULTS = []                    # or [\"C01-C12\"]")
+        else:
+            print("[compare]     Clear one or both, or write them to match the list above:")
+            print("[compare]         ONLY_EVENTS = []")
+            print("[compare]         ONLY_FAULTS = []")
+        print("")
+    return ok
+
+
+def audit_project_results(where):
+    """After the studies: which projects actually produced a results folder.
+
+       A project that fails loudly is easy. A project that never STARTS leaves
+       nothing at all -- no folder, no log, no line in any summary -- and the
+       run ends looking like a success that covered one project instead of four.
+       This says, per case, which of the projects asked for came back with
+       something and which did not."""
+    print("")
+    print("[compare] --- what each project produced (%s) ---" % where)
+    want = compare_projects() or []
+    if not want:
+        return
+    missing = []
+    for case in (CASE_BASE, CASE_TEST):
+        for proj in want:
+            for mode in MODES:
+                d = results_dir(case, proj, mode)
+                n_out = len(glob.glob(os.path.join(d, "outs", "*.out")))
+                rep = bool(rfile(d, "SPP_CRITERIA_REPORT", "txt", proj))
+                if not os.path.isdir(d):
+                    state = "*** NO FOLDER -- this study never started ***"
+                    missing.append((case["key"], proj, mode))
+                elif not n_out:
+                    state = "folder exists, NO .out -- it started and stopped"
+                    missing.append((case["key"], proj, mode))
+                else:
+                    state = "%d .out, report %s" % (n_out, "yes" if rep else "NOT WRITTEN")
+                print("[compare]   %-5s %-16s %-8s %s" % (case["key"], proj, mode, state))
+    if not missing:
+        return
+    print("[compare]")
+    print("[compare] *** %d project/case combination(s) produced nothing ***" % len(missing))
+    print("[compare] Where to look, in order:")
+    print("[compare]   1. the launcher's queue banner in the output above:")
+    print("[compare]        '%d STUDIES QUEUED -- %d project(s) x %d fault mode(s)'"
+          % (len(want) * len(MODES), len(want), len(MODES)))
+    print("[compare]      If it names fewer projects than PROJECTS does, the list did not")
+    print("[compare]      reach the launcher and nothing after that could have run them.")
+    print("[compare]   2. that project's build log, if the folder exists:")
+    for key, proj, mode in missing[:4]:
+        case = CASE_BASE if key == "BASE" else CASE_TEST
+        print("[compare]        %s" % os.path.join(results_dir(case, proj, mode),
+                                                   "logs", "DYN_STUDY_build.log"))
+    print("[compare]      A build that stops on the collector table or the mismatch")
+    print("[compare]      tolerance says so there, and the queue moves to the next project.")
+    print("[compare]   3. PROJECTS here must name projects the STUDY knows: they are")
+    print("[compare]      matched against BESS_PROJECTS in the study script, by name.")
+
+
+def compare_now(quiet=True):
+    """Build the comparison from whatever is scored right now. Never raises.
+
+       Used both for the live refresh and by phase 3, so there is exactly one
+       path that produces a comparison -- a live view that could differ from the
+       final one would be worse than no live view."""
+    out, only_b, only_t = [], set(), set()
+    for mode in MODES:
+        try:
+            common, ob, ot = discover_projects(mode)
+        except Exception:
+            continue
+        only_b |= set(ob)
+        only_t |= set(ot)
+        for proj in [p for p in common if (not _panel_projects() or p in _panel_projects())]:
+            try:
+                res = compare_project(proj, mode)
+            except Exception as e:
+                if not quiet:
+                    print("[compare] %s (%s) could not be compared yet: %s"
+                          % (proj, mode, e))
+                continue
+            # None = compare_project refused, having said why. Not an error
+            # and not an empty result: it printed the reason and the fix.
+            if res is None or not res["rows"]:
+                continue
+            try:
+                if not ONE_REPORT:
+                    write_project_report(res)
+                    write_project_csv(res)
+                    write_elements(res)
+            except Exception as e:
+                if not quiet:
+                    print("[compare] could not write %s: %s" % (proj, e))
+                continue
+            out.append(res)
+    if out:
+        for _res in out:
+            try:
+                with _cmp_into(_res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_runtime_comparison(_res["project"], _res["mode"])
+            except Exception as e:
+                if not quiet:
+                    print("[compare] could not write the run-time comparison: %s" % e)
+        try:
+            if not ONE_REPORT:
+                write_spp_event_tables(out)
+        except Exception as e:
+            if not quiet:
+                print("[compare] could not write the SPP event table: %s" % e)
+        # The capacity sweep is NOT run from here. This function is also what
+        # the live-refresh thread calls every LIVE_COMPARE_EVERY seconds, and a
+        # sweep launches full PSS/E studies -- from a daemon thread, repeatedly,
+        # while the main run is still going. It belongs to the one-shot path in
+        # main(), which is where it now lives.
+        # ONE FOLDER PER PROJECT. Every writer below uses the same file names,
+        # so with several projects and one folder the last one silently
+        # overwrites the rest. Only when this comparison IS one project: a
+        # report covering several belongs above them, not inside one of them.
+        _one_proj = out[0]["project"] if (COMPARE_BY_PROJECT and len(
+            set(r["project"] for r in out)) == 1) else ""
+        try:
+            with _cmp_into(_one_proj):
+                if ONE_REPORT:
+                    write_one_report(out, sorted(only_b), sorted(only_t))
+                else:
+                    write_summary(out, sorted(only_b), sorted(only_t))
+        except Exception as e:
+            if not quiet:
+                print("[compare] could not write the summary: %s" % e)
+        # AND ONE REPORT PER PROJECT, inside its own folder, when the
+        # comparison covers several. The report above answers for all of
+        # them together; comparison\<project>\00_COMPARISON_REPORT.* answers
+        # for that project alone, beside its detail\ folder.
+        _projs = []
+        for r in out:
+            if r["project"] not in _projs:
+                _projs.append(r["project"])
+        if COMPARE_BY_PROJECT and len(_projs) > 1:
+            for _pj in _projs:
+                _sub = [r for r in out if r["project"] == _pj]
+                try:
+                    with _cmp_into(_pj):
+                        if ONE_REPORT:
+                            write_one_report(_sub, [], [])
+                        else:
+                            write_summary(_sub, [], [])
+                except Exception as e:
+                    if not quiet:
+                        print("[compare] could not write %s's own report: %s" % (_pj, e))
+    return out, sorted(only_b), sorted(only_t)
+
+
+def _live_compare_start():
+    """Refresh the comparison every LIVE_COMPARE_EVERY seconds until stopped.
+
+       A DAEMON thread that only reads study reports and writes comparison
+       files. It cannot affect the studies, and if it throws it is caught here:
+       a partially-written report on one side must not take down a run that is
+       hours in."""
+    if not LIVE_COMPARE_EVERY:
+        return None
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(LIVE_COMPARE_EVERY):
+            try:
+                got, _b, _t = compare_now(quiet=True)
+            except Exception:
+                continue
+            if not got:
+                continue
+            n = sum(len(r["rows"]) for r in got)
+            new = sum(1 for r in got for x in r["rows"]
+                      if x["class"] == CLS_NEW or x["hidden_new"])
+            print("[compare] live: %d scenario(s) comparable so far, %d introduced "
+                  "by the projects -> %s"
+                  % (n, new, cmp_path("COMPARISON_SUMMARY", "txt")))
+            sys.stdout.flush()
+
+    th = threading.Thread(target=_loop)
+    th.daemon = True
+    th.start()
+    print("[compare] live comparison every %ds -> %s"
+          % (LIVE_COMPARE_EVERY, COMPARE_DIR))
+    return stop.set
+
+
+def _cases_to_run():
+    """The cases RUN_CASES asks to simulate, as a tuple.
+
+       Only the SIMULATION is restricted. The comparison always reads both
+       folders, because comparing one case against itself is not a comparison
+       and the point of running one side alone is usually to catch the other one
+       up. Running only the base case still writes the comparison over whatever
+       the project case already has on disk."""
+    w = str(RUN_CASES or "both").strip().lower()
+    if w in ("base", "cq", "b"):
+        return (CASE_BASE,)
+    if w in ("proj", "test", "pq", "p", "t"):
+        return (CASE_TEST,)
+    if w not in ("both", "all", ""):
+        print("[compare] RUN_CASES = %r is not one of both/base/proj -- running BOTH"
+              % RUN_CASES)
+    return (CASE_BASE, CASE_TEST)
+
+
+def _study_script_for(case):
+    """The STUDY script for this case -- z4_spp_b_con.py / z4_spp_p_con.py.
+
+       NOT case["script"], which is the LAUNCHER. The launcher runs a whole
+       study: build, simulate, report. It does not know SPP_PLOT_MISSING and
+       would ignore it, so handing that variable to the launcher starts a full
+       simulation -- with SPP_FRESH_START from the panel, one that clears the
+       .done markers and re-runs everything. The plotter must be the study
+       script itself, whose very first act under SPP_PLOT_MISSING is to draw
+       what is on disk and exit before main() -- no PSS/E, no queue, no case."""
+    lch = case.get("script") or ""
+    spp = os.path.basename(lch).replace("z4_lch_", "z4_spp_")
+    p = os.path.join(case["dir"], spp)
+    return p if os.path.isfile(p) else ""
+
+
+PLOT_QUICK_EXITS   = 3      # quick clean exits with nothing drawn a slot may have before it is left down
+PLOT_NOGAIN_MAX    = 2      # launches on one folder that draw nothing before the slot is moved elsewhere
+PLOT_QUICK_PAUSE_S = 5      # seconds between those retries
+
+
+def _plotter_log_tail(sl, n=12):
+    """Print the last n lines of a plotter slot's log, so a quick death says why."""
+    try:
+        p = os.path.join(_res_root(sl["case"]), "logs",
+                         "PLOTTER_%s_%s_%s.log" % (sl["case"].get("key", "x"), sl["proj"] or "x", sl["slot"]))
+        if not os.path.isfile(p):
+            return
+        with open(p, errors="replace") as fh:
+            lines = fh.read().splitlines()
+        for ln in lines[-n:]:
+            print("[compare]     | %s" % ln[:160])
+    except Exception:
+        pass
+
+
+def _start_plotter(case, proj, mode, slot, rdir=None):
+    """One background plotter for one results folder. Returns its Popen, or None.
+
+       Everything it needs to find the folder comes through the environment, the
+       same variables the launcher passes its own workers."""
+    script = _study_script_for(case)
+    if not script:
+        print("[compare]   *** no study script beside %s -- cannot plot there ***"
+              % case.get("script"))
+        return None
+    env = dict(os.environ)
+    # THE SAME STUDY SETTINGS A SIMULATION RUN GETS.
+    #
+    # This built a bare environment and the plotter therefore ran on the study
+    # script's OWN defaults -- SIM_END_S 10.0, PRE_FAULT_S 5.0, FLAT_RUN_S 5 --
+    # while this panel says 30.2, 10 and 3. Three things went wrong with that,
+    # and all three are silent:
+    #
+    #   * "complete" is decided by  t_end >= SIM_END_S - 0.11.  Against 10.0, an
+    #     .out that stopped at 10.45 s -- a third of the run -- was declared
+    #     complete, given a .done marker, and scored. Truncated results were
+    #     being certified as finished.
+    #   * the fault marker is drawn at PRE_FAULT_S. Against 5.0 the red line
+    #     landed five seconds before the fault, on every PDF the plotter drew.
+    #   * the criteria windows start at PRE_FAULT_S too, so the recovery and
+    #     overshoot tests were measured from the wrong instant.
+    #
+    # run_study() sends these; the plot pass reads exactly the same globals and
+    # needs them just as much.
+    if FLAT_RUN_S is not None:
+        env["SPP_FLAT_RUN_S"] = repr(float(FLAT_RUN_S))
+    if PRE_FAULT_S is not None:
+        env["SPP_PRE_FAULT_S"] = repr(float(PRE_FAULT_S))
+    if SIM_END_S is not None:
+        env["SPP_SIM_END_S"] = repr(float(SIM_END_S))
+    if RUN_NPLT is not None:
+        env["SPP_RUN_NPLT"] = str(int(RUN_NPLT))
+    _push_settings(env, case)              # criteria thresholds, radius, the rest
+    env["SPP_PLOT_MISSING"] = "1"          # draw and exit; never reaches main()
+    env["SPP_PLOT_FLEET"] = "1"            # per-file claims, not one-at-a-time
+    env["SPP_PLOT_SLOT"] = str(slot)
+    # A SWEEP FOLDER, NOT THE PLAIN ONE. The engine finds its results folder
+    # from RUN_PROJECT + SPP_CAP_TAG + SPP_RUN_TAG, so a plotter pointed at
+    # ..._cap50_dyr_Kqv2 must be handed exactly the tags that folder was written
+    # with. They are read back off the folder name -- the one place the run and
+    # the folder are guaranteed to agree.
+    if rdir:
+        _sfx = os.path.basename(rdir)[len("%s_%s" % (proj, mode)):].lstrip("_")
+        if _sfx:
+            _cap = ""
+            if _sfx.startswith("cap"):
+                _cap, _, _sfx = _sfx.partition("_")
+                _cap = _cap[len("cap"):]
+            if _cap:
+                env["SPP_CAP_TAG"] = _cap
+            if _sfx:
+                env["SPP_RUN_TAG"] = _sfx
+    env["SPP_STUDY_DIR"] = case["dir"]
+    env["SPP_ROLE"] = "work"
+    env["SPP_N_WORKERS"] = "1"
+    env["SPP_WORKER"] = "9"                # its own part file, never a worker's
+    if proj:
+        env["SPP_PROJECT"] = proj
+    if mode:
+        env["SPP_FAULT_MODE"] = mode
+    # NOTHING THAT COULD SIMULATE OR CLEAR STATE. These decide what a real study
+    # run does to the folder; a plotter must carry none of them.
+    for k in ("SPP_FRESH_START", "SPP_ONLY", "SPP_ONLY_PRESLICED", "SPP_REGEN_FAULTS",
+              "SPP_SKIP_DONE", "SPP_NEW_FAULT_LIST", "SPP_RUN_PROJECTS", "SPP_RUN_MODES"):
+        env.pop(k, None)
+    ld = _res_root(case)
+    try:
+        os.makedirs(ld)
+    except Exception:
+        pass
+    kw = {"cwd": case["dir"], "env": env}
+    try:
+        kw["stdout"] = open(os.path.join(
+            ld, "PLOTTER_%s_%s_%s.log" % (case.get("key", "x"), proj or "x", slot)), "a")
+        kw["stderr"] = subprocess.STDOUT
+    except Exception:
+        pass
+    if os.name == "nt":
+        kw["creationflags"] = 0x08000000                # CREATE_NO_WINDOW
+
+    return subprocess.Popen([PYTHON, "-u", script], **kw)
+
+
+def _plot_refused_here(out_path):
+    """True when the plotter has recorded that this .out will never get a PDF --
+       a run that gave up with a short file, or one that did not finish.
+
+       The marker (<sid>.plotted, beside the .out) is written by the plot pass.
+       Without it this counter and the plotter disagree: the plotter refuses the
+       file, the counter still calls it 'needs a PDF', and the supervisor
+       restarts the slot on that folder for ever -- 45 seconds a time, 20 times,
+       until the slot is retired with the folder still 'unfinished'."""
+    try:
+        mk = os.path.splitext(out_path)[0] + ".plotted"
+        if not os.path.isfile(mk):
+            return False
+        if os.path.getmtime(mk) + 1.0 < os.path.getmtime(out_path):
+            return False                     # re-simulated since
+        if FORCE_REPLOT and os.path.getmtime(mk) < float(_LAUNCH_T0):
+            return False                     # this launch re-judges it once
+    except Exception:
+        return False
+    return True
+
+
+def _pdf_is_current(out_path, pdf_path):
+    """The SAME rule the plotter's _pdf_current() applies, so the panel and
+       the plotter agree on what still needs drawing:
+         * no PDF                                   -> not current
+         * PDF older than its .out (re-simulated)   -> not current
+         * FORCE_REPLOT and PDF older than launch   -> not current
+       Counting only MISSING PDFs is what made a FORCE_REPLOT launch print
+       "every .out already has its PDF -- nothing to draw" and start no plotter."""
+    if not os.path.isfile(pdf_path):
+        return _plot_refused_here(out_path)
+    try:
+        if os.path.getmtime(pdf_path) + 1.0 < os.path.getmtime(out_path):
+            return False
+    except Exception:
+        pass
+    if FORCE_REPLOT:
+        try:
+            if os.path.getmtime(pdf_path) < float(_LAUNCH_T0):
+                return False
+        except Exception:
+            pass
+    return True
+
+
+def _count_unplotted(rdir):
+    """How many .out files in this results folder still need a PDF -- none,
+       an out-of-date one, or (FORCE_REPLOT) one drawn before this launch."""
+    od = os.path.join(rdir, "outs")
+    pd = os.path.join(rdir, "plots")
+    n = 0
+    try:
+        for p in glob.glob(os.path.join(od, "*.out")):
+            sid = os.path.splitext(os.path.basename(p))[0]
+            if not _pdf_is_current(p, os.path.join(pd, "%s_plots.pdf" % sid)):
+                n += 1
+    except Exception:
+        pass
+    return n
+
+
+def _unplotted_reasons(rdir):
+    """{scenario: (why, fix)} for .out files the plotter has REFUSED to draw.
+
+       Written by plot_missing_outs() as plots\\NOT_PLOTTED.txt. Read here so a
+       plotter that exits in five seconds because every file left to it is
+       condemned can be reported as what it is, instead of as a startup
+       failure -- which is what it used to be called, sending the reader to a
+       log about a startup that was perfectly fine."""
+    out = {}
+    try:
+        p = os.path.join(rdir, "plots", "NOT_PLOTTED.txt")
+        if not os.path.isfile(p):
+            return out
+        for ln in open(p):
+            bits = ln.rstrip("\n").split("\t")
+            if len(bits) >= 3 and bits[0].strip():
+                out[bits[0].strip()] = (bits[1], bits[2])
+    except Exception:
+        pass
+    return out
+
+
+def _unplotted_list(rdir):
+    """[(scenario, why, fix)] for every .out in this folder with no PDF."""
+    od = os.path.join(rdir, "outs")
+    pd = os.path.join(rdir, "plots")
+    why = _unplotted_reasons(rdir)
+    rows = []
+    try:
+        for p in sorted(glob.glob(os.path.join(od, "*.out"))):
+            sid = os.path.splitext(os.path.basename(p))[0]
+            if os.path.isfile(os.path.join(pd, "%s_plots.pdf" % sid)):
+                continue
+            w, fix = why.get(sid, (None, None))
+            if w is None:
+                # No recorded refusal. The markers on disk still say why.
+                if os.path.isfile(p + ".badout"):
+                    w = "marked .badout by an earlier pass"
+                    fix = "delete %s.badout" % os.path.basename(p)
+                elif os.path.isfile(p + ".readfail"):
+                    w = "has recorded read failure(s)"
+                    fix = "delete %s.readfail" % os.path.basename(p)
+                else:
+                    w = "not drawn yet -- no refusal recorded"
+                    fix = "run the plot pass again"
+            rows.append((sid, w, fix))
+    except Exception:
+        pass
+    return rows
+
+
+@_timed("plotting")
+def plot_missing_everywhere(pipeline, after_runs=False):
+    """Draw every missing PDF, in ROUNDS, with fewer plotters each time.
+
+       WHY ROUNDS. A plotter is a 32-bit process reading a ~113 MB .out into
+       Python floats -- roughly 550 MB of live objects before a line is drawn.
+       Three of those per case, six across a run, on a machine that is also
+       running the study, is past what the address space allows: they die, the
+       fleet shrinks, and the pass ends with a folder that has 21 .out files and
+       11 PDFs. That is exactly what happened -- C01, C04 and C06 left .readfail
+       markers and stale .pclaim files, and six more scenarios were never
+       reached at all.
+
+       One pass cannot fix that, because the thing that killed the plotters is
+       how many of them there were. So the pass is repeated with the fleet
+       halved each time, down to a single plotter that has the whole address
+       space to itself:
+
+           round 1   PLOT_WORKERS per folder      (fast, may lose the big files)
+           round 2   half of that
+           round 3   one plotter per folder       (slowest, most likely to finish)
+
+       A round that draws NOTHING stops the sequence -- if one plotter working
+       alone cannot draw a file, another round of one plotter will not either,
+       and the reason is already recorded in NOT_PLOTTED.txt. A round that draws
+       something has made progress and earns the next one.
+
+       PLOT_ROUNDS_MAX = 1 restores the single-pass behaviour."""
+    rounds = max(1, int(PLOT_ROUNDS_MAX or 1))
+    n = max(1, int(PLOT_WORKERS or 1))
+    left = None
+    for r in range(1, rounds + 1):
+        if r > 1:
+            print("")
+            print("[compare] " + "=" * 70)
+            print("[compare] PLOT ROUND %d of %d -- %d file(s) still without a PDF, "
+                  "retrying with %d plotter(s) per folder"
+                  % (r, rounds, left, n))
+            print("[compare]   Fewer processes, more address space each. The files "
+                  "that fail are the")
+            print("[compare]   big ones, and they fail because of how many plotters "
+                  "are reading at once.")
+            print("[compare] " + "=" * 70)
+        before = left
+        left = _plot_missing_pass(pipeline, after_runs=after_runs, n_plot=n)
+        if not left:
+            return
+        if before is not None and left >= before:
+            print("[compare] round %d drew nothing -- stopping. The %d remaining "
+                  "file(s) and the reason for each are in each folder's "
+                  "plots\\NOT_PLOTTED.txt." % (r, left))
+            return
+        if n <= 1:
+            break
+        # HALVED, ROUNDING UP. Plain n // 2 takes 3 straight to 1 and skips the
+        # middle round entirely -- two plotters is the setting most likely to
+        # both finish and finish quickly, and it was never tried.
+        n = max(1, (n + 1) // 2)
+    if left:
+        print("[compare] %d file(s) still have no PDF after %d round(s). The "
+              "reason for each is in that folder's plots\\NOT_PLOTTED.txt."
+              % (left, r))
+
+
+def _pid_alive_here(pid):
+    """Is this PID running on THIS machine? Conservative: unsure means yes."""
+    try:
+        pid = int(str(pid).strip())
+    except Exception:
+        return True
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        try:
+            out = subprocess.check_output(
+                ["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                stderr=subprocess.STDOUT)
+            try:
+                out = out.decode("utf-8", "replace")
+            except Exception:
+                out = str(out)
+            return str(pid) in out
+        except Exception:
+            return True                    # could not ask -- do not take it
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return True
+
+
+def clear_stale_plot_claims(jobs):
+    """Free every plot claim whose plotter is no longer running, in every folder
+       this pass is about to work on.
+
+       WHY THE SUPERVISOR DOES THIS AND NOT THE PLOTTERS. A claim says "I am
+       drawing this file RIGHT NOW". When a fleet of twenty-one plotters dies
+       -- which is what happened -- every one of them leaves its claim behind,
+       and the files they name are then skipped by every later plotter with
+       "another plotter has it". Clearing them by hand means eight folders
+       across two case trees, which is not a thing anybody should have to do to
+       redraw a PDF.
+
+       Nothing of ours is running when this is called, so a claim here is either
+       a dead plotter's or another person's. The PID inside it decides, and a
+       claim whose owner cannot be checked -- another machine, unreadable -- is
+       LEFT ALONE. Being slow is recoverable; two plotters writing one PDF is
+       not.
+
+       Also clears _plotter.claim, the per-folder singleton lock, on the same
+       test: held by a process that no longer exists, it stops the folder's
+       plotting entirely."""
+    if not PLOT_CLEAR_STALE_CLAIMS:
+        return 0
+    freed, held = 0, 0
+    for _c, _p, _m, rdir in jobs:
+        pdir = os.path.join(rdir, "plots")
+        if not os.path.isdir(pdir):
+            continue
+        for f in (sorted(glob.glob(os.path.join(pdir, "*.pclaim")))
+                  + sorted(glob.glob(os.path.join(pdir, "_plotter.claim")))):
+            try:
+                with open(f, "r") as fh:
+                    txt = fh.read(200)
+            except Exception:
+                held += 1
+                continue
+            pid = host = None
+            for tok in (txt or "").split():
+                if tok.startswith("pid"):
+                    pid = tok[3:]
+                elif tok.startswith("host="):
+                    host = tok[5:]
+            if host is not None and host != socket.gethostname():
+                held += 1                  # another machine -- cannot ask
+                continue
+            if pid is not None and _pid_alive_here(pid):
+                held += 1
+                continue
+            try:
+                os.remove(f)
+                freed += 1
+            except Exception:
+                held += 1
+    if freed:
+        print("[compare] freed %d plot claim(s) left by plotters that are no longer "
+              "running -- those files can be drawn again" % freed)
+    if held:
+        print("[compare] %d claim(s) left alone: their process is still running, or "
+              "belongs to another machine" % held)
+    return freed
+
+
+def _plot_missing_pass(pipeline, after_runs=False, n_plot=None):
+    """Draw the PDFs for .out files that have none, in every results folder this
+       run covers -- BOTH cases, every project, every mode.
+
+       WHY THIS EXISTS. A scenario's plot is written by the run loop right after
+       the scenario is marked done. An .out whose worker died in the post-run
+       checks, or a study stopped part way, therefore leaves a complete .out with
+       no PDF beside it and nothing that will ever draw one: the run loop only
+       revisits scenarios that are marked done, and this one is not.
+
+       So this asks the only question that matters -- is there an .out with no
+       PDF? -- and draws it. It does not consult .done at all. The .out is the
+       evidence the simulation happened.
+
+       No PSS/E session, no queue, no case load: the study script is started with
+       SPP_PLOT_MISSING=1, reads the files already on disk, writes the plots and
+       exits. Safe to run while a study is going in another window."""
+    if pipeline == "all" and not after_runs:
+        return 0        # during a full run each scenario is plotted as it finishes
+    if not PLOT_MISSING_OUTS:
+        return 0
+    if pipeline in ("all", "missing") and after_runs:
+        # ---- THE CATCH-UP PASS A FULL RUN NEEDED ALL ALONG ---------------
+        #
+        # "a full run plots each scenario as it finishes" is true only while it
+        # IS running. The plotter is a background singleton started on request;
+        # it reads one ~110 MB .out at a time and a scenario can take longer to
+        # draw than the next one takes to simulate. When the run phase ends the
+        # requests stop, and any .out whose turn had not come never gets a PDF.
+        #
+        # A four-scenario run finished with two: C01 and FLAT_RUN drawn, C02 and
+        # C03 left with a .out and a .done and nothing else. Nothing was wrong
+        # and nothing said anything was -- the study reported 4 DONE.
+        #
+        # So the pass runs again once the simulations are over, where "every
+        # .out without a PDF" means exactly what it says.
+        n = 0
+        for _c in ([CASE_BASE] if RUN_CASES in ("both", "base") else []) + \
+                  ([CASE_TEST] if RUN_CASES in ("both", "proj") else []):
+            for _p in (list(PROJECTS) or [""]):
+                for _m in (list(MODES) or ["spp"]):
+                    n += _count_unplotted(results_dir(_c, _p, _m))
+        if not n:
+            return 0
+    cases = []
+    if RUN_CASES in ("both", "base"): cases.append(CASE_BASE)
+    if RUN_CASES in ("both", "proj"): cases.append(CASE_TEST)
+    if not cases: cases = [CASE_BASE, CASE_TEST]
+    projs = list(PROJECTS) or [""]
+    modes = list(MODES) or ["spp"]
+    print("")
+    print("[compare] " + "=" * 70)
+    print("[compare] PLOTS FOR .out FILES THAT HAVE NONE")
+    print("[compare]   PIPELINE = %r, so nothing is being simulated. Any .out already" % pipeline)
+    print("[compare]   on disk without a PDF beside it gets one now. .done is not")
+    print("[compare]   consulted -- the .out is the evidence the run happened.")
+    print("[compare] " + "=" * 70)
+    jobs = []
+    for case in cases:
+        for proj in projs:
+            for mode in modes:
+                # EVERY FOLDER THE PROJECT OWNS, not only the plain one. The
+                # sweep and capacity folders (..._dyr_Kqv2, ..._cap50, ..._poi492)
+                # are where a mitigation study spends its time, and their PDFs
+                # were never caught up: in-run plotting is one plotter per
+                # folder trailing the workers, so with more faults per variant
+                # more .out files were left in its queue when the study ended
+                # -- and nothing came back for them. This is the pass that does.
+                for rdir in (_result_folders_for(case, proj, mode)
+                             or [results_dir(case, proj, mode)]):
+                    if not os.path.isdir(os.path.join(rdir, "outs")):
+                        continue
+                    jobs.append((case, proj, mode, rdir))
+    if not jobs:
+        print("[compare] no results folder with .out files -- nothing to draw")
+        print("")
+        return 0
+    n_plot = max(1, int(n_plot or PLOT_WORKERS or 1))
+    total_todo = 0
+    for _c, _p, _m, _rd in jobs:
+        total_todo += _count_unplotted(_rd)
+    print("[compare] %d .out file(s) still need a PDF across %d folder(s)%s"
+          % (total_todo, len(jobs),
+             "   (FORCE_REPLOT: every PDF drawn before this launch is redrawn)" if FORCE_REPLOT else ""))
+    if total_todo == 0:
+        print("[compare] every .out already has its PDF -- nothing to draw")
+        print("")
+        return 0
+    print("[compare] starting %d plotter(s) per folder; they share the list by"
+          % n_plot)
+    print("[compare] claiming one .out each, so none is drawn twice.")
+    # ONE SLOT PER PLOTTER, AND THE SLOT IS REFILLED IF ITS PROCESS DIES.
+    #
+    # A plotter is a 32-bit process reading a ~110 MB .out into Python floats. It
+    # can be lost -- out of memory, a bad .out, a stray kill -- and when it was,
+    # the fleet simply got smaller ("10 plotter(s) working" becoming 8, then 5)
+    # until nothing was drawing and the pass declared itself finished with the
+    # work undone. A slot that loses its process now says so, with the exit code,
+    # and starts a new one as long as that folder still has files to draw.
+    # >>> A TOTAL CAP, NOT A PER-FOLDER ONE. THIS IS THE BUG THAT KILLED THEM.
+    #
+    # PLOT_WORKERS says "plotter processes PER CASE" and this loop applied it
+    # PER FOLDER. With four projects on two cases there are eight folders, so
+    # PLOT_WORKERS = 3 started TWENTY-ONE plotters, not three:
+    #
+    #     [compare] 76 .out file(s) still need a PDF across 7 folder(s)
+    #     [compare] starting 3 plotter(s) per folder
+    #     [compare] plotting: 0 of 76 drawn, 21 plotter(s) working
+    #
+    # Twenty-one 32-bit processes, each about to hold ~550 MB of a 113 MB .out.
+    # That is ~11 GB of live Python floats and every one of them is over its own
+    # 2 GB ceiling before it draws a line. It is the whole reason plotters keep
+    # dying, and no amount of restarting or retrying fixes a fleet that is eight
+    # times the size anybody asked for.
+    #
+    # So the fleet is capped ACROSS ALL FOLDERS at PLOT_TOTAL_MAX, and the slots
+    # are handed out round-robin to the folders that still have work. A slot
+    # whose folder finishes is re-pointed at whichever folder has the most left,
+    # so the cap is never idle while work remains.
+    # FREE WHAT DEAD PLOTTERS LEFT BEHIND, before starting any of our own.
+    try:
+        clear_stale_plot_claims(jobs)
+    except Exception as _e:
+        print("[compare] could not check the plot claims (%s) -- continuing" % _e)
+    # ---- AND THE CONDEMNATIONS -------------------------------------------
+    #
+    # .badout and .readfail mean "this .out is poison" and "this .out could not
+    # be read", and both take the file out of the pass permanently. They are
+    # written when a plotter dies -- and a plotter that died because the ADDRESS
+    # SPACE ran out condemns whichever file it happened to be holding, which is
+    # innocent. A byte scan of this study's own files found four in
+    # Projects\...\outs carrying .readfail and finite from end to end: four
+    # finished results being thrown away over a verdict that was not true.
+    #
+    # The verdict is cheap to re-derive -- the NaN prescan reads the bytes in a
+    # second or two -- and it is re-derived on every pass anyway. So the markers
+    # are cleared here and each file is judged again on its own contents. A file
+    # that really is poison gets its marker straight back; one that was condemned
+    # by a dying process gets drawn.
+    _freed = 0
+    for _c, _p, _m, _rd in jobs:
+        for _pat in ("*.badout", "*.readfail"):
+            for _f in glob.glob(os.path.join(_rd, "outs", _pat)):
+                try:
+                    os.remove(_f)
+                    _freed += 1
+                except Exception:
+                    pass
+    if _freed:
+        print("[compare] cleared %d .badout/.readfail marker(s). Each .out is "
+              "judged again from its own bytes this pass -- a file that really "
+              "holds NaN gets its marker straight back." % _freed)
+    # THE PLOT FLEET COMES OUT OF THE SAME BUDGET AS THE SIMULATIONS.
+    # PLOT_TOTAL_MAX used to sit outside CORES_MAX entirely, so the two pools
+    # were sized independently and the machine carried both.
+    _cap = _plot_core_budget()
+    _cap = max(1, min(_cap, len(jobs) * n_plot))
+    for case, proj, mode, rdir in jobs:
+        print("[compare] %s / %s / %s  -- %d to draw"
+              % (case.get("key", "?"), proj or "-", mode, _count_unplotted(rdir)))
+    print("[compare] %d plotter(s) IN TOTAL across %d folder(s) -- capped by "
+          "PLOT_TOTAL_MAX, not per folder. Each one holds ~550 MB of a .out "
+          "while it reads." % (_cap, len(jobs)))
+
+    # ONE PROJECT AT A TIME. The jobs list is cases x projects, so the fleet
+    # (or the single plotter) hopped between eight folders and no project's set
+    # of PDFs was complete until the very end. With PLOT_ONE_PROJECT_AT_A_TIME
+    # the folders are taken in PROJECTS order, base then project for each, and
+    # a slot goes to the FIRST folder that still has work (up to n_plot slots
+    # per folder) -- so SantaFe's base and project PDFs are finished before
+    # IronStar's are started.
+    if PLOT_ONE_PROJECT_AT_A_TIME:
+        _porder = dict((p, i) for i, p in enumerate(list(PROJECTS) or [""]))
+        _corder = {id(CASE_BASE): 0, id(CASE_TEST): 1}
+        jobs.sort(key=lambda j: (_porder.get(j[1], 99), _corder.get(id(j[0]), 2), str(j[2])))
+
+    def _busiest(taken):
+        """The folder with the most .out files still to draw, least-served first.
+
+           taken = {rdir: how many slots are already on it}. Returns a jobs row
+           or None when there is nothing left to do anywhere.
+
+           With PLOT_ONE_PROJECT_AT_A_TIME: the first folder in project order
+           that still has work and fewer than n_plot slots on it."""
+        best, best_key = None, None
+        if PLOT_ONE_PROJECT_AT_A_TIME:
+            for _j in jobs:
+                if _count_unplotted(_j[3]) > 0 and taken.get(_j[3], 0) < n_plot:
+                    return _j
+            for _j in jobs:                    # every open folder is full: queue behind it
+                if _count_unplotted(_j[3]) > 0:
+                    return _j
+            return None
+        for _j in jobs:
+            _n = _count_unplotted(_j[3])
+            if _n <= 0:
+                continue
+            _k = (-(_n // max(1, taken.get(_j[3], 0) + 1)), taken.get(_j[3], 0))
+            if best_key is None or _k < best_key:
+                best, best_key = _j, _k
+        return best
+
+    slots, _taken = [], {}
+    for k in range(_cap):
+        _j = _busiest(_taken)
+        if _j is None:
+            break
+        case, proj, mode, rdir = _j
+        try:
+            p = _start_plotter(case, proj, mode, k, rdir=rdir)
+            if p is not None:
+                slots.append({"case": case, "proj": proj, "mode": mode,
+                              "rdir": rdir, "slot": k, "proc": p,
+                              "restarts": 0, "since": time.time(),
+                              "todo0": _count_unplotted(rdir)})
+                _taken[rdir] = _taken.get(rdir, 0) + 1
+        except Exception as e:
+            print("[compare]   could not start a plotter on %s: %s" % (rdir, e))
+    for _j in jobs:
+        if _taken.get(_j[3]):
+            print("[compare]   %-5s %-14s %d plotter(s)"
+                  % (_j[0].get("key", "?"), _j[1] or "-", _taken[_j[3]]))
+    if not slots:
+        print("[compare] no plotter started -- drawing was skipped")
+        print("")
+        return 0
+    # WAIT, AND SAY SOMETHING WHILE WAITING. This is hours of work; a silent
+    # console for that long is indistinguishable from a hang.
+    t0 = time.time()
+    last = -1.0
+    n_restart = 0
+    # PROGRESS, SO THE LOOP CAN TELL SLOW FROM STUCK. _last_left only ever falls,
+    # and _t_progress is when it last did. See the stall test below.
+    _last_left = total_todo
+    _t_progress = time.time()
+    while True:
+        alive = 0
+        for sl in slots:
+            p = sl["proc"]
+            if p is None:
+                continue
+            rc = p.poll()
+            if rc is None:
+                alive += 1
+                continue
+            # This one is gone. Was it done, or did it fall over?
+            up = time.time() - sl["since"]
+            todo_here = _count_unplotted(sl["rdir"])
+            if todo_here <= 0:
+                # ITS FOLDER IS FINISHED -- MOVE IT, DO NOT RETIRE IT.
+                # The cap is a total, so a slot standing idle while another
+                # folder still has thirteen files to draw is a plotter the run
+                # has paid for and is not using.
+                _taken2 = {}
+                for _s2 in slots:
+                    if _s2["proc"] is not None:
+                        _taken2[_s2["rdir"]] = _taken2.get(_s2["rdir"], 0) + 1
+                _j2 = _busiest(_taken2)
+                if _j2 is None:
+                    sl["proc"] = None                  # nothing left anywhere
+                    continue
+                print("[compare] plotter slot %d finished %s/%s -- moving it to %s/%s "
+                      "(%d still to draw there)"
+                      % (sl["slot"], sl["case"].get("key", "?"), sl["proj"] or "-",
+                         _j2[0].get("key", "?"), _j2[1] or "-",
+                         _count_unplotted(_j2[3])))
+                sl["case"], sl["proj"], sl["mode"], sl["rdir"] = _j2
+                try:
+                    sl["proc"] = _start_plotter(sl["case"], sl["proj"], sl["mode"],
+                                                sl["slot"], rdir=sl["rdir"])
+                except Exception as e:
+                    print("[compare]   could not start it there: %s" % e)
+                    sl["proc"] = None
+                sl["since"] = time.time()
+                sl["todo0"] = _count_unplotted(sl["rdir"])
+                if sl["proc"] is not None:
+                    alive += 1
+                continue
+            # ONE FILE PER PROCESS IS THE DESIGN, NOT A DEATH. The plotter draws
+            # ONE scenario and exits 0 so the next file gets a fresh 32-bit
+            # address space (see plot_missing_outs). With matplotlib that is
+            # ten to twenty seconds, which the rule below read as "died at
+            # startup" -- eighteen slots were retired in the first half minute
+            # of a 1158-file pass, having drawn fourteen. If the folder has
+            # FEWER files to draw than when this process started, it drew: the
+            # slot is refilled at once, and it does not count as a restart.
+            if todo_here < sl.get("todo0", todo_here):
+                sl["quick"] = 0
+                sl["nogain"] = 0
+                try:
+                    np_ = _start_plotter(sl["case"], sl["proj"], sl["mode"], sl["slot"],
+                                         rdir=sl["rdir"])
+                except Exception as e:
+                    print("[compare]   could not start the next plotter: %s" % e)
+                    np_ = None
+                sl["proc"] = np_
+                sl["since"] = time.time()
+                sl["todo0"] = todo_here
+                if np_ is not None:
+                    alive += 1
+                continue
+            # A SLOT THAT DIES INSTANTLY IS NOT WORTH REFILLING. A plotter needs
+            # a minute or two just to list the folder and read its first .out,
+            # so a process gone in under half a minute never got as far as
+            # drawing -- restarting it only repeats whatever killed it, twenty
+            # times, filling the console and doing nothing.
+            if up < 30.0:
+                # NOT ON THE FIRST QUICK EXIT. A clean, quick exit 0 with nothing
+                # drawn is usually a claim race -- every file it looked at was
+                # held by another plotter for a moment -- or a file another slot
+                # finished first. Give the slot PLOT_QUICK_EXITS tries, a few
+                # seconds apart, and show the tail of its log, before deciding
+                # it cannot start.
+                sl["quick"] = sl.get("quick", 0) + 1
+                if sl["quick"] <= PLOT_QUICK_EXITS and todo_here > 0:
+                    print("[compare] plotter %s/%s slot %d exited in %s (code %s) without drawing "
+                          "-- retry %d/%d in %ds"
+                          % (sl["case"].get("key", "?"), sl["proj"] or "-", sl["slot"],
+                             _fmt_hms(up), rc, sl["quick"], PLOT_QUICK_EXITS, PLOT_QUICK_PAUSE_S))
+                    _plotter_log_tail(sl, 8)
+                    time.sleep(PLOT_QUICK_PAUSE_S)
+                    try:
+                        np_ = _start_plotter(sl["case"], sl["proj"], sl["mode"], sl["slot"],
+                                             rdir=sl["rdir"])
+                    except Exception as e:
+                        print("[compare]   could not restart it: %s" % e)
+                        np_ = None
+                    sl["proc"] = np_
+                    sl["since"] = time.time()
+                    sl["todo0"] = todo_here
+                    if np_ is not None:
+                        alive += 1
+                    continue
+                # WHY IT WENT SO FAST. A plotter whose remaining files are all
+                # condemned refuses them in a second or two and exits 0, which
+                # is correct behaviour and not a crash. Ask the folder before
+                # calling it a startup failure.
+                _rows = _unplotted_list(sl["rdir"])
+                _known = [r for r in _rows if not r[1].startswith("not drawn yet")]
+                if _known:
+                    print("[compare] plotter %s/%s slot %d exited in %s (code %s) "
+                          "because every .out left to it is REFUSED -- not a startup "
+                          "failure:"
+                          % (sl["case"].get("key", "?"), sl["proj"] or "-",
+                             sl["slot"], _fmt_hms(up), rc))
+                    for _sid, _w, _fix in _known:
+                        print("[compare]     %-22s %s" % (_sid, _w))
+                        print("[compare]     %-22s FIX: %s" % ("", _fix))
+                else:
+                    print("[compare] plotter %s/%s slot %d died in %s (code %s) -- it is "
+                          "failing at startup, not while drawing; leaving it down. See "
+                          "logs\\PLOTTER_*.log"
+                          % (sl["case"].get("key", "?"), sl["proj"] or "-", sl["slot"],
+                             _fmt_hms(up), rc))
+                    _plotter_log_tail(sl, 20)
+                sl["proc"] = None
+                continue
+            if sl["restarts"] >= PLOT_RESTART_MAX:
+                print("[compare] plotter %s/%s slot %d exited (code %s) and has been "
+                      "restarted %d time(s) already -- leaving it down; see "
+                      "logs\\PLOTTER_*.log"
+                      % (sl["case"].get("key", "?"), sl["proj"] or "-", sl["slot"],
+                         rc, sl["restarts"]))
+                sl["proc"] = None
+                continue
+            # DREW NOTHING, AGAIN. Restarting a slot on a folder whose count
+            # did not move repeats whatever stopped it. After PLOT_NOGAIN_MAX
+            # tries the slot is sent to the folder with the most work left, so
+            # the pass keeps going instead of burning its restarts in place.
+            sl["nogain"] = sl.get("nogain", 0) + 1
+            if sl["nogain"] >= PLOT_NOGAIN_MAX:
+                _taken3 = {}
+                for _s3 in slots:
+                    if _s3["proc"] is not None and _s3 is not sl:
+                        _taken3[_s3["rdir"]] = _taken3.get(_s3["rdir"], 0) + 1
+                _taken3[sl["rdir"]] = 99            # anywhere but here
+                _j3 = _busiest(_taken3)
+                if _j3 is not None and _j3[3] != sl["rdir"]:
+                    print("[compare] plotter slot %d has drawn nothing on %s/%s in %d "
+                          "launch(es) -- moving it to %s/%s"
+                          % (sl["slot"], sl["case"].get("key", "?"), sl["proj"] or "-",
+                             _j3[0].get("key", "?"), _j3[1] or "-"))
+                    _plotter_log_tail(sl, 12)
+                    sl["case"], sl["proj"], sl["mode"], sl["rdir"] = _j3
+                    sl["nogain"] = 0
+                    try:
+                        sl["proc"] = _start_plotter(sl["case"], sl["proj"], sl["mode"],
+                                                    sl["slot"], rdir=sl["rdir"])
+                    except Exception as e:
+                        print("[compare]   could not start it there: %s" % e)
+                        sl["proc"] = None
+                    sl["since"] = time.time()
+                    sl["todo0"] = _count_unplotted(sl["rdir"])
+                    if sl["proc"] is not None:
+                        alive += 1
+                    continue
+                print("[compare] plotter slot %d has drawn nothing on %s/%s and no other "
+                      "folder has work -- leaving it down"
+                      % (sl["slot"], sl["case"].get("key", "?"), sl["proj"] or "-"))
+                _plotter_log_tail(sl, 12)
+                sl["proc"] = None
+                continue
+            print("[compare] plotter %s/%s slot %d exited after %s (code %s) with %d "
+                  "file(s) still to draw -- restarting it"
+                  % (sl["case"].get("key", "?"), sl["proj"] or "-", sl["slot"],
+                     _fmt_hms(up), rc, todo_here))
+            sys.stdout.flush()
+            try:
+                np_ = _start_plotter(sl["case"], sl["proj"], sl["mode"], sl["slot"],
+                                     rdir=sl["rdir"])
+            except Exception as e:
+                print("[compare]   could not restart it: %s" % e)
+                np_ = None
+            sl["proc"] = np_
+            sl["restarts"] += 1
+            sl["since"] = time.time()
+            sl["todo0"] = todo_here
+            n_restart += 1
+            if np_ is not None:
+                alive += 1
+        left = sum(_count_unplotted(j[3]) for j in jobs)
+        if alive == 0:
+            break
+        # ---- IS IT GETTING ANYWHERE AT ALL? ---------------------------------
+        #
+        # THE LOOP HAD NO NOTION OF PROGRESS. It ended only when every slot was
+        # down, and a slot may be restarted PLOT_RESTART_MAX times: four slots
+        # each taking seven to twenty-three minutes an attempt is most of a day.
+        # One run spent 5h 25m and sixty restarts to draw NOTHING, and the only
+        # way out was Ctrl-C -- which also killed the comparison that had
+        # already finished.
+        #
+        # A pass that has drawn nothing for half an hour is not slow, it is
+        # stuck, and the difference is worth knowing at the time rather than in
+        # the morning.
+        if left < _last_left:
+            _last_left = left
+            _t_progress = time.time()
+        _stall = time.time() - _t_progress
+        _giveup = ""
+        if PLOT_STALL_MIN and _stall > float(PLOT_STALL_MIN) * 60.0:
+            _giveup = ("nothing has been drawn for %s" % _fmt_hms(_stall))
+        elif PLOT_PASS_MAX_MIN and (time.time() - t0) > float(PLOT_PASS_MAX_MIN) * 60.0:
+            _giveup = ("the pass has run for %s" % _fmt_hms(time.time() - t0))
+        if _giveup:
+            print("")
+            print("[compare] " + "=" * 66)
+            print("[compare] STOPPING THE PLOT PASS -- %s" % _giveup)
+            print("[compare] " + "=" * 66)
+            print("[compare]   %d of %d drawn, %d restart(s), %d plotter(s) still up."
+                  % (total_todo - left, total_todo, n_restart, alive))
+            print("[compare]   Exit code 3221225477 is 0xC0000005, an ACCESS VIOLATION:")
+            print("[compare]   the reader died inside PSS/E on the .out, which is what")
+            print("[compare]   happens to a 32-bit process on a large or non-finite file.")
+            print("[compare]   Exit code 0 with nothing drawn means the files left were")
+            print("[compare]   REFUSED -- see each folder's plots\\NOT_PLOTTED.txt.")
+            print("[compare]")
+            print("[compare]   NOTHING ELSE IS AFFECTED: the studies, the reports and the")
+            print("[compare]   comparison are already written. Only the PDFs are missing.")
+            print("[compare]   To draw them: install matplotlib for this Python (the pure-")
+            print("[compare]   Python writer is what takes tens of minutes per file), or")
+            print("[compare]   lower PLOT_MAX_PANELS / set INDIVIDUAL_KEYWORDS, or raise")
+            print("[compare]   PLOT_STALL_MIN if it really is just slow.")
+            for _sl in slots:
+                if _sl.get("proc") is not None:
+                    try:
+                        _sl["proc"].kill()
+                    except Exception:
+                        pass
+                    _sl["proc"] = None
+            break
+        if time.time() - last >= 60.0:
+            last = time.time()
+            drawn = total_todo - left
+            print("[compare] plotting: %d of %d drawn, %d plotter(s) working, %s elapsed%s"
+                  % (drawn, total_todo, alive, _fmt_hms(time.time() - t0),
+                     ("  (%d restart(s))" % n_restart) if n_restart else ""))
+            sys.stdout.flush()
+        time.sleep(5.0)
+    left = 0
+    for j in jobs:
+        left += _count_unplotted(j[3])
+    print("[compare] plotting finished: %d of %d drawn in %s"
+          % (total_todo - left, total_todo, _fmt_hms(time.time() - t0)))
+    if left:
+        # NAME THEM. "2 .out file(s) still have no PDF" is not something anyone
+        # can act on; the scenario, the reason and the file to delete are.
+        print("[compare] %d .out file(s) still have no PDF:" % left)
+        for j in jobs:
+            for _sid, _w, _fix in _unplotted_list(j[3]):
+                print("[compare]     %-22s %s" % (_sid, _w))
+                print("[compare]     %-22s FIX: %s" % ("", _fix))
+        print("[compare] (full detail in each folder's plots\\NOT_PLOTTED.txt and "
+              "logs\\PLOTTER_*.log)")
+    print("")
+    return left
+
+
+@_timed("merge-only report rebuild")
+def run_merge_only():
+    """The merge step alone, for every project and both cases. Returns how many
+       folders were rebuilt.
+
+       See MERGE_ONLY. This spawns the STUDY script (z4_spp_p_con.py / z4_spp_b_con.py)
+       with SPP_MERGE_ONLY=1, which is handled before main() -- so no PSS/E
+       session is started, no case is loaded and no .out is opened. A folder
+       with no parts\ is skipped and said so, rather than writing an empty
+       report over a good one."""
+    _banner_line = "=" * 78
+    print("")
+    print(_banner_line)
+    print(" MERGE ONLY -- rebuilding every report from parts\\, nothing is scored")
+    print(_banner_line)
+    n_ok = n_skip = 0
+    for mode in (list(MODES) or ["spp"]):
+        for proj in (list(PROJECTS) or [""]):
+            for case in (CASE_BASE, CASE_TEST):
+                rdir = results_dir(case, proj, mode)
+                if not os.path.isdir(rdir):
+                    continue
+                parts = os.path.join(rdir, "parts")
+                if not os.path.isdir(parts) or not glob.glob(os.path.join(parts, "*.csv")):
+                    print("[merge-only] %-6s %-16s no parts\\ -- nothing scored yet, "
+                          "skipped" % (case["key"], proj))
+                    n_skip += 1
+                    continue
+                spp = _study_script_for(case)
+                if not spp:
+                    print("[merge-only] %-6s %-16s no study script beside the launcher "
+                          "-- skipped" % (case["key"], proj))
+                    n_skip += 1
+                    continue
+                env = dict(os.environ)
+                env["SPP_MERGE_ONLY"] = "1"
+                # The engine takes the results folder from the working
+                # directory, exactly as the plot children do.
+                env.pop("SPP_ONLY", None)
+                # AND WHICH PROJECT -- see _merge_one_folder(): without it the
+                # project script raises "ACTIVE_PROJECT '' not in BESS_PROJECTS"
+                # and the base script merges its default dynamics\ folder.
+                if proj:
+                    env["SPP_PROJECT"] = proj
+                print("[merge-only] %-6s %-16s %s" % (case["key"], proj, rdir))
+                try:
+                    rc = subprocess.call([sys.executable, os.path.abspath(spp)],
+                                         cwd=rdir, env=env)
+                except Exception as e:
+                    print("[merge-only]        FAILED to start: %s" % e)
+                    n_skip += 1
+                    continue
+                if rc == 0:
+                    n_ok += 1
+                else:
+                    print("[merge-only]        the merge returned rc=%s -- its own "
+                          "output above says why" % rc)
+                    n_skip += 1
+    print("[merge-only] %d folder(s) rebuilt, %d skipped" % (n_ok, n_skip))
+    if not n_ok:
+        print("[merge-only] NOTHING was rebuilt. Either no results folder holds a")
+        print("[merge-only] parts\\ directory yet (no scenario has been scored), or")
+        print("[merge-only] PROJECTS/MODES name folders that are not on disk.")
+    return n_ok
+
+
+def _resolve_pipeline():
+    """One answer to 'what is this run going to do', from three settings that can
+       disagree. Resolved once, printed once, and used everywhere -- rather than
+       three separate `if`s that can each be true for a different reason."""
+    mode = (PIPELINE or "compare").strip().lower()
+    if RUN_STUDIES and mode == "compare":
+        mode = "all"
+    if RUN_MISSING and mode == "compare":
+        mode = "missing"
+    if mode not in ("compare", "missing", "all"):
+        print("[compare] PIPELINE = %r is not one of compare/missing/all -- "
+              "treating it as 'compare'" % PIPELINE)
+        mode = "compare"
+    return mode
+
+
+def _report_stale_by(case, proj, mode):
+    """Seconds by which the newest .out is younger than the criteria report.
+
+       0 or negative = the report covers everything on disk.
+
+       WHY THIS IS NOT A TIMESTAMP PEDANTRY. Phase 2 used to fire only when a
+       report was MISSING. Re-run a dozen scenarios into a folder that already
+       has a report and the report is not missing -- it is simply describing the
+       previous run of those scenarios. The comparison then reads it, reports
+       verdicts from before your change, and nothing anywhere says so. A fault
+       list check would not catch it either: the list is the same, the ids mean
+       the same events, and only the RESULTS moved.
+
+       Compared against the report a shard actually wrote, and only for THIS
+       project, so one project's fresh run does not condemn another's report."""
+    rdir = results_dir(case, proj, mode)
+    rep = rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj) or \
+        rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj)
+    if not rep:
+        return 0.0
+    try:
+        t_rep = os.path.getmtime(rep)
+    except Exception:
+        return 0.0
+    newest = 0.0
+    for op in glob.glob(os.path.join(rdir, "outs", "*.out")):
+        try:
+            t = os.path.getmtime(op)
+        except Exception:
+            continue
+        if t > newest:
+            newest = t
+    if not newest:
+        return 0.0
+    return newest - t_rep
+
+
+def _result_folders_for(case, proj, mode):
+    """Every results folder this project/mode owns in one case.
+
+       The plain one, plus every variant the sweeps write beside it --
+       ..._dyr_Kqv2, ..._cap50, ..._newplant. They all hold parts\\ and reports
+       and they all go stale the same way, so a check that only looked at the
+       plain folder would miss exactly the sweep folders a mitigation study
+       spends its time in."""
+    base = _res_root(case)
+    pref = "%s_%s" % (proj, mode)
+    out = []
+    try:
+        for n in sorted(os.listdir(base)):
+            if n == pref or n.startswith(pref + "_"):
+                d = os.path.join(base, n)
+                if os.path.isdir(d):
+                    out.append(d)
+    except Exception:
+        pass
+    return out
+
+
+def _report_behind_parts_by(rdir, proj):
+    """Seconds by which the newest parts\\ file is younger than the report.
+
+       > 0 means a scenario was scored AFTER the folder's reports were written,
+       so the reports describe less than the parts hold. This is the companion
+       to _report_stale_by: that one asks "was it re-SIMULATED after the report"
+       (report vs .out), this one asks "was it re-SCORED after the report"
+       (report vs parts). The .out never moves in this case, so the other test
+       cannot see it.
+
+       0 when there is no report or no parts -- nothing to be behind."""
+    rep = rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj) or \
+        rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj)
+    if not rep:
+        return 0.0
+    try:
+        t_rep = os.path.getmtime(rep)
+    except Exception:
+        return 0.0
+    newest = 0.0
+    for pp in glob.glob(os.path.join(rdir, "parts", "*.csv")):
+        try:
+            t = os.path.getmtime(pp)
+        except Exception:
+            continue
+        if t > newest:
+            newest = t
+    if not newest:
+        return 0.0
+    return newest - t_rep
+
+
+def _merge_one_folder(case, rdir):
+    """Rebuild ONE results folder's reports from its parts\\. True on success.
+
+       The same MERGE step run_merge_only() runs, for a single folder: the study
+       script with SPP_MERGE_ONLY=1, which returns before main() -- no PSS/E
+       session, no case load, no .out opened."""
+    parts = os.path.join(rdir, "parts")
+    if not os.path.isdir(parts) or not glob.glob(os.path.join(parts, "*.csv")):
+        return False
+    spp = _study_script_for(case)
+    if not spp:
+        return False
+    env = dict(os.environ)
+    env["SPP_MERGE_ONLY"] = "1"
+    env.pop("SPP_ONLY", None)
+    # WHICH PROJECT. The study script picks its plant from SPP_PROJECT; launched
+    # without it the project script stops at "ACTIVE_PROJECT '' not in
+    # BESS_PROJECTS" and the base script falls back to its default results
+    # folder (dynamics\), finds no parts there and rebuilds nothing -- a
+    # traceback on every run and an auto-merge that never merged. The folder
+    # being merged is <project>_<mode>, the same split inventory() reads.
+    _proj = os.path.basename(os.path.normpath(rdir)).rpartition("_")[0]
+    if _proj:
+        env["SPP_PROJECT"] = _proj
+    try:
+        rc = subprocess.call([sys.executable, os.path.abspath(spp)],
+                             cwd=rdir, env=env)
+    except Exception as e:
+        print("[auto-merge]     could not start the merge (%s)" % e)
+        return False
+    if rc != 0:
+        print("[auto-merge]     the merge returned rc=%s -- its own output says why" % rc)
+    return rc == 0
+
+
+def auto_remerge_stale_reports(quiet=False):
+    """Rebuild every folder whose reports are older than its parts\\.
+
+       Run BEFORE anything reads a report, so the comparison, the sweep tables
+       and the convergence lists are all built from the same, complete set of
+       parts instead of whatever each file happened to catch mid-pass."""
+    if not AUTO_REMERGE_STALE_PARTS:
+        return 0
+    todo = []
+    for mode in (list(MODES) or ["spp"]):
+        for proj in (list(PROJECTS) or [""]):
+            for case in (CASE_BASE, CASE_TEST):
+                for rdir in _result_folders_for(case, proj, mode):
+                    by = _report_behind_parts_by(rdir, proj)
+                    if by > STALE_REPORT_TOL_S:
+                        todo.append((case, proj, rdir, by))
+    if not todo:
+        return 0
+    print("")
+    print("[auto-merge] %d folder(s) hold parts NEWER than the reports built from"
+          % len(todo))
+    print("[auto-merge] them -- scenarios were scored after those reports were")
+    print("[auto-merge] written, so the reports describe less than the parts hold.")
+    print("[auto-merge] Rebuilding them from parts\\ first (merge only -- no .out is read).")
+    n = 0
+    for case, proj, rdir, by in todo:
+        print("[auto-merge] %-6s %-16s %-42s report is %s behind"
+              % (case["key"], proj, os.path.basename(rdir), _fmt_hms(by)))
+        if _merge_one_folder(case, rdir):
+            n += 1
+    print("[auto-merge] %d of %d folder(s) rebuilt." % (n, len(todo)))
+    print("")
+    return n
+
+
+def _out_and_scored_sets(rdir, proj):
+    """({scenarios with an .out}, {scenarios with a verdict}) for one folder."""
+    outs = set()
+    for p in glob.glob(os.path.join(rdir, "outs", "*.out")):
+        outs.add(os.path.splitext(os.path.basename(p))[0])
+    scored = set()
+    try:
+        ct, _src = read_criteria(rdir, proj)
+        for k, v in (ct or {}).items():
+            if norm_verdict((v or {}).get("verdict")):
+                scored.add(str(k).strip())
+    except Exception:
+        pass
+    return outs, scored
+
+
+def verify_scoring_coverage(quiet=False):
+    """Does every .out in every folder have a verdict? Run BEFORE comparing.
+
+       An .out with no verdict is the one failure mode this whole toolchain
+       cannot report honestly on its own: the comparison reads the criteria
+       report, finds no row for that fault, and treats it as a fault it has
+       nothing to say about -- which in a table of PASS/FAIL reads as "fine".
+
+       Two different problems land here and they have two different fixes, so
+       they are separated rather than counted together:
+
+         * the parts ALREADY hold the scenario -- the report was just built
+           before it landed. A merge fixes it, and one is run here.
+         * the parts do NOT hold it -- it was never scored. No amount of merging
+           will produce it; it needs a scoring pass, and the message says so and
+           names the setting.
+
+       Returns the number of scenarios still unscored after the merge attempt."""
+    if not VERIFY_SCORING_COVERAGE:
+        return 0
+    still = []
+    for mode in (list(MODES) or ["spp"]):
+        for proj in (list(PROJECTS) or [""]):
+            for case in (CASE_BASE, CASE_TEST):
+                for rdir in _result_folders_for(case, proj, mode):
+                    outs, scored = _out_and_scored_sets(rdir, proj)
+                    if not outs:
+                        continue
+                    missing = sorted(outs - scored, key=_fault_key)
+                    if not missing:
+                        continue
+                    print("[coverage] %-6s %-16s %-38s %d of %d .out(s) have NO "
+                          "verdict: %s" % (case["key"], proj,
+                                           os.path.basename(rdir), len(missing),
+                                           len(outs), ", ".join(missing[:12])
+                                           + (" ..." if len(missing) > 12 else "")))
+                    # THE PARTS MAY ALREADY HOLD THEM -- merge and look again.
+                    if _merge_one_folder(case, rdir):
+                        _MEAS_CACHE.clear()
+                        outs, scored = _out_and_scored_sets(rdir, proj)
+                        _after = sorted(outs - scored, key=_fault_key)
+                        if len(_after) < len(missing):
+                            print("[coverage]     merged from parts -- %d of those now "
+                                  "scored" % (len(missing) - len(_after)))
+                        missing = _after
+                    if missing:
+                        still.append((case, proj, rdir, missing))
+    if not still:
+        return 0
+    print("")
+    print("=" * 92)
+    print(" *** SCENARIOS THAT RAN BUT WERE NEVER SCORED ***")
+    print("=" * 92)
+    print(" Each of these has an .out file and NO verdict. They are not passes.")
+    print(" The comparison cannot judge them, and a fault with no verdict beside")
+    print(" faults that have one reads as a fault with nothing wrong.")
+    print("")
+    _ids = set()
+    for case, proj, rdir, missing in still:
+        print(" %-6s %-16s %s" % (case["key"], proj, os.path.basename(rdir)))
+        print("        %s" % ", ".join(missing))
+        _ids.update(missing)
+    print("")
+    print(" Their parts\\ do not hold them, so merging cannot help -- they need")
+    print(" SCORING. To score exactly these and nothing else:")
+    print("")
+    print('     ONLY_FAULTS = [%s]'
+          % ", ".join('"%s"' % s for s in sorted(_ids, key=_fault_key)))
+    print("     FORCE_RESCORE = True")
+    print("     PIPELINE = \"all\"")
+    print("")
+    print(" A scenario that keeps failing to score is usually one whose .out the")
+    print(" reader cannot get through -- check 06_DIVERGED and the logs for it.")
+    print("=" * 92)
+    print("")
+    return sum(len(m) for _c, _p, _r, m in still)
+
+
+_PDF_PROJ_RE = re.compile(r"PROJ (\d{4,})")
+
+
+def retire_stale_pdfs(quiet=False):
+    """Move aside PDFs that were drawn for a DIFFERENT build of the project.
+
+       A PDF does not carry the bus numbers of the machines it shows. The .out
+       stores its project channels as PROJ1_PELEC, PROJ2_PELEC -- an INDEX --
+       and the plotter turns that index into a label by reading PROJECT_GENS as
+       it stands AT DRAWING TIME. Same channel, same file, two different labels
+       depending only on what the settings said the day it was written:
+
+           PROJ1_PELEC  +  PROJECT_GENS[0] == (765912, "B")  ->  "PROJ 765912"
+           PROJ1_PELEC  +  PROJECT_GENS[0] == (999001, "B")  ->  "PROJ 999001"
+
+       999001 is the BESS builder's first new bus. A folder that has survived a
+       change of build therefore holds pages headed with a plant that is not the
+       one being studied -- and the plot pass will never replace them, because
+       it draws only where there is NO PDF beside the .out. Right for resuming a
+       long run, wrong for a stale page, and nothing downstream looks at them
+       again before they reach the comparison.
+
+       The pure-Python writer stores its text uncompressed, so the labels are
+       read straight out of the file -- a byte scan, not a parse. PDFs are
+       grouped by the bus set printed on their face and any group that disagrees
+       with the majority is renamed to *.oldbuild. Renamed, never deleted; the
+       next pass then draws a current one because no PDF sits beside that .out."""
+    if not RETIRE_STALE_PDFS:
+        return 0
+    n_moved = 0
+    for case in (CASE_BASE, CASE_TEST):
+        for proj in (list(PROJECTS) or [""]):
+            for mode in (list(MODES) or ["spp"]):
+                pdir = os.path.join(results_dir(case, proj, mode), "plots")
+                if not os.path.isdir(pdir):
+                    continue
+                groups = {}
+                for p in sorted(glob.glob(os.path.join(pdir, "*_plots.pdf"))):
+                    buses = set()
+                    try:
+                        fh = open(p, "rb")
+                    except Exception:
+                        continue
+                    try:
+                        tail = b""
+                        while True:
+                            buf = fh.read(1 << 20)
+                            if not buf:
+                                break
+                            for m in _PDF_PROJ_RE.finditer(
+                                    (tail + buf).decode("latin-1", "replace")):
+                                buses.add(int(m.group(1)))
+                            tail = buf[-64:]     # a label can straddle the boundary
+                    except Exception:
+                        continue
+                    finally:
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+                    groups.setdefault(tuple(sorted(buses)), []).append(p)
+                if len(groups) < 2:
+                    continue                     # one build, or nothing to read
+                # ---- THE NEWEST BUILD WINS, NOT THE MOST NUMEROUS ----------
+                #
+                # This ranked by HOW MANY pages each build had, and that is
+                # backwards whenever the older build produced more of them.
+                # SantaFe is 502 MW over a 200 MW feeder cap = THREE units, so
+                # 999001/999002/999003 is the current facility -- and the
+                # majority rule retired exactly those two page sets and kept
+                # three older ones drawn when the plant had two:
+                #
+                #     3 page set(s) show project machines 999001, 999002  <- kept
+                #     2 show 999001, 999002, 999003  -> renamed *.oldbuild
+                #
+                # It threw away the current plots and kept the stale ones. Which
+                # build is CURRENT is a question about time, not about counting,
+                # so the group holding the most recently written page set is the
+                # one kept. Ties fall back to the larger group, then to the bus
+                # list, so the choice is deterministic either way.
+                def _newest(files):
+                    t = 0.0
+                    for _f in files:
+                        try:
+                            t = max(t, os.path.getmtime(_f))
+                        except Exception:
+                            pass
+                    return t
+                ranked = sorted(groups.items(),
+                                key=lambda kv: (-_newest(kv[1]), -len(kv[1]), kv[0]))
+                keep = ranked[0]
+                if not quiet:
+                    print("")
+                    print("[compare] %s/%s: the PDFs here describe more than one build."
+                          % (case.get("key", "?"), proj or "-"))
+                    print("[compare]   %4d page set(s) show project machines %s  <- kept "
+                          "(most recently drawn: %s)"
+                          % (len(keep[1]), ", ".join(str(b) for b in keep[0]) or "(none named)",
+                             time.strftime("%Y-%m-%d %H:%M",
+                                           time.localtime(_newest(keep[1])))))
+                for buses, files in ranked[1:]:
+                    if not quiet:
+                        print("[compare]   %4d show %s  -> renamed *.oldbuild (last "
+                              "drawn %s)"
+                              % (len(files),
+                                 ", ".join(str(b) for b in buses) or "(none named)",
+                                 time.strftime("%Y-%m-%d %H:%M",
+                                               time.localtime(_newest(files)))))
+                    for p in files:
+                        try:
+                            tgt = p + ".oldbuild"
+                            if os.path.exists(tgt):
+                                os.remove(tgt)
+                            os.rename(p, tgt)
+                            n_moved += 1
+                            if not quiet:
+                                print("[compare]        %s" % os.path.basename(p))
+                        except Exception as e:
+                            if not quiet:
+                                print("[compare]        could not rename %s: %s"
+                                      % (os.path.basename(p), e))
+    if n_moved and not quiet:
+        print("[compare] %d PDF(s) renamed aside -- not deleted. The plot pass below"
+              % n_moved)
+        print("[compare] draws a current one for each, because no PDF sits beside")
+        print("[compare] those .out files any more.")
+        print("")
+    return n_moved
+
+
+def retire_truncated_done(quiet=False):
+    """Take back the .done markers that were written for runs which stopped early.
+
+       WHY THIS HAS TO HAPPEN HERE. The report phase's only test for "did this
+       scenario finish" is whether a .done marker exists -- deliberately, so a
+       crashed scenario's .out is never opened, because reading a truncated one
+       has taken the whole report down at the Fortran level. It does not, and
+       cannot cheaply, re-measure the run.
+
+       That test was sound until the plot pass started writing markers with the
+       wrong SIM_END_S. Against 10.0 rather than 30.2 it declared every .out
+       that reached 10.45 s complete, and wrote a marker saying so. Fourteen
+       scenarios that stopped a third of the way through are now indistinguish-
+       able, to the report, from scenarios that ran the full 30.2 s.
+
+       Scoring them is not merely inaccurate, it inverts the answer. Voltage
+       recovery is judged at tclear + V_RECOVERY_S -- about 12.6 s -- and
+       idx_after() returns the LAST sample when the file ends before that. So
+       recovery gets measured 0.3 s after the fault clears, while the voltage is
+       still down, and a scenario that was never simulated far enough to judge
+       is reported as a FAILURE of the project.
+
+       SIZE ANSWERS IT WITHOUT OPENING ANYTHING. A .out is fixed-width records:
+       same channels, same sample rate. Every scenario in a folder lands within
+       a few percent of the same size unless it stopped early, and then it is
+       short in exact proportion -- 39 MB against a 113 MB median is 10.5 s of
+       30.2. This is os.path.getsize and nothing else, so it costs milliseconds
+       on a folder of 240 files.
+
+       The marker is RENAMED, not deleted, and every one is named on screen."""
+    if not RETIRE_TRUNCATED_DONE:
+        return 0
+    n_moved, folders = 0, []
+    _retired = set()          # (case key, project, mode) whose report is now wrong
+    for case in (CASE_BASE, CASE_TEST):
+        for proj in (list(PROJECTS) or [""]):
+            for mode in (list(MODES) or ["spp"]):
+                od = os.path.join(results_dir(case, proj, mode), "outs")
+                if os.path.isdir(od):
+                    folders.append((case, od, proj, mode))
+    for case, od, _proj, _mode in folders:
+        sizes = {}
+        for p in glob.glob(os.path.join(od, "*.out")):
+            sid = os.path.splitext(os.path.basename(p))[0]
+            if sid.upper().startswith("FLAT"):
+                continue                      # the flat run is meant to be short
+            try:
+                sizes[sid] = os.path.getsize(p)
+            except Exception:
+                pass
+        if len(sizes) < 4:
+            continue                          # too few to have a meaningful median
+        v = sorted(sizes.values())
+        med = v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2.0
+        cut = med * TRUNCATED_FRAC
+        short = [sid for sid, z in sizes.items()
+                 if z < cut and os.path.isfile(os.path.join(od, sid + ".done"))]
+        if not short:
+            continue
+        if not quiet:
+            print("")
+            print("[compare] %s: %d scenario(s) carry a .done marker but their .out is"
+                  % (case.get("key", "?"), len(short)))
+            print("[compare] far short of the %.0f MB the rest of the folder shows --"
+                  % (med / 1048576.0))
+            print("[compare] they stopped early and must not be scored as finished:")
+        for sid in sorted(short, key=lambda x: (len(x), x)):
+            frac = 100.0 * sizes[sid] / med if med else 0.0
+            src = os.path.join(od, sid + ".done")
+            try:
+                tgt = src + ".truncated"
+                if os.path.exists(tgt):
+                    os.remove(tgt)
+                os.rename(src, tgt)
+                n_moved += 1
+                _retired.add((case["key"], _proj, _mode))
+                if not quiet:
+                    print("[compare]     %-8s %6.1f MB  (%.0f%% of a full run)  "
+                          "-> .done.truncated" % (sid, sizes[sid] / 1048576.0, frac))
+            except Exception as e:
+                if not quiet:
+                    print("[compare]     %-8s could not move its marker aside: %s" % (sid, e))
+    if n_moved and not quiet:
+        print("[compare] %d marker(s) renamed -- not deleted. Those scenarios are now"
+              % n_moved)
+        print("[compare] reported as 'crashed or never finished', which is what they are.")
+        print("[compare] The report phase names them, with a RUN_ONLY_FAULTS line to")
+        print("[compare] re-run them when you want to.")
+        print("")
+    # AND THE REPORTS THAT ALREADY SCORED THEM MUST BE WRITTEN AGAIN.
+    #
+    # THIS IS WHY RETIRING A MARKER CHANGED NOTHING. Renaming <sid>.done aside
+    # does not touch the .out, the report, or the number of verdicts in it --
+    # and those three tests are the only ones ensure_reports() uses to decide
+    # whether to re-score. So the report that had already scored the truncated
+    # runs as finished was handed straight to the comparison, and the retirement
+    # took effect only on some later launch that happened to re-simulate them.
+    # A scenario that stopped at a third of its run was being reported as a
+    # failure of the project, which is the finding this function exists to
+    # prevent.
+    #
+    # The report is back-dated instead of deleted: ensure_reports() re-scores
+    # anything older than the newest .out, the rescore replaces it, and if
+    # anything goes wrong the previous report is still there to read.
+    for key, proj, mode in sorted(_retired):
+        _c = CASE_BASE if key == CASE_BASE.get("key") else CASE_TEST
+        try:
+            _rep = rfile(results_dir(_c, proj, mode), "SPP_CRITERIA_REPORT", "txt")
+        except Exception:
+            continue
+        for _f in glob.glob(os.path.splitext(_rep)[0] + "*"):
+            try:
+                os.utime(_f, (0, 0))
+            except Exception:
+                continue
+        if not quiet:
+            print("[compare] %s/%s/%s: its criteria report scored those runs as "
+                  "finished -- back-dated so it is scored again before the "
+                  "comparison reads it" % (key, proj or "-", mode))
+    if _retired and not RESCORE_STALE_REPORTS and not quiet:
+        print("[compare] *** RESCORE_STALE_REPORTS is False, so those reports will "
+              "NOT be written again ***")
+        print("[compare]     The markers have been retired, but the reports on disk "
+              "still score")
+        print("[compare]     the truncated runs as finished and the comparison will "
+              "read them.")
+        print("[compare]     Set RESCORE_STALE_REPORTS = True, or re-run those "
+              "scenarios.")
+    return n_moved
+
+
+def ensure_reports(mode_list):
+    """Give any case/project a criteria report it is missing -- and replace one
+       that is OLDER than the .out files it describes.
+
+       A study can finish every simulation and still leave no report -- the
+       report phase is a separate phase and it can be killed, crash, or simply
+       not have been asked for. Hours of finished simulation then compare as
+       'never ran', which is both wrong and expensive to believe.
+
+       The fix costs no simulation: run that launcher with REPORT_ONLY, which
+       scores the .out files already on disk. Returns the number of report runs
+       it started."""
+    n = 0
+    jobs = []
+    for case in (CASE_BASE, CASE_TEST):
+        need, stale, thin, nomeas = [], [], [], []
+        for nm, proj, md, rep, n_out, _when in inventory(case):
+            if md not in mode_list or not n_out:
+                continue
+            # ONLY THE PROJECTS THIS LAUNCH IS ABOUT. The results root holds
+            # every project ever run; with FORCE_RESCORE on, an EastFork launch
+            # was re-scoring SantaFe and EmpirePrairie as well.
+            if _panel_projects() and proj not in _panel_projects():
+                continue
+            # SCORE IT AGAIN WHATEVER ITS DATE -- see FORCE_RESCORE.
+            #
+            # THE CASE THIS EXISTS FOR IS A CHANGED CRITERION. The three tests
+            # below all ask about the .out files: is there a report, is it
+            # older than them, does it cover enough of them. None of them can
+            # notice that the SCORING RULE changed -- a tolerance edited in the
+            # panel, a threshold corrected -- because the .out files did not
+            # move and neither did the report. So a report full of verdicts
+            # from the old rule is recent, complete, and quietly kept, and the
+            # comparison is built on it.
+            #
+            # There is no way to detect that from the outside, so it is a
+            # setting rather than a guess. Turn it on for the run after you
+            # change a criterion, and off again afterwards -- scoring is not
+            # free.
+            if FORCE_RESCORE:
+                need.append(proj)
+                continue
+            if not rep:
+                need.append(proj)
+                continue
+            if not RESCORE_STALE_REPORTS:
+                continue
+            # A REPORT OLDER THAN THE RESULTS IT DESCRIBES.
+            #
+            # The tolerance is not cosmetic: the study rewrites its criteria
+            # report after every scenario (LIVE_REPORT), so the newest .out is
+            # routinely a few seconds younger than the report through no fault
+            # of anyone. Anything past the tolerance is a re-run that was never
+            # scored.
+            by = _report_stale_by(case, proj, md)
+            if by > STALE_REPORT_TOL_S:
+                stale.append((proj, by))
+                need.append(proj)
+                continue
+            # A REPORT THAT IS RECENT BUT COVERS ALMOST NOTHING.
+            #
+            # Staleness is a question about TIME, and it is the wrong question
+            # when a report was written a minute ago and describes 8 of 119
+            # scenarios. That happens whenever the scoring shards die part way
+            # -- each one loads a ~113 MB .out into 32-bit PSS/E -- and the
+            # merge then writes a perfectly fresh report over a handful of
+            # verdicts. Nothing about its timestamp says so, the existence test
+            # passes, and the comparison silently covers 8 faults.
+            #
+            # So ask about COVERAGE too: a report describing far fewer scenarios
+            # than there are .out files beside it has not finished, whatever its
+            # date.
+            try:
+                _rd = results_dir(case, proj, md)
+                _scored = len([1 for _k, _v in (read_criteria(_rd, proj)[0] or {}).items()
+                               if norm_verdict(_v.get("verdict"))])
+            except Exception:
+                _scored = -1
+            # THE DENOMINATOR IS THE SELECTION, NOT THE FOLDER. n_out counts
+            # every .out on disk, and a folder that ran 100 faults last week
+            # and 5 today (ONLY_FAULTS) then read 5 < 0.9 x 100 -> "thin" ->
+            # re-scored -- on EVERY launch, because the re-score writes only
+            # the _SELECTED report and the next launch counts 100 .out again.
+            # A full scoring pass per launch is exactly the "scoring takes too
+            # long" symptom. Measure coverage against the .out files this
+            # comparison is actually about.
+            _n_den = n_out
+            if _sel_tag() and n_out:
+                try:
+                    _n_den = len([1 for _q in glob.glob(
+                        os.path.join(results_dir(case, proj, md), "outs", "*.out"))
+                        if _id_selected(os.path.splitext(os.path.basename(_q))[0])])
+                except Exception:
+                    _n_den = n_out
+            if 0 <= _scored and _n_den and _scored < REPORT_COVERAGE_MIN * _n_den:
+                thin.append((proj, _scored, _n_den))
+                need.append(proj)
+                continue
+            # A REPORT WITH VERDICTS BUT NO MEASUREMENTS BEHIND THEM.
+            #
+            # The three tests above ask about VERDICTS, and the verdicts can be
+            # complete while the measurement files hold one fault. That is what
+            # a forced rescore that was stopped part way leaves behind: every
+            # shard deleted the saved parts first, scored a scenario or two,
+            # and the merge rebuilt SPP_MEASURE_*.csv from those alone -- while
+            # the criteria report kept every verdict. The workbook then has all
+            # 150 rows and no base value, no machine MW, no POI power on any of
+            # them, and nothing here noticed because the report looked whole.
+            #
+            # The study re-reads any scenario that has a verdict and no
+            # measurements as soon as a scoring pass is run -- but a pass has to
+            # be run. So the measurements are tested for coverage too.
+            if not _sel_tag():
+                try:
+                    _mm = read_measurements(results_dir(case, proj, md), proj)
+                    _mf = set(k[0] for k in (_mm.get("volts") or {}))
+                    _mf |= set(k[0] for k in (_mm.get("machines") or {}))
+                    _mf |= set((_mm.get("poi") or {}).keys())
+                    _n_meas = len(_mf)
+                except Exception:
+                    _n_meas = -1
+                if 0 <= _n_meas and _n_den and _n_meas < REPORT_COVERAGE_MIN * _n_den:
+                    nomeas.append((proj, _n_meas, _n_den))
+                    need.append(proj)
+        if FORCE_RESCORE and need:
+            print("")
+            print("[compare] FORCE_RESCORE: scoring all %d %s folder(s) again, however "
+                  "fresh their reports look." % (len(need), case["key"]))
+            print("[compare]     Use this after changing a criterion -- nothing about "
+                  "the .out")
+            print("[compare]     files or the report's date can show that the RULE "
+                  "changed, so")
+            print("[compare]     a report scored under the old one would be kept and "
+                  "compared.")
+        if stale:
+            print("")
+            print("[compare] *** %s: %d report(s) are OLDER than the .out files they "
+                  "describe ***" % (case["key"], len(stale)))
+            for proj, by in stale:
+                print("[compare]     %-16s newest .out is %s newer than the report"
+                      % (proj, _fmt_hms(by)))
+            print("[compare]     Those verdicts are from a PREVIOUS run of those")
+            print("[compare]     scenarios. Re-scoring them now -- no simulation.")
+        if thin:
+            print("")
+            print("[compare] *** %s: %d report(s) cover only a fraction of the .out "
+                  "files beside them ***" % (case["key"], len(thin)))
+            for proj, sc, no in thin:
+                print("[compare]     %-16s %d scenario(s) scored of %d .out file(s)"
+                      % (proj, sc, no))
+            print("[compare]     A report can be minutes old and still describe almost")
+            print("[compare]     nothing -- that is what a scoring pass that died part")
+            print("[compare]     way leaves behind. Re-scoring them now -- no simulation.")
+        if nomeas:
+            print("")
+            print("[compare] *** %s: %d report(s) have verdicts for their .out files but "
+                  "MEASUREMENTS for only a few of them ***" % (case["key"], len(nomeas)))
+            for proj, nmf, no in nomeas:
+                print("[compare]     %-16s measurements cover %d fault(s) of %d .out file(s)"
+                      % (proj, nmf, no))
+            print("[compare]     That is what a forced rescore stopped part way leaves: the")
+            print("[compare]     verdicts survive, the measurement files are rebuilt from the")
+            print("[compare]     few scenarios it reached. Every base value, machine MW and POI")
+            print("[compare]     power in the workbook comes from those files. Re-scoring the")
+            print("[compare]     scenarios that have no measurements -- no simulation.")
+        if not need:
+            continue
+        _banner("%s: %d project(s) need scoring -- .out with no report, or a report "
+                "older than them" % (case["label"], len(set(need))))
+        print("[compare] %s" % ", ".join(need))
+        print("[compare] this reads .out files and runs NO simulation.")
+        jobs.append((case, sorted(set(need))))
+        n += 1
+    if not jobs:
+        return 0
+    # THE SAME CONCURRENCY RULE AS PHASE 1. Scoring is the slow half of this
+    # study -- minutes per .out -- so running the two cases one after the other
+    # here would take as long as phase 1 did, on a machine sized for both.
+    env_extra = {"SPP_REPORT_ONLY": "1"}
+    if RUN_IN_PARALLEL and len(jobs) > 1:
+        print("[compare] scoring both cases at once -- REPORT_WORKERS shards each")
+        res, ths = {}, []
+        for case, need in jobs:
+            def _go(c=case, nd=need):
+                res[c["key"]] = run_study(c, projects=nd, modes=mode_list,
+                                          extra_env=env_extra)
+            th = threading.Thread(target=_go)
+            th.start()
+            ths.append(th)
+        for th in ths:
+            th.join()
+        rcs = list(res.items())
+    else:
+        rcs = []
+        for case, need in jobs:
+            rcs.append((case["key"],
+                        run_study(case, projects=need, modes=mode_list,
+                                  extra_env=env_extra)))
+    # THE MEASUREMENTS JUST CHANGED ON DISK. Anything read before this pass --
+    # the live comparison's thread, the coverage test above -- is out of date.
+    _MEAS_CACHE.clear()
+    for key, rc in rcs:
+        if rc not in (0, None):
+            print("[compare] *** the %s report pass ended rc=%s -- anything it did"
+                  % (key, rc))
+            print("[compare]     write is still used below. ***")
+    return n
+
+
+def main():
+    _banner("SPP STUDY COMPARISON")
+    print("[compare] BASE  %-44s %s" % (CASE_BASE["label"], CASE_BASE["dir"]))
+    print("[compare] TEST  %-44s %s" % (CASE_TEST["label"], CASE_TEST["dir"]))
+    print("[compare] output -> %s" % COMPARE_DIR)
+
+    for case in (CASE_BASE, CASE_TEST):
+        if not os.path.isdir(case["dir"]):
+            # NAME THE SETTING, not just the path. The folders are BASE_FOLDER
+            # and PROJ_FOLDER now, so "that path does not exist" leaves the
+            # reader to work out which of two settings built it.
+            _which = "BASE_FOLDER = %r" % BASE_FOLDER if case is CASE_BASE \
+                else "PROJ_FOLDER = %r" % PROJ_FOLDER
+            print("")
+            print("[compare] *** the %s case folder does not exist ***" % case["key"])
+            print("[compare]     %s" % case["dir"])
+            print("[compare]     built from ROOT = %r and %s" % (ROOT, _which))
+            try:
+                _here = sorted(q for q in os.listdir(STUDY_ROOT)
+                               if os.path.isdir(os.path.join(STUDY_ROOT, q)))
+                print("[compare]     folders in %s: %s"
+                      % (STUDY_ROOT, ", ".join(_here[:20]) or "(none)"))
+            except Exception:
+                pass
+            return 2
+    if not os.path.isdir(COMPARE_DIR):
+        os.makedirs(COMPARE_DIR)
+
+    # MERGE ONLY -- see the setting at the top. Checked before anything else,
+    # because it neither simulates nor plots and must not wait on the phases
+    # that do. The comparison still runs afterwards, over the reports this has
+    # just rebuilt.
+    if MERGE_ONLY:
+        try:
+            run_merge_only()
+        except Exception as _e:
+            # traceback is not imported at module level here -- import it where
+            # it is needed rather than widening the launcher's imports.
+            try:
+                import traceback as _tb
+                _tb.print_exc()
+            except Exception:
+                pass
+            print("[merge-only] FAILED: %s" % _e)
+            return 2
+        print("[merge-only] reports rebuilt -- continuing to the comparison, "
+              "which reads them.")
+
+    pipeline = _resolve_pipeline()
+    print("[compare] pipeline: %s" % {
+        "compare": "compare what is on disk (no simulation)",
+        "missing": "simulate only what is missing, then compare",
+        "all":     "simulate BOTH cases, report both, then compare",
+    }[pipeline])
+    # THE SETTINGS THAT MAKE THIS RUN POINTLESS, CHECKED FIRST.
+    #
+    # This test used to sit in PHASE 0, several hundred lines below -- and
+    # BELOW the plot pass. NEW_FAULT_LIST with PIPELINE = "compare" therefore
+    # spent however many hours the plotting took, printed "set PIPELINE =
+    # \"all\"" and returned 2, having compared nothing. The console showed
+    # PDFs appearing and the comparison folder stayed empty, with no visible
+    # connection between the two.
+    #
+    # A run that cannot reach its own last phase should say so in its first
+    # second, before it draws anything.
+    if NEW_FAULT_LIST and pipeline == "compare":
+        print("")
+        print("[compare] *** NOTHING WOULD BE COMPARED -- STOPPING NOW ***")
+        print("[compare] NEW_FAULT_LIST is on but PIPELINE is \"compare\", which runs")
+        print("[compare] nothing. A brand-new fault list renumbers the scenarios and")
+        print("[compare] retires the old results, so it only means anything with both")
+        print("[compare] studies re-run against it.")
+        print("")
+        print("[compare] You almost certainly want:   NEW_FAULT_LIST = False")
+        print("[compare]   -- compare the .out files you already have, against the")
+        print("[compare]      fault list they were run with. Nothing simulates.")
+        print("[compare] Or, to start over:           PIPELINE = \"all\"")
+        print("")
+        return 2
+    # BEFORE THE PLOT PASS, so anything retired here is redrawn in this same
+    # run rather than needing a second night.
+    try:
+        retire_stale_pdfs()
+    except Exception as _e:
+        print("[compare] could not check the PDFs for an older build: %s" % _e)
+    # ---- PLOTS: ONLY BEFORE THE RUNS WHEN THERE ARE NO RUNS -----------------
+    #
+    # THE ORDER WAS WRONG FOR "missing" AND "all". This pass drew every .out on
+    # disk that lacked a PDF -- 76 of them, hours of work -- BEFORE starting the
+    # simulation the run was launched to do. The one thing the study was short
+    # of, PROJ/EmpirePrairie, waited behind the drawing of results that were
+    # already finished, and from the console it looked as though the missing
+    # runs had been skipped altogether.
+    #
+    # With a simulation to run, the drawing waits: the catch-up pass after the
+    # runs draws everything, including whatever the runs have just produced.
+    # With PIPELINE = "compare" there is nothing to wait for and it runs here.
+    if pipeline == "compare":
+        try:
+            plot_missing_everywhere(pipeline)
+        except Exception as _e:
+            print("[compare] plot-missing pass failed: %s" % _e)
+    else:
+        _npdf = 0
+        for _c in ([CASE_BASE] if RUN_CASES in ("both", "base") else []) + \
+                  ([CASE_TEST] if RUN_CASES in ("both", "proj") else []):
+            for _p in (list(PROJECTS) or [""]):
+                for _m in (list(MODES) or ["spp"]):
+                    _npdf += _count_unplotted(results_dir(_c, _p, _m))
+        if _npdf:
+            print("")
+            print("[compare] %d .out file(s) have no PDF. They are drawn AFTER the "
+                  "simulations, not before -- see the plot pass at the end. Drawing "
+                  "them first would hold the runs behind hours of work on results "
+                  "that are already finished." % _npdf)
+    if pipeline != "compare":
+        if NEW_PLANT_RUN:
+            _npn = (NEW_PLANT or {}).get("units")
+            print("[compare] new plant: one EXTRA study per project that BUILDS a")
+            print("[compare]           facility at the POI -- %s,"
+                  % ("feeders worked out from each project's rating and the "
+                     "200 MW cap" if not _npn else "%s feeder(s)" % _npn))
+            print("[compare]           new buses from %s, a GSU each, a collector, an"
+                  % (NEW_PLANT or {}).get("bus_start"))
+            print("[compare]           MPT and a tie. NOTHING existing is switched off.")
+            print("[compare]           The bus numbers must be FREE -- the build stops")
+            print("[compare]           if any is already in the case.")
+        if PROJECT_OFF_RUN:
+            print("[compare] project off: one EXTRA study per project, its machines out")
+            print("[compare]           of service, the rest of the network unchanged.")
+            print("[compare]           Runs AFTER the main comparison, so that is")
+            print("[compare]           written either way.")
+        if DYR_SWEEP or DYR_SWEEP_BY_PROJECT:
+            # THE TOTAL, NOT THE PER-PROJECT COUNT. Four projects at three
+            # values each is twelve complete studies, and the number that
+            # decides whether to start it is twelve.
+            _pj = _dyr_sweep_projects(compare_projects())
+            _tot = 0
+            for _p in _pj:
+                _v = _dyr_sweep_variants(_p)
+                _tot += len(_v)
+                print("[compare] dyr sweep: %-14s %d value(s)" % (_p, len(_v)))
+                for _t, _e in _v[:6]:
+                    print("[compare]             %-22s %s" % (_t, _dyr_edits_text(_e)))
+                if len(_v) > 6:
+                    print("[compare]             ... and %d more" % (len(_v) - 6))
+            if not _pj:
+                print("[compare] dyr sweep: nothing to sweep -- DYR_SWEEP_PROJECTS "
+                      "matches no project here")
+            else:
+                # THE LEVELS MULTIPLY IT. Two projects at three values is six
+                # studies; repeated at one reduced output it is twelve, and the
+                # number that decides whether to start is twelve.
+                _lv = _cap_levels()
+                if len(_lv) > 1:
+                    print("[compare]           REPEATED AT %d capacity level(s): %s"
+                          % (len(_lv), ", ".join(_cap_label(t) for t, _s in _lv)))
+                    print("[compare]           (SWEEP_AT_CAPACITY_LEVELS = True) "
+                          "-> x%d" % len(_lv))
+                    _tot *= len(_lv)
+                print("[compare]           this SIMULATES %d COMPLETE stud%s of the "
+                      "project case." % (_tot, "y" if _tot == 1 else "ies"))
+                # WHICH OF THOSE WILL ACTUALLY RUN. A value whose folder is
+                # already complete costs nothing when resuming and a full study
+                # when not, and that is the difference between minutes and hours.
+                if SWEEP_SKIP_DONE:
+                    print("[compare]           RESUMING: a value already finished on "
+                          "disk is read, not re-run")
+                    print("[compare]           (SWEEP_SKIP_DONE = True -- set it False "
+                          "if anything but the swept")
+                    print("[compare]            value changed, since the folder name "
+                          "records only that)")
+                else:
+                    print("[compare]           EVERY value is re-simulated from nothing "
+                          "(SWEEP_SKIP_DONE = False)")
+                print("[compare]           It runs AFTER the main comparison, so that "
+                      "is written either way.")
+        if CAPACITY_LEVELS:
+            print("[compare] capacity: after the comparison, the failing faults are re-run")
+            print("[compare]           at %s of project output"
+                  % ", ".join("%.0f%%" % (float(x) * 100) for x in CAPACITY_LEVELS))
+        if str(RUN_CASES or "both").strip().lower() not in ("both", "all", ""):
+            _only = _cases_to_run()[0]
+            print("[compare] cases:    ONLY %s (%s) will be simulated" % (_only["key"], _only["dir"]))
+            print("[compare]           the other case is read from disk as it stands, and")
+            print("[compare]           the comparison still covers both.")
+        # THE TOTAL, not the per-case number: it is what the licence sees, and
+        # it is only doubled when two cases are actually running.
+        _ncase = len(_cases_to_run())
+        _why = []
+        _nc = _ncase if RUN_IN_PARALLEL else 1
+        _nw = _workers_for("PROJ", N_WORKERS, _nc, why=_why)
+        _nwb = _workers_for("BASE", N_WORKERS, _nc)
+        _nr = _report_workers_for("PROJ", _nc, _why)
+        _conc = _total_sessions(N_WORKERS, _nc)
+        if (FLAT_RUN_S is not None or SIM_END_S is not None
+                or PRE_FAULT_S is not None):
+            _d = lambda v: "study default" if v is None else v
+            print("[compare] sim:      flat %s s, pre-fault %s s, fault run %s s "
+                  "(set here for both cases)"
+                  % (_d(FLAT_RUN_S), _d(PRE_FAULT_S), _d(SIM_END_S)))
+            if (PRE_FAULT_S is not None and SIM_END_S is not None
+                    and float(PRE_FAULT_S) >= float(SIM_END_S)):
+                print("[compare] *** PRE_FAULT_S is not before SIM_END_S -- the fault")
+                print("[compare]     would never be applied. Both studies will stop.")
+        if MISMATCH_MVA is not None:
+            print("[compare] mismatch: both cases are solved to <= %.4f MVA total system"
+                  % float(MISMATCH_MVA))
+            print("[compare]           mismatch before anything is saved%s"
+                  % (" -- a build that cannot reach it stops" if MISMATCH_ABORT else ""))
+        if _nc > 1 and _nw != _nwb:
+            print("[compare] workers:  %d for the project case, %d for the base -- "
+                  "%d PSS/E session(s) at once" % (_nw, _nwb, _conc))
+        else:
+            print("[compare] workers:  %d per case -- %d PSS/E session(s) at once"
+                  % (_nw, _conc))
+        print("[compare]           report shards: %d%s"
+              % (_nr, " (in the foreground, so they never run alongside "
+                      "another project's workers)" if CORES_MAX_INCLUDES_REPORTS
+                 else ""))
+        for _w in _why:
+            print("[compare]           %s" % _w)
+        print("[compare]           CORES_MAX is the TOTAL across both cases, not per case")
+        if CORES_FOR_REPORTS:
+            print("[compare]           of CORES_MAX = %s, %d held back for scoring and "
+                  "plotting" % (CORES_MAX, CORES_FOR_REPORTS))
+            print("[compare]           -> %s simulation session(s) + %d scoring/plot "
+                  "process(es), running together"
+                  % (_sim_core_budget() or "unlimited", _plot_core_budget()))
+        # SAY THE PEAK, NOT THE SETTING. The number that matters is how many
+        # PSS/E sessions can exist at one moment, and until CORES_MAX covered
+        # the scoring that number was not the one in the panel.
+        if CORES_MAX_INCLUDES_REPORTS:
+            print("[compare]           peak:  %d session(s) -- the scoring shares the "
+                  "workers' budget," % _conc)
+            print("[compare]                  it does not add to it "
+                  "(CORES_MAX_INCLUDES_REPORTS = True)")
+        else:
+            print("[compare]           peak:  up to %d session(s) -- the report runs in "
+                  "the background" % (_conc + _nr * 2))
+            print("[compare]                  and ADDS to the workers "
+                  "(CORES_MAX_INCLUDES_REPORTS = False)")
+        # WHAT THIS FILE IS FORCING ON BOTH CASES. Anything left None is the
+        # study scripts' own value, and is not listed -- so this says exactly
+        # what was overridden and nothing else.
+        _forced = [(n, v) for n, v in (
+            ("auto-generate faults", AUTO_SPP_FAULTS), ("hops from POI", SPP_FAULT_HOPS),
+            ("kV floor", SPP_FAULT_KV_MIN), ("max faults", SPP_MAX_FAULTS),
+            ("planning events", SPP_EVENTS_ON), ("event hops", SPP_EVENT_HOPS),
+            ("custom types", CUSTOM_TYPES), ("custom cycles", CUSTOM_CYCLES),
+            ("custom hops", CUSTOM_HOPS),
+            ("POI P target MW", POI_P_TARGET_MW), ("POI P levels", POI_P_LEVELS),
+            ("POI P levels %", POI_P_LEVELS_PCT),
+            ("POI area held", POI_HOLD_AREA_MW), ("POI P share", POI_P_SHARE),
+            ("POI project machines at", POI_P_PROJECT_AT),
+            ("POI extra plant buses", POI_P_EXISTING_BUSES),
+            ("P4 mode", SPP_P4_MODE), ("P4 grouping", SPP_P4_GROUP),
+            ("P4 tap segments", SPP_P4_TAP_SEGMENTS),
+            ("normal clearing", NORMAL_CLEAR_CYCLES), ("stuck clearing", SPP_STUCK_CYCLES),
+            ("reclose wait", RECLOSE_WAIT_CYCLES), ("reclose on", ENABLE_RECLOSE),
+            ("reclose simulated", SIMULATE_RECLOSE),
+            ("reclose dropped if it islands a gen", RECLOSE_SKIP_IF_ISLANDS),
+            ("SLG retained V", SPP_SLG_RETAIN_VPU),
+            ("run flat", RUN_FLAT), ("run faults", RUN_FAULTS), ("plots", MAKE_PLOTS),
+            ("rebuild", FORCE_REBUILD), ("attempts", MAX_SCENARIO_ATTEMPTS),
+            ("monitor radius", POI_RADIUS_HOPS),
+            ("V recovery", V_RECOVERY_PU), ("V overshoot", V_OVERSHOOT_PU),
+            ("V steady low", V_SS_LOW), ("V steady high", V_SS_HIGH),
+            ("angle deviation", ANGLE_DEV_DEG)) if v is not None]
+        if _forced:
+            print("[compare] set here for BOTH cases:")
+            for _i in range(0, len(_forced), 3):
+                print("[compare]   " + "   ".join("%s=%s" % (n, v)
+                                                  for n, v in _forced[_i:_i + 3]))
+        if DYNAMIC_WORK:
+            print("[compare] queue:    SHARED -- each worker takes the next free scenario,")
+            print("[compare]           for the runs AND the scoring, so no core idles while")
+            print("[compare]           another finishes a slow one")
+        # SAY WHICH ONE, UP FRONT. "Resume" and "start over" differ by however
+        # many hours are already on disk, and the difference is invisible until
+        # the run is either finished early or still going the next morning.
+        if NEW_FAULT_LIST:
+            print("[compare] start:    OVER -- NEW_FAULT_LIST renumbers the faults, so the")
+            print("[compare]           results on disk cannot be carried forward")
+        elif FRESH_START:
+            print("[compare] start:    OVER -- FRESH_START clears every .done marker in "
+                  "BOTH cases")
+        elif SKIP_DONE:
+            print("[compare] start:    RESUME -- finished scenarios are skipped in both cases")
+        else:
+            print("[compare] start:    RESUME -- markers kept, but SKIP_DONE is off, so "
+                  "every scenario is dealt out and skips itself")
+
+    # ---- PHASE 0 -- SAME EVENTS ON BOTH SIDES ------------------------------
+    # Before ANY simulation. A mismatched fault set does not crash: it produces a
+    # complete, readable, worthless comparison, and by then the hours are spent.
+    if NEW_FAULT_LIST and pipeline == "compare":
+        # Already caught before the plot pass; kept as a second line of defence
+        # in case a caller reaches PHASE 0 by another route.
+        print("[compare] NEW_FAULT_LIST is on but PIPELINE is \"compare\", which runs")
+        print("[compare] nothing. A new fault set needs both studies re-run against it --")
+        print("[compare] set NEW_FAULT_LIST = False, or PIPELINE = \"all\".")
+        return 2
+    if pipeline in ("all", "missing"):
+        if not check_fault_lists():
+            print("")
+            print("[compare] *** stopping before any simulation. ***")
+            print("[compare]     Nothing has been run and nothing changed. Fix the fault-set")
+            print("[compare]     configuration above and start again.")
+            return 2
+        # AND DOES THE SELECTION SELECT ANYTHING? Checked here, against the list
+        # phase 0 has just built, because a selection that matches nothing runs
+        # to completion with a clean exit code and an empty report.
+        if not check_selection_matches():
+            print("[compare] *** stopping before any simulation. ***")
+            print("[compare]     Every worker would start PSS/E, find nothing to run and")
+            print("[compare]     exit -- minutes of startup, an empty report, and an exit")
+            print("[compare]     code that says it worked.")
+            return 2
+        # AND DOES EVERY PROJECT'S SIZE FIT ITS FEEDERS? Checked here with the
+        # other things that cost a whole pass to discover. See the function.
+        if not check_feeder_ratings():
+            print("[compare] *** stopping before any simulation. ***")
+            print("[compare]     Nothing has been run. One project would have produced")
+            print("[compare]     no results at all on one side, which is much harder to")
+            print("[compare]     see afterwards than it is to fix now.")
+            return 2
+
+    # The live view starts BEFORE the studies do, so the first scenarios each
+    # side finishes are compared as soon as both have one.
+    _live_stop = _live_compare_start() if pipeline != "compare" else None
+    # THE WHOLE CAMPAIGN, BEFORE THE FIRST STUDY. Written once here so the plan
+    # exists from the outset -- what is already on disk and what this launch
+    # will run -- and then refreshed on its own timer while the studies go.
+    _plan_p = write_sweep_plan(note="(launch starting)")
+    if _plan_p:
+        print("[compare] campaign plan (every run, done and to-do): %s" % _plan_p)
+    # REFRESHED IN EVERY PIPELINE. It used to run only while simulating, so a
+    # PIPELINE = "compare" launch (re-score, re-plot) left the plan frozen at
+    # "(launch starting)" until the very end.
+    _plan_stop = _sweep_plan_start()
+
+    # ---- PHASE 1 -- SIMULATE BOTH CASES ------------------------------------
+    # A case that was NOT RUN has no exit code. None, not 2: the check below
+    # treats anything non-zero as "that study ended badly", and RUN_CASES =
+    # "base" would otherwise report the project case as having failed when it
+    # was deliberately left alone.
+    rb = rt = None
+    if pipeline == "all":
+        # BEFORE ANY SIMULATION. The studies write into the same folders as
+        # last time, so this is the only moment the previous run can be kept.
+        # ONLY WHEN THIS LAUNCH STARTS OVER. KEEP_PREVIOUS_RUNS renamed the
+        # project folders aside on EVERY launch, including a resume -- and a
+        # resume with FRESH_START = False and SKIP_DONE = True then found an
+        # empty folder, decided nothing was done, and re-simulated all 149
+        # scenarios of a project that had 137 finished in the folder that had
+        # just been renamed to __run1. Keeping the previous run is what you do
+        # before writing a NEW one; a resume writes into the same run, so there
+        # is nothing to keep it from.
+        if KEEP_PREVIOUS_RUNS and FRESH_START:
+            _banner("KEEPING THE PREVIOUS RUN")
+            print("[runs] the project case's existing results folders are renamed, not")
+            print("[runs] deleted, so this run starts clean and the last one survives.")
+            archive_previous_runs()
+        elif KEEP_PREVIOUS_RUNS:
+            print("[runs] FRESH_START is off: this launch RESUMES the run already on disk,")
+            print("[runs] so the results folders are left in place (KEEP_PREVIOUS_RUNS")
+            print("[runs] renames them aside only when a launch starts over).")
+        # LAST LAUNCH'S PARTS ARE NOT THIS ONE'S STATUS. A case that is not
+        # running this time would otherwise keep showing its old table, dated,
+        # beside a live one -- which is exactly the kind of half-true progress
+        # report that sent people looking for a worker that finished yesterday.
+        if LIVE_STATUS_ALL:
+            _lsa = _root_named(LIVE_STATUS_ALL)
+            for _q in glob.glob(_lsa + ".*.part") + [_lsa]:
+                try:
+                    os.remove(_q)
+                except Exception:
+                    pass
+            print("[compare] live status (both cases): %s" % _lsa)
+        _banner("PHASE 1 of 3 -- SIMULATING BOTH CASES")
+        print("[compare] This is the long part: two complete studies. Everything after")
+        print("[compare] it reads files and takes seconds, so if this is interrupted you")
+        print("[compare] can re-run with PIPELINE = \"compare\" and still get a report on")
+        print("[compare] whatever finished.")
+        # THE SAME PROJECT LIST ON BOTH SIDES. If the two launchers are left to
+        # their own RUN_PROJECTS and those differ, the studies are not comparable
+        # and nothing downstream would say so -- every unmatched project would
+        # read as "scored on one side only" as if it had crashed.
+        pjs = _panel_projects() or None
+        if pjs:
+            print("[compare] both cases will run: %s" % ", ".join(pjs))
+        else:
+            print("[compare] each launcher uses its own RUN_PROJECTS. If those differ the")
+            print("[compare] two studies are not comparable -- set PROJECTS here to force")
+            print("[compare] the same list on both sides.")
+        if RUN_IN_PARALLEL:
+            # SAY THE SESSION COUNT OUT LOUD. Two studies at N_WORKERS each is
+            # twice the PSS/E sessions of a single run, and the failure when
+            # there are not enough licences arrives minutes in, as a worker that
+            # dies on startup for no obvious reason.
+            _nw = []
+            for _c in (CASE_BASE, CASE_TEST):
+                try:
+                    _t = _read_text(os.path.join(_c["dir"], _c["script"]))
+                    _m = re.search(r'^N_WORKERS\s*=\s*(\d+)', _t, re.M)
+                    _nw.append(int(_m.group(1)) if _m else 0)
+                except Exception:
+                    _nw.append(0)
+            if all(_nw):
+                _banner("running BOTH studies at once -- %s = %d concurrent PSS/E "
+                        "session(s)" % (" + ".join(str(x) for x in _nw), sum(_nw)))
+            else:
+                # Could not read N_WORKERS from one of the launchers. Say that,
+                # rather than printing "= 0 concurrent sessions", which reads as
+                # a finding rather than a failure to look.
+                _banner("running BOTH studies at once -- N_WORKERS from each launcher")
+                print("[compare] (could not read N_WORKERS from %s)"
+                      % " and ".join(c["script"] for c, n in
+                                     zip((CASE_BASE, CASE_TEST), _nw) if not n))
+            if sum(_nw) > 8:
+                print("[compare] that is a lot of sessions. If workers start dying on")
+                print("[compare] launch, it is the licence count -- lower N_WORKERS in")
+                print("[compare] each launcher, or set RUN_IN_PARALLEL = False.")
+            res, ths, t_go = {}, [], time.time()
+            for case in _cases_to_run():
+                def _go(c=case):
+                    res[c["key"]] = run_study(c, projects=pjs, modes=MODES)
+                    # ONE CASE FINISHING LONG BEFORE THE OTHER IS THE SYMPTOM.
+                    # Both cases run the same events on the same machine, so a
+                    # base case that exits in four minutes while the project
+                    # case runs for five hours has not "finished" -- it has
+                    # stopped. Said at the moment it happens, while the other
+                    # is still going and something can be done about it.
+                    el = time.time() - t_go
+                    _other = "PROJ" if c["key"] == "BASE" else "BASE"
+                    if _other not in res:
+                        print("")
+                        print("[compare] === %s finished after %s (exit %s) ==="
+                              % (c["key"], _fmt_hms(el), res[c["key"]]))
+                        if el < 600:
+                            print("[compare] *** that is FAST for a whole study -- the other")
+                            print("[compare]     case is still running. Check %s"
+                                  % _res_root(c))
+                            print("[compare]     for RUN_PLAN_<project>.txt: it says what that")
+                            print("[compare]     case resolved to run, and 'nothing to run' is")
+                            print("[compare]     indistinguishable from 'finished' out here.")
+                        print("")
+                th = threading.Thread(target=_go)
+                th.start()
+                ths.append(th)
+            for th in ths:
+                th.join()
+            rb, rt = res.get("BASE", 2), res.get("PROJ", 2)
+        else:
+            for case in _cases_to_run():
+                _banner("running the %s study" % ("BASE" if case is CASE_BASE
+                                                  else "study WITH THE PROJECTS"))
+                res_rc = run_study(case, projects=pjs, modes=MODES)
+                if case is CASE_BASE:
+                    rb = res_rc
+                else:
+                    rt = res_rc
+        try:
+            audit_project_results("after simulating")
+        except Exception as e:
+            print("[compare] (project audit failed: %s)" % e)
+        if rb not in (0, None) or rt not in (0, None):
+            print("[compare] NOTE: base rc=%s, project rc=%s. Continuing -- a study that"
+                  % (rb, rt))
+            print("[compare]       ended badly may still have scored most of its faults,")
+            print("[compare]       and anything missing shows as scored on one side only.")
+
+    # ---- RUN WHAT IS MISSING ------------------------------------------------
+    # A project with results in one case only cannot be classified at all: every
+    # one of its faults comes out "scored on one side only", which is true and
+    # useless. This runs exactly the side that is missing, for exactly the
+    # projects that are missing it, and nothing else.
+    if pipeline == "missing":
+        todo = {"BASE": set(), "PROJ": set()}
+        for mode in MODES:
+            _c, ob, ot = discover_projects(mode)
+            for pj in ot:
+                todo["BASE"].add((pj, mode))    # only the project study has it
+            for pj in ob:
+                todo["PROJ"].add((pj, mode))
+        if not any(todo.values()):
+            print("[compare] RUN_MISSING: nothing is missing -- both studies have the")
+            print("[compare]              same projects. Going straight to the comparison.")
+        for key, case in (("BASE", CASE_BASE), ("PROJ", CASE_TEST)):
+            if not todo[key]:
+                continue
+            pjs = sorted(set(x[0] for x in todo[key]))
+            mds = sorted(set(x[1] for x in todo[key]))
+            _banner("%s is missing %s -- running it" % (case["label"], ", ".join(pjs)))
+            print("[compare] this SIMULATES: hours, not seconds. The comparison itself")
+            print("[compare] needs no simulation and is re-runnable at any time.")
+            rc = run_study(case, projects=pjs, modes=mds)
+            if rc not in (0, None):
+                print("[compare] *** that study ended rc=%s. Whatever it did finish will"
+                      % rc)
+                print("[compare]     still be compared; the rest stays one-sided. ***")
+
+    # ---- PHASE 2 -- MAKE SURE EVERY FINISHED STUDY HAS A REPORT -------------
+    # The comparison reads reports, not .out files. A study that simulated
+    # everything and never got its report phase would otherwise compare as if it
+    # had never run -- hours of finished work, invisible. Costs no simulation.
+    #
+    # THIS RUNS UNDER "compare" TOO. Scoring is not simulation -- it reads the
+    # .out files already on disk -- and "I have .out files from an earlier run
+    # and want to compare them" is the ordinary reason to choose "compare".
+    # Refusing to score there meant the run printed "*** NOT WRITTEN ***" and
+    # compared nothing, with the answer one REPORT_ONLY pass away and no hint
+    # that this was what it needed.
+    # ---- DID EVERY PROJECT THIS LAUNCH SIMULATED ACTUALLY FINISH? ----------
+    #
+    # A study whose queue ended early -- one pass failing, a launcher exiting,
+    # a build refused -- leaves that project with few or no results, and the
+    # comparison then runs on what is there and reports the missing scenarios as
+    # "scored on one side only". That is a true statement about the files and a
+    # misleading one about the projects, and it is easy to read a comparison
+    # that never covered EastFork as a comparison in which EastFork was fine.
+    #
+    # So the state of every project is stated plainly here, and under
+    # COMPARE_REQUIRE_COMPLETE a launch that SIMULATED stops rather than compare
+    # an unfinished set. PIPELINE = "compare" is exempt: comparing what is
+    # already on disk is exactly what it is for.
+    if pipeline != "compare":
+        try:
+            _short = []
+            print("")
+            print("[compare] " + "=" * 70)
+            print("[compare] WHAT EACH PROJECT HAS, BEFORE COMPARING")
+            print("[compare] " + "=" * 70)
+            print("[compare]   %-16s %-6s %8s %9s   %s"
+                  % ("project", "case", ".out", "expected", "state"))
+            for _pj in (compare_projects() or [""]):
+                for _md in (list(MODES) or ["spp"]):
+                    for _cs, _lbl in ((CASE_BASE, "BASE"), (CASE_TEST, "PROJ")):
+                        if _cs is CASE_BASE and RUN_CASES not in ("both", "base"):
+                            continue
+                        if _cs is CASE_TEST and RUN_CASES not in ("both", "proj"):
+                            continue
+                        _d = results_dir(_cs, _pj, _md)
+                        try:
+                            _n = len(glob.glob(os.path.join(_d, "outs", "*.out")))
+                        except Exception:
+                            _n = 0
+                        _exp = 0
+                        try:
+                            _fp = os.path.join(_d, "faults", "SPP_FAULTS.csv")
+                            if os.path.isfile(_fp):
+                                _exp = max(0, len(_read_text(_fp).splitlines()) - 1)
+                        except Exception:
+                            _exp = 0
+                        if _n == 0:
+                            _state = "NOT RUN"
+                        elif _exp and _n < _exp:
+                            _state = "PART DONE"
+                        else:
+                            _state = "done"
+                        print("[compare]   %-16s %-6s %8d %9s   %s"
+                              % (_pj or "-", _lbl, _n, _exp or "?", _state))
+                        if _state != "done":
+                            _short.append("%s %s (%s, %d of %s)"
+                                          % (_pj or "-", _lbl, _state, _n, _exp or "?"))
+            if _short:
+                print("[compare]")
+                print("[compare] *** %d run(s) did not finish: %s ***"
+                      % (len(_short), ", ".join(_short)))
+                if COMPARE_REQUIRE_COMPLETE:
+                    print("[compare]     COMPARE_REQUIRE_COMPLETE is on, so the comparison is")
+                    print("[compare]     NOT written from a partial set. Nothing is lost:")
+                    print("[compare]     run again and the finished scenarios are skipped, so")
+                    print("[compare]     only the missing work is done. Set")
+                    print("[compare]     COMPARE_REQUIRE_COMPLETE = False to compare anyway.")
+                    print("[compare] " + "=" * 70)
+                    return 2
+                print("[compare]     Comparing anyway (COMPARE_REQUIRE_COMPLETE = False):")
+                print("[compare]     their scenarios show as scored on one side only.")
+            print("[compare] " + "=" * 70)
+            print("")
+        except Exception as _e:
+            print("[compare] completeness check failed (%s) -- continuing" % _e)
+
+    _banner("PHASE 2 of 3 -- SCORING ANY RESULTS THAT HAVE NO REPORT")
+    if pipeline == "compare":
+        print("[compare] PIPELINE = \"compare\": this scores .out files that have no")
+        print("[compare] report yet. It runs NO simulation.")
+    # BEFORE SCORING, NOT AFTER. A .done marker written for a run that stopped
+    # early is the one thing the report phase cannot see past.
+    try:
+        retire_truncated_done()
+    except Exception as _e:
+        print("[compare] could not check the .done markers against the .out sizes: %s" % _e)
+    n = ensure_reports(MODES)
+    if not n:
+        print("[compare] every folder with .out files already has its criteria report.")
+
+    if _live_stop:
+        _live_stop()            # phase 3 writes the final one; no double writer
+    if pipeline != "compare":
+        _banner("PHASE 3 of 3 -- COMPARING")
+
+    # ---- IS EVERYTHING ON DISK ACTUALLY SCORED? -----------------------------
+    # Before a single report is read. Two checks, cheapest first:
+    #
+    #   1. a folder whose reports are OLDER than its parts\ -- the scoring
+    #      finished after the reports were written, so they describe less than
+    #      the parts hold. Rebuilt here from those parts (merge only).
+    #   2. an .out with no verdict anywhere -- listed by name, and merged once
+    #      in case the parts already hold it. Whatever is still unscored after
+    #      that is printed loudly, because the comparison cannot tell an
+    #      unscored fault from a clean one.
+    #
+    # Both cover the sweep and capacity folders too (..._dyr_Kqv2, ..._cap50),
+    # which is where a mitigation study actually spends its time.
+    try:
+        auto_remerge_stale_reports()
+    except Exception as _e:
+        print("[auto-merge] the staleness check failed (%s) -- comparing what is "
+              "on disk" % _e)
+    try:
+        verify_scoring_coverage()
+    except Exception as _e:
+        print("[coverage] the coverage check failed (%s) -- comparing what is "
+              "on disk" % _e)
+
+    # ---- RESULTS FROM A DIFFERENT FAULT LIST --------------------------------
+    # Ids collide across fault lists: F27 exists in both, and means a different
+    # event in each. Nothing in a results folder looks wrong, so this has to be
+    # checked explicitly, every time -- including in "compare", where no phase 0
+    # ran and the user may simply have edited the shared list by hand.
+    _tmpl = SHARED_FAULTS_CSV
+    for _c in (CASE_BASE, CASE_TEST):
+        _sp, _auto, _csvp = fault_config(_c)
+        if _csvp:
+            _tmpl = _csvp
+            break
+    # PER PROJECT. Each project's results are checked against ITS OWN list --
+    # checking them all against one list would report every other project's
+    # folders as stale, which is the fastest way to teach someone to ignore the
+    # warning that matters.
+    for _proj in (compare_projects() or [""]):
+        _shared_now = shared_faults_path(_proj, _tmpl)
+        if not os.path.isfile(_shared_now):
+            continue
+        _stale = [x for x in stale_results(_shared_now)
+                  if (not _proj) or _proj_of_results_dir(x[0]) == _proj]
+        if _stale:
+            print("")
+            print("[compare] *** RESULTS FROM A DIFFERENT FAULT LIST ***")
+            print("[compare]     current list: %s" % _shared_now)
+            for _d, _why in _stale:
+                print("[compare]     %s" % _d)
+                print("[compare]        %s" % _why)
+            print("[compare]     Fault ids collide across lists -- F27 exists in both and")
+            print("[compare]     means a different event in each -- so anything compared")
+            print("[compare]     from these folders is two different faults under one name.")
+            print("[compare]     Re-run those studies against the current list, or point")
+            print("[compare]     FAULTS_CSV back at the list they were run with.")
+            print("")
+
+    for mode in MODES:
+        common, only_b, only_t = discover_projects(mode)
+        wanted = [p for p in common if (not _panel_projects() or p in _panel_projects())]
+        if _panel_projects():
+            for p in _panel_projects():
+                if p not in common:
+                    print("[compare] *** %s (%s) has no results in both studies -- skipped ***"
+                          % (p, mode))
+        if not wanted:
+            print("[compare] no project has %s results in BOTH studies" % mode)
+            if only_b or only_t:
+                print("[compare]    base only:    %s" % (", ".join(only_b) or "(none)"))
+                print("[compare]    project only: %s" % (", ".join(only_t) or "(none)"))
+        else:
+            print("[compare] comparing %s: %s" % (mode, ", ".join(wanted)))
+    # ONE path builds a comparison, whether live or final -- see compare_now().
+    results, all_only_b, all_only_t = compare_now(quiet=False)
+    all_only_b, all_only_t = set(all_only_b), set(all_only_t)
+
+    # ---- CAPACITY HEADROOM ---------------------------------------------------
+    # After the comparison, because it re-runs the PROJECT case at reduced
+    # output and that is only worth doing once it is known which faults fail.
+    # HERE and not inside compare_now(): that function is also the live refresh,
+    # called from a daemon thread on a timer, and a sweep started from there
+    # would launch studies repeatedly while the main run was still going.
+    # ---- THE PROJECT SWITCHED OFF --------------------------------------------
+    # Before the sweep: it is one run per project, it answers "is this the
+    # machines at all", and the answer decides whether tuning their constants is
+    # worth the studies the sweep would spend.
+    # ---- A NEW PLANT BUILT AT THE POI ---------------------------------------
+    # Before project-off and the sweeps, and for the same reason project-off
+    # comes before the sweep: it answers a question about the ARRANGEMENT, and
+    # the answer decides whether tuning constants on the existing arrangement
+    # is the right thing to spend studies on.
+    if results and NEW_PLANT_RUN and pipeline != "compare":
+        _np_pj = _new_plant_projects([r["project"] for r in results])
+        for res in [r for r in results if r["project"] in _np_pj]:
+            try:
+                rows = run_new_plant(res["project"], res["mode"])
+                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_new_plant_report(res["project"], res["mode"], rows)
+                if NEW_PLANT_COMPARE:
+                    write_new_plant_comparison(res["project"], res["mode"])
+            except Exception as e:
+                print("[newplant] the new-plant run failed (%s) -- the comparison "
+                      "above is unaffected" % e)
+
+    if results and PROJECT_OFF_RUN and pipeline != "compare":
+        _off_pj = _project_off_projects([r["project"] for r in results])
+        for res in [r for r in results if r["project"] in _off_pj]:
+            try:
+                rows = run_project_off(res["project"], res["mode"])
+                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_project_off_report(res["project"], res["mode"], rows)
+                if PROJECT_OFF_COMPARE:
+                    write_project_off_comparison(res["project"], res["mode"])
+            except Exception as e:
+                print("[proj-off] the project-off run failed (%s) -- the comparison "
+                      "above is unaffected" % e)
+
+    # ---- .dyr PARAMETER SWEEP ------------------------------------------------
+    # Same placement and the same reason as the capacity sweep below: it runs
+    # full studies, so it belongs to the one-shot path in main() and not to
+    # compare_now(), which the live-refresh thread calls on a timer.
+    if results and (DYR_SWEEP or DYR_SWEEP_BY_PROJECT) and pipeline != "compare":
+        _sweep_pj = _dyr_sweep_projects([r["project"] for r in results])
+        # ONE PASS PER CAPACITY LEVEL. ("", None) first, so the ordinary
+        # full-output sweep is complete and written before a single reduced-
+        # output study starts -- an extra level that fails must not cost the
+        # sweep that would have run anyway.
+        for _ctag, _cscale in _cap_levels():
+            if _ctag:
+                _banner("REPEATING THE .dyr SWEEP AT %s PROJECT OUTPUT"
+                        % _cap_label(_ctag))
+            for res in [r for r in results if r["project"] in _sweep_pj]:
+                try:
+                    rows, variants = run_dyr_sweep(res["project"], res["mode"],
+                                                   cap_tag=_ctag, cap_scale=_cscale)
+                    with _cmp_into(res["project"] if COMPARE_BY_PROJECT else "",
+                                   ("cap%s" % _ctag) if _ctag else ""):
+                        write_dyr_sweep_report(res["project"], res["mode"], rows,
+                                               variants, cap_tag=_ctag)
+                        # THE SIDE-BY-SIDE MEASURED OVERVOLTAGE: base, project,
+                        # then each .dyr value, in pu -- the "does Kqv reduce it"
+                        # answer as numbers, next to the PASS/FAIL matrix.
+                        write_dyr_sweep_overvoltage(res["project"], res["mode"],
+                                                    variants, cap_tag=_ctag)
+                    if DYR_SWEEP_COMPARE:
+                        write_dyr_sweep_comparisons(res["project"], res["mode"],
+                                                    variants, cap_tag=_ctag)
+                except Exception as e:
+                    print("[dyr-sweep] sweep%s failed (%s) -- the comparison above "
+                          "is unaffected" % (_cap_note(_ctag), e))
+
+    # ---- THE PLANT'S OWN SIZE, one complete study per size ------------------
+    #
+    # PROJECT_MW carrying a LIST for a project is two studies, not two numbers.
+    # EmpirePrairie is the case it exists for: 604 MW, and the full 769 MW that
+    # fills the POI on its own.
+    if results and pipeline != "compare":
+        for res in results:
+            if not _project_mw_levels(res["project"]):
+                continue
+            try:
+                rows, levels = run_project_mw_sweep(res["project"], res["mode"])
+                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_project_mw_table(res["project"], res["mode"], rows, levels,
+                                           os.path.join(os.getcwd(),
+                                                        "PROJECT_MW_LEVELS.txt"))
+            except Exception as e:
+                print("[mw] the size sweep failed (%s) -- the comparison above is "
+                      "unaffected" % e)
+
+    # ---- TOTAL P AT THE POI, one complete study per level --------------------
+    if results and (POI_P_LEVELS or POI_P_LEVELS_PCT) and pipeline != "compare":
+        for res in results:
+            try:
+                rows, levels = run_poi_p_sweep(res["project"], res["mode"])
+                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_poi_p_table(res["project"], res["mode"], rows, levels,
+                                      os.path.join(os.getcwd(), "POI_P_LEVELS.txt"))
+                if POI_P_COMPARE:
+                    write_poi_p_comparisons(res["project"], res["mode"])
+                # The MEASURED overvoltage per level, side by side, the same
+                # table the .dyr sweep gets -- base | project | 983 MW | 786 MW
+                # ... so "does backing the POI down fix it" is answered in pu
+                # rather than in PASS/FAIL.
+                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_sweep_overvoltage(
+                        res["project"], res["mode"],
+                        [(_poi_tag(mw), os.path.join(_res_root(CASE_TEST), "%s_%s_%s"
+                            % (res["project"], res["mode"], _poi_tag(mw))))
+                         for mw in levels],
+                        "POI_P_MEASURED", "TOTAL P AT THE POI",
+                        [(_poi_tag(mw), "%.0f MW total at the POI" % mw)
+                         for mw in levels],
+                        "[poi-p]", noun="level")
+            except Exception as e:
+                print("[poi-p] sweep failed (%s) -- the comparison above is "
+                      "unaffected" % e)
+
+    # ---- EVERY VARIANT OF EVERY KIND, IN ONE TABLE ---------------------------
+    # Each sweep above writes its own axis's table. This writes ONE more over
+    # everything on disk at once -- .dyr values, POI MW and percentage levels,
+    # capacity levels, the new plant -- because the question "which of the
+    # things we tried actually brought the bus under 1.20" spans the axes, and
+    # answering it from four separate tables means doing the join by hand.
+    if results:
+        for res in results:
+            try:
+                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_all_variants_overvoltage(res["project"], res["mode"])
+            except Exception as e:
+                print("[variants] the all-variants table failed (%s) -- the "
+                      "per-sweep tables above are unaffected" % e)
+    # ---- EVERY .dyr VALUE AGAINST THE BASE, ONE WORKBOOK -------------------
+    # In EVERY pipeline. A "compare" launch used to skip the sweep entirely, so
+    # the values already on disk had no cross-value answer; a sweep launch wrote
+    # its tables per project and per value and nothing over all of them. The
+    # matrix and per-value folders are rebuilt from disk only when this launch
+    # did not just write them.
+    if results:
+        try:
+            compare_dyr_sweeps_on_disk(results, tables=(pipeline == "compare"), quiet=True)
+        except Exception as e:
+            print("[dyr-sweep] the cross-value workbook failed (%s) -- everything "
+                  "above is unaffected" % e)
+
+    # ---- ANY .out THAT STILL HAS NO PDF -------------------------------------
+    # After the simulations and before the comparison, so the plots exist by the
+    # time anyone opens the folder the comparison points at.
+    if pipeline in ("all", "missing"):
+        try:
+            plot_missing_everywhere(pipeline, after_runs=True)
+        except Exception as e:
+            print("[compare] the catch-up plot pass failed (%s) -- the results "
+                  "and the comparison are unaffected" % e)
+
+    # ---- SPP'S TWO SURPLUS SCENARIOS, one complete study each ---------------
+    #
+    # BEFORE the capacity and POI sweeps in the reading order of this file, and
+    # deliberately its own step: these are not a sweep of one study, they are
+    # the two systems BP-7250 7.6 defines, and each is compared against the
+    # base on its own terms.
+    if results and SURPLUS_SCENARIOS and pipeline != "compare":
+        for res in results:
+            try:
+                run_surplus_scenarios(res["project"], res["mode"])
+            except Exception as e:
+                print("[surplus] the scenario runs failed (%s) -- the comparison "
+                      "above is unaffected" % e)
+    if results and SURPLUS_SCENARIOS:
+        for res in results:
+            try:
+                compare_surplus_scenarios(res["project"], res["mode"])
+            except Exception as e:
+                print("[surplus] the scenario comparisons failed (%s)" % e)
+
+    if results and CAPACITY_LEVELS and pipeline != "compare":
+        for res in results:
+            try:
+                rows = run_capacity_sweep(res["project"], res["mode"])
+                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_capacity_report(res["project"], res["mode"], rows)
+                    try:
+                        write_capacity_plot(res["project"], res["mode"], rows)
+                    except Exception as _e:
+                        print("[capacity] the headroom plot failed (%s) -- the "
+                              "table is unaffected" % _e)
+                if CAPACITY_COMPARE:
+                    write_capacity_comparisons(res["project"], res["mode"])
+            except Exception as e:
+                print("[capacity] sweep failed (%s) -- the comparison above is "
+                      "unaffected" % e)
+
+    # EVERY STUDY THIS LAUNCH WAS GOING TO RUN HAS NOW RUN. The timer stops and
+    # the plan is written once more, so the file left on disk is the finished
+    # state rather than whichever refresh happened to land last.
+    if _plan_stop:
+        _plan_stop()
+    _plan_p = write_sweep_plan(note="(launch finished)")
+    if _plan_p:
+        print("[plan] -> %s" % _plan_p)
+
+    # ---- EVERY RUN ON DISK, IN ONE TABLE ------------------------------------
+    # Last of all, so it sees the capacity folders this run just produced as
+    # well as the archived earlier runs. Independent of the sweep: with no
+    # levels set it still tabulates this run against the ones kept before it.
+    if results:
+        # RUNS AS COLUMNS. Last, so every sweep folder this launch produced is
+        # on disk and gets a column.
+        _seen_m = set()
+        for _res in results:
+            _k = (_res["project"], _res["mode"])
+            if _k in _seen_m:
+                continue
+            _seen_m.add(_k)
+            try:
+                with _cmp_into(_res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_run_matrix(_res["project"], _res["mode"])
+            except Exception as e:
+                print("[matrix] the side-by-side table could not be written (%s)" % e)
+            # WHICH RUN TO SUBMIT, per fault. Reads the same comparisons the
+            # matrix does and ranks them, so a cell here and a cell there
+            # cannot disagree.
+            try:
+                with _cmp_into(_res["project"] if COMPARE_BY_PROJECT else ""):
+                    # NOT GATED BY SIMPLE_OUTPUT. This is the one file that
+                    # ranks the runs per fault and says which one to submit;
+                    # hiding it with the auxiliary tables left a sweep with
+                    # no recommendation at all.
+                    write_best_case_report(_res["project"], _res["mode"])
+            except Exception as e:
+                print("[best] the best-case report could not be written (%s)" % e)
+        try:
+            write_all_runs_comparison(results)
+        except Exception as e:
+            print("[runs] the all-runs table could not be written (%s)" % e)
+        if COMPARE_RUNS:
+            _seen = set()
+            for _res in results:
+                _k = (_res["project"], _res["mode"])
+                if _k in _seen:
+                    continue
+                _seen.add(_k)
+                try:
+                    write_run_vs_run(_res["project"], _res["mode"])
+                except Exception as e:
+                    print("[runs] run-against-run failed (%s) -- the comparison above "
+                          "is unaffected" % e)
+
+    if not results:
+        print("")
+        print("[compare] *** nothing was compared. Here is what is on disk. ***")
+        print_inventory()
+        print("")
+        print("[compare] A project is comparable only when BOTH studies have a folder for")
+        print("[compare] it AND that folder holds SPP_CRITERIA_REPORT. Reading the table:")
+        print("[compare]")
+        print("[compare]   folder in one case only     -> set RUN_MISSING = True and re-run;")
+        print("[compare]                                  it runs just the missing side")
+        print("[compare]   .out files but NO report    -> the runs finished, the REPORT phase")
+        print("[compare]                                  did not. Run that launcher with")
+        print("[compare]                                  REPORT_ONLY = True -- no simulation")
+        print("[compare]   mode is not %-14s -> MODES here must match FAULT_MODES in"
+              % ("/".join(MODES) + ","))
+        print("[compare]                                  the launcher that produced it")
+        print("[compare]   no results\\ folder          -> that study has never run")
+        print("[compare]")
+        print("[compare] Nothing was deleted or overwritten by this run -- it only reads.")
+        print("[compare] Nor by the launchers: FRESH_START and CLEAR_BADOUT remove MARKER")
+        print("[compare] files (.done, .attempts, .badout, status) and never .out files or")
+        print("[compare] result folders. A results folder that has vanished was removed from")
+        print("[compare] outside these scripts, or the case folder now points somewhere new.")
+        return 1
+
+    p = cmp_path("COMPARISON_SUMMARY", "txt")
+    print("")
+    try:
+        print(_read_text(p))
+    except Exception:
+        # A console that cannot render a character must not lose the run. The
+        # file on disk is the deliverable and it is already written.
+        print("[compare] (the summary is at %s -- this console cannot print it)" % p)
+    return 0
+
+
+if __name__ == "__main__":
+    # THE TIME TABLE IS THE LAST THING PRINTED, whatever main() returns and
+    # however it leaves -- a run that stopped early should still say how long
+    # it spent getting there.
+    _T0 = time.time()
+    _rc = 1
+    try:
+        _rc = main()
+    finally:
+        try:
+            _print_phase_times(time.time() - _T0)
+        except Exception:
+            pass
+    sys.exit(_rc)
+
+
+# ============================================================================
+# NOTES ON THE SETTINGS
+#
+# Kept word for word from the control panel, which now carries one line per
+# setting. Nothing here is read by the program; it is why the values are
+# what they are, in the order they were written.
+# ============================================================================
+# WHICH PROJECTS, AND IN WHAT ORDER. Each is a COMPLETE study of its own --
+# build, simulate, report -- run one after another into its own results folder,
+# on BOTH cases, so the base and the project side always cover the same set.
+#
+# [] does NOT mean "all four" when simulating: it means each launcher falls back
+# to its own RUN_PROJECTS, which is one project. Naming them here is what makes
+# the run cover all four and what keeps the two sides comparable.
+
+# ---- THE DECK EACH CASE READS ----------------------------------------------
+# None = the study script's own SOURCE_CASE / DYR_FILE. A bare name is a file
+# in that case's folder; an absolute path is used as it stands, so the two
+# cases may read from different folders. Set here so a comparison cannot be
+# run against two decks that were never meant to be compared, and so changing
+# deck is one edit rather than two.
+#
+# A named file that is not there STOPS the run. Falling back to the study
+# script's own would study the previous deck under the new one's name.
+
+# ---- ONE DECK, BOTH CASES: THE BASE CASE *IS* THE DECK ----------------------
+#
+# THE STUDY THIS IS FOR. There is a single deck --
+# DIS2201-25SP-G03-CQ.sav in the Projects folder -- and it holds the system
+# WITHOUT any of the new BESS. That file is the base case. Each project's case
+# is then MADE from it, one project at a time: the study script adds that one
+# BESS, dispatches the plant to the POI total, and puts the area back where it
+# was. There is no second deck to build and none to keep in step.
+#
+# HOW THE TWO SIDES STAY APART. They read the same file and write different
+# ones:
+#
+#   base case      ENABLE_BESS = False in z4_spp_b_con.py, so NO .sav is ever
+#                  saved -- it reads the deck, converts in memory, and writes
+#                  DIS2201-25SP-G03-CQ.cnv/.snp/.cnl into the Base folder
+#   project case   ENABLE_BESS = True in z4_spp_p_con.py, so the build writes
+#                  DIS2201-25SP-G03-CQ_BESS_<project>_<MW>MW.sav/.cnv/.snp
+#                  into the Projects folder -- one set per project, beside the
+#                  untouched original
+#
+# So the deck this names is READ by both and OVERWRITTEN by neither, and each
+# case keeps its own results\ folder because BASE_FOLDER and PROJ_FOLDER are
+# still two folders. Both of those matter: point the two cases at one FOLDER
+# and the second project's results would land on the first's.
+#
+# "" turns this off and BASE_SAV/PROJ_SAV above are used as written.
+
+# ---- ADD A PROJECT, OR REDEFINE ONE, WITHOUT EDITING THE STUDY SCRIPTS ------
+# A project lived only in BESS_PROJECTS inside BOTH study scripts, so adding
+# one meant two edits kept in step. Send it from here instead.
+#
+# Matched BY NAME: a name already in the study script's list is MERGED onto
+# that row -- {"name": "SantaFe", "mw": 600} changes the rating and keeps the
+# POI and feeders -- and a name not in it is added. Nothing is removed, so a
+# short list here cannot silently delete the projects it does not mention.
+#
+#   ADD_PROJECTS = [
+#       {"name": "WestMesa", "area": 534, "poi": 765911, "mw": 300,
+#        "feeders": [765912, 765922], "disable_existing": True},
+#   ]
+#
+# feeders may be [] when NEW_PLANT_RUN builds the plant instead -- the unit
+# buses it creates become the feeders.
+# >>> RUN WHAT IS ABSENT, THEN PLOT, SCORE AND COMPARE EVERYTHING.
+#
+#     "missing" simulates only the case/project pairs that have NO results
+#     folder -- EmpirePrairie's project case, and any base-case folder that was
+#     never run -- and leaves the finished ones alone. SKIP_DONE keeps it off
+#     scenarios that already have a .done and a .out, so nothing that took
+#     twenty-nine minutes is done twice. Then every .out on disk without a PDF
+#     gets one, everything is scored, and the comparison is written.
+#
+#     "compare" is the same WITHOUT the simulation, for when there is nothing
+#     left to run.
+# READ WHAT IS ON DISK. No PSS/E simulation starts: every .out already there
+# is scored, any that has no PDF gets one, and the comparison is written.
+# CHANGED FROM "all" -- and this is the one setting that had to change.
+# "all" SIMULATES both cases from the start: another twelve hours, and it would
+# overwrite the .out files you already have. You asked not to run the study
+# again, so this reads what is on disk: it draws the missing PDFs, scores the
+# .out files, and compares. It starts no PSS/E simulation at all.
+#     "compare"  read the .out files on disk -- plots, scores, compares  <-- now
+#     "missing"  the same, but ALSO simulates a case whose folder is absent
+#     "all"      simulate both cases from scratch, then compare
+# HARD CAP on plotters running at once,
+# ACROSS EVERY FOLDER. PLOT_WORKERS was applied per folder, so four projects on
+# two cases turned "3 per case" into 21 processes at once -- each holding about
+# 550 MB of a 113 MB .out in a 32-bit address space. That is why they died. This
+# is the number that actually matters; 0 = fall back to PLOT_WORKERS x 2.
+# whose plotter is no longer running. A fleet that dies leaves one claim per
+# process, and every later plotter then skips those files with "another plotter
+# has it" -- for good. Clearing them by hand is eight folders across two case
+# trees. A claim whose owner is still running, or belongs to another machine, is
+# never touched.
+
+# times, halving the plotter count each round (3 -> 2 -> 1). A plotter that dies
+# reading a 113 MB .out dies because of how many plotters are reading at once,
+# so the retry is worth nothing unless the fleet shrinks with it. 1 = one pass.
+# 2, NOT 3. Three per case is six 32-bit processes each holding ~550 MB of a
+# 113 MB .out, and that is what killed them: 21 .out files, 11 PDFs. With no
+# simulation competing for memory two can run comfortably, and PLOT_ROUNDS_MAX
+# steps down to one if any still die.
+# A ~2,000-panel PDF takes the pure-Python writer the better part of an hour, so
+# ONE plotter drew eleven plots in twelve hours while ninety waited. These run
+# side by side, each taking the next .out nobody has claimed.
+#
+# IT IS MEMORY, NOT CPU, THAT DECIDES HOW MANY ARE WORTH HAVING. A plotter starts
+# no PSS/E session and loads no case, but reading one ~110 MB .out turns 7,858
+# channels x 3,624 samples into 28.5 million Python float objects -- roughly
+# 550 MB in a 32-bit process, before anything is drawn. Ten of those at once is
+# ~5.5 GB of live objects; past the point where Windows starts paging, every
+# plotter crawls and the 32-bit ones hit their 2 GB ceiling and die.
+#
+# 5 per case was tried on the 12-core machine and IT IS TOO MANY: the plotters
+# died with 0xC0000005 (access violation -- a 32-bit process that could not get
+# the memory it asked for) every eight to thirty minutes, all ten of them, for
+# two hours. 3 per case is the setting that came out of that. Three plotters
+# that stay up beat five that keep falling over -- 64 PDFs in two hours was the
+# five-per-case rate, and most of the wall-clock went into restarts.
+#
+# Raise it only if the console shows NO "restarting it" lines for an hour.
+# restarted after its process exits with files still to draw. A lost plotter used
+# to just shrink the fleet -- "10 plotter(s) working" becoming 8, then 5, then a
+# pass that reported itself finished with 220 of 221 PDFs undrawn. Now the slot
+# is refilled, the exit code is printed, and the per-file claims mean the new
+# process picks up the files the dead one never reached.
+# An .out whose worker died after the simulation but before the run was marked
+# done leaves a complete file with no PDF, and nothing would ever draw one --
+# the run loop only revisits scenarios that ARE marked done. With this on, a
+# "missing" or "compare" pass draws a plot for every .out that lacks one, without
+# consulting .done and without starting a simulation. Set False to skip it.
+
+
+
+                             #   each in results\<proj>_<mode>_poi1000\ etc.
+                             #   "capacity" (default) | "present" | "equal"
+                             #   the POI, reached by iteration; the BESS is grossed up
+                             #   until its own share at the POI is its rating.
+                             # "machines" = the sum of the plant's machine P, which
+                             #   meters ~2-3 % lower after collector/GSU/MPT losses.
+                             # per project.  Generator buses that belong to a plant but are NOT
+                             # on its feeder list -- e.g. [765910, 765920, 765930].
+                             # They take their share of the remainder and are kept
+                             # out of the area rescale so they are not moved twice.
+                             #   "rated" (default) = on their rating, so the BESS is
+                             #     always at capacity and the existing units add the
+                             #     rest;  "as-is" = leave them where the case has them.
+                             #   A capacity level still applies: at 50 % "rated"
+                             #   means half the rating.
+
+# False: nothing is being simulated and every result on disk is wanted.
+# False because nothing is being simulated and everything on disk is wanted.
+# project-machine labels disagree with the rest of the folder -- pages drawn
+# under an earlier build (e.g. the BESS builder's 999001.. buses) that the plot
+# pass would never replace, because it only draws where there is NO PDF.
+# Renamed to *.oldbuild, never deleted. False to leave them alone.
+# markers of scenarios whose .out is far shorter than the rest of the folder.
+# The report's only test for "did this finish" is whether a .done exists, and
+# the plot pass wrote markers for runs that stopped at a third of the length.
+# Judged by file size alone -- os.path.getsize, nothing is opened -- and the
+# marker is RENAMED to .done.truncated, never deleted. False to leave them.
+# folder's median .out size. A complete set spans a few percent; a run that
+# stopped at 10.5 s of 30.2 s is at 35%. Nothing sits between.
+# OFF, AND IT HAS TO BE. True builds a brand-new fault list and RENUMBERS it,
+# so the C01..C20 ids already on disk stop matching the scenarios they name --
+# and it retires the old results with them. There are 20 finished .out files
+# per project; nothing about the fault set may move now.
+# SET TO False FOR THIS RUN, DELIBERATELY. With PIPELINE = "compare" the two
+# are contradictory and the run refuses to start: a brand-new list renumbers
+# the scenarios and retires the results already on disk, so it means nothing
+# unless both studies are re-run against it. Comparing .out files you already
+# have means judging them against the list they were RUN with, which is this.
+# Set it back to True only together with PIPELINE = "all".
+
+# ---- CORES AND OUTPUT ------------------------------------------------------------
+# SCORING DIED ON THESE FILES TOO -- 15 of 20 and 17 of 20 scored. A scoring
+# shard reads the same 113 MB .out as a plotter and hits the same ceiling, so
+# it is held to 2 rather than "auto" for this pass.
+
+# A SCENARIO IS NEVER TAKEN FROM A WORKER THAT IS STILL RUNNING.
+#
+# This number used to be the whole answer, and it could not be a good one. It
+# infers death from silence, and a 30 s simulation with ~7,800 channels takes
+# 30-45 minutes here -- longer on a loaded machine or one with fewer cores. Any
+# value short enough to recycle a crash quickly was short enough to take a
+# scenario off a worker that was most of the way through it.
+#
+# The queue now asks the operating system instead. Every claim file records the
+# owner's PID and host; if that process is still alive, the scenario is not
+# available and the claim's age is never even looked at. Work is only reclaimed
+# when its owner is provably gone -- and then immediately, without waiting.
+#
+# So this is now a backstop for the one case liveness cannot answer: a claim
+# written by a DIFFERENT MACHINE, or one caught empty in the instant between
+# being created and being written. An hour is deliberately longer than the
+# slowest scenario you have seen.
+# A FLOOR UNDER EVERY WATCHDOG, not another watchdog. The launcher keeps several
+# silence limits -- worker hang, build/report phase, report shard -- and any one of
+# them set too low is enough to kill a worker that is merely deep inside a blocking
+# psspy call. This is checked before all of them and overrides all of them: inside
+# 50 minutes of silence nothing is killed, whatever the individual settings say, and
+# whatever NEVER_KILL_WORKERS is set to.
+# The launchers watch for silence and will now REPORT it instead of acting on it.
+# A worker inside one blocking psspy call prints nothing by definition, so the
+# silence watchdogs were killing healthy work on slow machines. With this on, a
+# worker ends when it exits by itself. The cost: a genuinely frozen session (a
+# Windows error dialog nobody clicks) holds its slot until you stop the run.
+
+# ---- .dyr PARAMETER SWEEP (one complete study per value -- see the notes below) ---
+
+# ---- A BRAND-NEW PLANT AT THE POI (new buses, GSU, collector, MPT, tie) ----------
+# The opposite question to PROJECT_OFF. That one takes the machines out; this
+# one BUILDS A FACILITY -- its own unit buses, a GSU each, a collector, a main
+# power transformer and a tie to the POI -- and adds it to the system without
+# switching anything off. One extra study per project, into ..._newplant, and
+# it becomes a column of the matrix like any other run.
+#
+# The equipment is described in NEW_PLANT below and sent to the study whole, so
+# the impedances that decide the voltage rise from the machines to the POI are
+# set HERE and recorded in NEW_PLANT.txt beside that run's results.
+
+# ---- PROJECT OFF (the same case, project machines out of service) ----------------
+
+# ---- HOW MUCH EACH PLANT PUTS ON THE SYSTEM --------------------------------------
+# PROJECT_MW says which rated size to study, for a project whose row in
+# BESS_PROJECTS lists more than one.
+#
+#     PROJECT_MW = {"EmpirePrairie": 604}          one size
+#     PROJECT_MW = {"EmpirePrairie": [604, 769]}   two, and two complete studies
+#
+# A LIST IS A SWEEP, NOT A CHOICE. Each entry gets its own complete study --
+# build, flat run, every fault -- into its own results folder (..._mw604,
+# ..._mw769), and a PROJECT_MW_LEVELS.txt in the comparison folder puts the
+# verdicts side by side, with the faults that pass at the lower size and fail at
+# the higher one named on their own. That last list is the question the two
+# sizes were chosen to ask.
+#
+# It has to be a complete study each time, not a re-score: the plant's rating
+# changes the dispatch of the whole area. The existing machines at the POI make
+# up whatever is left of POI_P_TARGET_MW, and every other machine in the area
+# moves to hold the area total where it was. Nothing about the 604 MW study can
+# be read off the 769 MW one.
+#
+# EMPIREPRAIRIE IS THE CASE THIS EXISTS FOR, and what went wrong before it did.
+# Its two scenarios are 604 MW and its full 769 MW. 769 is ALSO the POI total,
+# so at the upper size the plant fills the interconnection on its own and the
+# existing machines sit at zero; at 604 they make up the remaining 165 MW.
+#
+# The panel used to say 804. That was above the interconnection AND above the
+# study script's 200 MW per-feeder cap (804 / 4 feeders = 201), and that cap is
+# a hard error raised at IMPORT -- so every process of that project's
+# PROJECT-case pass died before main(), the launcher retried the build three
+# times, and the pass left no results folder at all while the base case ran the
+# same project normally. From outside it looked exactly like "it did not run
+# EmpirePrairie", with the traceback in a child process's log for a pass that
+# left nothing behind. check_feeder_ratings() now tests every size a project
+# will be studied at, before anything is launched, and stops with the numbers.
+#
+# POI_P_TARGET_MW is the OTHER number, and it is not this one: the total the POI
+# meter must read, which the plant and the existing machines make up between
+# them. POI_P_LEVELS sweeps THAT the same way, for when the interconnection
+# total is what varies rather than the plant.
+
+# ---- SYSTEM ADJUSTMENTS (SPP's "pre-existing issues") ----------------------------
+# An SPP interconnection study report ends with a paragraph like this one:
+#
+#     The following system adjustments were made to address pre-existing issues
+#     that are not attributed to the modification request:
+#       1. Disable drive train model (WTDTA1) for busses 51565 and 515652
+#       2. Multiple overvoltage protection relays were disabled
+#       3. Minute impedance changes to faulted lines to help PSSE fault analysis
+#          numerical stability
+#       4. Acceleration factors of multiple faults were adjusted
+#
+#     The modified power flow models and associated dynamic database were
+#     initialized (no-fault test) to confirm that there were no errors in the
+#     initial conditions of the system and the dynamic data.
+#
+# These settings are that paragraph, made into something the study does rather
+# than something a person remembers to do -- and, just as important, made into
+# something the study REPORTS. Each of the five maps onto a setting here:
+#
+# 1 and 2 -- DYR_DISABLE.
+#   A model that will not initialise, and a relay that picks up on a fault it
+#   was never meant to see and trips a plant nowhere near the disturbance. Both
+#   are fixed the same way: the record is REMOVED from the deck fed to dyre_new,
+#   so PSS/E never loads it. That is exactly what the deck's own
+#   000_Disable_532957_WTDTA1.idv does -- and this study already applies that
+#   one -- but only for buses somebody else chose, months ago, for a different
+#   case. This is the same operation for the ones THIS run finds.
+#
+#       DYR_DISABLE = [
+#           ("WTDTA1", 51565),           that model, that bus
+#           ("WTDTA1", 515652),
+#           (52868905, "1", "VTGTPAT"),  bus, id, model -- one relay instance
+#           "@OV_RELAYS",                every voltage relay in the deck
+#       ]
+#
+#   A bare string is a model name and means every instance. A 2-tuple is the
+#   model and the bus, either way round. A 3-tuple is (bus, id, model), the same
+#   order DYR_EDITS uses. The families "@OV_RELAYS", "@FREQ_RELAYS", "@RELAYS"
+#   and "@DRIVE_TRAIN" expand to the model names.
+#
+#   The original .dyr is never modified: a new deck is written beside it, named
+#   for the project and the run, and that deck IS the record of what was
+#   simulated. Every record removed is listed on the console and in
+#   DYR_DISABLED.txt in that run's results folder.
+#
+#   THE THREE THE DECK USED TO APPLY BY ITSELF ARE GONE. The study script's
+#   DYRECHANGE_IDV list carried 000_Disable_532957_WTDTA1.idv,
+#   000_Disable_534023_WTDTA1.idv and 000_Disable_WTDTA1.idv -- the last of
+#   which disables EVERY wind drive train in the deck -- and applied all three
+#   on every run, silently, for buses chosen months ago for a different case.
+#   They have been removed. Nothing disables a model now unless it is written
+#   here. To put them back:
+#
+#       DYR_DISABLE = [("WTDTA1", 532957), ("WTDTA1", 534023)]
+#       DYR_DISABLE = ["WTDTA1"]                  the system-wide one
+#
+#   DYR_DISABLE_STRICT stops a run whose disable matched NOTHING. That is the
+#   dangerous case and the reason the setting exists: the model is still in the
+#   deck and still running, while the results are filed under a study where it
+#   was disabled.
+#
+#   DYR_DISABLE_APPLY_TO is "both" and should stay there. A pre-existing problem
+#   is pre-existing in the BASE case as well. Disable a model on one side only
+#   and its behaviour vanishes from that side alone -- the comparison then
+#   reports the difference as something the project did.
+#
+# 3 -- FAULT_LINE_MIN_X_PU and FAULT_LINE_X_WARN_PU.
+#   A line whose series reactance is at or near zero -- a breaker tie, a bus
+#   section, a jumper modelled as a branch instead of as a bus merge -- is
+#   already a short circuit in the admittance matrix. Fault one end of it and
+#   the fault reaches both ends at once; trip it while the fault is on and a row
+#   of that matrix goes singular. What comes out is not a crash: it is pages of
+#   "Network not converged", a solution limping on the last good iterate, and
+#   results that look perfectly ordinary.
+#
+#   FAULT_LINE_X_WARN_PU is the CHECK, and it is on. Every line a scenario
+#   faults or trips is measured first, and anything under it is named. That
+#   costs nothing and it is how you find out whether this study has the problem
+#   at all.
+#
+#   FAULT_LINE_MIN_X_PU is the FIX, and it is off (0.0). Set it to 0.0001 and
+#   anything below that is raised to it, sign kept, R and B untouched, before
+#   the dynamics initialise -- and the case goes back to the snapshot at the
+#   start of the next scenario, so a nudge never leaks between scenarios. Off by
+#   default because changing an impedance changes the case, and that has to be a
+#   decision rather than a side effect. Both cases get the same floor, applied
+#   from the same shared fault list: nudging one side only would mean the
+#   comparison was measuring the nudge.
+#
+# 4 -- SOLVER_RETRY_ON_NONCONV, SOLVER_RETRY_MAX_NONCONV, SOLVER_RETRY_RECIPES.
+#   A scenario that produces more than SOLVER_RETRY_MAX_NONCONV "Network not
+#   converged" steps is re-run from the top on the next recipe in the ladder:
+#   200 iterations, then 200 at ACCEL 0.30, then 400 at 0.20, then 600 at 0.10.
+#   Only MAXITER and ACCEL are ever touched -- tolerance and time step keep
+#   whatever the .idv set, so a retried scenario is still solved to the same
+#   accuracy on the same time step as every other one. A mismatch of 1.0 or more
+#   stops the retries rather than spending them: that is genuine divergence and
+#   no solver setting fixes it.
+#
+#   OFF BY DEFAULT, AND SENT FROM HERE. The machinery lived in the study script
+#   with its own switch, which meant it was neither in this panel nor obviously
+#   off. Re-solving a hard event on different settings is a decision about the
+#   study -- a run that quietly re-solved its difficult scenarios and reported
+#   them beside the ones that converged first time is presenting two different
+#   studies as one -- so it is a setting here, it reaches BOTH cases, and the
+#   run says on startup whether it is on.
+#
+#   THE FIRST RECIPE IS ATTEMPT ONE, not a fallback: with retries on, every
+#   scenario is solved at 200 iterations and the case's own 60 is never tried.
+#   That is why the ladder starts with the mildest change there is. Write
+#   SOLVER_RETRY_RECIPES = [("case settings", None, None), ("iterations 200",
+#   200, None), ...] if you want the case's own parameters to be attempt one.
+#
+#   Which recipe worked for which event is in the run summary, and in the
+#   adjustments paragraph.
+#
+# 5 -- already here: the FLAT RUN. Every case runs FLAT_RUN_S seconds with no
+#   disturbance before any fault is applied, and "Initial conditions: no drift"
+#   is one of the scored criteria. That IS SPP's no-fault initialisation test.
+#
+# ADJUSTMENTS_REPORT collects all of it. Every change of this kind appends one
+# line to SYSTEM_ADJUSTMENTS.txt in the run's results folder -- by append,
+# because the workers are separate processes and none of them can see the
+# others' memory -- and the run summary prints them under a SYSTEM ADJUSTMENTS
+# heading, numbered, repeats collapsed, in SPP's own shape. A study whose
+# adjustments are not written down is a study nobody can check.
+
+# ---- SIMULATION LENGTHS (seconds of SIMULATED time) ------------------------------
+# HOW OFTEN THE CHANNELS ARE WRITTEN, in solution steps.
+#
+#   ~7,800 channels, DELT = 1/4 cycle, a 30.2 s run
+#     RUN_NPLT = 2   sample every 0.0083 s (half a cycle)  ->  113 MB per scenario
+#
+# KEEP THIS AT 2. Coarser sampling misses the sub-cycle detail the SPP checks
+# are read from -- the recovery instant, the overshoot peak, the first swing --
+# and reports a number that is not what the system did. Disk and scoring time
+# are the price of a correct answer. Both cases are sampled identically; two
+# studies compared at different resolutions is not a comparison.
+
+# ---- THE FAULT SET ---------------------------------------------------------------
+# ---- WHAT SPP THEMSELVES SAID, 2026-08 --------------------------------------
+# Asked directly how P1 and P4 events are defined, SPP answered:
+#
+#   CLEARING   "6 cycles for 345 kV and above, and 7 cycles for 230 kV and
+#              below." Where an issue is seen they confirm with the host TO and
+#              use the TO-submitted time, which may be LOWER. -> the study
+#              scripts' own SPP_CLEAR_BY_KV table is already this; leave
+#              NORMAL_CLEAR_CYCLES None unless you want one time at every kV.
+#   RECLOSE    20 cycles by default. NOT applicable to a P1 that takes out a
+#              transformer (P1.3), and removed where it would island a
+#              generator.
+#   P4         16 cycles. Elements from the ITP P4 steady-state definitions and
+#              TO fault sheets; where a busbar has none -- which is every busbar
+#              here, we hold neither file -- two proxy events: the WHOLE busbar,
+#              and the TWO HIGHEST-LOADED branches.
+#   FILES      "The fault descriptions in the stability results sheet provide
+#              all details needed to recreate the faults as an IDV. IDVs for
+#              specific faults of interest can be provided upon request."
+#              -> worth asking for, on the faults that decide the outcome. Put
+#              what they send in FAULTS_TABLE and add "table" to MODES.
+#
+# Every one of these is settable from here. None = leave the study scripts'
+# own value alone, which already matches the answer above.
+                             # -1 all but one | 2 every pair | 1 one | 0 whole bus | "all"
+                             # the 6/7 table -- normally leave None)
+                             # would strand a machine; False = emit it regardless
+
+# ---- CUSTOM 3PH / SLG FAULTS  (MODES = ["custom"]) -------------------------------
+# >>> CLEARING TIME, AS SPP SETS IT -------------------------------------------
+#
+# A table by fault type. None means "SPP's kV rule for that bus" --
+# SPP_CLEAR_BY_KV, which is [(345, 6), (0, 7)]: SPP's own answer is 6 cycles at
+# 345 kV and above, 7 at 230 kV and below. SLG here is the stuck-breaker case
+# and takes SPP_STUCK_CYCLES, 16 cycles, the same as P4.
+#
+# This was [10] -- one flat number for every bus and every type -- which is
+# where C01_3PH_761383_10cy came from: ten cycles, at 345 kV, on a fault SPP
+# clears in six. The fault set was not the one the study claimed to run.
+#
+# A plain list still works and still applies to every type, for a deliberate
+# sweep: CUSTOM_CYCLES = [6, 9, 12].
+
+# ---- WHAT EACH RUN DOES ----------------------------------------------------------
+
+# ---- THE LIMITS THAT DECIDE PASS AND FAIL ----------------------------------------
+# NOT None-able, unlike most of the panel: this script uses them ITSELF, to say
+# how far past a limit each element sits. So they are always real numbers, they
+# are always sent to both studies, and the three places that judge a result --
+# the base case, the project case and this comparison -- cannot disagree.
+
+# ---- POWER-FLOW QUALITY ----------------------------------------------------------
+# A report can be minutes old and still describe 8 of 119 scenarios, which is
+# what a scoring pass that died part way leaves behind. Timestamps cannot see
+# that; counting what it scored can. 0 turns the coverage test off.
+
+# ---- COLLECTOR-SYSTEM IMPEDANCE --------------------------------------------------
+# COLLECTOR_SCALE = {"SantaFe": (0.2, 0.2, 1.0), "IronStar": (0.5, 0.5, 1.0)}
+# ONE IMPEDANCE FOR EVERY COLLECTOR, every project. (R, X, B) applied to every
+# row in the table above, whatever that row says -- so four projects with
+# thirteen collectors between them are set to one value in one line.
+#
+#   COLLECTOR_ALL = (0.001, 0.010, 0.020)     every collector, exactly this
+#   COLLECTOR_ALL = (None,  0.010, None)      set X only; R and B stay as they are
+#   COLLECTOR_ALL = None                      off -- each row decides for itself
+#
+# It OVERRIDES the per-row R/X/B and the multipliers, because "the same value
+# everywhere" and "this row is different" cannot both be true. The run prints
+# every branch it changed, so what actually happened is never in doubt.
+
+# ONE IMPEDANCE PER PROJECT: {project: (R, X, B)}. Every collector belonging to
+# that project is set to it, and a project not named here is left to its own
+# rows. None per quantity leaves that quantity alone, as above.
+#
+#     COLLECTOR_BY_PROJECT = {
+#         "SantaFe":       (0.0008, 0.0060, 0.0400),
+#         "IronStar":      (0.0020, 0.0150, 0.0900),
+#         "EastFork":      (None,   0.0120, None),     # X only
+#     }
+#
+# WHICH SETTING WINS, most specific first:
+#     1. R/X/B written in the ROW               -- this one branch
+#     2. COLLECTOR_BY_PROJECT                   -- every branch of one project
+#     3. COLLECTOR_SCALE                        -- multiplies what the case has
+#     4. COLLECTOR_ALL                          -- every branch, everywhere
+# (4) is last because it is the blunt one: it is there to say "all of them,
+# this value", and it overrides the other three by design.
+
+
+# ---- COMPARE TWO RUNS OF THE SAME PROJECT ----------------------------------
+# Not project-against-base -- run-against-run. "What did changing the collector
+# actually do", answered with the same report, spreadsheet and element detail as
+# the main comparison, instead of by reading two reports side by side.
+#
+# Both sides are the PROJECT case. Name the two results folders by their suffix:
+#     ""           the run just finished
+#     "__run1"     the first run kept by KEEP_PREVIOUS_RUNS
+#     "__run2"     the next one, and so on
+#     "_cap50"     a capacity level
+#
+#     COMPARE_RUNS = ("__run1", "")     the older run as the reference,
+#                                        the newest as the thing being judged
+#
+# Read it as: "NEW" means the SECOND run broke a fault the FIRST one passed.
+# [] or None = off. Runs are listed in ALL_RUNS_<project>_<mode>.txt.
+
+# ---- .DYR MODEL PARAMETERS (REGC / REEC / REPC) -----------------------------
+# Change a dynamic model constant and see what it does. Sent to BOTH cases.
+#
+# FIRST, LOOK AT THE DECK. Set DYR_SHOW and run once: the build prints every
+# constant of those models WITH ITS NUMBER, and that numbering is what an edit
+# addresses. A con number taken from a model diagram and applied to a deck whose
+# record is ordered differently changes the wrong parameter, and nothing about
+# the result would look wrong.
+#
+#     DYR_SHOW = ["REECAU1"]                 every REECAU1 in the deck
+#     DYR_SHOW = [("REGCAU1", 765912)]       that model at that bus
+
+# THEN CHANGE IT. The short form is the one to use: it means THIS PROJECT'S
+# machines, and a dict changes several constants of one model at once.
+#
+#     DYR_EDITS = [
+#         ("REECAU1", {20: 1.0, 14: 0.75}),   # two constants, this project
+#         ("REGCAU1", {5: -0.9}),             # another model, same project
+#         ("REPCAU1", 8, 25.0),               # one constant, long-hand
+#     ]
+#
+# It works unchanged when PROJECTS names four projects: each project's build
+# resolves "this project" to its own machines, so one list retunes all four
+# plants and touches nothing else.
+#
+# THE FULL FORM, when you need a particular machine or the wider system:
+#
+#     (bus, id, model, con, value)   or  (bus, id, model, {con: value, ...})
+#
+#     765912       that one machine
+#     "PROJECT"    this project's machines            <- what the short form uses
+#     "*"          every record of that model in the WHOLE DECK
+#
+# DYR_SCOPE is the safety net. At its default "project" every edit is confined
+# to the project's own machines whatever the row says -- a "*" is narrowed and a
+# bus belonging to someone else's plant is skipped and named. The .dyr holds
+# every dynamic model in the interconnection, so without that a mistyped bus
+# retunes hundreds of other people's plants and nothing would flag it.
+#
+# Set DYR_SCOPE = "deck" deliberately, for a system-wide sensitivity study.
+
+
+# PER PROJECT. The studies run one project at a time, so edits can be aimed at
+# whichever project is building -- which is what you want when the same
+# parameter takes a different value at each plant.
+#
+#     DYR_EDITS_BY_PROJECT = {
+#         "SantaFe":  [("REECAU1", {20: 1.0})],
+#         "IronStar": [("REECAU1", {20: 0.5})],
+#     }
+#
+# The short form is right here too. This list decides during WHICH PROJECT'S
+# BUILD an edit applies; the row itself still decides which machines, and the
+# short form means that project's own. Entries in DYR_EDITS above apply during
+# every project's build; the two are merged, per-project last.
+
+# ---- RECOMPILE THE USER MODELS AFTER A .dyr CHANGE --------------------------
+# dyre_new rewrites conec.flx and conet.flx for the model set it just read.
+# They are Fortran sources until they are compiled and linked into dsusr.dll --
+# and PSS/E will happily run with the PREVIOUS model set's routines in memory,
+# returning numbers that look like results. So the two batch files beside the
+# case are run between dyre_new and the snapshot:
+#
+#   MyCompile34.bat   conec.flx / conet.flx -> CONEC.OBJ / CONET.OBJ
+#   MyCload41.bat     link them with the model libraries -> dsusr.dll
+#
+#   None       leave the study script's own setting alone  <- recommended
+#   "always"   every build -- what the study scripts now default to
+#   "on-edit"  only when this build changed the .dyr
+#   "never"    not at all (only if you recompile by hand)
+#
+# NOT None-ABLE BEFORE, AND IT OVERRODE THE STUDY. This was sent unconditionally,
+# so "on-edit" here won over the study scripts' own "always" -- and every reason
+# the compile finds not to run came back with it. None now means what None means
+# everywhere else in this panel: leave the study script to decide.
+# Run them again after the .snp is saved, so dsusr.dll on disk cannot be older
+# than the snapshot beside it.
+
+# ---- A MODEL THE DECK NAMES AND NO LIBRARY CONTAINS -------------------------
+# In the init output, among several hundred harmless FLOW1 warnings:
+#
+#     CCT TYPE USER DEFINED MISCELLANEOUS MODEL "NXWPCA" NOT ACCESSIBLE
+#     CCT TYPE USER DEFINED MISCELLANEOUS MODEL "GWFFC"  NOT ACCESSIBLE
+#
+# The .dyr declares those models and no loaded library holds their code. PSS/E
+# does not stop for it. It initialises, runs the flat case, writes FLAT_RUN.out
+# -- and then calls into the empty slot and dies with a Windows access
+# violation. From outside, all that is visible is:
+#
+#     [parallel] build exited rc=3221225477      (= 0xC0000005)
+#     [parallel] BUILD failed -- aborting.
+#
+# ...which is a build that "ran flat, plotted nothing and just stopped". True
+# stops the run at init instead, naming the models and listing the .dll files
+# actually present. False runs on, with results for a system missing them.
+
+# WHICH CASE THE EDITS GO INTO -- "project" | "base" | "both".
+#
+#   "project"  the Project case only. The base keeps the deck it has.
+#   "both"     both cases -- for a system-wide model that exists in each, this
+#              isolates the parameter from the presence of the projects.
+#   "base"     the base case only (a check, rarely what you want).
+#
+# Same reasoning as COLLECTOR_APPLY_TO. An edit to the PROJECT's own machines
+# cannot match anything in the base case anyway, so "project" and "both" behave
+# identically for those; the choice matters for an edit aimed at models that
+# exist in both decks -- "project" then measures the projects AND the retune
+# together, "both" measures the retune alone.
+
+# ONE dsusr.dll BUILD AT A TIME, ACROSS BOTH CASES.
+#
+# The problem you hit: the base case is already running when the project case
+# reaches its link step, and the link leaves .def/.exp/.lib/.map/.res behind and
+# no .dll. The obvious fix -- build both .dll files up front, before any PSS/E
+# starts -- is WRONG, and it is wrong for exactly the reason you gave.
+#
+# dyre_new REWRITES conec.flx and conet.flx from the deck it has just read. A
+# build done before dyre_new is a build of the PREVIOUS .flx. If the model set
+# ever differs -- a project's machines added to the deck, a model renamed, a
+# USRMDL record whose model name changed -- the .dll does not match the deck the
+# snapshot holds, PSS/E runs anyway, and the numbers are garbage that looks like
+# results. The build has to stay after dyre_new, where the .flx are correct.
+#
+# So the ordering is left alone and the CONTENTION is fixed instead: a lock file
+# in the study root that exactly one build may hold. The project's link waits
+# for the base's link to finish rather than colliding with it. Waiting costs a
+# few seconds; a mismatched .dll costs the whole study.
+#
+# COMPILE_LOCK_WAIT_S: how long to wait for the other case before giving up and
+# taking the lock anyway (a build killed mid-way must not block the next one for
+# ever). Generous -- a cload4 link is seconds, not minutes.
+
+# ---- CAPACITY SWEEP --------------------------------------------------------------
+# ---- TOTAL P AT THE POI -- MOVED TO THE PANEL AT THE TOP OF THIS FILE -------
+# Every POI_* setting now lives in the panel, under
+# "THE POI DISPATCH -- HOW MUCH EACH PLANT PUTS ON THE SYSTEM". They are the
+# numbers you change per study, and they were 700 lines below the ones you
+# change beside them.
+
+# ---- SPP BP-7250 7.6: THE SURPLUS INTERCONNECTION SCENARIOS -----------------
+#
+# SPP's answer to "how is the 600 MW allocated between the existing wind and the
+# proposed BESS" is that it is not one dispatch, it is TWO cases:
+#
+#     the SGF dispatched at 100 % and the EGF turned off
+#     the SGF dispatched at 100 % and the EGF dispatched to set the POI
+#     injection to the Interconnection Service amount of the EGF
+#
+# So a surplus study is not one run of the project case per fault list, it is
+# two, and each is compared against the base separately. Each scenario gets its
+# own results folder and its own comparison, so neither can be read as the
+# other -- which matters more here than anywhere else in this script, because
+# the two differ by whether the existing plant is IN SERVICE and that is
+# precisely what a reviewer will ask about a voltage recovery at the POI.
+#
+#   tag       the results folder suffix and the name in every report
+#   label     what it is, in SPP's words, printed at the head of the comparison
+#   egf_off   True  = the plant's existing machines go OUT OF SERVICE
+#             False = they make up the difference to poi_mw
+#   poi_mw    the POI injection to hold, in MW. None with egf_off = True means
+#             "whatever the surplus machines alone deliver", which is what
+#             scenario 1 asks for. For scenario 2 this is the EGF's
+#             INTERCONNECTION SERVICE AMOUNT -- 600 MW here -- and not the
+#             surplus facility's rating.
+#
+# [] = off, and the study runs once at whatever POI_P_TARGET_MW says.
+# A CHARGING SCENARIO, for the CLOSIS that SPP says it will perform (BP-7250
+# 5.5). The surplus facility is a battery and its charging case is a different
+# system: the POI injection is lower by the charging power, and the plant is a
+# LOAD at the point the study calls a generator.
+#
+# It is not enabled by default because the charging limit is SPP's to set and
+# this script must not invent it. Give the ESR's charging power as a NEGATIVE
+# poi_mw and it is run like any other scenario.
+#
+#   {"tag": "s3_closis", "label": "CLOSIS -- ESR charging",
+#    "egf_off": False, "poi_mw": -100.0},
+
+
+# ---- .dyr PARAMETER SWEEP (set in the panel at the top) ---------------------
+# THE SAME PROJECT, RUN SEVERAL TIMES, WITH A DIFFERENT MODEL CONSTANT EACH TIME.
+#
+#     DYR_SWEEP = {"REECCU1": {"Kqv": [0.0, 1.0, 2.0]}}
+#
+# is three complete studies of the project case -- Kqv = 0, then 1, then 2 --
+# each into its own results folder, each compared against the SAME base case,
+# and one table at the end saying what each value did to every fault.
+#
+# More than one constant may be listed. Every combination is run, so two
+# constants with three values each is nine studies: the count is printed before
+# anything starts.
+#
+#     DYR_SWEEP = {"REECCU1": {"Kqv": [0.0, 1.0], "Tp": [0.02, 0.05]}}   # 4 runs
+#     DYR_SWEEP = {"REGCAU1": {"Tg": [0.02, 0.05]},
+#                  "REECCU1": {"Kqv": [0.0, 1.0]}}                       # 4 runs
+#
+# The values REPLACE whatever DYR_EDITS_BY_PROJECT sets for the swept project,
+# so the panel's own edit is not silently added on top of the value being
+# tested. Edits for OTHER projects are untouched.
+#
+# Which projects: the ones in PROJECTS, as everywhere else. Each is swept
+# separately, and each gets its own table.
+
+# WHICH PROJECTS TO SWEEP. [] = every project this comparison covers, which
+# with four projects and three values is TWELVE complete studies -- so the
+# count is printed before anything starts, and this is how you narrow it:
+#
+#     DYR_SWEEP_PROJECTS = ["SantaFe"]      # sweep one, leave the rest alone
+
+# A DIFFERENT SWEEP PER PROJECT. Same shape as DYR_SWEEP, keyed by project, and
+# it REPLACES DYR_SWEEP for the projects named -- a project listed here is swept
+# over its own values, one not listed uses DYR_SWEEP as before.
+#
+#     DYR_SWEEP_BY_PROJECT = {
+#         "SantaFe":  {"REECCU1": {"Kqv": [0.0, 1.0, 2.0]}},
+#         "IronStar": {"REECCU1": {"Kqv": [0.5, 1.5]}},
+#     }
+
+# ---- EVERYTHING ELSE -------------------------------------------------------------
+# ==========================================================================
+#             END QUICK SETTINGS -- explanations follow below
+# ==========================================================================
+
+# ============================================================================
+# ============================  CONTROL PANEL  ===============================
+# ============================================================================
+# EVERYTHING YOU NORMALLY CHANGE IS HERE. The rest of this file, and both
+# launchers, take their instructions from these -- z4_cmp_all_con.py passes
+# them down through the environment, so a run driven from here does not need
+# z4_lch_b_con.py or z4_lch_p_con.py to be edited at all. Anything set in
+# a launcher is OVERRIDDEN while this script is driving.
+#
+# Each setting keeps its full explanation further down, beside the code that
+# reads it. This is the panel; that is the manual.
+#
+# THE FOUR COMBINATIONS THAT MATTER
+#
+#   carry on where it stopped        FRESH_START=False  SKIP_DONE=True   NEW_FAULT_LIST=False
+#   re-run everything, same faults   FRESH_START=True                    NEW_FAULT_LIST=False
+#   new fault list, from scratch     NEW_FAULT_LIST=True   (retires the old results)
+#   just compare what is on disk     PIPELINE="compare"    (simulates nothing)
+#
+# ---- THE ONLY PLACE A LOCATION IS WRITTEN DOWN ------------------------------
+# "" = the folder THIS FILE is in. Nothing else needs editing to move the study
+# to another machine: put the five scripts and the two case folders on the new
+# PC, run this file from where it sits, and every path below follows it.
+#
+#   <ROOT>\                  z4_cmp_all_con.py    <- this file
+#     Base\                  z4_lch_b_con.py  z4_spp_b_con.py
+#     Projects\              z4_lch_p_con.py  z4_spp_p_con.py  + THE ONE DECK
+#
+# With SHARED_DECK on there is a single deck, in Projects\, and it is the BASE
+# CASE -- the system with none of the new BESS in it. The Base folder holds the
+# two base-case scripts and its own results\, and reads that same file. See
+# SHARED_DECK above.
+#     comparison\            written by this script
+#     SPP_FAULTS_<project>.csv                the shared fault list
+#
+# The two study folders take their location from here too, through
+# SPP_STUDY_DIR, and each study script falls back to ITS OWN folder when run on
+# its own -- so there is no absolute path left anywhere in any of the five
+# files. Set ROOT only to point at a study somewhere other than beside this
+# script.
+# ============================================================================
+# END OF NOTES
+# ============================================================================
+
