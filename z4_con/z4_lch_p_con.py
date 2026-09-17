@@ -346,7 +346,14 @@ elif _envfs in ("0", "false", "no", "off"):
 # dialog nobody clicks) holds its slot until you stop the run yourself.
 #
 # Set False to restore the old kill-on-silence behaviour.
-NEVER_KILL_WORKERS = True
+#
+# IT IS FALSE NOW. The cost above -- "a truly frozen worker holds its slot
+# until you stop the run yourself" -- was paid in full on 2026-09-16: IronStar
+# F166 held work5 for 18h 33m behind a CodeMeter dialog while the other six
+# workers had retired, and the campaign made no progress for a day. The
+# watchdogs below act again. KILL_GRACE_S still floors every one of them, so
+# a long solve is safe; a frozen one is not left standing.
+NEVER_KILL_WORKERS = False
 _envnk = (os.environ.get("SPP_NEVER_KILL") or "").strip().lower()
 if _envnk in ("1", "true", "yes", "on"):
     NEVER_KILL_WORKERS = True
@@ -362,7 +369,8 @@ elif _envnk in ("0", "false", "no", "off"):
 #
 # So the guarantee holds even if NEVER_KILL_WORKERS is turned off later, or a limit
 # below is edited down, or a new watchdog is added that forgets the rule.
-KILL_GRACE_S = 3000.0                       # 50 minutes
+KILL_GRACE_S = 1800.0                       # 30 minutes. Slowest scenario ever
+                                            # measured here: 24m 02s, mean 5m 14s.
 try:
     KILL_GRACE_S = float((os.environ.get("SPP_KILL_GRACE_S") or "").strip()
                          or KILL_GRACE_S)
@@ -539,6 +547,138 @@ if _envcd in ("1", "true", "yes", "on"):
 elif _envcd in ("0", "false", "no", "off"):
     CLOSE_PSSE_DIALOGS = False
 
+# ---- A SCENARIO MAY NOT RUN FOREVER ------------------------------------------
+# HANG_TIMEOUT_S watches SILENCE, which is a proxy for stuck and not the thing
+# itself. IronStar F166 sat on work5 for 18h 33m while six other workers had
+# already retired, and the run made no progress for a whole day. Whatever it was
+# doing, it was not a 24-minute solve: the slowest scenario ever measured on this
+# machine is 24m 02s and the mean is 5m 14s.
+#
+# This is the hard ceiling, read from the study's own PROGRESS rows: a scenario
+# that has been RUNNING longer than this is killed and requeued, whether or not
+# its worker is printing. 4500 s is three times the slowest scenario ever seen,
+# so nothing legitimate can reach it.
+SCENARIO_MAX_S = 4500.0
+try:
+    SCENARIO_MAX_S = float((os.environ.get("SPP_SCENARIO_MAX_S") or "").strip()
+                           or SCENARIO_MAX_S)
+except Exception:
+    pass
+SCENARIO_SCAN_EVERY_S = 30.0    # how often the PROGRESS rows are re-read for this
+
+# ---- A LICENCE OUTAGE MAY NOT RETIRE A WORKER SLOT ---------------------------
+# _schedule() used to do done.add(i) once a worker had passed MAX_LICENCE_FAILS,
+# which abandons that worker's share of the queue for the rest of the launch. On
+# 2026-09-16 the CodeMeter runtime started answering
+#   "A network error occurred, Error 100"
+# and six of the seven workers walked through their 30 failures and retired --
+# permanently, while the licence server came back minutes later. Nothing was
+# left to notice.
+#
+# A licence outage is a condition of the machine, not a verdict on the slot. With
+# LICENCE_RETIRE False the worker is parked for LICENCE_COOLDOWN_S, its failure
+# count is cleared, and it is launched again. It can do that forever, because the
+# alternative -- a dead slot -- is strictly worse.
+LICENCE_RETIRE     = False
+LICENCE_COOLDOWN_S = 600.0      # 10 min parked, then the slot tries again
+try:
+    LICENCE_COOLDOWN_S = float((os.environ.get("SPP_LICENCE_COOLDOWN_S") or "").strip()
+                               or LICENCE_COOLDOWN_S)
+except Exception:
+    pass
+
+# ---- HOW OFTEN PSS/E MAY BE ASKED FOR A LICENCE ------------------------------
+# Every worker relaunch is a fresh psseinit(), and a fresh psseinit() is a
+# CodeMeter checkout. The 2026-09-16 run had used W0=308, W1=307, W2=305, W3=307,
+# W4=311, W6=305 relaunches for ~110 finished scenarios -- about 2.8 process
+# starts per scenario -- and the BASE and PROJECT launchers were both doing it at
+# 7 workers each. That is roughly 170 checkouts an hour against one network
+# licence server, which is what Error 100 is: not a missing licence, a flooded
+# one.
+#
+# This throttles process STARTS across BOTH launchers through a lock directory
+# beside the cases, so base and project share one budget instead of each keeping
+# its own. It costs nothing when starts are rare and only bites during a relaunch
+# storm, which is exactly when the server is drowning.
+#
+# 0 disables the gate.
+LICENCE_STARTS_PER_MIN  = 6
+LICENCE_GATE_MAX_WAIT_S = 300.0   # never hold a launch longer than this
+try:
+    LICENCE_STARTS_PER_MIN = int((os.environ.get("SPP_LICENCE_STARTS_PER_MIN") or "").strip()
+                                 or LICENCE_STARTS_PER_MIN)
+except Exception:
+    pass
+_LIC_GATE_DIR = os.path.join(os.path.dirname(os.path.normpath(STUDY_DIR)),
+                             ".spp_licence_gate")
+
+
+def _licence_gate(tag):
+    """Wait until this process may start a PSS/E child, across BOTH launchers.
+
+       A token bucket of LICENCE_STARTS_PER_MIN starts per rolling minute, kept
+       in a file guarded by an atomically-created lock DIRECTORY (os.mkdir is
+       atomic on Windows and POSIX alike; Python 3.4 on Windows has no fcntl).
+
+       EVERY FAILURE PATH FALLS THROUGH AND LETS THE LAUNCH PROCEED. A gate that
+       can stop the run is worse than no gate: this may only ever slow starts
+       down, never block them."""
+    if LICENCE_STARTS_PER_MIN <= 0:
+        return
+    lock = os.path.join(_LIC_GATE_DIR, "lock")
+    stamps_p = os.path.join(_LIC_GATE_DIR, "starts.txt")
+    try:
+        if not os.path.isdir(_LIC_GATE_DIR):
+            os.makedirs(_LIC_GATE_DIR)
+    except Exception:
+        return
+    deadline = time.time() + LICENCE_GATE_MAX_WAIT_S
+    said = False
+    while True:
+        got = False
+        for _ in range(240):                       # up to ~60 s for the mutex
+            try:
+                os.mkdir(lock); got = True; break
+            except Exception:
+                # A LAUNCHER THAT DIED HOLDING THE MUTEX MUST NOT WEDGE THE REST.
+                try:
+                    if time.time() - os.path.getmtime(lock) > 120.0:
+                        os.rmdir(lock); continue
+                except Exception:
+                    pass
+                time.sleep(0.25)
+        if not got:
+            return                                  # cannot coordinate -- go
+        try:
+            now = time.time()
+            try:
+                with open(stamps_p) as fh:
+                    stamps = [float(x) for x in fh.read().split() if x.strip()]
+            except Exception:
+                stamps = []
+            stamps = [t for t in stamps if 0 <= now - t < 60.0]
+            if len(stamps) < LICENCE_STARTS_PER_MIN:
+                stamps.append(now)
+                try:
+                    with open(stamps_p, "w") as fh:
+                        fh.write("\n".join("%.3f" % t for t in stamps))
+                except Exception:
+                    pass
+                return
+            wait = 60.0 - (now - min(stamps)) + 0.5
+        finally:
+            try: os.rmdir(lock)
+            except Exception: pass
+        if time.time() >= deadline:
+            return
+        if not said:
+            said = True
+            print("[parallel] %s: holding this launch -- %d PSS/E start(s) already in the "
+                  "last minute across both cases (LICENCE_STARTS_PER_MIN=%d)"
+                  % (tag, LICENCE_STARTS_PER_MIN, LICENCE_STARTS_PER_MIN))
+        time.sleep(max(1.0, min(wait, 20.0)))
+
+
 # ---- A SECOND CHANCE FOR SCENARIOS THAT GAVE UP -----------------------------
 # A scenario is GAVE-UP when MAX_SCENARIO_ATTEMPTS workers died while holding
 # it. On this machine most of those deaths were the WORKER's -- an access
@@ -568,7 +708,7 @@ POLL_SECS        = 5         # how often to poll the running workers
 # it has simply had long enough, and the queue continues.
 PLOT_CATCHUP_STALL_S = 900   # kill the catch-up plotter if it prints NOTHING for this long (15 min)
 PLOT_CATCHUP_MAX_S   = 3600  # ...or when it has run this long in total, whatever it is printing
-HANG_TIMEOUT_S   = 5000      # if a worker prints NOTHING for this many seconds it is treated as
+HANG_TIMEOUT_S   = 2700      # if a worker prints NOTHING for this many seconds it is treated as
                              # HUNG (a PSS/E crash that popped a Windows error dialog / Fortran
                              # pause and never exited -- the "worker still open, no summary" case).
                              # The launcher then KILLS it and relaunches/gives up, so the run ALWAYS
@@ -1295,7 +1435,14 @@ _NOISE_HELD = {}          # idx -> how many have been swallowed since the last r
 # child so the worker loop can tell a licence failure from a crash box.
 _CHILD_PIDS  = {}          # pid -> key ("w3", "phase:build", "shard2", ...)
 _DIALOG_HITS = {}          # key -> [(time, title, text)]
-_DIALOG_SEEN = set()       # hwnds already closed (a box can take a moment to go)
+_DIALOG_SEEN = {}          # hwnd -> when it was last closed. A box that is STILL
+                           # showing 30 s later is closed again: the Abort/Retry/
+                           # Ignore box that psseng.dll raises on a CodeMeter
+                           # network error comes back under the same handle when
+                           # the first click lands on Retry, and a set never
+                           # looked at it twice. That is how F166 stood for 18 h
+                           # with the sweeper on.
+_DIALOG_RECLOSE_S = 30.0
 _DIALOG_LOCK = threading.Lock()
 _LICENCE_RE  = re.compile(r"codemeter|licen[cs]e|start error|pssenng|psseng", re.I)
 
@@ -1382,10 +1529,32 @@ def _close_box(hwnd):
     from ctypes import wintypes
     u = ctypes.windll.user32
     BM_CLICK, WM_CLOSE, WM_COMMAND, IDOK, IDCANCEL = 0x00F5, 0x0010, 0x0111, 1, 2
+    IDABORT, IDRETRY, IDIGNORE = 3, 4, 5
+    # THE psseng.dll LICENCE BOX HAS THREE BUTTONS: Abort / Retry / Ignore, no
+    # close box (its X is greyed), and no OK or Cancel. Clicking "the first
+    # Button" lands on whichever one Windows created first, and Retry asks the
+    # same dead licence server the same question and shows the same box again.
+    # Ignore lets psseng carry on without the licence -- the psspy call fails,
+    # the study records it, and the worker exits or moves on. Abort ends the
+    # process outright. Either ends the hang; Retry never does. So Ignore, then
+    # Abort, are posted BY ID, before the generic click, and Retry never is.
+    for wp in (IDIGNORE, IDABORT):
+        try:
+            u.PostMessageW(wintypes.HWND(hwnd), WM_COMMAND, wp, 0)
+        except Exception:
+            pass
     try:
         btn = u.FindWindowExW(wintypes.HWND(hwnd), None, "Button", None)
-        if btn:
-            u.PostMessageW(btn, BM_CLICK, 0, 0)
+        while btn:
+            try:
+                _n = ctypes.create_unicode_buffer(64)
+                u.GetWindowTextW(btn, _n, 64)
+                _lab = (_n.value or "").replace("&", "").strip().lower()
+            except Exception:
+                _lab = ""
+            if _lab != "retry":
+                u.PostMessageW(btn, BM_CLICK, 0, 0)
+            btn = u.FindWindowExW(wintypes.HWND(hwnd), btn, "Button", None)
     except Exception:
         pass
     for wp in (IDOK, IDCANCEL):
@@ -1401,13 +1570,16 @@ def _close_box(hwnd):
 
 def _dialog_sweep_once():
     for hwnd, pid, key, title, text in _modal_boxes_of_children():
-        if hwnd in _DIALOG_SEEN:
+        _last = _DIALOG_SEEN.get(hwnd)
+        if _last is not None and (time.time() - _last) < _DIALOG_RECLOSE_S:
             continue
-        _DIALOG_SEEN.add(hwnd)
+        _again = _last is not None
+        _DIALOG_SEEN[hwnd] = time.time()
         kind = "LICENCE" if _LICENCE_RE.search("%s %s" % (title, text)) else "modal"
         with _PRINT_LOCK:
-            print("[dialog] %s (pid %d) is showing a %s box  '%s': %s  -- closing it"
-                  % (key, pid, kind, title, text or "(no text)"))
+            print("[dialog] %s (pid %d) is showing a %s box  '%s': %s  -- closing it%s"
+                  % (key, pid, kind, title, text or "(no text)",
+                     "  (STILL SHOWING -- closing it again)" if _again else ""))
             if kind == "LICENCE":
                 print("[dialog]   PSS/E in that process could not take a licence from the "
                       "CodeMeter runtime. The process is relaunched after a pause.")
@@ -1461,6 +1633,43 @@ def _pid_holds_claim(pid):
         except Exception:
             continue
     return False
+
+
+
+_SCEN_SCAN = {"t": 0.0, "rows": {}}
+
+
+def _worker_scenario_age(i):
+    """(scenario_id, seconds_it_has_been_RUNNING) for the scenario worker i holds,
+       or (None, 0). Read from the study's own PROGRESS rows -- the same source the
+       live table uses -- and cached, because this is asked every POLL_SECS.
+
+       THIS IS THE ONE WATCHDOG THAT DOES NOT MEASURE SILENCE. A worker blocked on
+       a modal Windows dialog can still have a pump thread and a last-activity time
+       that look recent; what it cannot do is finish the scenario."""
+    now = time.time()
+    if now - _SCEN_SCAN["t"] > SCENARIO_SCAN_EVERY_S:
+        try:
+            _SCEN_SCAN["rows"] = _progress_rows(since=_RUN_STARTED) or {}
+        except Exception:
+            _SCEN_SCAN["rows"] = {}
+        _SCEN_SCAN["t"] = now
+    want = "work%d" % i
+    best = (None, 0.0)
+    for sid, row in (_SCEN_SCAN["rows"] or {}).items():
+        try:
+            st, _att, wk, tm, _note = row
+        except Exception:
+            continue
+        if (st or "").strip() != "RUNNING" or (wk or "").strip() != want or not tm:
+            continue
+        try:
+            age = now - time.mktime(time.strptime(tm, "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            continue
+        if age > best[1]:
+            best = (sid, age)
+    return best
 
 
 def _gave_up_ids(ids=None):
@@ -3420,6 +3629,7 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                    ("  -- starts PSS/E after %ds (LAUNCH_STAGGER_S)" % _delay) if _delay else ""))
         # -u = unbuffered child stdout so its lines stream to us live (not block-buffered
         # because it's a pipe); stderr merged into stdout so everything is tagged.
+        _licence_gate("worker %d" % i)
         procs[i] = subprocess.Popen([PYTHON, "-u", STUDY_SCRIPT], cwd=STUDY_DIR,
                                     env=_env("work", i, n, _worker_slice(i, n, selected),
                                              start_delay=_delay, max_attempts=_attempts),
@@ -3443,11 +3653,23 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
         """Relaunch i after the licence backoff instead of in PAUSE_BETWEEN seconds."""
         lic_fails[i] += 1
         if lic_fails[i] > MAX_LICENCE_FAILS:
-            _banner("worker %d: PSS/E failed to start %d times in a row (%s) -- giving up on this "
-                    "slot. Restart the 'CodeMeter Runtime Server' service (services.msc, or "
-                    "CodeMeter Control Center > Process > Restart CodeMeter Service) and launch "
-                    "again; finished scenarios are kept and the rest resume." % (i, lic_fails[i], why))
-            done.add(i)
+            if LICENCE_RETIRE:
+                _banner("worker %d: PSS/E failed to start %d times in a row (%s) -- giving up on this "
+                        "slot. Restart the 'CodeMeter Runtime Server' service (services.msc, or "
+                        "CodeMeter Control Center > Process > Restart CodeMeter Service) and launch "
+                        "again; finished scenarios are kept and the rest resume." % (i, lic_fails[i], why))
+                done.add(i)
+                return
+            # PARK IT, DO NOT BURY IT. The slot's share of the queue is still
+            # there; the licence server usually is not, for a while. Clear the
+            # count so the backoff restarts from LICENCE_BACKOFF_S when it wakes.
+            _banner("worker %d: PSS/E failed to start %d times in a row (%s). The licence "
+                    "runtime is not answering -- parking this slot for %s, then trying again. "
+                    "Nothing is given up. If this repeats, restart the 'CodeMeter Runtime "
+                    "Server' service (services.msc)." % (i, lic_fails[i], why,
+                                                        _fmt_hms(LICENCE_COOLDOWN_S)))
+            lic_fails[i] = 0
+            pending[i] = time.time() + LICENCE_COOLDOWN_S
             return
         _wait = min(LICENCE_BACKOFF_S * (2 ** (lic_fails[i] - 1)), LICENCE_BACKOFF_MAX_S)
         pending[i] = time.time() + _wait
@@ -3506,6 +3728,20 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                     _banner("worker %d HUNG (no output for %ds > %ds) -- killing it"
                             % (i, int(idle), HANG_TIMEOUT_S))
                     kill(i)
+                    continue
+            # --- A SCENARIO THAT HAS SIMPLY BEEN RUNNING TOO LONG. Not silence:
+            #     elapsed. This is what would have ended F166 at 75 minutes
+            #     instead of 18 hours. The kill goes through _quiet_watch so
+            #     KILL_GRACE_S still applies to it.
+            if SCENARIO_MAX_S > 0:
+                _sid, _on = _worker_scenario_age(i)
+                if _sid and _on > SCENARIO_MAX_S and _on > KILL_GRACE_S:
+                    _banner("worker %d has been on %s for %s > SCENARIO_MAX_S=%s -- the slowest "
+                            "scenario ever measured here took 24 min. Killing the worker; %s goes "
+                            "back in the queue and this counts as one of its attempts."
+                            % (i, _sid, _fmt_hms(_on), _fmt_hms(SCENARIO_MAX_S), _sid))
+                    kill(i)
+                    continue
         alive = [i for i in range(n) if i not in done and i not in pending and procs[i].poll() is None]
         with _PRINT_LOCK:
             idles = {i: int(now - _LAST_ACTIVITY.get(i, now)) for i in alive}

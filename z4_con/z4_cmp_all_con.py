@@ -369,7 +369,7 @@ FLAT_RUN_S  = 25                # s, the no-fault initial-condition run
 PRE_FAULT_S = 5                 # s, steady state before the fault
 SIM_END_S   = 25.2              # s per fault; SPP needs ~2.5 s recovery + ~10 s damping; longer = bigger .out
 RUN_NPLT    = 2                 # write every N steps: 1 = every step (huge) | 2 = half-cycle | 4 = per cycle
-KILL_GRACE_MIN = 60             # minutes of worker silence before any watchdog may act
+KILL_GRACE_MIN = 30             # minutes of worker silence before any watchdog may act (slowest scenario ever measured: 24 min)
 # -- CORES / SESSIONS: how many PSS/E runs at once --
 RUN_IN_PARALLEL = True          # True = base and project at once | False = one after the other
 N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
@@ -456,7 +456,10 @@ PLOT_PASS_MAX_MIN = 0                       # hard wall-clock cap on the plot pa
 DYNAMIC_WORK = True                         # True = one shared queue; workers take the next free scenario
 LIVE_STATUS_ALL = "LIVE_STATUS.txt"         # both cases' live table in one file here ("" = off)
 CLAIM_STALE_S = 3600                        # backstop age for a stale claim; liveness decides first
-NEVER_KILL_WORKERS = True                   # True = no watchdog ever kills a running process
+NEVER_KILL_WORKERS = False                  # True = no watchdog ever kills a running process. FALSE NOW: on 2026-09-16 F166 held a worker 18h 33m behind a CodeMeter dialog and nothing was allowed to end it
+SCENARIO_MAX_MIN = 75                       # a scenario RUNNING longer than this is killed and requeued, printing or not -- 3x the slowest ever measured (24 min); 0 = off
+LICENCE_COOLDOWN_MIN = 10                   # a worker that hit MAX_LICENCE_FAILS is PARKED this long and relaunched, not retired -- six of seven slots retired for good on 2026-09-16 during a licence outage
+LICENCE_STARTS_PER_MIN = 6                  # PSS/E process starts per minute across BOTH cases (shared gate beside the cases); ~170/h flooded CodeMeter into "Error 100". 0 = off
 LAUNCH_STAGGER_S = 20                       # worker i starts PSS/E i x this many s after launch, so N licence requests do not hit CodeMeter at once
 CLOSE_PSSE_DIALOGS = True                   # True = close modal PSS/E boxes ("CodeMeter runtime system is currently busy") shown by this launch's own processes
 LICENCE_BACKOFF_S = 60                      # pause before relaunching a worker whose PSS/E could not take a licence (doubles each time, max 15 min)
@@ -576,7 +579,7 @@ RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-m
 RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
 TRUNCATED_FRAC = 0.80                       # short = under this fraction of the folder's median .out size
 ONLY_EVENTS = []                            # [] = every event
-ONLY_FAULTS = ["F01-F50"]                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
+ONLY_FAULTS = []                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
 SEARCH_DEPTH = 4                            # how many folder levels below SEARCH_ROOT to look
 
 # ---- HOW MUCH EACH PLANT PUTS ON THE SYSTEM ----------------------------------
@@ -13107,12 +13110,19 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False)
     env["SPP_CLAIM_STALE_S"] = str(float(CLAIM_STALE_S))
     env["SPP_NEVER_KILL"] = "1" if NEVER_KILL_WORKERS else "0"
     env["SPP_KILL_GRACE_S"] = str(float(KILL_GRACE_MIN) * 60.0)
+    env["SPP_SCENARIO_MAX_S"] = str(float(SCENARIO_MAX_MIN) * 60.0)
+    env["SPP_LICENCE_COOLDOWN_S"] = str(float(LICENCE_COOLDOWN_MIN) * 60.0)
+    env["SPP_LICENCE_STARTS_PER_MIN"] = str(int(LICENCE_STARTS_PER_MIN))
     env["SPP_LAUNCH_STAGGER_S"] = str(float(LAUNCH_STAGGER_S))
     env["SPP_CLOSE_DIALOGS"] = "1" if CLOSE_PSSE_DIALOGS else "0"
     env["SPP_LICENCE_BACKOFF_S"] = str(float(LICENCE_BACKOFF_S))
     env["SPP_STARTUP_SILENT_S"] = str(float(STARTUP_SILENT_MIN) * 60.0)
     env["SPP_RETRY_GAVE_UP_ROUNDS"] = str(int(RETRY_GAVE_UP_ROUNDS))
-    env["SPP_NEVER_STEAL_LIVE"] = "1" if NEVER_KILL_WORKERS else "0"
+    # ALWAYS 1. This used to follow NEVER_KILL_WORKERS, but the two are different
+    # questions: whether a watchdog may end a frozen process, and whether a worker
+    # may take a scenario whose owner is still alive. The second is never yes.
+    # A worker the watchdog kills is dead, so its claim frees itself.
+    env["SPP_NEVER_STEAL_LIVE"] = "1"
     if extra_env:
         env.update(extra_env)
     print("[compare] launching %s : %s%s" % (case["key"], script,

@@ -927,7 +927,7 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 @!/ Vdip            Vup             Trv             dbd1          dbd2
     0.900          1.1000          0.0100         -0.1000        0.1000
 @!/ Kqv             Iqh1            Iql1            Vref0         Tp
-    0.0000          1.0000         -1.0000          0.0000        0.0500
+    2.0000          1.0000         -1.0000          0.0000        0.0500
 @!/ QMax            QMin
     0.4840         -0.4840
 @!/ Vmax            Vmin            Kqp             Kqi           Kvp
