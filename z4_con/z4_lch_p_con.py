@@ -528,7 +528,9 @@ LICENCE_BACKOFF_S     = 60.0
 LICENCE_BACKOFF_MAX_S = 900.0
 MAX_LICENCE_FAILS     = 30      # per worker; after this it gives up with a note on what to do
 STARTUP_SILENT_S      = 900.0   # 15 min silent with NO claim = stuck at start (dialog / dead licence)
-STARTUP_DEAD_S        = 180.0   # died within this many s of launch with no claim = a start failure
+STARTUP_DEAD_S        = 600.0   # died within this many s of launch with no claim = a start failure
+                                # (was 180: the psseng.dll licence timeout is ~180 s, so
+                                #  a licence death landed just outside it and was filed as a crash)
 EXIT_LICENCE_BUSY     = 86
 for _nm, _ev in (("LAUNCH_STAGGER_S", "SPP_LAUNCH_STAGGER_S"),
                  ("LICENCE_BACKOFF_S", "SPP_LICENCE_BACKOFF_S"),
@@ -1444,7 +1446,18 @@ _DIALOG_SEEN = {}          # hwnd -> when it was last closed. A box that is STIL
                            # with the sweeper on.
 _DIALOG_RECLOSE_S = 30.0
 _DIALOG_LOCK = threading.Lock()
-_LICENCE_RE  = re.compile(r"codemeter|licen[cs]e|start error|pssenng|psseng", re.I)
+_LICENCE_RE  = re.compile(r"codemeter|licen[cs]e|start error|pssenng|psseng|dll load failed|initialization routine failed", re.I)
+_DLL_INIT_RE = re.compile(r"DLL load failed|initialization routine failed", re.I)
+
+
+def _key_of_idx(idx):
+    """The _DIALOG_HITS key the pump index maps to: workers are w<i>, the
+       build is -1 and the merge -2 (their own keys)."""
+    if idx == -1:
+        return "build"
+    if idx == -2:
+        return "report-merge"
+    return "w%d" % idx
 
 
 def _register_child(key, proc):
@@ -1754,6 +1767,20 @@ def _pump(idx, tag, proc):
                 break
             _LAST_ACTIVITY[idx] = time.time()
             txt = line.rstrip("\n")
+            # "import psspy" DYING IS THE LICENCE, NOT THE SCRIPT. psseng.dll
+            # takes its CodeMeter licence inside its DLL initialisation, and
+            # when the server does not answer the import raises
+            #   ImportError: DLL load failed: A dynamic link library (DLL)
+            #   initialization routine failed.
+            # about three minutes in -- CodeMeter's network timeout. No box,
+            # no rc=86, and it lands just past STARTUP_DEAD_S, so it used to
+            # be filed as an ordinary crash and relaunched three seconds
+            # later, forever. It is recorded as a licence hit for this child
+            # so the exit takes the backoff + cooldown path instead.
+            if _DLL_INIT_RE.search(txt):
+                with _DIALOG_LOCK:
+                    _DIALOG_HITS.setdefault(_key_of_idx(idx), []).append(
+                        (time.time(), "psspy import", txt.strip()))
             if QUIET_PSSE_NOISE and _NOISE_RE.match(txt):
                 key = txt.strip()
                 if key in _NOISE_SEEN[idx]:
