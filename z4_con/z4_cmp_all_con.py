@@ -16889,6 +16889,17 @@ def main():
         if _runs:
             print("[compare] this SIMULATES: hours, not seconds. The comparison itself")
             print("[compare] needs no simulation and is re-runnable at any time.")
+            # A CLEAN LIVE VIEW, as "all" gets. The .part files of the previous
+            # launch were left in place here, so the LIVE NOW panels in the
+            # campaign plan showed the last run's workers for the whole of this one.
+            if LIVE_STATUS_ALL:
+                _lsa = _root_named(LIVE_STATUS_ALL)
+                for _q in glob.glob(_lsa + ".*.part") + [_lsa]:
+                    try:
+                        os.remove(_q)
+                    except Exception:
+                        pass
+                print("[compare] live status (both cases): %s" % _lsa)
         if len(_runs) == 2 and RUN_IN_PARALLEL:
             # BOTH CASES AT ONCE, as PIPELINE = "all" does. One after the other
             # doubled the wall clock for no reason.
