@@ -22401,6 +22401,39 @@ def evaluate_case(path, kind, tclear, kb):
             "%d channel(s) not judged (SPP applies to the BES only); highest was "
             "%.3f pu (%s)" % (len(nonbes), nb_hi[0], nb_hi[1]))
 
+    # EXISTING MACHINE TERMINALS ABOVE THE OVERSHOOT LIMIT -- RECORDED, NOT
+    # SCORED. SPP's 1.20 pu criterion is a BES bus criterion; a generator
+    # terminal (ETERM channel) is not a BES bus and was checked for nothing
+    # but a trip. An existing unit next to the project peaking at 1.66 pu on
+    # the clearing step was therefore invisible in the report while its trace
+    # sat in the PDF. Named here, with the time spent above the limit, so the
+    # reader can judge it against the unit's own protection; INFO, so the
+    # verdict is unchanged. Set SPP_ETERM_OVERSHOOT_SCORED=1 to make it FAIL.
+    if eterms:
+        _dt_e = (t[1] - t[0]) if len(t) > 1 else 0.0
+        _e_hi = []
+        for ti, v in eterms:
+            seg = v[i_clr:]
+            if not len(seg):
+                continue
+            pk = max(seg)
+            if pk > V_OVERSHOOT_PU:
+                _n_over = sum(1 for x in seg if x > V_OVERSHOOT_PU)
+                _at = t[i_clr + list(seg).index(pk)] if i_clr + list(seg).index(pk) < len(t) else t[-1]
+                _e_hi.append((pk, chan_label(ti), _at, _n_over * _dt_e))
+        _e_hi.sort(key=lambda r: -r[0])
+        _scored = str(os.environ.get("SPP_ETERM_OVERSHOOT_SCORED") or "0").strip() == "1"
+        add("Machine terminal voltage > %.2f pu after clearing (ETERM, existing units)" % V_OVERSHOOT_PU,
+            (not _e_hi) if _scored else None,
+            ("none of %d machine terminal(s) above the limit after clearing" % len(eterms))
+            if not _e_hi else
+            ("%d machine terminal(s) above the limit -- NOT a BES bus criterion, "
+             "judge against the unit's own overvoltage protection: %s%s"
+             % (len(_e_hi),
+                ", ".join("%s=%.3f@%.2fs for %.0fms" % (l, pk, at, ms * 1000.0)
+                          for pk, l, at, ms in _e_hi[:VIOLATION_LIST_MAX]),
+                _more(_e_hi))))
+
     if bus_angles:
         bworst = (0.0, "")
         for ti, v in bus_angles:
