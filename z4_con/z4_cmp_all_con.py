@@ -3571,19 +3571,89 @@ def _proj_of_results(rdir):
 
 
 def read_descriptions(rdir, proj):
-    """{fault: SPP contingency text} from faults\\SPP_CONTINGENCIES.csv."""
+    """{fault: SPP contingency text} from faults\\SPP_CONTINGENCIES.csv --
+       or, when the study READ its list rather than building it (the DISIS
+       lists; that path never writes SPP_CONTINGENCIES.csv), a description
+       composed from the fault list's own columns, so the column is never
+       empty for a fault that ran."""
     out = {}
     p = os.path.join(rdir, "faults", "SPP_CONTINGENCIES.csv")
-    if not os.path.isfile(p):
+    if os.path.isfile(p):
+        try:
+            with csv_open(p) as fh:
+                for r in csv.DictReader(fh):
+                    fid = (r.get("Fault ID") or "").strip()
+                    if fid:
+                        out[fid] = (r.get("Contingency Description") or "").strip()
+        except Exception:
+            pass
+    if out:
         return out
+    return _descriptions_from_faultlist(rdir, proj)
+
+
+def _descriptions_from_faultlist(rdir, proj):
+    """'GROUP3_... (P1) -- 3PH fault at bus 531623 (115 kV), cleared after 5
+       cycles; trips 531623-531632 ckt 1; drops load at 531210' from the columns
+       of SPP_FAULTS.csv. The fields are the ones the study simulated, so the
+       text cannot disagree with the run."""
+    out = {}
+    cands = [os.path.join(rdir, "faults", "SPP_FAULTS.csv")]
     try:
-        with csv_open(p) as fh:
-            for r in csv.DictReader(fh):
-                fid = (r.get("Fault ID") or "").strip()
-                if fid:
-                    out[fid] = (r.get("Contingency Description") or "").strip()
+        cands.append(_shared_list_for(proj))
     except Exception:
         pass
+    src = next((c for c in cands if c and os.path.isfile(c)), None)
+    if not src:
+        return out
+
+    def _g(r, k):
+        return (r.get(k) or "").strip()
+    try:
+        with csv_open(src) as fh:
+            for r in csv.DictReader(fh):
+                fid = _g(r, "fault_id")
+                if not fid:
+                    continue
+                bits = []
+                head = " ".join(x for x in (_g(r, "con_id"),
+                                            ("(%s)" % _g(r, "planning_event")) if _g(r, "planning_event") else "")
+                                if x)
+                if _g(r, "no_fault").lower() in ("1", "true", "yes"):
+                    ev = "no fault applied"
+                else:
+                    ev = "%s fault" % (_g(r, "fault_type") or "3PH")
+                    if _g(r, "fault_bus"):
+                        ev += " at bus %s" % _g(r, "fault_bus")
+                    if _g(r, "fault_kv"):
+                        ev += " (%s kV)" % _g(r, "fault_kv")
+                    if _g(r, "clear_cycles"):
+                        ev += ", cleared after %s cycles" % _g(r, "clear_cycles")
+                    if _g(r, "primary_cycles") and _g(r, "primary_cycles") != _g(r, "clear_cycles"):
+                        ev += " (primary %s)" % _g(r, "primary_cycles")
+                bits.append(ev)
+                if _g(r, "trip_from") and _g(r, "trip_to"):
+                    bits.append("trips %s-%s%s" % (_g(r, "trip_from"), _g(r, "trip_to"),
+                                                  (" ckt %s" % _g(r, "trip_ckt")) if _g(r, "trip_ckt") else ""))
+                if _g(r, "trip_elements"):
+                    bits.append("also trips %s" % _g(r, "trip_elements").replace(";", ", "))
+                if _g(r, "trip_3wind"):
+                    bits.append("3-winding %s" % _g(r, "trip_3wind"))
+                for col, verb in (("drop_machines", "drops machine(s)"),
+                                  ("drop_loads", "drops load at"),
+                                  ("drop_shunts", "disconnects shunt at")):
+                    if _g(r, col):
+                        bits.append("%s %s" % (verb, _g(r, col).replace(";", ", ")))
+                if _g(r, "pre_outage"):
+                    bits.append("prior outage %s" % _g(r, "pre_outage"))
+                if _g(r, "reclose").lower() in ("1", "true", "yes"):
+                    bits.append("recloses%s" % ((" after %s cycles" % _g(r, "reclose_wait")) if _g(r, "reclose_wait") else ""))
+                if _g(r, "subtype"):
+                    bits.append(_g(r, "subtype"))
+                txt = "; ".join(bits)
+                out[fid] = ("%s -- %s" % (head, txt)) if head else txt
+    except Exception as e:
+        print("[compare] could not build descriptions from %s (%s)" % (src, e))
     return out
 
 
@@ -6201,6 +6271,13 @@ def _dyr_label(proj):
     return _dyr_edits_text(rows) if rows else ""
 
 
+def _dyr_cell(proj):
+    """The dyr_edits CELL: the edit label, or 'as studied' when nothing was
+       edited. _dyr_label() returning "" is used as a test elsewhere ("was
+       anything swept?"), so the words live here, at the cell, not in it."""
+    return _dyr_label(proj) or "as studied (.dyr unchanged)"
+
+
 def _dyr_norm_edits_local(edits):
     """The 5-field form of whatever the panel wrote, for the label only.
 
@@ -6362,7 +6439,7 @@ def _report_rows(results):
         meas_b, meas_t = res.get("meas_b"), res.get("meas_t")
         extra_b, extra_t = res.get("extra_b") or {}, res.get("extra_t") or {}
         _lbl = dict(run_setting=_run_setting(res["project"]),
-                    dyr_edits=_dyr_label(res["project"]),
+                    dyr_edits=_dyr_cell(res["project"]),
                     project_output=_output_label(), project=res["project"])
         for r in res["rows"]:
             # "YES" only when the FAULT itself is new with the projects. A fault
@@ -6997,7 +7074,7 @@ def _summary_rows(results, want=None):
                 # from a colour alone.
                 act = "ACT -- new criterion in a pre-existing failure"
             out.append([_run_setting(res["project"]),
-                        _dyr_label(res["project"]), _output_label(),
+                        _dyr_cell(res["project"]), _output_label(),
                         r["fault"], res["project"],
                         (r.get("event") if r.get("event") not in (None, "-") else ""),
                         r.get("source", ""),
@@ -7210,7 +7287,7 @@ def _notrun_rows(results):
             if _st.startswith("CRASHED"):
                 _hints.append("projects: " + (_crash_hint(_rt, fid) or "see logs"))
             out.append([_run_setting(res["project"]),
-                        _dyr_label(res["project"]), _output_label(),
+                        _dyr_cell(res["project"]), _output_label(),
                         r["fault"], res["project"],
                         (r.get("event") if r.get("event") not in (None, "-") else ""),
                         r.get("source", ""),
