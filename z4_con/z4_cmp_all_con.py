@@ -7901,13 +7901,19 @@ def write_one_report(results, only_base, only_test):
             _new_el = _compact_view(_project_caused_rows(_detail))
             _pre_el = _compact_view(_pre_existing_element_rows(_detail))
             _poi_rows = _poi_power_rows(results)
-            _sheets = [("1 Summary", _SUMMARY_COLS, _sum_all, _SUMMARY_WIDTHS,
+            # NO BLANK CELL ON ANY SHEET. Sheets 2, 3, 5 and 6 already write
+            # EMPTY_CELL where they have nothing; 1 and 4 wrote "" -- so a PASS
+            # fault's worst_criterion, or an unscored side's verdict, showed as
+            # an empty cell, which reads as forgotten. Same word everywhere.
+            def _filled(rows):
+                return [[(EMPTY_CELL if v in ("", None) else v) for v in r] for r in rows]
+            _sheets = [("1 Summary", _SUMMARY_COLS, _filled(_sum_all), _SUMMARY_WIDTHS,
                         _xl_style_of_summary),
                        ("2 Project introduces", _COMPACT_COLS, _new_el,
                         _COMPACT_WIDTHS, _xl_style_compact),
                        ("3 Pre-existing", _COMPACT_COLS, _pre_el,
                         _COMPACT_WIDTHS, _xl_style_compact),
-                       ("4 Not compared", _NOTRUN_COLS, _notrun,
+                       ("4 Not compared", _NOTRUN_COLS, _filled(_notrun),
                         _NOTRUN_WIDTHS, _xl_style_of_notrun),
                        ("5 All detail", _REPORT_COLS, _detail,
                         _REPORT_WIDTHS, _xl_style_of),
