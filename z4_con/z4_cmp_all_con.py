@@ -312,7 +312,7 @@ def _panel_projects():
         return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
     return list(PROJECTS)
 MODES      = ["spp"]                        # spp | con | table | custom | manual
-PIPELINE   = "compare"                      # "compare" = RESCORE + report from the .out files on disk, no simulation | ***SET TO "all" TO RUN THE SWEEP***
+PIPELINE   = "all"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
                                             #   "all"     simulate each value, then compare
                                             #   "compare" only reads disk -- SKIPS the sweep
 
@@ -381,7 +381,7 @@ CORES_FOR_REPORTS = 4          # of CORES_MAX, cores for scoring s-*hards + plot
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
-FORCE_RESCORE   = True        # True = re-score EVERY .out under the current criteria (trip = power to zero, ETERM line). Set back to False after this launch
+FORCE_RESCORE   = False       # True = re-score every folder every launch (only after a criterion change)
 RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
 SCORE_NO_CASE   = True          # True = shards score without loading the case (32-bit memory fix) -- keep
 # -- PLOTS: PDFs --
@@ -573,7 +573,7 @@ EXPORT_PDF_PUREPY = True                    # the pure-Python PDF writer -- what
 EXPORT_CSV      = False                     # one CSV per run beside the plots: time, then a column per channel
 EXPORT_SVG      = False                     # one SVG per run; open in a browser, print to PDF if you want one
 PLOT_CLEAR_STALE_CLAIMS = True              # before a plot pass, free every claim whose plotter is no longer running
-FRESH_START    = False                     # False = resume where it stopped, True = start over False: nothing ...
+FRESH_START    = True                      # True = START OVER: clears every .done/.attempts marker so all 1,100 faults simulate again with the 20-area monitoring. SET BACK TO False ONCE THE RUN IS GOING, or a relaunch starts over again
 SKIP_DONE      = True                       # skip scenarios that already have a .done and a .out
 FORCE_REBUILD = None                        # True = rebuild the snapshot even if the flat run is done
 MAX_SCENARIO_ATTEMPTS = 3                   # give up on a scenario after this many crashes
