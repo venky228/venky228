@@ -1054,6 +1054,61 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 
 """
 
+# >>> PROJECT PROTECTION: PRC-029-1 RIDE-THROUGH, MEASURED AT THE POI ---------
+# The block above (the "PRC-24" records as supplied) is replaced when
+# BESS_PRC029_CURVE is True. This is an inverter-based plant: from 1 Oct 2026
+# (FERC Order 909) it falls under PRC-029-1, not PRC-024 (which then covers
+# synchronous units and Type 1/2 wind only). SPP's frequency profile follows
+# PRC-029-1: continuous 58.8-61.2 Hz, 299 s out to 57.0 / 61.8 Hz. Voltage is
+# the PRC-029-1 must-ride-through table for "all other IBR" (BESS/solar):
+#   high  1.10-1.15 pu 1.0 s / 1.15-1.175 pu 0.5 s / 1.175-1.20 pu 0.2 s /
+#         above 1.20 pu no ride-through required
+#   low   0.70-0.90 pu 6.0 s / 0.50-0.70 pu 2.5 s / 0.25-0.50 pu 1.2 s /
+#         below 0.25 pu 0.16 s
+# Each record trips at the END of the required ride-through window (pickup =
+# the table time, plus TB 0.10 s breaker time), so the model rides through
+# exactly what the standard demands and no longer. The "no ride-through
+# required" stages (1.20 pu, 61.8 Hz, 57.0 Hz) carry a 0.10 s pickup so a
+# one-to-two cycle switching step at clearing (the 1.4 pu POI spike in
+# SantaFe F01) does not trip the plant on a numerical artefact. PRC-029-1
+# measures at the high side of the main transformer, so the monitored bus is
+# POIBUS, substituted per project in _bess_clone_models(); the machine bus
+# stays the feeder. Set False to run the supplied block instead.
+BESS_PRC029_CURVE = True
+BESS_RELAY_BLOCK_PRC029 = r"""/High Voltage Protections PRC-029-1 (all other IBR) -- measured at the POI
+  99900001   'VTGTPAT'     POIBUS    999000  '1'
+         -1.0000       1.2000       0.100       0.1000      /
+  99900002   'VTGTPAT'     POIBUS    999000  '1'
+         -1.0000       1.1750       0.200       0.1000      /
+  99900003   'VTGTPAT'     POIBUS    999000  '1'
+         -1.0000       1.1500       0.500       0.1000      /
+  99900004   'VTGTPAT'     POIBUS    999000  '1'
+         -1.0000       1.1000       1.000       0.1000      /
+/Low Voltage Protections PRC-029-1 (all other IBR) -- measured at the POI
+  99900011   'VTGTPAT'     POIBUS    999000  '1'
+          0.2500       5.0000       0.160       0.1000      /
+  99900012   'VTGTPAT'     POIBUS    999000  '1'
+          0.5000       5.0000       1.200       0.1000      /
+  99900013   'VTGTPAT'     POIBUS    999000  '1'
+          0.7000       5.0000       2.500       0.1000      /
+  99900014   'VTGTPAT'     POIBUS    999000  '1'
+          0.9000       5.0000       6.000       0.1000      /
+/High Frequency Protections PRC-029-1 (SPP / Eastern Interconnection)
+  99900021   'FRQDCAT'     POIBUS    999000  '1'
+       -100.0000      61.8000       0.100       0.1000      /
+  99900022   'FRQDCAT'     POIBUS    999000  '1'
+       -100.0000      61.2000     299.000       0.1000      /
+/Low Frequency Protections PRC-029-1 (SPP / Eastern Interconnection)
+  99900031   'FRQDCAT'     POIBUS    999000  '1'
+         57.0000     100.0000       0.100       0.1000      /
+  99900032   'FRQDCAT'     POIBUS    999000  '1'
+         58.8000     100.0000     299.000       0.1000      /
+"""
+_RELAY_SPLIT = "/High Voltage Protections PRC-24"
+if BESS_PRC029_CURVE and _RELAY_SPLIT in BESS_MODEL_TEMPLATE:
+    BESS_MODEL_TEMPLATE = (BESS_MODEL_TEMPLATE.split(_RELAY_SPLIT)[0]
+                           + BESS_RELAY_BLOCK_PRC029)
+
 # ---- NEW_PLANT NEEDS ENABLE_BESS -----------------------------------------
 #
 # NEW_PLANT builds the NETWORK: the unit buses, the GSUs, the collector, the MPT
@@ -8497,6 +8552,7 @@ def _bess_clone_models(feeder, poi):
        preserving every ICON/CON verbatim, then apply the isolation toggles."""
     txt = BESS_MODEL_TEMPLATE
     txt = txt.replace(BESS_REF_BUS, str(feeder))       # machine bus -> feeder bus
+    txt = txt.replace("POIBUS", str(poi))              # relay monitored bus -> the POI (PRC-024 point)
     if BESS_ID != BESS_REF_ID:
         nid = BESS_ID
         # the USRMDL header id: the token between 'USRMDL' and the 'RE...' model name
