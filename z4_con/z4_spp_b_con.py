@@ -10474,6 +10474,46 @@ def _xl_sheet_xml(header, rows, widths=None, style_of=None, first=False):
     return "".join(xml)
 
 
+def _xl_sheet_to_file(fpath, header, rows, widths=None, style_of=None, first=False):
+    """_xl_sheet_xml, written STRAIGHT TO A FILE a row at a time.
+
+       _xl_sheet_xml returns the whole sheet as one string. For the 'Transient
+       voltage' sheet -- 758,676 rows x 17 cells for one side of SantaFe --
+       that string is ~400 MB, built by joining a list of ~13 million pieces,
+       inside a 32-bit python with 2 GB for everything. That allocation is
+       what raised the out-of-memory box, and the workbook was then either
+       missing or written short. Nothing here is ever larger than one row; the
+       zip picks the file up from disk. Same XML, same styles, same filter."""
+    import io as _io
+    ncol = len(header)
+    n_rows = 0
+    with _io.open(fpath, "w", encoding="utf-8", newline="") as fh:
+        fh.write('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                 '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                 '<sheetViews><sheetView workbookViewId="0"%s>'
+                 '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+                 '</sheetView></sheetViews>' % (' tabSelected="1"' if first else ""))
+        if widths:
+            fh.write("<cols>")
+            for i, w in enumerate(widths[:ncol]):
+                fh.write('<col min="%d" max="%d" width="%d" customWidth="1"/>' % (i + 1, i + 1, w))
+            fh.write("</cols>")
+        fh.write("<sheetData>")
+        fh.write('<row r="1">' + "".join(_xl_cell(i, 1, h, 1) for i, h in enumerate(header)) + "</row>")
+        n = 1
+        for row in rows:
+            n += 1
+            st = style_of(row) if style_of else 0
+            fh.write('<row r="%d">' % n
+                     + "".join(_xl_cell(i, n, row[i] if i < len(row) else "", st) for i in range(ncol))
+                     + "</row>")
+        n_rows = n - 1
+        fh.write("</sheetData>")
+        fh.write('<autoFilter ref="A1:%s%d"/>' % (_xl_col(ncol - 1), n_rows + 1))
+        fh.write("</worksheet>")
+    return n_rows
+
+
 def _xl_sheet_name(name):
     """Excel refuses : \\ / ? * [ ] in a sheet name, and more than 31 characters."""
     out = "".join(("-" if ch in ":\\/?*[]" else ch) for ch in str(name))
@@ -10492,52 +10532,67 @@ def write_xlsx_multi(path, sheets, legend=None, title_rows=None):
        what must be acted on, what was already broken, what was not compared --
        is the same data and a report someone can act on."""
     import zipfile
+    import tempfile
+    import shutil
 
+    # EVERY DATA SHEET IS STREAMED TO A TEMP FILE, never held as one string --
+    # see _xl_sheet_to_file. `parts` holds (name, xml_text) for the small Key
+    # sheet and (name, ("file", path)) for the rest; the zip reads the files.
+    _tmpdir = tempfile.mkdtemp(prefix="xlsx_", dir=os.path.dirname(os.path.abspath(path)) or None)
     parts = []
-    for i, sh in enumerate(sheets):
-        name, header, rows, widths, style_of = (list(sh) + [None, None])[:5]
-        parts.append((_xl_sheet_name(name),
-                      _xl_sheet_xml(header, rows, widths, style_of, first=(i == 0))))
-    parts.append(("Key", _xl_legend_sheet(legend or [], title_rows or [])))
-
-    ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
-          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
-          '<Default Extension="xml" ContentType="application/xml"/>',
-          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>']
-    wb = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"',
-          ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
-          '<sheets>']
-    rels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
-    for i, (name, _xml) in enumerate(parts, start=1):
-        ct.append('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType='
-                  '"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i)
-        wb.append('<sheet name="%s" sheetId="%d" r:id="rId%d"/>'
-                  % (_xl_esc(name), i, i))
-        rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
-                    '/officeDocument/2006/relationships/worksheet" Target="worksheets'
-                    '/sheet%d.xml"/>' % (i, i))
-    ct.append('<Override PartName="/xl/styles.xml" ContentType="application/vnd.'
-              'openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
-    wb.append("</sheets></workbook>")
-    rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
-                '/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
-                % (len(parts) + 1))
-    rels.append("</Relationships>")
-
-    z = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED)
     try:
-        z.writestr("[Content_Types].xml", "".join(ct))
-        z.writestr("_rels/.rels", _XL_RELS)
-        z.writestr("xl/workbook.xml", "".join(wb))
-        z.writestr("xl/_rels/workbook.xml.rels", "".join(rels))
-        z.writestr("xl/styles.xml", _XL_STYLES)
-        for i, (_name, xml) in enumerate(parts, start=1):
-            z.writestr("xl/worksheets/sheet%d.xml" % i, xml)
+        for i, sh in enumerate(sheets):
+            name, header, rows, widths, style_of = (list(sh) + [None, None])[:5]
+            _fp = os.path.join(_tmpdir, "sheet%d.xml" % (i + 1))
+            _xl_sheet_to_file(_fp, header, rows, widths, style_of, first=(i == 0))
+            parts.append((_xl_sheet_name(name), ("file", _fp)))
+        parts.append(("Key", _xl_legend_sheet(legend or [], title_rows or [])))
+
+        ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+              '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+              '<Default Extension="xml" ContentType="application/xml"/>',
+              '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>']
+        wb = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+              '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"',
+              ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+              '<sheets>']
+        rels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
+        for i, (name, _xml) in enumerate(parts, start=1):
+            ct.append('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType='
+                      '"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i)
+            wb.append('<sheet name="%s" sheetId="%d" r:id="rId%d"/>'
+                      % (_xl_esc(name), i, i))
+            rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
+                        '/officeDocument/2006/relationships/worksheet" Target="worksheets'
+                        '/sheet%d.xml"/>' % (i, i))
+        ct.append('<Override PartName="/xl/styles.xml" ContentType="application/vnd.'
+                  'openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+        wb.append("</sheets></workbook>")
+        rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
+                    '/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                    % (len(parts) + 1))
+        rels.append("</Relationships>")
+
+        # allowZip64: a 700k-row sheet is well past 2 GB uncompressed across
+        # the archive's own accounting on some versions; the flag costs nothing.
+        z = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, allowZip64=True)
+        try:
+            z.writestr("[Content_Types].xml", "".join(ct))
+            z.writestr("_rels/.rels", _XL_RELS)
+            z.writestr("xl/workbook.xml", "".join(wb))
+            z.writestr("xl/_rels/workbook.xml.rels", "".join(rels))
+            z.writestr("xl/styles.xml", _XL_STYLES)
+            for i, (_name, xml) in enumerate(parts, start=1):
+                if isinstance(xml, tuple) and xml and xml[0] == "file":
+                    z.write(xml[1], "xl/worksheets/sheet%d.xml" % i)
+                else:
+                    z.writestr("xl/worksheets/sheet%d.xml" % i, xml)
+        finally:
+            z.close()
     finally:
-        z.close()
+        shutil.rmtree(_tmpdir, ignore_errors=True)
     return path
 
 
@@ -14625,7 +14680,7 @@ def load_out(p, cache=True):
                     out = _fast_read(p, _cid, _lay, lenient=True)
                     if out is not None and not _read_reaches_end(p, out[0]):
                         _pf = _FAST_PREFIX.get("last") or (None, 0, 0, 0)
-                        _poison, _pwhy = _out_is_poison(p)
+                        _poison, _pwhy = out_is_poison(p)
                         if _poison:
                             print("  [fast] %s: that prefix ends at t=%.2f s, short of the "
                                   "run -- but the file is %s, so dyntools must not read it. "
@@ -18021,6 +18076,12 @@ SPP_VIOLATIONS = {}
 #   {case: {"angles": [row, ...], "volts": [row, ...]}}
 # Written to the measurements workbook. See write_measurements_workbook().
 SPP_MEASURE = {}
+# THE FULL 'Transient voltage' SHEET IS WRITTEN ONLY UP TO THIS MANY ROWS.
+# One side of SantaFe is 758,676 voltage rows; write_xlsx_multi builds each
+# sheet as ONE XML string in memory, and in this 32-bit python that string
+# is what raised the out-of-memory box. Past the cap the sheet holds the
+# flagged rows only and says so; the CSV beside it always holds them all.
+MEAS_XLSX_MAX_VOLT_ROWS = 0        # 0 = NO CAP: every voltage row is in the workbook (the writer streams now)
 VIOLATION_LIST_MAX = 20      # how many to name inline in the criteria report
 
 
@@ -21019,14 +21080,41 @@ def write_measurements_workbook(cases, verdicts):
         return 3 if "EXEMPT" in f else 2
 
     paths = []
+    # THE CSVs FIRST. They are what the comparison reads, they stream out
+    # row by row, and they must exist even if the workbook below runs this
+    # 32-bit python out of memory -- which it has.
+    # THE CSVs REGARDLESS. A workbook that Excel will not open, on a machine
+    # with no Excel, is not a deliverable; the same rows as plain text always
+    # are. They cost nothing next to a .out file.
+    for stem, hdr, rows in (("SPP_MEASURE_ANGLES", A_HDR, a_rows),
+                            ("SPP_MEASURE_VOLTS", V_HDR, v_rows),
+                            ("SPP_MEASURE_MACHINES", M_HDR, m_rows),
+                            ("SPP_MEASURE_POI", P_HDR, p_rows)):
+        try:
+            cp = report_path(stem, "csv", _selected_tag())
+            with open(cp, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(hdr)
+                w.writerows(rows)
+            paths.append(cp)
+            print("Measurements     -> %s" % cp)
+        except Exception as e:
+            print("Measurements     -> could not write %s (%s)" % (stem, e))
     xp = report_path("SPP_MEASUREMENTS", "xlsx", _selected_tag())
+    _v_sheet = v_rows if (not MEAS_XLSX_MAX_VOLT_ROWS or len(v_rows) <= MEAS_XLSX_MAX_VOLT_ROWS) else v_bad
+    _v_note = ("" if _v_sheet is v_rows else
+               "Transient voltage sheet: %d rows exceed MEAS_XLSX_MAX_VOLT_ROWS=%d, so it "
+               "holds the FLAGGED rows only; SPP_MEASURE_VOLTS.csv beside this file has all %d."
+               % (len(v_rows), MEAS_XLSX_MAX_VOLT_ROWS, len(v_rows)))
+    if _v_note:
+        print("Measurements     -> " + _v_note)
     try:
         write_xlsx_multi(
             xp,
             [("Rotor angle SPPR", A_HDR, a_rows,
               [22, 30, 10, 13, 14, 14, 10, 10, 10, 10, 10, 18, 18, 11, 15, 17, 34],
               _a_style),
-             ("Transient voltage", V_HDR, v_rows,
+             ("Transient voltage", V_HDR, _v_sheet,
               [22, 20, 10, 20, 8, 18, 9, 16, 9, 17, 9, 15, 17, 22, 40, 14, 14], _v_style),
              ("Voltage flagged", V_HDR, v_bad,
               [22, 20, 10, 20, 8, 18, 9, 16, 9, 17, 9, 15, 17, 22, 40, 14, 14], _v_style),
@@ -21051,6 +21139,7 @@ def write_measurements_workbook(cases, verdicts):
                 % int(ANGLE_DEV_DEG),
                 "the reason they were not evaluated.",
                 "",
+                _v_note,
                 "Voltage: recovery >= %.2f pu by %.1f s after clearing; no swing"
                 % (V_RECOVERY_PU, V_RECOVERY_S),
                 "above %.2f pu after clearing; settled %.2f-%.2f pu."
@@ -21061,27 +21150,10 @@ def write_measurements_workbook(cases, verdicts):
         print("Measurements     -> %s" % xp)
     except Exception as e:
         print("Measurements     -> could not write the .xlsx (%s) -- writing CSVs" % e)
-    # THE CSVs REGARDLESS. A workbook that Excel will not open, on a machine
-    # with no Excel, is not a deliverable; the same rows as plain text always
-    # are. They cost nothing next to a .out file.
-    for stem, hdr, rows in (("SPP_MEASURE_ANGLES", A_HDR, a_rows),
-                            ("SPP_MEASURE_VOLTS", V_HDR, v_rows),
-                            ("SPP_MEASURE_MACHINES", M_HDR, m_rows),
-                            ("SPP_MEASURE_POI", P_HDR, p_rows)):
-        try:
-            cp = report_path(stem, "csv", _selected_tag())
-            with open(cp, "w", newline="") as fh:
-                w = csv.writer(fh)
-                w.writerow(hdr)
-                w.writerows(rows)
-            paths.append(cp)
-            print("Measurements     -> %s" % cp)
-        except Exception as e:
-            print("Measurements     -> could not write %s (%s)" % (stem, e))
     print("Measurements     -> %d rotor angle row(s), %d bus voltage row(s) "
           "(%d flagged) over %d scenario(s)"
           % (len(a_rows), len(v_rows), len(v_bad), len(SPP_MEASURE)))
-    return paths[0] if paths else ""
+    return (xp if xp in paths else (paths[0] if paths else ""))
 
 
 # SPIKE OR SWING. Below this many seconds above the limit the excursion is one

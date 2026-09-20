@@ -2802,17 +2802,112 @@ def exceedance(kind, value, lim):
 # value can be shown for every project-side violation, violation or not.
 _MEAS_CACHE = {}
 
+# THE BUSES THE COMPARISON WILL ASK ABOUT, per project. Filled from the
+# violation lists of every side before the measurements are read, so the
+# bus-voltage table can be read SELECTIVELY -- see read_measurements().
+_WANT_BUSES = {}
 
-def read_measurements(rdir, proj):
+
+def _want_buses(proj):
+    return _WANT_BUSES.setdefault(str(proj or ""), set())
+
+
+def _note_wanted_elements(proj, rows):
+    """Record every bus named in any violation list of `rows` (both sides) as
+       one the bus-voltage read must keep."""
+    w = _want_buses(proj)
+    for _r in rows or []:
+        for _kind, _d in ((_r.get("elements") or {}).items()):
+            for _side in ("vb", "vt"):
+                for _el in (_d.get(_side) or {}):
+                    try:
+                        _b = _bus_of_element(_el)
+                    except Exception:
+                        _b = None
+                    if _b is not None:
+                        w.add(str(_b))
+    return w
+
+
+def measured_fault_ids(rdir, proj):
+    """The set of scenario ids that have ANY measurement row on one side --
+       volts, machines or POI -- read by STREAMING, storing nothing but the ids.
+
+       For the coverage test only. It used to take the keys of a full
+       read_measurements(), which now keeps a subset of the voltage rows on
+       purpose; counting faults through that subset would call a complete
+       study incomplete and re-score it for nothing."""
+    ids = set()
+    for stem in ("SPP_MEASURE_VOLTS", "SPP_MEASURE_MACHINES", "SPP_MEASURE_POI"):
+        fp = rfile(rdir, stem, "csv", proj)
+        if not fp:
+            continue
+        try:
+            with csv_open(fp) as fh:
+                rd = csv.reader(fh)
+                hdr = next(rd, None) or []
+                try:
+                    i_sc = [h.strip() for h in hdr].index("Scenario")
+                except ValueError:
+                    continue
+                for r in rd:
+                    try:
+                        s = r[i_sc].strip()
+                    except IndexError:
+                        continue
+                    if s:
+                        ids.add(s)
+        except Exception as e:
+            print("[compare] could not count scenarios in %s (%s)" % (fp, _err_text(e)))
+    return ids
+
+
+def _err_text(e):
+    """str(e) -- except that a MemoryError's str() is EMPTY, which is how a
+       32-bit python running out of address space printed as 'could not read
+       ... ()' and went unread for a week."""
+    if isinstance(e, MemoryError):
+        return ("MemoryError -- this 32-bit python (%s) ran out of its 2 GB address "
+                "space reading it" % os.path.basename(sys.executable))
+    return "%s: %s" % (type(e).__name__, e) if str(e) else type(e).__name__
+
+
+def read_measurements(rdir, proj, full=False):
     """{"volts": {(fault, bus): (rec_min, ov_max, ov_t, settled, above_s)},
         "angles": {(fault, bus): deviation}, "src": [files]} for one study.
 
        Bus keys are the bus NUMBER as text. Missing files give empty maps, and
-       a column the study did not write yet (above_s) reads as None."""
+       a column the study did not write yet (above_s) reads as None.
+
+       THE BUS-VOLTAGE TABLE IS READ SELECTIVELY. SPP_MEASURE_VOLTS is every
+       monitored bus of every scenario -- 758,676 rows and 100+ MB for one
+       side of SantaFe -- and this process is the same 32-bit Python34 that
+       runs PSS/E, with 2 GB of address space for everything. Loading that
+       table whole, twice (base and project), for four projects, is what ran
+       it out: the read died partway through the volts (so SOME base values
+       were there and the rest read UNKNOWN), and the small tables read after
+       it -- machines, POI -- got nothing at all, which is why the POI power
+       sheet was 175 rows of n/a while the POI file on disk was complete.
+
+       So the small tables are read FIRST, and of the voltage rows only these
+       are kept: rows whose 'Limits broken' is not OK (every violation, on
+       every side), and rows of buses recorded in _WANT_BUSES for this project
+       (every bus any side's violation list names, so the OTHER side's number
+       for it is always there). That is every row the comparison can ask for,
+       at a few thousand rows instead of three quarters of a million.
+       full=True restores the whole table for a caller that really needs it."""
     _k = _side_key(rdir)
-    if _k in _MEAS_CACHE:
-        return _MEAS_CACHE[_k]
-    out = {"volts": {}, "angles": {}, "machines": {}, "area": {}, "src": [], "poi": {}}
+    _want = _want_buses(proj)
+    _c = _MEAS_CACHE.get(_k)
+    if _c is not None:
+        # STILL GOOD if it was a full read, or nothing new has been asked for
+        # since it was taken. A bus added to the want-list after the read means
+        # the cached subset may lack it: read again.
+        if _c.get("_full") or (not full and _c.get("_want_n", -1) >= len(_want)):
+            return _c
+    out = {"volts": {}, "angles": {}, "machines": {}, "area": {}, "src": [], "poi": {},
+           "_full": bool(full), "_want_n": len(_want), "partial": False}
+    _keep_all = bool(full)
 
     def _f(x):
         try:
@@ -2821,53 +2916,6 @@ def read_measurements(rdir, proj):
         except (TypeError, ValueError):
             return None
 
-    vp = rfile(rdir, "SPP_MEASURE_VOLTS", "csv", proj)
-    if vp:
-        try:
-            with csv_open(vp) as fh:
-                rd = csv.reader(fh)
-                hdr = next(rd, None) or []
-                H = dict((h.strip(), i) for i, h in enumerate(hdr))
-                # 'at (s)' appears twice; the overshoot instant is the one
-                # right after the post-clear maximum.
-                i_sc, i_bus = H.get("Scenario"), H.get("Bus")
-                i_rec, i_ov = H.get("Recovery min (pu)"), H.get("Post-clear max (pu)")
-                i_ss = H.get("Settled avg (pu)")
-                i_area = H.get("Area")
-                i_ab = None
-                for h, i in H.items():
-                    if h.startswith("Above ") and h.endswith("total (s)"):
-                        i_ab = i
-                if None not in (i_sc, i_bus, i_ov):
-                    for r in rd:
-                        try:
-                            fid = r[i_sc].strip()
-                            bus = r[i_bus].strip()
-                        except IndexError:
-                            continue
-                        if not fid or not bus:
-                            continue
-                        bus = bus.split(".")[0]
-                        def _g(i):
-                            try:
-                                return _f(r[i]) if i is not None else None
-                            except IndexError:
-                                return None
-                        key = (fid, bus)
-                        rec = (_g(i_rec), _g(i_ov), _g(i_ov + 1), _g(i_ss), _g(i_ab))
-                        # WORST OF THE LABELS. The POI is recorded under two
-                        # labels; keep the higher overshoot for the bus.
-                        old = out["volts"].get(key)
-                        if old is None or ((rec[1] or -1) > (old[1] or -1)):
-                            out["volts"][key] = rec
-                        if i_area is not None and key not in out["area"]:
-                            try:
-                                out["area"][key] = r[i_area].strip()
-                            except IndexError:
-                                pass
-                    out["src"].append(os.path.basename(vp))
-        except Exception as e:
-            print("[compare] could not read %s (%s)" % (vp, e))
     ap = rfile(rdir, "SPP_MEASURE_ANGLES", "csv", proj)
     if ap:
         try:
@@ -2896,7 +2944,8 @@ def read_measurements(rdir, proj):
                                 pass
                     out["src"].append(os.path.basename(ap))
         except Exception as e:
-            print("[compare] could not read %s (%s)" % (ap, e))
+            out["partial"] = True
+            print("[compare] *** could not read %s (%s) ***" % (ap, _err_text(e)))
     # THE MACHINES. Written by the study beside the volts and the angles: every
     # machine's pre-fault MW, final MW, lowest post-clearing MW, terminal
     # voltage before and after, and whether it was called tripped. This is what
@@ -2961,7 +3010,8 @@ def read_measurements(rdir, proj):
                         _nm += 1
                     out["src"].append(os.path.basename(mp))
         except Exception as e:
-            print("[compare] could not read %s (%s)" % (mp, e))
+            out["partial"] = True
+            print("[compare] *** could not read %s (%s) ***" % (mp, _err_text(e)))
     # THE POI POWER. SPP_MEASURE_POI: per scenario, the TOTAL delivered into
     # the POI (new plant + existing) and its parts, MW and MVAr. Read into
     # out["poi"][fault][(quantity, component)] = {p0, min, max, end, src}.
@@ -3002,7 +3052,75 @@ def read_measurements(rdir, proj):
                         _np += 1
                     out["src"].append(os.path.basename(pp))
         except Exception as e:
-            print("[compare] could not read %s (%s)" % (pp, e))
+            out["partial"] = True
+            print("[compare] *** could not read %s (%s) ***" % (pp, _err_text(e)))
+    # THE BUS VOLTAGES LAST, and selectively -- see the docstring.
+    vp = rfile(rdir, "SPP_MEASURE_VOLTS", "csv", proj)
+    if vp:
+        try:
+            with csv_open(vp) as fh:
+                rd = csv.reader(fh)
+                hdr = next(rd, None) or []
+                H = dict((h.strip(), i) for i, h in enumerate(hdr))
+                # 'at (s)' appears twice; the overshoot instant is the one
+                # right after the post-clear maximum.
+                i_sc, i_bus = H.get("Scenario"), H.get("Bus")
+                i_rec, i_ov = H.get("Recovery min (pu)"), H.get("Post-clear max (pu)")
+                i_ss = H.get("Settled avg (pu)")
+                i_area = H.get("Area")
+                i_ab = None
+                for h, i in H.items():
+                    if h.startswith("Above ") and h.endswith("total (s)"):
+                        i_ab = i
+                i_flag = H.get("Limits broken")
+                _n_seen = _n_kept = 0
+                if None not in (i_sc, i_bus, i_ov):
+                    for r in rd:
+                        try:
+                            fid = r[i_sc].strip()
+                            bus = r[i_bus].strip()
+                        except IndexError:
+                            continue
+                        if not fid or not bus:
+                            continue
+                        bus = bus.split(".")[0]
+                        _n_seen += 1
+                        if not _keep_all:
+                            # KEEP: any row over a limit, and any bus a
+                            # violation list names. Drop the rest unread.
+                            try:
+                                _flag = (r[i_flag] or "").strip() if i_flag is not None else ""
+                            except IndexError:
+                                _flag = ""
+                            if bus not in _want and _flag in ("", "OK"):
+                                continue
+                        _n_kept += 1
+                        def _g(i):
+                            try:
+                                return _f(r[i]) if i is not None else None
+                            except IndexError:
+                                return None
+                        key = (fid, bus)
+                        rec = (_g(i_rec), _g(i_ov), _g(i_ov + 1), _g(i_ss), _g(i_ab))
+                        # WORST OF THE LABELS. The POI is recorded under two
+                        # labels; keep the higher overshoot for the bus.
+                        old = out["volts"].get(key)
+                        if old is None or ((rec[1] or -1) > (old[1] or -1)):
+                            out["volts"][key] = rec
+                        if i_area is not None and key not in out["area"]:
+                            try:
+                                out["area"][key] = r[i_area].strip()
+                            except IndexError:
+                                pass
+                    out["src"].append(os.path.basename(vp))
+                    if not _keep_all:
+                        print("[compare] bus voltages %s: kept %d of %d row(s) -- every "
+                              "row over a limit plus %d wanted bus(es)"
+                              % (os.path.basename(rdir), _n_kept, _n_seen, len(_want)))
+        except Exception as e:
+            out["partial"] = True
+            print("[compare] *** could not read %s (%s) -- base/project VOLTAGE values "
+                  "from this side will be missing ***" % (vp, _err_text(e)))
     if out["src"]:
         print("[compare] measurements read from %s: %d bus-voltage, %d rotor-angle, "
               "%d machine record(s) (%s)"
@@ -4149,6 +4267,9 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
                      "worse_within": any(c["worse_within"] for c in crits)})
     # EVERY BUS'S NUMBERS, BOTH SIDES, so a project-side violation can show
     # what the same bus did in the base study whether or not it violated there.
+    # The buses named by either side's violation lists are recorded first, so
+    # the selective voltage read keeps the OTHER side's row for each of them.
+    _note_wanted_elements(proj, rows)
     meas_b, meas_t = read_measurements(rb, proj), read_measurements(rt, proj)
     # THE CHANNEL NUMBERS, both studies in one file, for checking by hand.
     # CHANNELS_<proj>.txt is ~900 kB of .out channel numbers, for checking a
@@ -5594,8 +5715,17 @@ def _xl_cell(col, row, value, style):
     # is most of the reason to produce a spreadsheet at all.
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return '<c r="%s"%s><v>%s</v></c>' % (ref, st, repr(value))
+    # EXCEL'S HARD LIMIT IS 32,767 CHARACTERS IN ONE CELL. One character over
+    # and Excel declares the whole workbook corrupt and offers to "repair" it
+    # by deleting the sheet. With CAUSE_BUSES_MAX = 0 the violating_buses cell
+    # names every bus, and a 345 kV fault with 900 buses over 1.20 pu gets
+    # there. The cell keeps what fits and says where the rest is -- the
+    # per-element detail sheet, which has every one of them on its own row.
+    _s = str(value)
+    if len(_s) > 32000:
+        _s = _s[:32000] + " ... [Excel cell limit -- every element is on sheet 5]"
     return ('<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
-            % (ref, st, _xl_esc(value)))
+            % (ref, st, _xl_esc(_s)))
 
 
 def _xl_legend_sheet(legend, title_rows):
@@ -15883,11 +16013,7 @@ def ensure_reports(mode_list):
             # be run. So the measurements are tested for coverage too.
             if not _sel_tag():
                 try:
-                    _mm = read_measurements(results_dir(case, proj, md), proj)
-                    _mf = set(k[0] for k in (_mm.get("volts") or {}))
-                    _mf |= set(k[0] for k in (_mm.get("machines") or {}))
-                    _mf |= set((_mm.get("poi") or {}).keys())
-                    _n_meas = len(_mf)
+                    _n_meas = len(measured_fault_ids(results_dir(case, proj, md), proj))
                 except Exception:
                     _n_meas = -1
                 if 0 <= _n_meas and _n_den and _n_meas < REPORT_COVERAGE_MIN * _n_den:
