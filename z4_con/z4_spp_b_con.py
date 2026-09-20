@@ -2585,11 +2585,18 @@ V_OVERSHOOT_JUDGE_SWING  = False
 # small unit that never moved (dispatched at 6 MW, still at 6 MW) is not called
 # tripped: the end value must ALSO be below TRIP_RESIDUAL_FRAC of the pre-fault
 # value. All three are MW on the system base (see SYS_MVA_BASE).
+# RULE: a machine is TRIPPED only if its power goes to ZERO after the fault.
+# TRIP_PGEN_DEAD_MW was 10.0: a 2.01 MW unit that settled at 0.78 MW (39 %,
+# terminal voltage healthy, still on line) was reported "TRIPPED 2.01 -> 0.78
+# MW" and became a NEW violation, while the same unit in the other case at
+# 2.47 -> 1.56 MW was not. 0.05 MW is numerical zero for a channel recorded
+# in pu on a 100 MVA base; a machine that is still connected never sits there.
 TRIP_PGEN_MIN_MW    = 0.5      # was carrying at least this before the fault
-TRIP_PGEN_DEAD_MW   = 10.0     # ...and ends below this -> tripped
-TRIP_RESIDUAL_FRAC  = 0.50     # ...and below this fraction of pre-fault (the never-moved guard)
+TRIP_PGEN_DEAD_MW   = 0.05     # ...and ends at ZERO (below this, in MW) -> tripped
+TRIP_RESIDUAL_FRAC  = 0.10     # ...and below this fraction of pre-fault (never binds once DEAD is 0.05; kept as a guard)
 try:
     TRIP_PGEN_DEAD_MW = float(os.environ.get("SPP_TRIP_PGEN_DEAD_MW") or TRIP_PGEN_DEAD_MW)
+    TRIP_RESIDUAL_FRAC = float(os.environ.get("SPP_TRIP_RESIDUAL_FRAC") or TRIP_RESIDUAL_FRAC)
 except Exception:
     pass
 # PELEC / QELEC channels are pu on the SYSTEM MVA base. Everything that reports
@@ -16901,6 +16908,26 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
             _tail = [x for x in _v2[-_nst:] if x == x and x not in (_INF, -_INF)]
             if (_v2 and float(_v2[0]) >= TRIP_ETERM_PREFAULT_PU and _tail
                     and sum(_tail) / float(len(_tail)) < TRIP_ETERM_DEAD_PU):
+                _b2 = _chan_bus(_t2)
+                if _b2 != "":
+                    _trip_buses.add(int(_b2))
+        except Exception:
+            pass
+    # ...AND THE MACHINES THE REPORT CALLS TRIPPED ON POWER. evaluate_case has
+    # two trip tests -- terminal voltage collapsed, or output gone from
+    # > TRIP_PGEN_MIN_MW to < TRIP_PGEN_DEAD_MW and < TRIP_RESIDUAL_FRAC of
+    # pre-fault. Only the first was mirrored here, so a machine tripped on the
+    # power test (763871 in SantaFe F01) was named in the report and its P /
+    # Eterm panel dropped by the compact filter: the verdict was stated with
+    # no trace to look at. Same rule, same constants; ch is already in MW here
+    # (see _plot_units), so no SYS_MVA_BASE factor.
+    for _k2, (_t2, _v2) in ch.items():
+        if categorize(_t2) != "PELEC" or not _v2:
+            continue
+        try:
+            _p0, _p1 = abs(float(_v2[0])), abs(float(_v2[-1]))
+            if (_p0 > TRIP_PGEN_MIN_MW and _p1 < TRIP_PGEN_DEAD_MW
+                    and _p1 < TRIP_RESIDUAL_FRAC * _p0):
                 _b2 = _chan_bus(_t2)
                 if _b2 != "":
                     _trip_buses.add(int(_b2))
