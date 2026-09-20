@@ -15733,6 +15733,14 @@ def auto_remerge_stale_reports(quiet=False):
     return n
 
 
+def _in_panel_order(names):
+    """The projects in PROJECTS order -- not alphabetical. sorted() put
+       EmpirePrairie ahead of SantaFe, so a run meant to finish SantaFe's last
+       45 scenarios started a 404-fault project first."""
+    order = list(_panel_projects() or [])
+    return sorted(set(names), key=lambda n: (order.index(n) if n in order else len(order), str(n)))
+
+
 def _expected_fault_ids(case, proj, mode):
     """The scenario ids this (case, project) is meant to run, in list order:
        the shared fault list beside the cases, else the copy the study wrote
@@ -16886,7 +16894,7 @@ def main():
             # doubled the wall clock for no reason.
             _res, _ths = {}, []
             for key, case in _runs:
-                pjs = sorted(set(x[0] for x in todo[key]))
+                pjs = _in_panel_order(set(x[0] for x in todo[key]))
                 mds = sorted(set(x[1] for x in todo[key]))
                 _banner("%s is missing %s -- running it" % (case["label"], ", ".join(pjs)))
 
@@ -16904,7 +16912,7 @@ def main():
                     print("[compare]     still be compared; the rest stays one-sided. ***")
         else:
             for key, case in _runs:
-                pjs = sorted(set(x[0] for x in todo[key]))
+                pjs = _in_panel_order(set(x[0] for x in todo[key]))
                 mds = sorted(set(x[1] for x in todo[key]))
                 _banner("%s is missing %s -- running it" % (case["label"], ", ".join(pjs)))
                 rc = run_study(case, projects=pjs, modes=mds)
