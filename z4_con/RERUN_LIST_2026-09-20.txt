@@ -1,0 +1,82 @@
+RERUN LIST  --  built 2026-09-20 from 04_RUN_SUMMARY_*, the console of the 08:19 compare,
+               and UNSWITCHED_BRANCHES_PROJ_SantaFe.txt
+==========================================================================================
+
+Fault ids are PER PROJECT (SantaFe F15 is not EastFork F15). Run one project at a time.
+
+------------------------------------------------------------------------------------------
+ A.  CRASHED / GAVE UP  (3 attempts, PSS/E died after "final trip" of the unsuccessful
+     reclose, t ~ 5.55 s).  Same mechanism on every one that was inspected.
+------------------------------------------------------------------------------------------
+ EastFork  project : F07 F08 F09 F113 F158 F162 F164 F167
+ EastFork  base    : F158 F162 F164 F167
+ SantaFe   base    : F15 F16 F33 F39 F84 F86 F87 F88 F89 F91 F92 F93 F159 F162 F164
+                     F257 F258 F259 F262 F267
+ SantaFe   project : F15 F16 F33 F51 F84 F86 F87 F164 F217 F255 F257 F258 F259 F262
+                     F267 F280
+
+ These will crash again with the same settings. Re-run them with SIMULATE_RECLOSE = False
+ (clear + trip only, first dip only) OR after the model that dies on the second fault
+ application has been found. Either way they need a fresh attempt budget -- see D.
+
+------------------------------------------------------------------------------------------
+ B.  INCOMPLETE / NOT RUN  (nothing wrong with them -- the run was stopped)
+     PIPELINE = "missing" picks these up by itself; listed so the count is visible.
+------------------------------------------------------------------------------------------
+ SantaFe   project incomplete : F22 F52 F128 F157 F191 F256 F288
+ SantaFe   project not run    : F23-F32  F53-F64  F88-F96  F158 F159 F160  F192  F289-F291
+ IronStar  both sides         : everything not yet done (base had 33/230 at 08:10)
+ EmpirePrairie both sides     : all 404
+
+------------------------------------------------------------------------------------------
+ C.  UNSWITCHED  (simulated, scored, but the trip did NOT happen -- the result is not the
+     event the description claims).  FIX THE LIST FIRST, then re-run these.
+------------------------------------------------------------------------------------------
+ SantaFe project, branch not in DIS2201-25SP-G03-CQ_F.sav (far bus is a queued-project tap):
+     F11   531469-771060    F42  768480-771060    F67  768480-771060    F76  530583-765035
+     F112  530583-765035    F113 530583-765035    F150 539671-766081    F166 560082-765035
+     F178  523823-768501    F195 539671-766081    F197 539679-763850    F206 560082-765035
+     F237  539783-766081    F240 640065-764430
+       -> mark "not in this case" in the list (or map to the in-case equivalent), do not
+          run them as-is.
+ SantaFe project, circuit id does not exist in this case:
+     F71   523853-531449 ck2 (only ck1 here)      F241  640066-640065 ck2 (only ck1 here)
+       -> decide: drop, or redefine on ck1 (a different, harsher event).
+ SantaFe project, 3-winding transformer named as a 2-winding branch:
+     F224  530626-530680
+       -> move to the trip_3wind column.
+ SantaFe BASE: 18 scenarios -- see UNSWITCHED_BRANCHES_BASE_SantaFe.txt (not reviewed here;
+     expected to be the same ids as above plus one).
+ EastFork: check reports\UNSWITCHED_BRANCHES_*_EastFork.txt for both sides.
+
+------------------------------------------------------------------------------------------
+ D.  HOW TO RE-RUN GROUP A (after the current runs finish)
+------------------------------------------------------------------------------------------
+ 1. Give the crashed scenarios a fresh budget -- PowerShell at C:\KV:
+
+    $ef = 'F07','F08','F09','F113','F158','F162','F164','F167'
+    $sf = 'F15','F16','F33','F39','F51','F84','F86','F87','F88','F89','F91','F92','F93',
+          'F159','F162','F164','F217','F255','F257','F258','F259','F262','F267','F280'
+    foreach ($f in $ef) { Remove-Item "Base\results_base\EastFork_spp\outs\$f.attempts","Projects\results_proj\EastFork_spp\outs\$f.attempts" -ErrorAction SilentlyContinue }
+    foreach ($f in $sf) { Remove-Item "Base\results_base\SantaFe_spp\outs\$f.attempts","Projects\results_proj\SantaFe_spp\outs\$f.attempts" -ErrorAction SilentlyContinue }
+
+    (An id that is in the list for one side only is harmless on the other -- there is
+     nothing to delete there.)
+
+ 2. In z4_cmp_all_con.py, one project at a time:
+
+    PROJECTS         = ["SantaFe"]                   # then ["EastFork"]
+    PIPELINE         = "missing"
+    SIMULATE_RECLOSE = False                         # ONLY if you accept first-dip-only for these
+    ONLY_FAULTS      = ["F15","F16","F33","F39","F51","F84","F86","F87","F88","F89","F91",
+                        "F92","F93","F159","F162","F164","F217","F255","F257","F258",
+                        "F259","F262","F267","F280"]                       # SantaFe
+    # EastFork:  ONLY_FAULTS = ["F07","F08","F09","F113","F158","F162","F164","F167"]
+
+    Run. The scored .out files already on disk are untouched; only these ids simulate.
+
+ 3. Put ONLY_FAULTS = [] and SIMULATE_RECLOSE back, then PIPELINE = "compare" for the
+    full workbook. The auto-merge rebuilds the reports from parts first.
+
+ GROUP C is re-run the same way once the list is corrected -- delete their .attempts and
+ .done markers (both sides), and list them in ONLY_FAULTS.
