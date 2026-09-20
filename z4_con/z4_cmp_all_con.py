@@ -15487,8 +15487,23 @@ def _merge_one_folder(case, rdir):
     if not spp:
         return False
     env = dict(os.environ)
+    # THE SAME ENVIRONMENT THE RUN HAD. Without it the merge process fell back
+    # to the study script's own deck names -- "DIS2201-25SP-G03-CQ.sav (this
+    # file -- z4_cmp_all_con.py did not name one)" -- could not find the
+    # _CQ_F_..._NEWPLANT_newplant_buses.txt the run had written, and rebuilt
+    # the violations report with "PROJECT_GENS stays on the project's declared
+    # feeder buses": the wrong machines labelled as the project's. The decks,
+    # the new-plant table, the collector and every criterion threshold come
+    # from _push_settings, exactly as run_study passes them.
+    try:
+        _push_settings(env, case)
+    except Exception as _e:
+        print("[auto-merge]     could not pass the run settings to the merge (%s) -- "
+              "it will use the study script's own" % _e)
     env["SPP_MERGE_ONLY"] = "1"
-    env.pop("SPP_ONLY", None)
+    env["SPP_STUDY_DIR"] = case["dir"]
+    for _k in ("SPP_ONLY", "SPP_ONLY_FAULTS", "SPP_REPORT_FAULTS", "SPP_ONLY_EVENTS"):
+        env.pop(_k, None)
     # WHICH PROJECT. The study script picks its plant from SPP_PROJECT; launched
     # without it the project script stops at "ACTIVE_PROJECT '' not in
     # BESS_PROJECTS" and the base script falls back to its default results
@@ -15498,6 +15513,7 @@ def _merge_one_folder(case, rdir):
     _proj = os.path.basename(os.path.normpath(rdir)).rpartition("_")[0]
     if _proj:
         env["SPP_PROJECT"] = _proj
+        env["SPP_RUN_PROJECTS"] = _proj
     try:
         rc = subprocess.call([sys.executable, os.path.abspath(spp)],
                              cwd=rdir, env=env)

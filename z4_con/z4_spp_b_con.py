@@ -21031,7 +21031,13 @@ def write_measurements_workbook(cases, verdicts):
              "Final Eterm (pu)", "Tripped", "Evidence"]
     P_HDR = ["Scenario", "POI", "Quantity", "Component", "Pre-fault", "Min after clearing",
              "Max after clearing", "Final", "Source"]
-    a_rows, v_rows, v_bad, m_rows, p_rows = [], [], [], [], []
+    def _f(x, d=0.0):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return d
+    a_rows, v_bad, m_rows, p_rows = [], [], [], []
+    n_volts = 0
     for case in cases:
         for r in ((SPP_MEASURE.get(case) or {}).get("poi") or []):
             r = list(r) + [""] * 16
@@ -21040,24 +21046,34 @@ def write_measurements_workbook(cases, verdicts):
         for r in (m.get("angles") or []):
             r = list(r) + [""] * 16
             a_rows.append([case] + r[:16])
-        for r in (m.get("volts") or []):
-            r = list(r) + [""] * 16
-            row = [case] + r[:16]
-            v_rows.append(row)
-            if str(row[13]).strip() not in ("", "OK"):
-                v_bad.append(row)
+        # THE BUS VOLTAGES ARE NOT COPIED. One side of SantaFe is 1,083,024
+        # voltage rows, already held by the merge; building a second, padded
+        # copy of every one of them here -- which this used to do -- is the
+        # allocation that ran the 32-bit merge process out of memory (rc=1,
+        # nothing written after the What-failed report). The rows are sorted
+        # IN PLACE per scenario (worst first, raw column 8 = post-clear max)
+        # and padded one at a time by _v_iter() as they are written.
+        _vl = m.get("volts") or []
+        try:
+            _vl.sort(key=lambda r: -_f(r[8] if len(r) > 8 else 0))
+        except Exception:
+            pass
+        n_volts += len(_vl)
+        for r in _vl:
+            if len(r) > 12 and str(r[12]).strip() not in ("", "OK"):
+                v_bad.append([case] + list(r)[:16] + [""] * max(0, 16 - len(r)))
         for r in (m.get("machines") or []):
             r = list(r) + [""] * 16
             m_rows.append([case] + r[:10])
+
+    def _v_iter():
+        """Every voltage row, padded, in scenario order -- built one at a time."""
+        for case in cases:
+            for r in ((SPP_MEASURE.get(case) or {}).get("volts") or []):
+                yield [case] + list(r)[:16] + [""] * max(0, 16 - len(r))
     # WORST FIRST inside each scenario, so the top of every block is the finding.
-    def _f(x, d=0.0):
-        try:
-            return float(x)
-        except (TypeError, ValueError):
-            return d
     # column 4 is the angle deviation; column 9 is the post-clearing maximum.
     a_rows.sort(key=lambda r: (str(r[0]), -_f(r[4])))
-    v_rows.sort(key=lambda r: (str(r[0]), -_f(r[9])))
     v_bad.sort(key=lambda r: (str(r[0]), -_f(r[9])))
     # tripped first, then the biggest unit
     m_rows.sort(key=lambda r: (str(r[0]), -_f(r[9]), -abs(_f(r[4]))))
@@ -21087,7 +21103,7 @@ def write_measurements_workbook(cases, verdicts):
     # with no Excel, is not a deliverable; the same rows as plain text always
     # are. They cost nothing next to a .out file.
     for stem, hdr, rows in (("SPP_MEASURE_ANGLES", A_HDR, a_rows),
-                            ("SPP_MEASURE_VOLTS", V_HDR, v_rows),
+                            ("SPP_MEASURE_VOLTS", V_HDR, _v_iter()),
                             ("SPP_MEASURE_MACHINES", M_HDR, m_rows),
                             ("SPP_MEASURE_POI", P_HDR, p_rows)):
         try:
@@ -21101,11 +21117,12 @@ def write_measurements_workbook(cases, verdicts):
         except Exception as e:
             print("Measurements     -> could not write %s (%s)" % (stem, e))
     xp = report_path("SPP_MEASUREMENTS", "xlsx", _selected_tag())
-    _v_sheet = v_rows if (not MEAS_XLSX_MAX_VOLT_ROWS or len(v_rows) <= MEAS_XLSX_MAX_VOLT_ROWS) else v_bad
-    _v_note = ("" if _v_sheet is v_rows else
+    _v_full = (not MEAS_XLSX_MAX_VOLT_ROWS or n_volts <= MEAS_XLSX_MAX_VOLT_ROWS)
+    _v_sheet = _v_iter() if _v_full else v_bad
+    _v_note = ("" if _v_full else
                "Transient voltage sheet: %d rows exceed MEAS_XLSX_MAX_VOLT_ROWS=%d, so it "
                "holds the FLAGGED rows only; SPP_MEASURE_VOLTS.csv beside this file has all %d."
-               % (len(v_rows), MEAS_XLSX_MAX_VOLT_ROWS, len(v_rows)))
+               % (n_volts, MEAS_XLSX_MAX_VOLT_ROWS, n_volts))
     if _v_note:
         print("Measurements     -> " + _v_note)
     try:
@@ -21152,7 +21169,7 @@ def write_measurements_workbook(cases, verdicts):
         print("Measurements     -> could not write the .xlsx (%s) -- writing CSVs" % e)
     print("Measurements     -> %d rotor angle row(s), %d bus voltage row(s) "
           "(%d flagged) over %d scenario(s)"
-          % (len(a_rows), len(v_rows), len(v_bad), len(SPP_MEASURE)))
+          % (len(a_rows), n_volts, len(v_bad), len(SPP_MEASURE)))
     return (xp if xp in paths else (paths[0] if paths else ""))
 
 
