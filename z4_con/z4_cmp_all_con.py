@@ -6954,7 +6954,7 @@ _XL_LEGEND = [(2, "RED", "introduced by the projects -- act on these first"),
               (3, "AMBER", "fails in BOTH cases -- pre-existing, still a violation"),
               (4, "GREEN (filled)", "resolved -- fails without the projects, passes with them"),
               (5, "GREEN (text)", "passes in both cases"),
-              (6, "GREY", "not compared -- sheet 4 says per side: crashed / simulated, not scored / not run"
+              (6, "GREY", "not compared -- sheet 4 says per side: crashed / simulated, not scored / not run / EVENT NOT AS DEFINED (a trip did not take)"
                           " (crashed rows are RED there)")]
 
 
@@ -7493,8 +7493,15 @@ def write_one_report(results, only_base, only_test):
         L.append(" %d fault(s) fail without the projects and pass with them." % len(fixed))
     L.append(" %d fault(s) pass in both." % len(ok))
     if onesided:
-        L.append(" %d fault(s) could not be compared -- scored on one side only."
-                 % len(onesided))
+        _n_unsw = sum(1 for _res, r in onesided if r.get("unswitched"))
+        _n_side = len(onesided) - _n_unsw
+        _bits = []
+        if _n_side:
+            _bits.append("%d scored on one side only (crashed / not run / not scored)" % _n_side)
+        if _n_unsw:
+            _bits.append("%d simulated on both sides but NOT as defined -- a trip or "
+                         "reclose did not take (see sheet 4 / UNSWITCHED_BRANCHES)" % _n_unsw)
+        L.append(" %d fault(s) could not be compared: %s." % (len(onesided), "; ".join(_bits)))
     # ONE LINE PER PROJECT, AND SAY WHICH. With two projects in the report this
     # printed the same sentence twice with nothing to tell them apart, which
     # reads as a duplicated line rather than as two results.
