@@ -3783,6 +3783,8 @@ def _criterion_family(criterion):
     # number that belongs to no limit.
     if c.startswith(("transient voltage:", "rotor angle:", "***")):
         return ""
+    if "terminal voltage" in c and "eterm" in c:
+        return "eterm"                  # existing-machine terminals: recorded, not a BES criterion
     if "recovery" in c:
         return "recovery"
     if "transient voltage" in c or "swing" in c or "overshoot" in c:
@@ -3852,6 +3854,13 @@ def metric_tagged(criterion, detail):
         if v is None:
             v = _f(_V_HIGHEST.search(detail))
         return (v, "pu", "max", "extreme") if v is not None else (None, "", "", "")
+
+    if fam == "eterm":
+        # "765912=1.665@5.12s for 17ms, 765922=1.665@5.12s for 17ms" -- the
+        # highest terminal named. No direction: it is a recorded line, so the
+        # "moved towards a limit" flag cannot fire on it.
+        vals = [float(x) for x in re.findall(r"=\s*(\d+\.\d+)@", detail)]
+        return (max(vals), "pu", "", "extreme") if vals else (None, "", "", "")
 
     if fam == "recovery":
         v = _f(_V_WORST.search(detail))
