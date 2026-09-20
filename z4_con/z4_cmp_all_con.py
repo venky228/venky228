@@ -265,7 +265,7 @@ def _print_phase_times(total):
 #   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
 #   dyr_<value>\                              <- a full comparison per value
 
-PROJECTS   = ["SantaFe","IronStar","EmpirePrairie","EastFork"]                    # one project at a time for a sweep
+PROJECTS   = ["EastFork","SantaFe","IronStar","EmpirePrairie"]                    # one project at a time for a sweep
                                             # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
 # -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
 # "each"      one study per project in PROJECTS, each alone in the case (as before)
@@ -371,11 +371,13 @@ SIM_END_S   = 25.2              # s per fault; SPP needs ~2.5 s recovery + ~10 s
 RUN_NPLT    = 2                 # write every N steps: 1 = every step (huge) | 2 = half-cycle | 4 = per cycle
 KILL_GRACE_MIN = 30             # minutes of worker silence before any watchdog may act (slowest scenario ever measured: 24 min)
 # -- CORES / SESSIONS: how many PSS/E runs at once --
-RUN_IN_PARALLEL = True          # True = base and project at once | False = one after the other
+RUN_IN_PARALLEL = True          # True = base and project at once, BOTH in PROJECTS order | False = one after the other
+ONE_PROJECT_AT_A_TIME = True    # with RUN_IN_PARALLEL = False: base THEN project for ONE project, then the next project
+                                # (False = the base study for every project, then the project study for every project)
 N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
 CORES_SPARE     = 2             # cores kept free for Windows / Excel / you (0-4)
 CORES_MAX       = 22            # ceiling on PSS/E sessions across BOTH cases; 0 = none; auto-clamped to the PC
-CORES_FOR_REPORTS = 8          # of CORES_MAX, cores for scoring shards + plotters (0 = hold none back)
+CORES_FOR_REPORTS = 4          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
@@ -390,7 +392,7 @@ FORCE_REPLOT    = False        # True = REDRAW every PDF from the .out files on 
 PLOT_SCOPE      = "compact"     # "compact" = SPP set + every violation (~5x fewer panels) | "full" = every kept channel
 PLOT_INRUN      = 1             # plotters trailing each running folder (1 = the old single plotter)
 PLOT_WORKERS    = 2             # plotters per case in the catch-up pass (0/1 = one)
-PLOT_TOTAL_MAX  = 4             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
+PLOT_TOTAL_MAX  = 3             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
 PLOT_ONE_PROJECT_AT_A_TIME = True   # True = finish one project's PDFs (base, then project case) before starting the next project's
 PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out stops before the end of the simulation (it did not run); False = draw it for diagnosis
 # ============================================================================
@@ -399,7 +401,7 @@ PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out s
 ROOT = ""                                   # "" = the folder this file is in; everything else follows it
 BASE_FOLDER = "Base"                        # the folder holding the BASE case (projects NOT modelled)
 PROJ_FOLDER = "Projects"                    # the folder holding the case WITH the projects
-CMP_FOLDER  = "comparison_CON"                  # where the comparison output goes (created if absent)
+CMP_FOLDER  = "comparison_all"                  # where the comparison output goes (created if absent)
 # PROJECTS -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
 # ---- THE DECK EACH CASE READS ------------------------------------------------
 SHARED_DECK     = ""                        # "" = NO SHARED FILES: each case reads its own deck, in its own ...
@@ -565,7 +567,7 @@ RUN_FAULTS = None                           # False = build and score only, simu
 # ---- HOW MUCH IS DRAWN (the throttle, when there is no matplotlib) -----------
 INDIVIDUAL_KEYWORDS = ["PROJ", "POI", "FLT", "GEN"]   # the SPP set. [] = a panel for EVERY signal -- see below
 PLOT_MAX_PANELS = 0                         # 0 = no cap. A number = at most that many panels per scenario
-PLOT_MAX_POINTS = 1800                      # samples per trace; lower draws faster
+PLOT_MAX_POINTS = 1500                      # samples per trace; lower draws faster
 PER_PAGE        = 3                         # panels per PDF page
 EXPORT_PDF_PUREPY = True                    # the pure-Python PDF writer -- what draws when matplotlib is absent
 EXPORT_CSV      = False                     # one CSV per run beside the plots: time, then a column per channel
@@ -574,7 +576,7 @@ PLOT_CLEAR_STALE_CLAIMS = True              # before a plot pass, free every cla
 FRESH_START    = False                     # False = resume where it stopped, True = start over False: nothing ...
 SKIP_DONE      = True                       # skip scenarios that already have a .done and a .out
 FORCE_REBUILD = None                        # True = rebuild the snapshot even if the flat run is done
-MAX_SCENARIO_ATTEMPTS = 2                   # give up on a scenario after this many crashes
+MAX_SCENARIO_ATTEMPTS = 3                   # give up on a scenario after this many crashes
 RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-machine labels differ from the newest group to *.oldbuild (guesswork; a PDF older than its .out is redrawn anyway)
 RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
 TRUNCATED_FRAC = 0.80                       # short = under this fraction of the folder's median .out size
@@ -3379,6 +3381,36 @@ def read_events(rdir, proj):
     return ev
 
 
+def read_sources_from_faultlist(rdir):
+    """{fault: "DISIS" | "SCRIPT"} from the fault list the study ran -- the
+       `source` column the converter writes, or, for a list without it, the
+       con_id: SPP's GROUPn_... ids are DISIS events, SCRIPT_Fnn are the
+       study's own topology-built faults. "" when neither says."""
+    src = {}
+    for p in (os.path.join(rdir, "faults", "SPP_FAULTS.csv"),
+              _shared_list_for(_proj_of_results(rdir))):
+        if not p or not os.path.isfile(p):
+            continue
+        try:
+            with csv_open(p) as fh:
+                for r in csv.DictReader(fh):
+                    fid = (r.get("fault_id") or "").strip()
+                    if not fid or src.get(fid):
+                        continue
+                    v = (r.get("source") or "").strip().upper()
+                    if not v:
+                        cid = (r.get("con_id") or "").strip().upper()
+                        v = ("SCRIPT" if cid.startswith("SCRIPT_") or cid.startswith("TOPOLOGY_")
+                             else ("DISIS" if cid else ""))
+                    if v or fid not in src:
+                        src[fid] = v
+        except Exception:
+            continue
+    # both files read: the study's own copy may carry con_id only, the shared
+    # list carries the source column -- a blank in one is filled from the other
+    return src
+
+
 def read_events_from_faultlist(rdir):
     """{fault: planning event} from the FAULT LIST the study ran.
 
@@ -3833,6 +3865,8 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
     # list, which knows them all -- otherwise ONLY_EVENTS drops the faults whose
     # scoring has not caught up yet, which is not a fact about the system.
     _fl = read_events_from_faultlist(rt) or read_events_from_faultlist(rb)
+    # DISIS or SCRIPT, per fault, from the same list -- carried on every row
+    sources = read_sources_from_faultlist(rt) or read_sources_from_faultlist(rb)
     if _fl:
         _added = 0
         for _f, _e in _fl.items():
@@ -4087,6 +4121,7 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
         el = {}
         if not el_ok or _one_sided or _vio_gap:
             rows.append({"fault": fid, "event": events.get(fid, "-"),
+                         "source": sources.get(fid, ""),
                          "vb": vb_, "vt": vt_, "class": cls,
                          "state_b": sb.get(fid, ""), "state_t": st.get(fid, ""),
                          "crits": crits, "new_crit": new_crit,
@@ -4104,6 +4139,7 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
                         "vb": eb, "vt": et}
 
         rows.append({"fault": fid, "event": events.get(fid, "-"),
+                     "source": sources.get(fid, ""),
                      "vb": vb_, "vt": vt_, "class": cls,
                      "state_b": sb.get(fid, ""), "state_t": st.get(fid, ""),
                      "crits": crits, "new_crit": new_crit,
@@ -5843,7 +5879,7 @@ def _bmap_area_text(bus):
     return ("%s %s" % (a, nm)).strip()
 
 
-def _bmap_hops_from(src, max_hops=40):
+def _bmap_hops_from(src, max_hops=60):
     """{bus: hops} from one bus, over the whole case. Cached per source."""
     try:
         src = int(src)
@@ -5971,7 +6007,9 @@ def _distance_cells(el, fid, bus_map, flt_map):
     # NOT REACHED FROM THE FAULTED BUS IN ANY OF THE THREE SOURCES: the bus is
     # outside the branch list BUS_MAP.csv carries. Said, rather than left empty
     # beside a row that has a hop count.
-    return [b, "beyond map" if fb is not None else "no faulted bus on record"]
+    # With the two- and three-winding legs in BUS_MAP.csv every bus of the
+    # synchronous system is reached; only an islanded bus lands here.
+    return [b, "no path in BUS_MAP.csv" if fb is not None else "no faulted bus on record"]
 
 
 # WHICH .dyr CONSTANTS THIS COMPARISON WAS RUN WITH.
@@ -6049,7 +6087,7 @@ def _dyr_norm_edits_local(edits):
     return out
 
 
-_REPORT_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "planning_event", "project", "verdict_base",
+_REPORT_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "planning_event", "fault_source", "project", "verdict_base",
                 "verdict_projects",
                 # TWO CLASSIFICATIONS, NOT ONE. The fault-level class says what
                 # happened to the scenario's verdict; the element-level class
@@ -6081,7 +6119,7 @@ _REPORT_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "planning
                 "past_limit", "limit", "unit", "criterion_is_new",
                 "fault_introduced_by_projects", "description"]
 
-_REPORT_WIDTHS = [26, 22, 14, 9, 8, 12, 8, 9, 15, 18, 22, 15, 18, 10,
+_REPORT_WIDTHS = [26, 22, 14, 9, 8, 8, 12, 8, 9, 15, 18, 22, 15, 18, 10,
                   8, 14, 10,
                   11, 11, 24, 24, 36, 15, 17, 9, 10, 14, 6, 9, 11,
                   40]
@@ -6210,7 +6248,7 @@ def _report_rows(results):
             fails = _failing_crits(r)
             base_scored = bool(norm_verdict(r["vb"]))
             if not fails:
-                out.append(_row(fault=r["fault"], planning_event=ev,
+                out.append(_row(fault=r["fault"], planning_event=ev, fault_source=r.get("source", ""),
                                 verdict_base=r["vb"] or "",
                                 verdict_projects=r["vt"] or "",
                                 fault_classification=r["class"],
@@ -6389,7 +6427,7 @@ def _report_rows(results):
                              or (_bmap_area_text(_bn) if _bn not in ("", None)
                                  else ""))
                     out.append(_row(
-                        fault=r["fault"], planning_event=ev,
+                        fault=r["fault"], planning_event=ev, fault_source=r.get("source", ""),
                         verdict_base=r["vb"] or "", verdict_projects=r["vt"] or "",
                         fault_classification=r["class"],
                         element_classification=ecls,
@@ -6680,14 +6718,14 @@ def _xl_style_of(row):
 # "Not compared" is its own sheet because those rows were the loudest complaint
 # about the old report: a fault that never ran appeared beside faults that did,
 # with empty value columns that read like a clean result.
-_SUMMARY_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "project", "planning_event", "verdict_base",
+_SUMMARY_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "project", "planning_event", "fault_source", "verdict_base",
                  "verdict_projects", "classification", "action",
                  "worst_criterion", "base_value", "project_value", "limit",
                  "unit", "past_limit", "elements_over", "new_criteria",
                  "violating_buses", "cause",
                  "description"]
 
-_SUMMARY_WIDTHS = [26, 22, 14, 9, 12, 9, 11, 13, 14, 26, 21, 11, 13, 9, 6, 10, 13, 16, 60, 80, 60]
+_SUMMARY_WIDTHS = [26, 22, 14, 9, 12, 9, 8, 11, 13, 14, 26, 21, 11, 13, 9, 6, 10, 13, 16, 60, 80, 60]
 
 # What the reader is being asked to DO about this fault, in the words of the
 # comparison rather than its jargon. The classification is kept beside it: the
@@ -6832,6 +6870,7 @@ def _summary_rows(results, want=None):
                         _dyr_label(res["project"]), _output_label(),
                         r["fault"], res["project"],
                         (r.get("event") if r.get("event") not in (None, "-") else ""),
+                        r.get("source", ""),
                         r["vb"] or "", r["vt"] or "", cls, act,
                         crit, bv if bv is not None else "",
                         tv if tv is not None else "",
@@ -6843,9 +6882,9 @@ def _summary_rows(results, want=None):
     return out
 
 
-_NOTRUN_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "project", "planning_event",
+_NOTRUN_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "project", "planning_event", "fault_source",
                 "base_state", "projects_state", "reason", "crash_hint", "why", "description"]
-_NOTRUN_WIDTHS = [26, 22, 14, 9, 12, 9, 30, 30, 34, 60, 70, 60]
+_NOTRUN_WIDTHS = [26, 22, 14, 9, 12, 9, 8, 30, 30, 34, 60, 70, 60]
 
 
 _OUT_SET_CACHE = {}
@@ -7044,6 +7083,7 @@ def _notrun_rows(results):
                         _dyr_label(res["project"]), _output_label(),
                         r["fault"], res["project"],
                         (r.get("event") if r.get("event") not in (None, "-") else ""),
+                        r.get("source", ""),
                         _sb, _st, _notrun_reason(_sb, _st, vb, vt), " || ".join(_hints), why,
                         (r.get("description") or "").replace("\n", " ").strip()])
     return out
@@ -7356,7 +7396,7 @@ def write_one_report(results, only_base, only_test):
                             (("at fault" if min(_e["hops"]) == 0 else
                               "%d hop%s" % (min(_e["hops"]),
                                             "" if min(_e["hops"]) == 1 else "s"))
-                             if _e["hops"] else "beyond map"),
+                             if _e["hops"] else "no path"),
                             _FAM_LABEL.get(fam2, fam2)[:22],
                             _fmt_metric(_e["worst"], _e["unit"])[:11],
                             ("%+.3f" % _e["amt"]) if _e["amt"] is not None else "-",
@@ -7365,13 +7405,13 @@ def write_one_report(results, only_base, only_test):
         L.append("")
         L.append(" Nearest = the FEWEST hops from a faulted bus, over the faults this")
         L.append("           element fails in -- how close it ever is to a fault.")
-        L.append("           \"beyond map\" = further than the study searched, so far")
-        L.append("           from every fault in this report rather than unknown.")
+        L.append("           \"no path\" = the element is not connected to any faulted bus of")
+        L.append("           this report in the case topology (BUS_MAP.csv).")
         L.append(" Faults  = how many of the faults in this report it fails in.")
         L.append("")
 
     L.append(" Flt = how many levels (hops) the element is from the FAULTED BUS of")
-    L.append(" that event. 0 = the faulted bus itself, - = beyond the mapped depth or")
+    L.append(" that event. 0 = the faulted bus itself, - = no path in the case or")
     L.append(" not in the distance file. Measured on the topology of the case that was")
     L.append(" run (faults\\FAULT_DISTANCE.csv) -- the same measure the plots carry.")
     L.append("")
@@ -16392,6 +16432,20 @@ def main():
             for th in ths:
                 th.join()
             rb, rt = res.get("BASE", 2), res.get("PROJ", 2)
+        elif ONE_PROJECT_AT_A_TIME and pjs and len(pjs) > 1:
+            # ONE PROJECT AT A TIME: its base study, then its project study,
+            # before the next project is touched. The worst exit code of each
+            # side is what the comparison sees, as before.
+            rb, rt = 0, 0
+            for _pj in pjs:
+                for case in _cases_to_run():
+                    _banner("%s: running the %s study" % (_pj, "BASE" if case is CASE_BASE
+                                                          else "study WITH THE PROJECT"))
+                    res_rc = run_study(case, projects=[_pj], modes=MODES)
+                    if case is CASE_BASE:
+                        rb = res_rc if res_rc not in (0, None) else rb
+                    else:
+                        rt = res_rc if res_rc not in (0, None) else rt
         else:
             for case in _cases_to_run():
                 _banner("running the %s study" % ("BASE" if case is CASE_BASE

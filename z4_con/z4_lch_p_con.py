@@ -881,7 +881,13 @@ RESULTS_SUBDIR = "auto"
 #
 # [] = the old behaviour: run once, with whatever RUN_PROJECT the study script
 # has set, into results\dynamics.
-RUN_PROJECTS = ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
+RUN_PROJECTS = ["EastFork", "SantaFe", "IronStar", "EmpirePrairie"]   # EastFork first; the panel passes the same order to both launchers
+# A PROJECT WHOSE PASS ENDS BADLY STOPS THE LAUNCHER. Before, "a failure in one
+# does not stop the rest": a pass that died in its first minute (a build error)
+# was followed at once by the next project, so a project launcher that failed
+# on EastFork was seen "moving to SantaFe" while the base launcher was still on
+# EastFork. Off = the old behaviour.
+STOP_ON_FAILED_PROJECT = True
 
 # >>> OVERRIDABLE FROM THE ENVIRONMENT.
 # run_compare.py works out which projects are missing from which case and needs
@@ -1943,6 +1949,78 @@ def _resolve_keyword(word):
 SKIP_DONE_SELECTED = False    # set by _apply_skip_done; reported, not used for naming
 
 
+def _fault_row_sig(r):
+    """A short fingerprint of ONE fault list row: bus, type, clearing time, the
+       elements tripped (direction-free, circuit upper-cased), three-winding,
+       drops, prior outage and the con_id. Written into <id>.done when a
+       scenario completes and checked before a .done is trusted, so a list
+       that was renumbered -- F27 on disk is not F27 in the new list -- is
+       never resumed as if it were the same faults."""
+    import hashlib
+    def _els(s):
+        out = set()
+        for e in (s or "").split(";"):
+            b = [x.strip() for x in e.split("-")]
+            if len(b) >= 2 and b[0] and b[1]:
+                try:
+                    a_, c_ = int(b[0]), int(b[1])
+                except ValueError:
+                    continue
+                out.add("%d-%d-%s" % (min(a_, c_), max(a_, c_), (b[3] if len(b) > 3 and b[3] else "1").upper()))
+        return ";".join(sorted(out))
+    def _tri(s):
+        out = set()
+        for e in (s or "").split(";"):
+            b = [x.strip() for x in e.split("-")]
+            if len(b) >= 3 and b[0]:
+                try:
+                    out.add("%s-%s" % ("-".join(str(x) for x in sorted(int(y) for y in b[:3])),
+                                       (b[3] if len(b) > 3 and b[3] else "1").upper()))
+                except ValueError:
+                    continue
+        return ";".join(sorted(out))
+    def _pairs(s):
+        return ";".join(sorted(x.strip().upper() for x in (s or "").split(";") if x.strip()))
+    try:
+        cyc = "%.2f" % float(r.get("clear_cycles") or 0)
+    except ValueError:
+        cyc = str(r.get("clear_cycles") or "")
+    parts = [str(r.get("fault_bus") or "").strip(), str(r.get("fault_type") or "3PH").strip().upper(), cyc,
+             _els(r.get("trip_elements")), _tri(r.get("trip_3wind")),
+             _pairs(r.get("drop_machines")), _pairs(r.get("drop_loads")), _pairs(r.get("drop_shunts")),
+             _els(r.get("pre_outage")), str(r.get("con_id") or "").strip().upper()]
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def _done_sig(path):
+    """The sig= line of a .done marker, or "" for a marker written before
+       markers carried one."""
+    try:
+        with open(path) as fh:
+            for ln in fh:
+                if ln.startswith("sig="):
+                    return ln[4:].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _stale_aside(out_dir, sid, why):
+    """Move <sid>.out / .done aside as *.stale_<stamp> -- never deleted."""
+    import time as _t
+    stamp = _t.strftime("%Y%m%d_%H%M%S")
+    moved = 0
+    for ext in ("out", "done"):
+        p = os.path.join(out_dir, "%s.%s" % (sid, ext))
+        if os.path.isfile(p):
+            try:
+                os.rename(p, "%s.stale_%s" % (p, stamp))
+                moved += 1
+            except Exception:
+                pass
+    return moved
+
+
 def _apply_skip_done(selected):
     """Drop scenarios that already finished. Returns the ids still to run.
 
@@ -1982,16 +2060,44 @@ def _apply_skip_done(selected):
     # AND a .out on disk. A marker with no .out is not a finished scenario, and
     # skipping it would quietly drop it from the run for good.
     prog = _progress_rows()
-    todo, done, gave_up = [], [], []
+    # THE SAME ID IS NOT THE SAME FAULT. The list on disk may have been
+    # renumbered since those .done files were written (a new DISIS list, a
+    # merged list): F27 then is not F27 now. Each marker carries the
+    # fingerprint of the row it was run for; a marker whose fingerprint is
+    # not this list's row -- or that has none -- is moved aside and re-run.
+    sigs = {}
+    for _lp in (_shared_fault_list_path(), os.path.join(RESULTS, "faults", "SPP_FAULTS.csv")):
+        if not _lp or not os.path.isfile(_lp):
+            continue
+        try:
+            with open(_lp, newline="") as _fh:
+                for _r in csv.DictReader(_fh):
+                    _fid = (_r.get("fault_id") or "").strip()
+                    if _fid and _fid not in sigs:
+                        sigs[_fid] = _fault_row_sig(_r)
+        except Exception:
+            continue
+        if sigs:
+            break
+    todo, done, gave_up, stale = [], [], [], []
     for sid in ids:
         if (os.path.isfile(os.path.join(OUT_DIR, "%s.done" % sid))
                 and os.path.isfile(os.path.join(OUT_DIR, "%s.out" % sid))):
-            done.append(sid)
-            continue
+            want = sigs.get(sid)
+            if want and _done_sig(os.path.join(OUT_DIR, "%s.done" % sid)) != want:
+                _stale_aside(OUT_DIR, sid, "sig")
+                stale.append(sid)
+            else:
+                done.append(sid)
+                continue
         todo.append(sid)
         st = (prog.get(sid) or ("",))[0]
         if st in ("GAVE-UP", "ERROR", "FAILED"):
             gave_up.append(sid)
+    if stale:
+        print("[parallel] SKIP_DONE: %d finished scenario(s) on disk were run for a DIFFERENT fault list"
+              " (renumbered, or markers without a fingerprint) -- moved aside as .stale and re-run: %s%s"
+              % (len(stale), ", ".join(stale[:8]), " ..." if len(stale) > 8 else ""))
     if not done:
         print("[parallel] SKIP_DONE: nothing has finished yet -- running all %d"
               % len(todo))
@@ -4727,6 +4833,12 @@ def main():
                   % (i, len(passes), proj or "default", mode, type(_be).__name__))
             rc = 1
         results.append((proj, mode, rc))
+        if STOP_ON_FAILED_PROJECT and rc not in (0, None) and i < len(passes):
+            print("")
+            print("[parallel] *** project %s ended with rc=%s -- STOP_ON_FAILED_PROJECT: the remaining"
+                  " %d pass(es) are NOT started. Read this project's logs (results\\%s_%s\\logs) first. ***"
+                  % (proj, rc, len(passes) - i, proj, mode))
+            break
         finished.add("%s/%s" % (proj or "default", mode))
         if len(passes) > 1:
             print("[parallel] study %d of %d (%s / %s) finished rc=%s at %s"

@@ -3625,7 +3625,7 @@ PLOT_ASYNC_SPEED  = True
 # panel that does not say which area a unit is in or how far it sits from the
 # fault is the one thing the labels exist to prevent.
 DISTANCE_ON_ETERM = True    # False = leave machine terminal voltage (ETERM) unannotated
-DISTANCE_MAX_HOPS = 8       # how deep to search; beyond this a bus shows as ">8 hops"
+DISTANCE_MAX_HOPS = 30      # deep enough to reach every bus of the synchronous system; the walk stops when the frontier empties
 
 # ---- terminal behaviour ------------------------------------------------------
 # stdin is replaced with a source of blank lines so a line-mode PSS/E deck can
@@ -5102,6 +5102,20 @@ def _neighbors(bus):
         pass
     return nb
 
+def _three_wind_legs():
+    """[(w1, w2, w3), ...] for every three-winding transformer in the case --
+       in-service ones (flag 2), or all of them when that call answers nothing."""
+    for flag in (2, 1):
+        try:
+            ie, a = psspy.atr3int(-1, 1, 1, flag, 1,
+                                  ["WIND1NUMBER", "WIND2NUMBER", "WIND3NUMBER"])
+        except Exception:
+            continue
+        if ie == 0 and a and len(a) >= 3 and len(a[0]) > 0:
+            return [(int(x), int(y), int(z)) for x, y, z in zip(a[0], a[1], a[2])]
+    return []
+
+
 def _radius(center, hops):
     """Buses within 'hops' branch-hops of 'center'. Global branch list + per-bus
        iterator union (so transformer legs are included)."""
@@ -5109,6 +5123,15 @@ def _radius(center, hops):
     adj = {}
     for x, y in _branches():
         adj.setdefault(int(x), set()).add(int(y)); adj.setdefault(int(y), set()).add(int(x))
+    # THREE-WINDING TRANSFORMERS TOO. abrnint and inibrn/nxtbrn both stop at a
+    # three-winding transformer, so a bus behind one -- MINGO 3 behind MINGO 7,
+    # EASTFORK3 behind its plant transformer -- was outside every radius, its
+    # voltage never channelled in the case that had no other path to it, and
+    # the comparison read "base value not available" for it. FLAG 3 is not a
+    # valid atr3int flag (it answers ierr and nothing); 2 = in service, 1 = all.
+    for _w1, _w2, _w3 in _three_wind_legs():
+        for _a, _b in ((_w1, _w2), (_w1, _w3), (_w2, _w3)):
+            adj.setdefault(_a, set()).add(_b); adj.setdefault(_b, set()).add(_a)
     # NO CASE IN THIS PROCESS -- USE THE MAP'S BRANCH LIST.
     #
     # SPP_SCORE_NO_CASE scores without loading the case, so the 341 MB .out
@@ -5255,7 +5278,7 @@ def _bus_map_write():
                 for ln in fh:
                     if ln.startswith("B,"):
                         _nb += 1
-                    elif ln.startswith("V,2"):
+                    elif ln.startswith("V,4"):
                         _ver = True
             if _nb == len(bi[0]) and _ver:
                 return
@@ -5263,7 +5286,7 @@ def _bus_map_write():
         pass
     try:
         with open(p + ".tmp", "w") as fh:
-            fh.write("V,2\n")   # map version: 2 = branch list includes transformers
+            fh.write("V,4\n")   # map version: 4 = three-winding legs + X/T3/M/S element rows
             for num, ar, name, base in zip(bi[0], bi[1],
                                            nm[0] if je == 0 else [""] * len(bi[0]),
                                            kv[0] if ke == 0 else [0.0] * len(bi[0])):
@@ -5316,6 +5339,55 @@ def _bus_map_write():
                 except Exception as _xe:
                     print("  [busmap] transformer legs not added (%s) -- a distance "
                           "across a transformer may read 'beyond map'" % _xe)
+                # THREE-WINDING LEGS TOO -- atrnint lists two-winding only, so
+                # the map had MINGO 3 and MINGO 7 with no edge between them and
+                # every hop count across a three-winding transformer was too
+                # long (or "beyond map"). Written as the three pairs.
+                _n_3w = 0
+                try:
+                    for _w1, _w2, _w3 in _three_wind_legs():
+                        for _x, _y in ((_w1, _w2), (_w1, _w3), (_w2, _w3)):
+                            _b = len(_seen)
+                            _add_pair(_x, _y)
+                            _n_3w += len(_seen) - _b
+                    if _n_3w:
+                        print("  [busmap] %d three-winding leg(s) recorded" % _n_3w)
+                except Exception as _xe:
+                    print("  [busmap] three-winding legs not added (%s)" % _xe)
+                # THE ELEMENTS THEMSELVES, so a process with no case -- the
+                # DISIS converter building P1.1 / P1.3 / P1.4 events -- knows
+                # which transformers, machines and shunts the case has and on
+                # which circuit:  X,from,to,ckt   T3,w1,w2,w3,ckt   M,bus,id
+                # S,bus,id  (in-service elements only).
+                try:
+                    _ie, _xa = psspy.atrnint(-1, 1, 3, 2, 1, ["FROMNUMBER", "TONUMBER"])
+                    _je, _xc = psspy.atrnchar(-1, 1, 3, 2, 1, ["ID"])
+                    if _ie == 0 and _xa and len(_xa) >= 2:
+                        _ids = _xc[0] if (_je == 0 and _xc) else ["1"] * len(_xa[0])
+                        for _x, _y, _ck in zip(_xa[0], _xa[1], _ids):
+                            fh.write("X,%d,%d,%s\n" % (int(_x), int(_y), str(_ck).strip()))
+                    for _w1, _w2, _w3 in _three_wind_legs():
+                        fh.write("T3,%d,%d,%d,%s\n" % (_w1, _w2, _w3, "1"))
+                    try:
+                        _ke, _t3 = psspy.atr3int(-1, 1, 1, 2, 1, ["WIND1NUMBER", "WIND2NUMBER", "WIND3NUMBER"])
+                        _le, _t3c = psspy.atr3char(-1, 1, 1, 2, 1, ["ID"])
+                        if _ke == 0 and _le == 0 and _t3 and _t3c and len(_t3[0]) == len(_t3c[0]):
+                            fh.write("".join("T3,%d,%d,%d,%s\n" % (int(a_), int(b_), int(c_), str(k_).strip())
+                                             for a_, b_, c_, k_ in zip(_t3[0], _t3[1], _t3[2], _t3c[0])))
+                    except Exception:
+                        pass
+                    _me, _mi = psspy.amachint(-1, 1, ["NUMBER"])
+                    _ne, _mc = psspy.amachchar(-1, 1, ["ID"])
+                    if _me == 0 and _ne == 0 and _mi and _mc:
+                        for _b, _id in zip(_mi[0], _mc[0]):
+                            fh.write("M,%d,%s\n" % (int(_b), str(_id).strip()))
+                    _se, _si = psspy.afxshuntint(-1, 1, ["NUMBER"])
+                    _te, _sc = psspy.afxshuntchar(-1, 1, ["ID"])
+                    if _se == 0 and _te == 0 and _si and _sc:
+                        for _b, _id in zip(_si[0], _sc[0]):
+                            fh.write("S,%d,%s\n" % (int(_b), str(_id).strip()))
+                except Exception as _xe:
+                    print("  [busmap] element rows (X/T3/M/S) not written (%s)" % _xe)
                 if _seen:
                     print("  [busmap] %d branch(es) recorded (%d line, %d transformer), "
                           "so the reports can say how far a bus is from the fault"
@@ -6648,7 +6720,12 @@ def add_channels():
                                                 ["POI%d V" % int(_pb), "POI%d ANG" % int(_pb)]),
                 "POI%d V/ANG" % int(_pb))
     elif MONITOR_POI_VANG:
-        chk(psspy.voltage_and_angle_channel([-1, -1, -1, POI_BUS], ["POI V", "POI ANG"]), "POI V/ANG")
+        # NAMED BY BUS, like every other voltage channel: "POI V" carries no
+        # bus number, so its measurement row had a blank bus and the
+        # comparison could never find the POI's own value on either side.
+        chk(psspy.voltage_and_angle_channel([-1, -1, -1, POI_BUS],
+                                            ["POI%d V" % int(POI_BUS), "POI%d ANG" % int(POI_BUS)]),
+            "POI%d V/ANG" % int(POI_BUS))
         for _pb in POI_BUSES[1:]:
             chk(psspy.voltage_and_angle_channel([-1, -1, -1, int(_pb)],
                                                 ["POI%d V" % int(_pb), "POI%d ANG" % int(_pb)]),
@@ -15811,6 +15888,10 @@ def _poi_hop_map(max_hops=None):
         for x, y in _branches():
             adj.setdefault(int(x), set()).add(int(y))
             adj.setdefault(int(y), set()).add(int(x))
+        for _w1, _w2, _w3 in _three_wind_legs():          # three-winding legs too
+            for _a, _b in ((_w1, _w2), (_w1, _w3), (_w2, _w3)):
+                adj.setdefault(_a, set()).add(_b)
+                adj.setdefault(_b, set()).add(_a)
 
         def nbrs(u):
             # _dist_nbrs falls back to BUS_MAP.csv when this process has no
@@ -15844,7 +15925,7 @@ def _hop_text(bus):
     """'POI' / '1 hop from POI' / '3 hops from POI' / '>8 hops from POI'."""
     h = _poi_hop_map().get(int(bus))
     if h is None:
-        return ">%d hops from %s" % (DISTANCE_MAX_HOPS, _poi_word())
+        return "no path to %s in the case" % _poi_word()
     if h == 0:
         return "POI"
     return "%d hop%s from %s" % (h, "" if h == 1 else "s", _poi_word())
@@ -16019,7 +16100,7 @@ def _where_text(label, fault_bus, short=False):
     if short:
         _a = "" if ar is None else str(ar)
         if h is None:
-            _h = "" if not fault_bus else ">%d" % FAULT_DIST_MAX_HOPS
+            _h = "" if not fault_bus else "no path"
         else:
             _h = "%dh" % h
         return ("%s / %s" % (_a, _h)).strip(" /")
@@ -16098,7 +16179,7 @@ def _fault_hop_text(bus, fault_bus):
     except Exception:
         return ""
     if h is None:
-        return ">%d hops from fault" % FAULT_DIST_MAX_HOPS
+        return "no path to the faulted bus in the case"
     if h == 0:
         return "at fault bus %d" % int(fault_bus)
     return "%d hop%s from fault bus %d" % (h, "" if h == 1 else "s", int(fault_bus))
@@ -21358,7 +21439,7 @@ def write_what_failed_report(cases, verdicts, rows, crit_rows=None):
             # never reached is further than the mapped depth, which is a fact
             # about it -- printing nothing reads as "unknown", or worse as zero.
             if d["hops"] in ("", None):
-                _h = ">%d" % FAULT_DIST_MAX_HOPS if d["fbus"] else "-"
+                _h = "no path" if d["fbus"] else "-"
             else:
                 _h = str(d["hops"])
             f.write(" %-20s %-9s %-8s %-14s %-7s %-6s %-5s %-24s %-11s %-9s %-9s %s\n"
@@ -22113,6 +22194,7 @@ def load_faults_csv(path):
                  "type": (r.get("fault_type") or "3PH").upper(),
                  "cycles": float(r.get("clear_cycles") or 16),
                  "trip_lines": tl}
+            _FAULT_SIG[f["id"]] = _fault_row_sig(r)
             if (r.get("planning_event") or "").strip():
                 f["planning_event"] = r["planning_event"].strip()
                 n_rich += 1
@@ -22252,10 +22334,89 @@ def _mark_attempt(scen_id):
     _write_text(_state_path(scen_id, "attempts"), n)
     return n
 
+
+def _fault_row_sig(r):
+    """A short fingerprint of ONE fault list row: bus, type, clearing time, the
+       elements tripped (direction-free, circuit upper-cased), three-winding,
+       drops, prior outage and the con_id. Written into <id>.done when a
+       scenario completes and checked before a .done is trusted, so a list
+       that was renumbered -- F27 on disk is not F27 in the new list -- is
+       never resumed as if it were the same faults."""
+    import hashlib
+    def _els(s):
+        out = set()
+        for e in (s or "").split(";"):
+            b = [x.strip() for x in e.split("-")]
+            if len(b) >= 2 and b[0] and b[1]:
+                try:
+                    a_, c_ = int(b[0]), int(b[1])
+                except ValueError:
+                    continue
+                out.add("%d-%d-%s" % (min(a_, c_), max(a_, c_), (b[3] if len(b) > 3 and b[3] else "1").upper()))
+        return ";".join(sorted(out))
+    def _tri(s):
+        out = set()
+        for e in (s or "").split(";"):
+            b = [x.strip() for x in e.split("-")]
+            if len(b) >= 3 and b[0]:
+                try:
+                    out.add("%s-%s" % ("-".join(str(x) for x in sorted(int(y) for y in b[:3])),
+                                       (b[3] if len(b) > 3 and b[3] else "1").upper()))
+                except ValueError:
+                    continue
+        return ";".join(sorted(out))
+    def _pairs(s):
+        return ";".join(sorted(x.strip().upper() for x in (s or "").split(";") if x.strip()))
+    try:
+        cyc = "%.2f" % float(r.get("clear_cycles") or 0)
+    except ValueError:
+        cyc = str(r.get("clear_cycles") or "")
+    parts = [str(r.get("fault_bus") or "").strip(), str(r.get("fault_type") or "3PH").strip().upper(), cyc,
+             _els(r.get("trip_elements")), _tri(r.get("trip_3wind")),
+             _pairs(r.get("drop_machines")), _pairs(r.get("drop_loads")), _pairs(r.get("drop_shunts")),
+             _els(r.get("pre_outage")), str(r.get("con_id") or "").strip().upper()]
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def _done_sig(path):
+    """The sig= line of a .done marker, or "" for a marker written before
+       markers carried one."""
+    try:
+        with open(path) as fh:
+            for ln in fh:
+                if ln.startswith("sig="):
+                    return ln[4:].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _stale_aside(out_dir, sid, why):
+    """Move <sid>.out / .done aside as *.stale_<stamp> -- never deleted."""
+    import time as _t
+    stamp = _t.strftime("%Y%m%d_%H%M%S")
+    moved = 0
+    for ext in ("out", "done"):
+        p = os.path.join(out_dir, "%s.%s" % (sid, ext))
+        if os.path.isfile(p):
+            try:
+                os.rename(p, "%s.stale_%s" % (p, stamp))
+                moved += 1
+            except Exception:
+                pass
+    return moved
+
+_FAULT_SIG = {}      # fault id -> _fault_row_sig of the row this run loaded
+
+
 def _mark_done(scen_id, tclear):
     """Mark a scenario fully complete. Store tclear so a resumed run can still plot /
-       score it without re-running (None -> empty)."""
-    _write_text(_state_path(scen_id, "done"), "" if tclear is None else repr(tclear))
+       score it without re-running (None -> empty) -- and the fault's fingerprint,
+       so a later run with a renumbered list does not resume it as the same fault."""
+    txt = "" if tclear is None else repr(tclear)
+    if scen_id in _FAULT_SIG:
+        txt += "\nsig=%s" % _FAULT_SIG[scen_id]
+    _write_text(_state_path(scen_id, "done"), txt)
 
 def _is_done(scen_id, out_path):
     """A scenario counts as done only if BOTH its .done marker and a real .out exist.
@@ -22264,8 +22425,21 @@ def _is_done(scen_id, out_path):
        it, so an existing .done must not short-circuit the run."""
     if ONLY_MODE_RERUNS_DONE and _only_mode() and _wanted(scen_id):
         return False
-    return (RESUME_ON_RESTART and os.path.isfile(_state_path(scen_id, "done"))
-            and os.path.isfile(out_path))
+    if not (RESUME_ON_RESTART and os.path.isfile(_state_path(scen_id, "done"))
+            and os.path.isfile(out_path)):
+        return False
+    # THE SAME ID IS NOT THE SAME FAULT. A .done written for another list --
+    # or before markers carried a fingerprint -- is not a result for THIS row.
+    want = _FAULT_SIG.get(scen_id)
+    if want:
+        have = _done_sig(_state_path(scen_id, "done"))
+        if have != want:
+            print("  [resume] %s on disk is %s -- moved aside as .stale, running it again"
+                  % (scen_id, "a DIFFERENT fault (the list was renumbered)" if have
+                     else "from a run whose markers carried no fault fingerprint"))
+            _stale_aside(OUT_DIR, scen_id, "sig")
+            return False
+    return True
 
 
 _FAULT_CYCLES_CACHE = {"loaded": False, "map": {}}
@@ -22317,7 +22491,7 @@ def _tclear_from_faultlist(scen_id):
 def _read_done_tclear(scen_id):
     try:
         with open(_state_path(scen_id, "done")) as fh:
-            s = fh.read().strip()
+            s = (fh.readline() or "").strip()      # first line = tclear; sig= follows
         return float(s) if s else None
     except Exception:
         return None
@@ -22790,6 +22964,12 @@ def _sf_adjacency():
             x, y = int(x), int(y)
             adj.setdefault(x, set()).add(y)
             adj.setdefault(y, set()).add(x)
+    # NO THREE-WINDING LEGS HERE. This adjacency is the plant builder's and the
+    # tie finder's: every pair in it is taken as a two-winding branch and looked
+    # up as one. Legs of a three-winding transformer are not such branches, and
+    # at a POI that sits on one (EastFork's 531623) they made the build fail.
+    # The distance and monitoring walks (_radius, _dist_nbrs, _poi_hop_map)
+    # carry the legs; this one stays as the case's branch tables give it.
     _SF_ADJ = adj
     return adj
 
@@ -23870,7 +24050,7 @@ def sf_build_spp_faults(poi_bus, hops, kv_min):
         print("  [make_spp_faults] dropped, by planning event: %s"
               % ", ".join("%s=%d" % (k, _dev[k]) for k in sorted(_dev)))
         print("  [make_spp_faults] they sit at level %s from the POI."
-              % ", ".join(str(d) if d != _FAR else ">%d" % hops for d in _dh))
+              % ", ".join(str(d) if d != _FAR else "no path" for d in _dh))
         print("  [make_spp_faults] The study therefore does NOT cover the radius those")
         print("  [make_spp_faults] settings describe. Raise SPP_MAX_FAULTS to %d to run"
               % _n_all)
@@ -23888,7 +24068,7 @@ def sf_build_spp_faults(poi_bus, hops, kv_min):
         d = _hops.get(int(f["fault_bus"]), _FAR)
         _byhop[d] = _byhop.get(d, 0) + 1
     print("  [make_spp_faults] ordered from the POI outward: %s"
-          % ", ".join("%s hop%s=%d" % (("%d" % d) if d != _FAR else ">%d" % hops,
+          % ", ".join("%s hop%s=%d" % (("%d" % d) if d != _FAR else "no path",
                                        "" if d == 1 else "s", _byhop[d])
                       for d in sorted(_byhop)))
     # per-event tally
@@ -24524,7 +24704,7 @@ def fault_hops_text(f):
     """'at the POI' / '1 hop from POI' / '>8 hops from POI'."""
     h = fault_hops(f)
     if h is None:
-        return ">%d hops from POI" % DIST_MAX_HOPS
+        return "no path to POI in the case"
     if h == 0:
         return "at the POI"
     return "%d hop%s from %s" % (h, "" if h == 1 else "s", _poi_word())
@@ -24767,8 +24947,8 @@ def sf_write_results_template(faults, base):
 # "within 3 levels of the POI"), so the report and the contingency scope are
 # then measured the same way. An electrical distance would be a second, quieter
 # definition of "near".
-DIST_MAX_HOPS = 8          # how far to map; beyond this a bus is just "far"
-FAULT_DIST_MAX_HOPS = 6    # per-fault map, kept smaller -- it is one per fault
+DIST_MAX_HOPS = 30         # deep enough to reach every bus of the synchronous system
+FAULT_DIST_MAX_HOPS = 30   # per-fault map, cached per faulted bus; every monitored bus gets a number
 
 _DIST_ADJ = None
 
@@ -24789,6 +24969,10 @@ def _dist_nbrs(bus):
             for x, y in _branches():
                 adj.setdefault(int(x), set()).add(int(y))
                 adj.setdefault(int(y), set()).add(int(x))
+            for _w1, _w2, _w3 in _three_wind_legs():      # three-winding legs too
+                for _a, _b in ((_w1, _w2), (_w1, _w3), (_w2, _w3)):
+                    adj.setdefault(_a, set()).add(_b)
+                    adj.setdefault(_b, set()).add(_a)
         except Exception as e:
             print("  [dist] branch list unavailable (%s) -- distances may be partial" % e)
         if not adj:

@@ -266,6 +266,49 @@ import math as _math
 _Q_PER_P       = (_math.tan(_math.acos(POI_PF)) )* 1.32   # 0.95 -> 0.3287 x 1.32 = 0.434 at the terminals (covers the collector/GSU vars)
 # A BESS charges as well as discharges: Pmin = -Pmax. False = Pmin 0 (solar/wind).
 BESS_PMIN_SYMMETRIC = True
+# >>> MBASE AS A WHOLE NUMBER OF INVERTERS. The power triangle gives a machine
+# MBASE like 123.15 MVA; a real plant is N inverters of INVERTER_MVA each, so
+# the MBASE written to the case is the nearest multiple: 28 x 4.4 = 123.2 MVA.
+# PG, Pmax/Pmin and Qmax/Qmin are not changed by this -- only the base. Where
+# MBASE has to be RAISED to cover a gross-up (see _set_machine_p) the next
+# multiple up is used. 0 = the raw power-triangle value, as before.
+INVERTER_MVA = 4.4
+
+
+def _inverter_record(p_ref, pg=None):
+    """(Pmax, Pmin, Qmax, MBASE, inverters) for one machine as a WHOLE NUMBER of
+       INVERTER_MVA inverters. The count is the nearest to the power triangle of
+       p_ref (Q = BESS_Q_CAP_FRACTION x P), stepped up until Pmax covers pg when
+       a dispatch is given. Pmax, Qmax and MBASE keep the triangle's shape:
+       MBASE = n x INVERTER_MVA, Pmax = MBASE / sqrt(1 + k^2), Qmax = k x Pmax."""
+    k = float(BESS_Q_CAP_FRACTION)
+    tri = _math.sqrt(float(p_ref) ** 2 + (k * float(p_ref)) ** 2)
+    # ROUNDED UP, never down: one inverter more is no issue, one less would put
+    # Pmax under the rating and the POI could not be met from the plant.
+    mb, n = _mbase_inverters(tri, up=True)
+    if n <= 0:                                   # INVERTER_MVA = 0: raw triangle, as before
+        pmax = float(p_ref)
+        return pmax, (-pmax if BESS_PMIN_SYMMETRIC else 0.0), k * pmax, tri, 0
+    unit = float(INVERTER_MVA)
+    shape = _math.sqrt(1.0 + k * k)
+    while pg is not None and (n * unit) / shape < abs(float(pg)) - 1e-6:
+        n += 1
+    mb = n * unit
+    pmax = mb / shape
+    return pmax, (-pmax if BESS_PMIN_SYMMETRIC else 0.0), k * pmax, mb, n
+
+
+def _mbase_inverters(mb, up=False):
+    """(MBASE as a whole number of inverters, that number). up = round up."""
+    try:
+        unit = float(INVERTER_MVA)
+    except (TypeError, ValueError):
+        unit = 0.0
+    if unit <= 0 or mb is None or float(mb) <= 0:
+        return float(mb or 0.0), 0
+    n = int(_math.ceil(float(mb) / unit - 1e-9)) if up else int(round(float(mb) / unit))
+    n = max(1, n)
+    return n * unit, n
 # WHAT THE MACHINE IS RATED AT when a project lists several study sizes
 # (EmpirePrairie: "mw": [604, 769]):
 #   "level"  the size being BUILT -- 604 MW is a 604 MW facility: Pmax 151 MW per
@@ -854,6 +897,22 @@ POI_TUNE_TOL_MW   = 0.5      # POI P within this (MW)   -> converged
 POI_TUNE_TOL_MVAR = 0.5      # POI Q within this (MVAr) -> converged
 POI_TUNE_RELAX    = 1.0      # step damping (1.0 = full correction)
 
+# >>> ZERO REACTIVE EXCHANGE AT THE POI ON THE METERED PATH TOO ----------------
+# With POI_P_TARGET_MW set the tuner above is SKIPPED, and the BESS machines were
+# left regulating whatever scheduled voltage their plant records carried -- so
+# they DREW the collector system's reactive losses from the grid. This step runs
+# after the P metering and the area hold, on every member: it moves the
+# machines' QG (equal share per machine, inside each machine's OWN QMAX/QMIN,
+# which are not changed) until the plant exchanges ~0 MVAr at the POI, then sets
+# each plant's scheduled voltage to the voltage the machine sits at, so the
+# regulating solves that follow reproduce the same Q. PMAX/PMIN, QMAX/QMIN and
+# MBASE are not touched; the QT/QB pinned during the iteration are put back to
+# what they were before it.
+POI_Q_ZERO      = True
+POI_Q_TOL_MVAR  = 0.5        # POI Q within this (MVAr) -> converged
+POI_Q_ITERS     = 12         # max solve/measure/adjust passes
+POI_Q_RELAX     = 1.0        # step damping (1.0 = full correction)
+
 # >>> REACTIVE CAPABILITY THE MACHINES KEEP IN THE SAVED CASE ------------------
 # The tuning loop must pin QT = QB = QG while it solves, or the machines regulate
 # voltage and the POI reactive flow never lands on target. Left pinned, the saved
@@ -927,7 +986,7 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 @!/ Vdip            Vup             Trv             dbd1          dbd2
     0.900          1.1000          0.0100         -0.1000        0.1000
 @!/ Kqv             Iqh1            Iql1            Vref0         Tp
-    2.0000          1.0000         -1.0000          0.0000        0.0500
+    0.5000          1.0000         -1.0000          0.0000        0.0500
 @!/ QMax            QMin
     0.4840         -0.4840
 @!/ Vmax            Vmin            Kqp             Kqi           Kvp
@@ -4240,7 +4299,7 @@ PLOT_ASYNC_SPEED  = True
 # panel that does not say which area a unit is in or how far it sits from the
 # fault is the one thing the labels exist to prevent.
 DISTANCE_ON_ETERM = True    # False = leave machine terminal voltage (ETERM) unannotated
-DISTANCE_MAX_HOPS = 8       # how deep to search; beyond this a bus shows as ">8 hops"
+DISTANCE_MAX_HOPS = 30      # deep enough to reach every bus of the synchronous system; the walk stops when the frontier empties
 
 # ---- terminal behaviour ------------------------------------------------------
 # stdin is replaced with a source of blank lines so a line-mode PSS/E deck can
@@ -5957,6 +6016,20 @@ def _neighbors(bus):
         pass
     return nb
 
+def _three_wind_legs():
+    """[(w1, w2, w3), ...] for every three-winding transformer in the case --
+       in-service ones (flag 2), or all of them when that call answers nothing."""
+    for flag in (2, 1):
+        try:
+            ie, a = psspy.atr3int(-1, 1, 1, flag, 1,
+                                  ["WIND1NUMBER", "WIND2NUMBER", "WIND3NUMBER"])
+        except Exception:
+            continue
+        if ie == 0 and a and len(a) >= 3 and len(a[0]) > 0:
+            return [(int(x), int(y), int(z)) for x, y, z in zip(a[0], a[1], a[2])]
+    return []
+
+
 def _radius(center, hops):
     """Buses within 'hops' branch-hops of 'center'. Global branch list + per-bus
        iterator union (so transformer legs are included)."""
@@ -5964,6 +6037,15 @@ def _radius(center, hops):
     adj = {}
     for x, y in _branches():
         adj.setdefault(int(x), set()).add(int(y)); adj.setdefault(int(y), set()).add(int(x))
+    # THREE-WINDING TRANSFORMERS TOO. abrnint and inibrn/nxtbrn both stop at a
+    # three-winding transformer, so a bus behind one -- MINGO 3 behind MINGO 7,
+    # EASTFORK3 behind its plant transformer -- was outside every radius, its
+    # voltage never channelled in the case that had no other path to it, and
+    # the comparison read "base value not available" for it. FLAG 3 is not a
+    # valid atr3int flag (it answers ierr and nothing); 2 = in service, 1 = all.
+    for _w1, _w2, _w3 in _three_wind_legs():
+        for _a, _b in ((_w1, _w2), (_w1, _w3), (_w2, _w3)):
+            adj.setdefault(_a, set()).add(_b); adj.setdefault(_b, set()).add(_a)
     # NO CASE IN THIS PROCESS -- USE THE MAP'S BRANCH LIST.
     #
     # SPP_SCORE_NO_CASE scores without loading the case, so the 341 MB .out
@@ -6110,7 +6192,7 @@ def _bus_map_write():
                 for ln in fh:
                     if ln.startswith("B,"):
                         _nb += 1
-                    elif ln.startswith("V,2"):
+                    elif ln.startswith("V,4"):
                         _ver = True
             if _nb == len(bi[0]) and _ver:
                 return
@@ -6118,7 +6200,7 @@ def _bus_map_write():
         pass
     try:
         with open(p + ".tmp", "w") as fh:
-            fh.write("V,2\n")   # map version: 2 = branch list includes transformers
+            fh.write("V,4\n")   # map version: 4 = three-winding legs + X/T3/M/S element rows
             for num, ar, name, base in zip(bi[0], bi[1],
                                            nm[0] if je == 0 else [""] * len(bi[0]),
                                            kv[0] if ke == 0 else [0.0] * len(bi[0])):
@@ -6171,6 +6253,55 @@ def _bus_map_write():
                 except Exception as _xe:
                     print("  [busmap] transformer legs not added (%s) -- a distance "
                           "across a transformer may read 'beyond map'" % _xe)
+                # THREE-WINDING LEGS TOO -- atrnint lists two-winding only, so
+                # the map had MINGO 3 and MINGO 7 with no edge between them and
+                # every hop count across a three-winding transformer was too
+                # long (or "beyond map"). Written as the three pairs.
+                _n_3w = 0
+                try:
+                    for _w1, _w2, _w3 in _three_wind_legs():
+                        for _x, _y in ((_w1, _w2), (_w1, _w3), (_w2, _w3)):
+                            _b = len(_seen)
+                            _add_pair(_x, _y)
+                            _n_3w += len(_seen) - _b
+                    if _n_3w:
+                        print("  [busmap] %d three-winding leg(s) recorded" % _n_3w)
+                except Exception as _xe:
+                    print("  [busmap] three-winding legs not added (%s)" % _xe)
+                # THE ELEMENTS THEMSELVES, so a process with no case -- the
+                # DISIS converter building P1.1 / P1.3 / P1.4 events -- knows
+                # which transformers, machines and shunts the case has and on
+                # which circuit:  X,from,to,ckt   T3,w1,w2,w3,ckt   M,bus,id
+                # S,bus,id  (in-service elements only).
+                try:
+                    _ie, _xa = psspy.atrnint(-1, 1, 3, 2, 1, ["FROMNUMBER", "TONUMBER"])
+                    _je, _xc = psspy.atrnchar(-1, 1, 3, 2, 1, ["ID"])
+                    if _ie == 0 and _xa and len(_xa) >= 2:
+                        _ids = _xc[0] if (_je == 0 and _xc) else ["1"] * len(_xa[0])
+                        for _x, _y, _ck in zip(_xa[0], _xa[1], _ids):
+                            fh.write("X,%d,%d,%s\n" % (int(_x), int(_y), str(_ck).strip()))
+                    for _w1, _w2, _w3 in _three_wind_legs():
+                        fh.write("T3,%d,%d,%d,%s\n" % (_w1, _w2, _w3, "1"))
+                    try:
+                        _ke, _t3 = psspy.atr3int(-1, 1, 1, 2, 1, ["WIND1NUMBER", "WIND2NUMBER", "WIND3NUMBER"])
+                        _le, _t3c = psspy.atr3char(-1, 1, 1, 2, 1, ["ID"])
+                        if _ke == 0 and _le == 0 and _t3 and _t3c and len(_t3[0]) == len(_t3c[0]):
+                            fh.write("".join("T3,%d,%d,%d,%s\n" % (int(a_), int(b_), int(c_), str(k_).strip())
+                                             for a_, b_, c_, k_ in zip(_t3[0], _t3[1], _t3[2], _t3c[0])))
+                    except Exception:
+                        pass
+                    _me, _mi = psspy.amachint(-1, 1, ["NUMBER"])
+                    _ne, _mc = psspy.amachchar(-1, 1, ["ID"])
+                    if _me == 0 and _ne == 0 and _mi and _mc:
+                        for _b, _id in zip(_mi[0], _mc[0]):
+                            fh.write("M,%d,%s\n" % (int(_b), str(_id).strip()))
+                    _se, _si = psspy.afxshuntint(-1, 1, ["NUMBER"])
+                    _te, _sc = psspy.afxshuntchar(-1, 1, ["ID"])
+                    if _se == 0 and _te == 0 and _si and _sc:
+                        for _b, _id in zip(_si[0], _sc[0]):
+                            fh.write("S,%d,%s\n" % (int(_b), str(_id).strip()))
+                except Exception as _xe:
+                    print("  [busmap] element rows (X/T3/M/S) not written (%s)" % _xe)
                 if _seen:
                     print("  [busmap] %d branch(es) recorded (%d line, %d transformer), "
                           "so the reports can say how far a bus is from the fault"
@@ -7534,7 +7665,12 @@ def add_channels():
                                                 ["POI%d V" % int(_pb), "POI%d ANG" % int(_pb)]),
                 "POI%d V/ANG" % int(_pb))
     elif MONITOR_POI_VANG:
-        chk(psspy.voltage_and_angle_channel([-1, -1, -1, POI_BUS], ["POI V", "POI ANG"]), "POI V/ANG")
+        # NAMED BY BUS, like every other voltage channel: "POI V" carries no
+        # bus number, so its measurement row had a blank bus and the
+        # comparison could never find the POI's own value on either side.
+        chk(psspy.voltage_and_angle_channel([-1, -1, -1, POI_BUS],
+                                            ["POI%d V" % int(POI_BUS), "POI%d ANG" % int(POI_BUS)]),
+            "POI%d V/ANG" % int(POI_BUS))
         for _pb in POI_BUSES[1:]:
             chk(psspy.voltage_and_angle_channel([-1, -1, -1, int(_pb)],
                                                 ["POI%d V" % int(_pb), "POI%d ANG" % int(_pb)]),
@@ -7741,10 +7877,10 @@ def _bess_machine_limits(project, mw_level):
        at their limits add up to, Pmin = -Pmax for a BESS (BESS_PMIN_SYMMETRIC)."""
     n = max(1, len(project["feeders"]))
     p_rated = _bess_feeder_mw(_bess_rating_mw(project, mw_level), n)
-    qmax = BESS_Q_CAP_FRACTION * p_rated
-    mbase = _math.sqrt(p_rated * p_rated + qmax * qmax)
-    pmin = -p_rated if BESS_PMIN_SYMMETRIC else 0.0
-    return p_rated, pmin, qmax, mbase
+    # THE RECORD IS A WHOLE NUMBER OF INVERTERS: Pmax, Qmax and MBASE from the
+    # rounded MBASE (see _inverter_record); the dispatch itself is not changed.
+    pmax, pmin, qmax, mbase, _n_inv = _inverter_record(p_rated)
+    return pmax, pmin, qmax, mbase
 
 
 def apply_bess_powerflow(project, mw_level):
@@ -7783,8 +7919,10 @@ def apply_bess_powerflow(project, mw_level):
           % (project["name"], mw_level, len(feeders), per, FEEDER_MAX_MW, p, q, mb,
              project["disable_existing"], POI_TUNE_DELIVERY))
     print("  [bess]   machine record (power triangle of the %.1f MW rating per machine): "
-          "Pmax %.1f  Pmin %.1f  Qmax +/-%.1f  MBASE %.1f MVA  (pf at Pmax %.3f)"
-          % (pmax, pmax, pmin, qcap, mb, pmax / mb if mb else 0.0))
+          "Pmax %.2f  Pmin %.2f  Qmax +/-%.2f  MBASE %.2f MVA  (pf at Pmax %.3f)%s"
+          % (per, pmax, pmin, qcap, mb, pmax / mb if mb else 0.0,
+             ("  = %d inverter(s) x %g MVA" % (_mbase_inverters(mb)[1], INVERTER_MVA))
+             if (INVERTER_MVA or 0) > 0 else ""))
     # a) optionally take the EXISTING gens at those buses off (surplus study)
     if project["disable_existing"]:
         mode = str(DISABLE_EXISTING_MODE).lower()
@@ -8043,9 +8181,7 @@ def _bess_restore_q_limits(project, mw_level):
             _pg = abs(float(_pg)) if _ie in (0, None) and _pg is not None else 0.0
         except Exception:
             _pg = 0.0
-        pmax_i = max(p_rated, _pg)
-        qcap = BESS_Q_CAP_FRACTION * pmax_i
-        mb_i = _math.sqrt(pmax_i * pmax_i + qcap * qcap)
+        pmax_i, _pmin_i, qcap, mb_i, _n_inv = _inverter_record(max(p_rated, _pg), pg=_pg)
         realar = [_f] * 17                     # _f = "leave unchanged" for every field
         realar[2] = qcap                       # QT
         realar[3] = -qcap                      # QB   (QG at index 1 is NOT touched)
@@ -8065,14 +8201,196 @@ def _bess_restore_q_limits(project, mw_level):
         except Exception as e:
             print("  [bess]   restore Q limits FAILED at %s: %s" % (b, e))
     print("  [bess] reactive capability restored on %d/%d machine(s): "
-          "QT/QB = +/-%.1f MVAr per feeder (%.2f pf); QG left at the solved value"
-          % (n_ok, len(feeders), qcap, POI_PF))
+          "QT/QB = +/-%.1f MVAr per feeder (%.2f pf); QG left at the solved value%s"
+          % (n_ok, len(feeders), qcap, POI_PF,
+             ("; MBASE %.2f MVA = %d inverter(s) x %g MVA per machine"
+              % (mb_i, _n_inv, INVERTER_MVA)) if (INVERTER_MVA or 0) > 0 else ""))
     for b in feeders:
         try:
             _, qg = psspy.macdat(int(b), BESS_ID, "Q")
             print("  [bess]   feeder %s initial Q = %s MVAr" % (b, qg))
         except Exception:
             pass
+
+
+def zero_bess_poi_q(project, mw_level):
+    """Set the project's machines so the plant exchanges ~0 MVAr at the POI --
+       the collector losses are supplied by the machines themselves.
+
+       solve -> measure Q delivered into the POI across the interconnection cut
+       -> move every machine's QG by an equal share of the error, clamped to
+       its own QMAX/QMIN -> solve again, up to POI_Q_ITERS times. QT/QB are
+       pinned to QG while iterating (or the solve regulates voltage and moves
+       Q), then put back to what they were. Finally each plant's scheduled
+       voltage is set to the voltage its machine sits at, so a regulating solve
+       lands on the same Q, and that is checked with one more solve."""
+    # THE SAME MACHINES AND THE SAME CUT THE P METERING USES. _member_gens()
+    # can answer the DECLARED feeder buses (EastFork: 531620 / 531607, where the
+    # disabled existing units sit) while the plant the build made is on the
+    # new unit buses; _poi_project_pairs() knows the built plant.
+    try:
+        gens, _rate, _from_new = _poi_project_pairs(project)
+    except Exception:
+        gens = []
+    if not gens:
+        gens = _member_gens(project)
+    gens = [(int(b), str(m)) for b, m in gens]
+    poi = int(project.get("poi") or POI_BUS)
+    if not gens:
+        print("  [poi-q] %s: no project machines -- nothing to do" % project.get("name"))
+        return
+    try:
+        _hv = [int(b) for r, b in _np_plant_buses_read() if r == "HV"]
+    except Exception:
+        _hv = []
+    cut = _hv or [b for b, _m in gens]
+    n = len(gens)
+    # what the machines have now: Q, and the limits they must stay inside
+    cur, lim, pinned = {}, {}, {}
+    for b, m in gens:
+        try:
+            _e, q = psspy.macdat(int(b), str(m), "Q")
+            cur[(b, m)] = float(q) if _e in (0, None) and q is not None else 0.0
+        except Exception:
+            cur[(b, m)] = 0.0
+        qmx = qmn = None
+        try:
+            _e1, qmx = psspy.macdat(int(b), str(m), "QMAX")
+            _e2, qmn = psspy.macdat(int(b), str(m), "QMIN")
+            qmx = float(qmx) if _e1 in (0, None) else None
+            qmn = float(qmn) if _e2 in (0, None) else None
+        except Exception:
+            qmx = qmn = None
+        # PINNED LIMITS ARE NOT THE CAPABILITY. The build creates and meters the
+        # units with QT = QB = QG (0 MVAr) so the solves hold that Q; read as
+        # limits, every move clamped to 0 and the machines were reported "at a
+        # reactive limit" with nothing changed. A machine whose QT and QB
+        # coincide gets the range the limit restore writes afterwards:
+        # +/- BESS_Q_CAP_FRACTION x Pmax (0.95 pf), and that range is what is
+        # left on it before the check solve below.
+        if qmx is None or qmn is None or (qmx - qmn) < 1e-6:
+            try:
+                _e3, _pmx = psspy.macdat(int(b), str(m), "PMAX")
+                _e4, _pg = psspy.macdat(int(b), str(m), "P")
+                _pmx = abs(float(_pmx)) if _e3 in (0, None) and _pmx is not None else 0.0
+                _pg = abs(float(_pg)) if _e4 in (0, None) and _pg is not None else 0.0
+                _cap = float(BESS_Q_CAP_FRACTION) * max(_pmx, _pg)
+            except Exception:
+                _cap = 0.0
+            if _cap > 0:
+                print("  [poi-q]   %s '%s': QT/QB pinned at %s -- using the 0.95-pf capability +/-%.1f MVAr"
+                      % (b, m, qmx, _cap))
+                qmx, qmn = _cap, -_cap
+        lim[(b, m)] = (qmn, qmx)
+        pinned[(b, m)] = (qmn, qmx)          # the range left on the machine afterwards
+    P0, Q0, nb = _delivered_to_poi(cut, poi)
+    if nb == 0:
+        print("  [poi-q] %s: no tie branch between the plant and POI %d could be read -- "
+              "the reactive exchange cannot be measured, machines left as they are"
+              % (project.get("name"), poi))
+        return
+    print("  [poi-q] === %s: driving the reactive exchange at POI %d to 0 MVAr (now P=%.1f MW, Q=%+.1f MVAr "
+          "delivered into the POI; machines Q %s) ==="
+          % (project.get("name"), poi, P0, Q0,
+             ", ".join("%s '%s' %+.1f" % (b, m, cur[(b, m)]) for b, m in gens)))
+    if abs(Q0) <= float(POI_Q_TOL_MVAR):
+        print("  [poi-q]   already within %.1f MVAr -- nothing moved" % float(POI_Q_TOL_MVAR))
+        return
+    Q, P = Q0, P0
+    limited = False
+    for it in range(1, int(POI_Q_ITERS) + 1):
+        dq = -float(Q) * float(POI_Q_RELAX) / n
+        at_limit = []
+        for b, m in gens:
+            qn = cur[(b, m)] + dq
+            qmn, qmx = lim[(b, m)]
+            if qmx is not None and qn > qmx:
+                qn = qmx; at_limit.append("%s '%s' at QMAX %.1f" % (b, m, qmx))
+            if qmn is not None and qn < qmn:
+                qn = qmn; at_limit.append("%s '%s' at QMIN %.1f" % (b, m, qmn))
+            realar = [_f] * 17
+            realar[1] = qn; realar[2] = qn; realar[3] = qn          # QG, and QT=QB pinned to it
+            try:
+                ie = psspy.machine_chng_2(int(b), str(m), [_i] * 6, realar)
+                ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+                if ie not in (0, None):
+                    print("  [poi-q]   machine_chng_2 %s '%s' ierr=%s" % (b, m, ie))
+            except Exception as e:
+                print("  [poi-q]   could not set Q at %s '%s': %s" % (b, m, e))
+            cur[(b, m)] = qn
+        try:
+            solve_powerflow("FDNS POI-Q %d" % it)
+        except Exception as e:
+            print("  [poi-q]   the re-solve failed (%s) -- stopping" % e)
+            break
+        P, Q, nb = _delivered_to_poi(cut, poi)
+        print("  [poi-q]   iter %d: machines Q %+.1f MVAr total -> POI P=%.1f MW, Q=%+.1f MVAr%s"
+              % (it, sum(cur.values()), P, Q, ("   [%s]" % "; ".join(at_limit)) if at_limit else ""))
+        if abs(Q) <= float(POI_Q_TOL_MVAR):
+            print("  [poi-q]   converged: %+.2f MVAr at the POI after %d pass(es)" % (Q, it))
+            break
+        limited = bool(at_limit)
+        if at_limit and len(at_limit) >= n:
+            print("  [poi-q]   *** every machine is at a reactive limit -- %+.1f MVAr at the POI "
+                  "cannot be removed within QMAX/QMIN (limits NOT changed) ***" % Q)
+            break
+    # THE SCHEDULED VOLTAGE = THE VOLTAGE REACHED, so the regulating solve that
+    # follows (limits restored) reproduces this Q instead of pulling back to the
+    # old schedule. A plant regulating a remote bus takes that bus's voltage.
+    ireg_of = {}
+    try:
+        _e, _a = psspy.agenbusint(-1, 1, ["NUMBER", "IREG"])
+        if _e in (0, None) and _a and len(_a) >= 2:
+            for _nb, _ir in zip(_a[0], _a[1]):
+                ireg_of[int(_nb)] = int(_ir or 0)
+    except Exception:
+        pass
+    n_vs = 0
+    for b, m in gens:
+        rb = ireg_of.get(int(b), 0) or int(b)
+        try:
+            _e, v = psspy.busdat(int(rb), "PU")
+            if _e not in (0, None) or v is None:
+                continue
+            ie = psspy.plant_data(int(b), _i, [float(v), _f])
+            ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+            if ie in (0, None):
+                n_vs += 1
+                print("  [poi-q]   %s '%s': scheduled voltage -> %.4f pu%s"
+                      % (b, m, float(v), (" (regulated bus %d)" % rb) if rb != int(b) else ""))
+            else:
+                print("  [poi-q]   plant_data %s ierr=%s -- scheduled voltage not set" % (b, ie))
+        except Exception as e:
+            print("  [poi-q]   scheduled voltage at %s not set: %s" % (b, e))
+    # QT/QB back to what they were -- QG stays where the iteration put it
+    for b, m in gens:
+        qmn, qmx = pinned[(b, m)]
+        realar = [_f] * 17
+        if qmx is not None: realar[2] = qmx
+        if qmn is not None: realar[3] = qmn
+        try:
+            psspy.machine_chng_2(int(b), str(m), [_i] * 6, realar)
+        except Exception as e:
+            print("  [poi-q]   could not restore QT/QB at %s '%s': %s" % (b, m, e))
+    # CHECKED, not assumed: one regulating solve with the limits back
+    try:
+        solve_powerflow("FDNS POI-Q check")
+        P2, Q2, _n2 = _delivered_to_poi(cut, poi)
+        qs = []
+        for b, m in gens:
+            try:
+                _e, q = psspy.macdat(int(b), str(m), "Q")
+                qs.append("%s '%s' %+.1f" % (b, m, float(q)))
+            except Exception:
+                pass
+        print("  [poi-q] RESULT %s: POI %d  P=%.1f MW  Q=%+.2f MVAr with the machines regulating their "
+              "scheduled voltage (%d plant(s) set); machines Q %s%s"
+              % (project.get("name"), poi, P2, Q2, n_vs, ", ".join(qs),
+                 "" if abs(Q2) <= 2.0 * float(POI_Q_TOL_MVAR) else
+                 ("   *** held back by the machines' QMAX/QMIN (not changed) ***" if limited else
+                  "   *** drifted past the tolerance on the regulating solve -- read the iterations above ***")))
+    except Exception as e:
+        print("  [poi-q]   check solve failed (%s)" % e)
 
 
 def tune_bess_poi_delivery(project, mw_level):
@@ -11229,7 +11547,7 @@ def _set_machine_p(bus, mid, p):
                 _e1, _qt = psspy.macdat(int(bus), str(mid), "QMAX")
                 _e2, _mb = psspy.macdat(int(bus), str(mid), "MBASE")
                 _qt = abs(float(_qt)) if _e1 in (0, None) else 0.0
-                _need = _math.sqrt(float(p) ** 2 + _qt ** 2)
+                _need, _n_inv = _mbase_inverters(_math.sqrt(float(p) ** 2 + _qt ** 2), up=True)
                 if _e2 in (0, None) and float(_mb) < _need - 1e-6:
                     realar[6] = _need     # MBASE
                     print("  [poi-p]   %s '%s': Pmax raised to %.1f MW -> MBASE %.1f -> %.1f MVA "
@@ -13168,7 +13486,14 @@ def _collector_stamp():
     # REECAU1 constant is as wrong to reuse as one built with a different
     # collector, and for the same reason: the change happens during the build.
     return (coll + " | " + _dyr_stamp() + " | " + _poi_stamp()
-            + " | " + _monitor_stamp())
+            + " | " + _monitor_stamp() + " | " + _poi_q_stamp())
+
+
+def _poi_q_stamp():
+    """The reactive-zeroing step is applied DURING THE BUILD, so a snapshot
+       built before it existed, or with it off, must not be reused under the new
+       setting: with it in the stamp the change rebuilds by itself."""
+    return "poi-q: %s tol=%s | inverter=%s MVA" % ("zero" if POI_Q_ZERO else "off", POI_Q_TOL_MVAR, INVERTER_MVA)
 
 
 def _monitor_stamp():
@@ -14636,6 +14961,17 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         if _any_poi_target() and POI_HOLD_AREA_MW:
             for _hr in _hold_rows():
                 _poi_hold_area_after_solve(_hr)
+        # ---- 0 MVAr AT THE POI (POI_Q_ZERO): the machines carry their own
+        # collector losses. After the P metering and the area hold, before the
+        # P verification, so what is verified and saved is the final state.
+        if ENABLE_BESS and POI_Q_ZERO:
+            for _mr, _mmw in _mm:
+                with _member_scope(_mr, _mmw):
+                    try:
+                        zero_bess_poi_q(_mr, _mmw)
+                    except Exception as _qe:
+                        print("  [poi-q] *** %s: reactive zeroing failed (%s) -- machines left as metered ***"
+                              % (_mr.get("name"), _qe))
         # THE LAST WORD ON THE POI TOTAL, per plant, on the solved case.
         for _mr, _mmw in _mm:
             with _member_scope(_mr, _mmw):
@@ -18812,6 +19148,10 @@ def _poi_hop_map(max_hops=None):
         for x, y in _branches():
             adj.setdefault(int(x), set()).add(int(y))
             adj.setdefault(int(y), set()).add(int(x))
+        for _w1, _w2, _w3 in _three_wind_legs():          # three-winding legs too
+            for _a, _b in ((_w1, _w2), (_w1, _w3), (_w2, _w3)):
+                adj.setdefault(_a, set()).add(_b)
+                adj.setdefault(_b, set()).add(_a)
 
         def nbrs(u):
             # _dist_nbrs falls back to BUS_MAP.csv when this process has no
@@ -18845,7 +19185,7 @@ def _hop_text(bus):
     """'POI' / '1 hop from POI' / '3 hops from POI' / '>8 hops from POI'."""
     h = _poi_hop_map().get(int(bus))
     if h is None:
-        return ">%d hops from %s" % (DISTANCE_MAX_HOPS, _poi_word())
+        return "no path to %s in the case" % _poi_word()
     if h == 0:
         return "POI"
     return "%d hop%s from %s" % (h, "" if h == 1 else "s", _poi_word())
@@ -19020,7 +19360,7 @@ def _where_text(label, fault_bus, short=False):
     if short:
         _a = "" if ar is None else str(ar)
         if h is None:
-            _h = "" if not fault_bus else ">%d" % FAULT_DIST_MAX_HOPS
+            _h = "" if not fault_bus else "no path"
         else:
             _h = "%dh" % h
         return ("%s / %s" % (_a, _h)).strip(" /")
@@ -19099,7 +19439,7 @@ def _fault_hop_text(bus, fault_bus):
     except Exception:
         return ""
     if h is None:
-        return ">%d hops from fault" % FAULT_DIST_MAX_HOPS
+        return "no path to the faulted bus in the case"
     if h == 0:
         return "at fault bus %d" % int(fault_bus)
     return "%d hop%s from fault bus %d" % (h, "" if h == 1 else "s", int(fault_bus))
@@ -24359,7 +24699,7 @@ def write_what_failed_report(cases, verdicts, rows, crit_rows=None):
             # never reached is further than the mapped depth, which is a fact
             # about it -- printing nothing reads as "unknown", or worse as zero.
             if d["hops"] in ("", None):
-                _h = ">%d" % FAULT_DIST_MAX_HOPS if d["fbus"] else "-"
+                _h = "no path" if d["fbus"] else "-"
             else:
                 _h = str(d["hops"])
             f.write(" %-20s %-9s %-8s %-14s %-7s %-6s %-5s %-24s %-11s %-9s %-9s %s\n"
@@ -25114,6 +25454,7 @@ def load_faults_csv(path):
                  "type": (r.get("fault_type") or "3PH").upper(),
                  "cycles": float(r.get("clear_cycles") or 16),
                  "trip_lines": tl}
+            _FAULT_SIG[f["id"]] = _fault_row_sig(r)
             if (r.get("planning_event") or "").strip():
                 f["planning_event"] = r["planning_event"].strip()
                 n_rich += 1
@@ -25253,10 +25594,89 @@ def _mark_attempt(scen_id):
     _write_text(_state_path(scen_id, "attempts"), n)
     return n
 
+
+def _fault_row_sig(r):
+    """A short fingerprint of ONE fault list row: bus, type, clearing time, the
+       elements tripped (direction-free, circuit upper-cased), three-winding,
+       drops, prior outage and the con_id. Written into <id>.done when a
+       scenario completes and checked before a .done is trusted, so a list
+       that was renumbered -- F27 on disk is not F27 in the new list -- is
+       never resumed as if it were the same faults."""
+    import hashlib
+    def _els(s):
+        out = set()
+        for e in (s or "").split(";"):
+            b = [x.strip() for x in e.split("-")]
+            if len(b) >= 2 and b[0] and b[1]:
+                try:
+                    a_, c_ = int(b[0]), int(b[1])
+                except ValueError:
+                    continue
+                out.add("%d-%d-%s" % (min(a_, c_), max(a_, c_), (b[3] if len(b) > 3 and b[3] else "1").upper()))
+        return ";".join(sorted(out))
+    def _tri(s):
+        out = set()
+        for e in (s or "").split(";"):
+            b = [x.strip() for x in e.split("-")]
+            if len(b) >= 3 and b[0]:
+                try:
+                    out.add("%s-%s" % ("-".join(str(x) for x in sorted(int(y) for y in b[:3])),
+                                       (b[3] if len(b) > 3 and b[3] else "1").upper()))
+                except ValueError:
+                    continue
+        return ";".join(sorted(out))
+    def _pairs(s):
+        return ";".join(sorted(x.strip().upper() for x in (s or "").split(";") if x.strip()))
+    try:
+        cyc = "%.2f" % float(r.get("clear_cycles") or 0)
+    except ValueError:
+        cyc = str(r.get("clear_cycles") or "")
+    parts = [str(r.get("fault_bus") or "").strip(), str(r.get("fault_type") or "3PH").strip().upper(), cyc,
+             _els(r.get("trip_elements")), _tri(r.get("trip_3wind")),
+             _pairs(r.get("drop_machines")), _pairs(r.get("drop_loads")), _pairs(r.get("drop_shunts")),
+             _els(r.get("pre_outage")), str(r.get("con_id") or "").strip().upper()]
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def _done_sig(path):
+    """The sig= line of a .done marker, or "" for a marker written before
+       markers carried one."""
+    try:
+        with open(path) as fh:
+            for ln in fh:
+                if ln.startswith("sig="):
+                    return ln[4:].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _stale_aside(out_dir, sid, why):
+    """Move <sid>.out / .done aside as *.stale_<stamp> -- never deleted."""
+    import time as _t
+    stamp = _t.strftime("%Y%m%d_%H%M%S")
+    moved = 0
+    for ext in ("out", "done"):
+        p = os.path.join(out_dir, "%s.%s" % (sid, ext))
+        if os.path.isfile(p):
+            try:
+                os.rename(p, "%s.stale_%s" % (p, stamp))
+                moved += 1
+            except Exception:
+                pass
+    return moved
+
+_FAULT_SIG = {}      # fault id -> _fault_row_sig of the row this run loaded
+
+
 def _mark_done(scen_id, tclear):
     """Mark a scenario fully complete. Store tclear so a resumed run can still plot /
-       score it without re-running (None -> empty)."""
-    _write_text(_state_path(scen_id, "done"), "" if tclear is None else repr(tclear))
+       score it without re-running (None -> empty) -- and the fault's fingerprint,
+       so a later run with a renumbered list does not resume it as the same fault."""
+    txt = "" if tclear is None else repr(tclear)
+    if scen_id in _FAULT_SIG:
+        txt += "\nsig=%s" % _FAULT_SIG[scen_id]
+    _write_text(_state_path(scen_id, "done"), txt)
 
 def _is_done(scen_id, out_path):
     """A scenario counts as done only if BOTH its .done marker and a real .out exist.
@@ -25265,8 +25685,21 @@ def _is_done(scen_id, out_path):
        it, so an existing .done must not short-circuit the run."""
     if ONLY_MODE_RERUNS_DONE and _only_mode() and _wanted(scen_id):
         return False
-    return (RESUME_ON_RESTART and os.path.isfile(_state_path(scen_id, "done"))
-            and os.path.isfile(out_path))
+    if not (RESUME_ON_RESTART and os.path.isfile(_state_path(scen_id, "done"))
+            and os.path.isfile(out_path)):
+        return False
+    # THE SAME ID IS NOT THE SAME FAULT. A .done written for another list --
+    # or before markers carried a fingerprint -- is not a result for THIS row.
+    want = _FAULT_SIG.get(scen_id)
+    if want:
+        have = _done_sig(_state_path(scen_id, "done"))
+        if have != want:
+            print("  [resume] %s on disk is %s -- moved aside as .stale, running it again"
+                  % (scen_id, "a DIFFERENT fault (the list was renumbered)" if have
+                     else "from a run whose markers carried no fault fingerprint"))
+            _stale_aside(OUT_DIR, scen_id, "sig")
+            return False
+    return True
 
 
 _FAULT_CYCLES_CACHE = {"loaded": False, "map": {}}
@@ -25318,7 +25751,7 @@ def _tclear_from_faultlist(scen_id):
 def _read_done_tclear(scen_id):
     try:
         with open(_state_path(scen_id, "done")) as fh:
-            s = fh.read().strip()
+            s = (fh.readline() or "").strip()      # first line = tclear; sig= follows
         return float(s) if s else None
     except Exception:
         return None
@@ -25791,6 +26224,12 @@ def _sf_adjacency():
             x, y = int(x), int(y)
             adj.setdefault(x, set()).add(y)
             adj.setdefault(y, set()).add(x)
+    # NO THREE-WINDING LEGS HERE. This adjacency is the plant builder's and the
+    # tie finder's: every pair in it is taken as a two-winding branch and looked
+    # up as one. Legs of a three-winding transformer are not such branches, and
+    # at a POI that sits on one (EastFork's 531623) they made the build fail.
+    # The distance and monitoring walks (_radius, _dist_nbrs, _poi_hop_map)
+    # carry the legs; this one stays as the case's branch tables give it.
     _SF_ADJ = adj
     return adj
 
@@ -26871,7 +27310,7 @@ def sf_build_spp_faults(poi_bus, hops, kv_min):
         print("  [make_spp_faults] dropped, by planning event: %s"
               % ", ".join("%s=%d" % (k, _dev[k]) for k in sorted(_dev)))
         print("  [make_spp_faults] they sit at level %s from the POI."
-              % ", ".join(str(d) if d != _FAR else ">%d" % hops for d in _dh))
+              % ", ".join(str(d) if d != _FAR else "no path" for d in _dh))
         print("  [make_spp_faults] The study therefore does NOT cover the radius those")
         print("  [make_spp_faults] settings describe. Raise SPP_MAX_FAULTS to %d to run"
               % _n_all)
@@ -26889,7 +27328,7 @@ def sf_build_spp_faults(poi_bus, hops, kv_min):
         d = _hops.get(int(f["fault_bus"]), _FAR)
         _byhop[d] = _byhop.get(d, 0) + 1
     print("  [make_spp_faults] ordered from the POI outward: %s"
-          % ", ".join("%s hop%s=%d" % (("%d" % d) if d != _FAR else ">%d" % hops,
+          % ", ".join("%s hop%s=%d" % (("%d" % d) if d != _FAR else "no path",
                                        "" if d == 1 else "s", _byhop[d])
                       for d in sorted(_byhop)))
     # per-event tally
@@ -27525,7 +27964,7 @@ def fault_hops_text(f):
     """'at the POI' / '1 hop from POI' / '>8 hops from POI'."""
     h = fault_hops(f)
     if h is None:
-        return ">%d hops from POI" % DIST_MAX_HOPS
+        return "no path to POI in the case"
     if h == 0:
         return "at the POI"
     return "%d hop%s from %s" % (h, "" if h == 1 else "s", _poi_word())
@@ -27768,8 +28207,8 @@ def sf_write_results_template(faults, base):
 # "within 3 levels of the POI"), so the report and the contingency scope are
 # then measured the same way. An electrical distance would be a second, quieter
 # definition of "near".
-DIST_MAX_HOPS = 8          # how far to map; beyond this a bus is just "far"
-FAULT_DIST_MAX_HOPS = 6    # per-fault map, kept smaller -- it is one per fault
+DIST_MAX_HOPS = 30         # deep enough to reach every bus of the synchronous system
+FAULT_DIST_MAX_HOPS = 30   # per-fault map, cached per faulted bus; every monitored bus gets a number
 
 _DIST_ADJ = None
 
@@ -27790,6 +28229,10 @@ def _dist_nbrs(bus):
             for x, y in _branches():
                 adj.setdefault(int(x), set()).add(int(y))
                 adj.setdefault(int(y), set()).add(int(x))
+            for _w1, _w2, _w3 in _three_wind_legs():      # three-winding legs too
+                for _a, _b in ((_w1, _w2), (_w1, _w3), (_w2, _w3)):
+                    adj.setdefault(_a, set()).add(_b)
+                    adj.setdefault(_b, set()).add(_a)
         except Exception as e:
             print("  [dist] branch list unavailable (%s) -- distances may be partial" % e)
         if not adj:
