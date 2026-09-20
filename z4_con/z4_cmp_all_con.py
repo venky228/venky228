@@ -312,7 +312,7 @@ def _panel_projects():
         return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
     return list(PROJECTS)
 MODES      = ["spp"]                        # spp | con | table | custom | manual
-PIPELINE   = "all"                          # ***SET TO "all" TO RUN THE SWEEP***
+PIPELINE   = "compare"                      # "compare" = RESCORE + report from the .out files on disk, no simulation | ***SET TO "all" TO RUN THE SWEEP***
                                             #   "all"     simulate each value, then compare
                                             #   "compare" only reads disk -- SKIPS the sweep
 
@@ -381,7 +381,7 @@ CORES_FOR_REPORTS = 4          # of CORES_MAX, cores for scoring s-*hards + plot
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
-FORCE_RESCORE   = False       # True = re-score every folder every launch (only after a criterion change)
+FORCE_RESCORE   = True        # True = re-score EVERY .out under the current criteria (trip = power to zero, ETERM line). Set back to False after this launch
 RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
 SCORE_NO_CASE   = True          # True = shards score without loading the case (32-bit memory fix) -- keep
 # -- PLOTS: PDFs --
