@@ -410,6 +410,44 @@ def _exit_reason(rc):
     return "rc=%s -- exited on its own, no crash code" % rc
 
 
+def _snapshot_psse_sink(i, why=""):
+    """Keep PSS/E's own output from the moment a worker died.
+
+       The engine sends PSS/E's console to logs\\_psse_sink_w<i>.txt, and the
+       next launch of that worker slot OVERWRITES it. So the one file that
+       holds PSS/E's last words about a crash -- "Network not converged",
+       a model's message, a floating-point trap -- was gone by the time anyone
+       looked: F15's three deaths on 2026-09-20 left a sink holding F22.
+
+       Copied here, on every death, to logs\\CRASH_<scenario>_w<i>_<hhmmss>.txt
+       (the last 4000 lines). The scenario is the one the study's PROGRESS
+       rows show RUNNING on this worker."""
+    try:
+        src = os.path.join(LOGS_DIR, "_psse_sink_w%s.txt" % i)
+        if not LOGS_DIR or not os.path.isfile(src) or os.path.getsize(src) == 0:
+            return ""
+        sid = ""
+        try:
+            sid, _age = _worker_scenario_age(int(i))
+        except Exception:
+            sid = ""
+        dst = os.path.join(LOGS_DIR, "CRASH_%s_w%s_%s.txt"
+                           % (sid or "unknown", i, time.strftime("%H%M%S")))
+        with open(src, "r", errors="replace") as fh:
+            lines = fh.readlines()
+        with open(dst, "w") as fh:
+            fh.write("PSS/E output of worker %s at the time it died -- %s\n" % (i, time.strftime("%Y-%m-%d %H:%M:%S")))
+            fh.write("scenario: %s\nreason:   %s\n" % (sid or "(no RUNNING row for this worker)", why))
+            fh.write("source:   %s (last %d of %d lines)\n" % (src, min(4000, len(lines)), len(lines)))
+            fh.write("=" * 96 + "\n")
+            fh.writelines(lines[-4000:])
+        print("[parallel] worker %s: PSS/E output at the crash kept -> %s" % (i, dst))
+        return dst
+    except Exception as e:
+        print("[parallel] worker %s: could not keep the PSS/E sink (%s)" % (i, e))
+        return ""
+
+
 def _worker_exit_note(i, text=""):
     """Remember, or recall, HOW a worker last died.
 
@@ -433,6 +471,7 @@ def _worker_exit_note(i, text=""):
                 fh.write("%s\t%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
         except Exception:
             pass
+        _snapshot_psse_sink(i, text)
         return text
     try:
         with open(p) as fh:
