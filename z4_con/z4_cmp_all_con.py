@@ -15733,6 +15733,37 @@ def auto_remerge_stale_reports(quiet=False):
     return n
 
 
+def _expected_fault_ids(case, proj, mode):
+    """The scenario ids this (case, project) is meant to run, in list order:
+       the shared fault list beside the cases, else the copy the study wrote
+       into its own faults\\ folder. [] when neither can be read."""
+    cands = []
+    try:
+        cands.append(shared_faults_path(proj, SHARED_FAULTS_CSV))
+    except Exception:
+        pass
+    for c in (case, CASE_BASE, CASE_TEST):
+        try:
+            cands.append(os.path.join(results_dir(c, proj, mode), "faults", "SPP_FAULTS.csv"))
+        except Exception:
+            pass
+    for p in cands:
+        if not p or not os.path.isfile(p):
+            continue
+        ids = []
+        try:
+            with csv_open(p) as fh:
+                for r in csv.DictReader(fh):
+                    fid = (r.get("fault_id") or "").strip()
+                    if fid:
+                        ids.append(fid)
+        except Exception:
+            continue
+        if ids:
+            return ids
+    return []
+
+
 def _out_and_scored_sets(rdir, proj):
     """({scenarios with an .out}, {scenarios with a verdict}) for one folder."""
     outs = set()
@@ -16786,29 +16817,101 @@ def main():
     # useless. This runs exactly the side that is missing, for exactly the
     # projects that are missing it, and nothing else.
     if pipeline == "missing":
+        # WHAT "MISSING" MEANS. It used to mean "a project that has a results
+        # folder on one side and not the other" -- so a project with no folder
+        # on EITHER side (IronStar, EmpirePrairie, never started) was not
+        # missing, and SantaFe at 254 of 291 was not missing either, and the
+        # run said "nothing is missing" and went straight to the comparison.
+        #
+        # Missing now means, per case and project: no results folder, OR the
+        # shared fault list has scenarios that are neither scored nor given up.
+        # A given-up scenario (attempts at the cap) is NOT counted as missing:
+        # a worker would only look at it and skip, and re-running it is a
+        # separate decision (RETRY_GAVE_UP_ROUNDS, or clearing its .attempts).
         todo = {"BASE": set(), "PROJ": set()}
-        for mode in MODES:
+        _lines = []
+        _pj_all = list(_panel_projects() or [])
+        for mode in (list(MODES) or ["spp"]):
             _c, ob, ot = discover_projects(mode)
-            for pj in ot:
-                todo["BASE"].add((pj, mode))    # only the project study has it
-            for pj in ob:
-                todo["PROJ"].add((pj, mode))
+            _cands = sorted(set(_pj_all) | set(_c) | set(ob) | set(ot), key=str)
+            for key, case in (("BASE", CASE_BASE), ("PROJ", CASE_TEST)):
+                for pj in _cands:
+                    rdir = results_dir(case, pj, mode)
+                    exp = _expected_fault_ids(case, pj, mode)
+                    if not os.path.isdir(rdir):
+                        todo[key].add((pj, mode))
+                        _lines.append("  %-5s %-16s no results folder -- %s to run"
+                                      % (key, pj, len(exp) if exp else "all"))
+                        continue
+                    try:
+                        _outs, scored = _out_and_scored_sets(rdir, pj)
+                    except Exception:
+                        _outs, scored = set(), set()
+                    try:
+                        _st = read_states(rdir, pj)
+                    except Exception:
+                        _st = {}
+                    gave = set(s for s, v in _st.items()
+                               if "GAVE" in (v or "") or "CRASH" in (v or ""))
+                    if not exp:
+                        # no list to measure against: a folder that exists is taken as run
+                        _lines.append("  %-5s %-16s %d scored (no fault list to measure against)"
+                                      % (key, pj, len(scored)))
+                        continue
+                    left = [f for f in exp if f not in scored and f not in gave]
+                    if left:
+                        todo[key].add((pj, mode))
+                        _lines.append("  %-5s %-16s %d of %d still to run%s"
+                                      % (key, pj, len(left), len(exp),
+                                         ("  (+%d given up, not re-run)" % len(gave & set(exp))) if gave else ""))
+                    else:
+                        _lines.append("  %-5s %-16s complete: %d scored%s"
+                                      % (key, pj, len(scored & set(exp)),
+                                         ("  (%d given up -- see the re-run list)" % len(gave & set(exp))) if gave else ""))
+        print("")
+        print("[compare] RUN_MISSING -- what each case still has to run:")
+        for _l in _lines:
+            print("[compare]" + _l)
         if not any(todo.values()):
-            print("[compare] RUN_MISSING: nothing is missing -- both studies have the")
-            print("[compare]              same projects. Going straight to the comparison.")
-        for key, case in (("BASE", CASE_BASE), ("PROJ", CASE_TEST)):
-            if not todo[key]:
-                continue
-            pjs = sorted(set(x[0] for x in todo[key]))
-            mds = sorted(set(x[1] for x in todo[key]))
-            _banner("%s is missing %s -- running it" % (case["label"], ", ".join(pjs)))
+            print("[compare] RUN_MISSING: nothing is missing -- every project is complete")
+            print("[compare]              on both sides (given-up scenarios are not re-run")
+            print("[compare]              here). Going straight to the comparison.")
+        _runs = [(key, case) for key, case in (("BASE", CASE_BASE), ("PROJ", CASE_TEST))
+                 if todo[key] and case in _cases_to_run()]
+        if _runs:
             print("[compare] this SIMULATES: hours, not seconds. The comparison itself")
             print("[compare] needs no simulation and is re-runnable at any time.")
-            rc = run_study(case, projects=pjs, modes=mds)
-            if rc not in (0, None):
-                print("[compare] *** that study ended rc=%s. Whatever it did finish will"
-                      % rc)
-                print("[compare]     still be compared; the rest stays one-sided. ***")
+        if len(_runs) == 2 and RUN_IN_PARALLEL:
+            # BOTH CASES AT ONCE, as PIPELINE = "all" does. One after the other
+            # doubled the wall clock for no reason.
+            _res, _ths = {}, []
+            for key, case in _runs:
+                pjs = sorted(set(x[0] for x in todo[key]))
+                mds = sorted(set(x[1] for x in todo[key]))
+                _banner("%s is missing %s -- running it" % (case["label"], ", ".join(pjs)))
+
+                def _go(c=case, k=key, p=pjs, m=mds):
+                    _res[k] = run_study(c, projects=p, modes=m)
+                th = threading.Thread(target=_go)
+                th.start()
+                _ths.append(th)
+            for th in _ths:
+                th.join()
+            for k, rc in _res.items():
+                if rc not in (0, None):
+                    print("[compare] *** the %s study ended rc=%s. Whatever it did finish will"
+                          % (k, rc))
+                    print("[compare]     still be compared; the rest stays one-sided. ***")
+        else:
+            for key, case in _runs:
+                pjs = sorted(set(x[0] for x in todo[key]))
+                mds = sorted(set(x[1] for x in todo[key]))
+                _banner("%s is missing %s -- running it" % (case["label"], ", ".join(pjs)))
+                rc = run_study(case, projects=pjs, modes=mds)
+                if rc not in (0, None):
+                    print("[compare] *** that study ended rc=%s. Whatever it did finish will"
+                          % rc)
+                    print("[compare]     still be compared; the rest stays one-sided. ***")
 
     # ---- PHASE 2 -- MAKE SURE EVERY FINISHED STUDY HAS A REPORT -------------
     # The comparison reads reports, not .out files. A study that simulated
