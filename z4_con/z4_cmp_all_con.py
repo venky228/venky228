@@ -635,7 +635,8 @@ POI_HOLD_AREA_MW = True                     # False = raise the POI and let the 
 POI_HOLD_AREA_TOL_MW = None                 # how close the area must come back (default 0.5 MW)
 POI_HOLD_AREA_PASSES = None                 # solve/correct passes allowed to get there (default 4)
 POI_RADIUS_HOPS = None                      # how many bus-hops from the POI to MONITOR voltage
-STUDY_AREAS     = None                      # None = the study script's 21 areas. A list = monitor only these
+STUDY_AREAS     = [327, 330, 356, 515, 520, 523, 524, 525, 526, 531, 534, 536, 541, 542,
+                   544, 545, 546, 635, 640, 645]   # the 20 areas named in the SPP report text; None = the engine's own list
 AREA_KV_MIN     = None                      # None = the study script's 100.0 kV -- MISO monitors from 100 kV
 
 # ---- THE FAULT SET -----------------------------------------------------------

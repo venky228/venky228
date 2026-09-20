@@ -1646,8 +1646,13 @@ SPP_FULL_AREAS   = (list(range(500, 600)) + [998, 999] + list(range(600, 700))
 # have been handed len()=1 and a nested list, and the swing selector's
 # "is this area in STUDY_AREAS" test raised TypeError and silently answered NO
 # for every area. Single brackets; the area numbers are exactly as you set them.
-STUDY_AREAS      = [520, 524, 525, 526, 531, 534, 536, 541, 542, 545,
-                    640, 645, 650, 652]
+# SPP REPORT TEXT, VERBATIM: 327 (EES-EAI), 330 (AECI), 356 (AMMO), 515 (SWPA),
+# 520 (AEPW), 523 (GRDA), 524 (OKGE), 525 (WFEC), 526 (SPS), 531 (MIDW),
+# 534 (SUNC), 536 (WERE), 541 (KCPL), 542 (KACY), 544 (EMDE), 545 (INDN),
+# 546 (SPRM), 635 (MEC), 640 (NPPD), 645 (OPPD). The shorter 14-area
+# neighbourhood that ran before is in the comment block below for reference.
+STUDY_AREAS      = [327, 330, 356, 515, 520, 523, 524, 525, 526, 531, 534, 536, 541, 542,
+                    544, 545, 546, 635, 640, 645]
 # SPP MEMBERS ONLY, named from the case's own area table (BUS_MAP.csv "A," rows):
 #   520 AEPW   524 OKGE   525 WFEC   526 SPS    531 MIDW   534 SUNC (the project)
 #   536 WERE   541 KCPL   542 KACY   545 INDN   640 NPPD   645 OPPD
@@ -3610,15 +3615,15 @@ AREA_SYNC_ONLY   = True
 # many branch hops it is from the POI -- the evidence for shortening that list.
 # It reads the case and changes nothing.
 AREA_FOOTPRINT_REPORT = True
-AREA_SYNC_MAX    = 500     # cap on synchronous area machines to channel
+AREA_SYNC_MAX    = 1500    # cap on synchronous area machines to channel (20 SPP areas; the build prints the count -- raise if it is hit)
 MINIMAL_CHANNELS = False
 # SPP wants ROTOR ANGLE for synchronous machines AND SPEED for asynchronous (wind/IBR)
 # machines in the study areas. AREA_SYNC_ONLY handles the synchronous side; this adds the
 # asynchronous SPEED channel (code 7 only -- speed stays bounded, so it does NOT overflow
 # the writer the way IBR P/Q/angle can). Set False if you ever hit an overflow traceable
 # to an async speed channel.
-MONITOR_ASYNC_SPEED = False   # speed channels dropped -- nothing scores or plots them now
-ASYNC_SPEED_MAX     = 500  # cap on asynchronous machines to channel for SPEED
+MONITOR_ASYNC_SPEED = True    # SPP: speed of asynchronous machines in the study areas (plotted, not scored)
+ASYNC_SPEED_MAX     = 1500 # cap on asynchronous machines to channel for SPEED (same rule)
 
 # Other Group 3 project buses (group minus your PROJECT_GENS) -- ALWAYS monitored for
 # P/Q/Eterm per SPP, regardless of the synchronous-radius setting.
@@ -6094,6 +6099,11 @@ def _find_area_gens_by_wmod(areas, kv_min, cap, want_synchronous):
             found.append((int(b), str(mid).strip()))
     except Exception as e:
         print("  [area-gens] failed: %s" % e)
+    if len(found) > cap:
+        print("  [area-gens] WARNING: %d %s machine(s) found in the study areas, "
+              "only the first %d (by MBASE) are channelled -- raise %s"
+              % (len(found), "synchronous" if want_synchronous else "asynchronous",
+                 cap, "AREA_SYNC_MAX" if want_synchronous else "ASYNC_SPEED_MAX"))
     return found[:cap]
 
 def find_area_sync_gens(areas, kv_min=0.0, cap=300):
