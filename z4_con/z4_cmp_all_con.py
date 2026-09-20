@@ -3391,6 +3391,50 @@ def write_channel_file(proj, rb, rt):
     return path
 
 
+def read_unswitched(rdir, proj):
+    """{scenario: "trip 530583-765035 ck1: not in this case at all; ..."} for one
+       side, from reports\\UNSWITCHED_BRANCHES_<KIND>_<proj>.txt.
+
+       A scenario listed there was simulated and scored, but a trip or reclose
+       in its definition did NOT take -- the branch is not in the case, is
+       under another circuit id, or is a three-winding transformer named as a
+       two-winding branch. Its .out is therefore NOT the contingency its
+       description claims, and its verdict must not be compared as if it were.
+       Missing file = nothing to report (an older study that never wrote it)."""
+    out = {}
+    p = rfile(rdir, "UNSWITCHED_BRANCHES", "txt", proj)
+    if not p:
+        return out
+    try:
+        cur = None
+        for ln in _read_text(p).splitlines():
+            s = ln.rstrip()
+            if not s.strip():
+                continue
+            if s.startswith("=") or s.startswith("-"):
+                if cur:
+                    cur = None
+                continue
+            if not s.startswith(" ") and re.match(r"^[A-Za-z]\w*\d+$", s.strip()):
+                cur = s.strip()
+                out.setdefault(cur, [])
+                continue
+            if cur and s.startswith(" "):
+                parts = s.split()
+                if len(parts) >= 4:
+                    step = parts[0] if parts[0] != "final" else "final trip"
+                    rest = parts[1:] if parts[0] != "final" else parts[2:]
+                    branch = " ".join(rest[:2]) if len(rest) >= 2 else " ".join(rest)
+                    state = " ".join(rest[3:]) if len(rest) > 3 else ""
+                    out[cur].append("%s %s: %s" % (step, branch, state or "did not switch"))
+                else:
+                    out[cur].append(s.strip())
+    except Exception as e:
+        print("[compare] could not read %s (%s)" % (p, e))
+    return dict((k, "; ".join(v) if v else "a trip or reclose did not take")
+                for k, v in out.items())
+
+
 def read_states(rdir, proj):
     """{scenario: run_status} -- DONE / GAVE-UP / NOT RUN.
 
@@ -4335,6 +4379,30 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
                      "vio_gap": "", "one_sided": False,
                      "description": descs.get(fid, ""),
                      "worse_within": any(c["worse_within"] for c in crits)})
+    # A FAULT WHOSE TRIP DID NOT TAKE IS NOT COMPARED. The study simulated and
+    # scored it -- chk_branch() records the refusal and carries on -- so it
+    # arrives here with a verdict like any other fault, and until now was
+    # classified like any other fault: 17 SantaFe rows describing events that
+    # did not happen, next to 274 that did, with nothing to tell them apart.
+    # UNSWITCHED_BRANCHES names them per side; they go to sheet 4 with the
+    # branch and the reason, and out of every comparison count.
+    _unsw_b, _unsw_t = read_unswitched(rb, proj), read_unswitched(rt, proj)
+    if _unsw_b or _unsw_t:
+        _n_unsw = 0
+        for r in rows:
+            fid = r["fault"]
+            if fid in _unsw_b or fid in _unsw_t:
+                r["unswitched"] = {"base": _unsw_b.get(fid, ""), "test": _unsw_t.get(fid, "")}
+                r["class"] = CLS_NEITHER
+                r["crits"], r["new_crit"], r["hidden_new"] = [], [], False
+                r["elements"], r["worse_within"] = {}, False
+                _n_unsw += 1
+        if _n_unsw:
+            print("[compare] %s %s: %d fault(s) NOT COMPARED -- a trip or reclose did not "
+                  "take (see UNSWITCHED_BRANCHES): %s"
+                  % (proj, mode, _n_unsw,
+                     ", ".join(sorted((set(_unsw_b) | set(_unsw_t)), key=_fault_key)[:12])
+                     + (" ..." if _n_unsw > 12 else "")))
     # EVERY BUS'S NUMBERS, BOTH SIDES, so a project-side violation can show
     # what the same bus did in the base study whether or not it violated there.
     # The buses named by either side's violation lists are recorded first, so
@@ -7282,6 +7350,17 @@ def _notrun_rows(results):
             _sb = ("scored %s" % vb) if vb else _side_state_words(_rb, fid)
             _st = ("scored %s" % vt) if vt else _side_state_words(_rt, fid)
             _hints = []
+            _u = r.get("unswitched")
+            if _u:
+                if _u.get("base"):
+                    _sb = "EVENT NOT AS DEFINED -- %s -- %s" % (_sb, _u["base"])
+                if _u.get("test"):
+                    _st = "EVENT NOT AS DEFINED -- %s -- %s" % (_st, _u["test"])
+                why = ("a trip or reclose in this fault's definition did not take, so the "
+                       ".out is not the contingency described (branch missing from the case, "
+                       "wrong circuit id, or a 3-winding transformer named as 2-winding). "
+                       "Correct the fault list and re-run it; see UNSWITCHED_BRANCHES_*.txt")
+                _hints.append("unswitched -- fix the fault definition")
             if _sb.startswith("CRASHED"):
                 _hints.append("base: " + (_crash_hint(_rb, fid) or "see logs"))
             if _st.startswith("CRASHED"):
@@ -7291,7 +7370,11 @@ def _notrun_rows(results):
                         r["fault"], res["project"],
                         (r.get("event") if r.get("event") not in (None, "-") else ""),
                         r.get("source", ""),
-                        _sb, _st, _notrun_reason(_sb, _st, vb, vt), " || ".join(_hints), why,
+                        _sb, _st,
+                        (("unswitched in " + ("both cases" if (_u.get("base") and _u.get("test"))
+                                              else ("base" if _u.get("base") else "projects")))
+                         if _u else _notrun_reason(_sb, _st, vb, vt)),
+                        " || ".join(_hints), why,
                         (r.get("description") or "").replace("\n", " ").strip()])
     return out
 
@@ -7312,7 +7395,7 @@ _NCOL = dict((c, i) for i, c in enumerate(_NOTRUN_COLS))
 
 def _xl_style_of_notrun(row):
     try:
-        if "crashed" in str(row[_NCOL["reason"]]):
+        if "crashed" in str(row[_NCOL["reason"]]) or "unswitched" in str(row[_NCOL["reason"]]):
             return 2
     except Exception:
         pass
