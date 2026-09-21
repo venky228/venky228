@@ -265,7 +265,7 @@ def _print_phase_times(total):
 #   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
 #   dyr_<value>\                              <- a full comparison per value
 
-PROJECTS   = ["EastFork","SantaFe","IronStar","EmpirePrairie"]                    # one project at a time for a sweep
+PROJECTS   = ["SantaFe"]                    # one project at a time for a sweep
                                             # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
 # -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
 # "each"      one study per project in PROJECTS, each alone in the case (as before)
@@ -312,14 +312,14 @@ def _panel_projects():
         return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
     return list(PROJECTS)
 MODES      = ["spp"]                        # spp | con | table | custom | manual
-PIPELINE   = "compare"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
+PIPELINE   = "all"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
                                             #   "all"     simulate each value, then compare
                                             #   "compare" only reads disk -- SKIPS the sweep
 
 # -- THE Kqv SWEEP ITSELF ----------------------------------------------------
 # model -> constant -> list of values. One study per value, each vs the base.
 # Replace REECCU1 with the model in YOUR .dyr that carries Kqv.
-DYR_SWEEP            = {}#{"REECCU1": {"Kqv": [2.0, 4.0]}, "REPCAU1": {"Ki": [10.0, 25.0 ]}}   # ONE key per model, values as a LIST: {"REECCU1": {"Kqv": [2.0, 4.0]}}. Two keys with the same model name keep only the last one (Python). Model names bare -- REPCAU1, not 'REPCAU1'. Every combination of the lists is one run.
+DYR_SWEEP            = {"REECCU1": {"Kqv": [0.0, 2.0]},}#{"REECCU1": {"Kqv": [2.0, 4.0]}, "REPCAU1": {"Ki": [10.0, 25.0 ]}}   # ONE key per model, values as a LIST: {"REECCU1": {"Kqv": [2.0, 4.0]}}. Two keys with the same model name keep only the last one (Python). Model names bare -- REPCAU1, not 'REPCAU1'. Every combination of the lists is one run.
 DYR_SWEEP_BY_PROJECT = {}                    # per-project override, e.g.
                                             #   {"SantaFe": {"REECCU1": {"Kqv": [0.5, 1.5]}}}
 DYR_SWEEP_PROJECTS   = []                    # [] = every project in PROJECTS
@@ -381,7 +381,7 @@ CORES_FOR_REPORTS = 12          # of CORES_MAX, cores for scoring s-*hards + plo
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
-FORCE_RESCORE   = True       # True = re-score every folder every launch (only after a criterion change)
+FORCE_RESCORE   = False       # True = re-score every folder every launch (only after a criterion change)
 RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
 SCORE_NO_CASE   = True          # True = shards score without loading the case (32-bit memory fix) -- keep
 # -- PLOTS: PDFs --
@@ -412,11 +412,7 @@ BASE_DYR = "DIS2201-25SP-G03-CQ.dyr"        # run z4_split_cases.py --copy to pu
 PROJ_SAV = "DIS2201-25SP-G03-CQ_F.sav"      # a bare name = this file, in PROJ_FOLDER
 PROJ_DYR = "DIS2201-25SP-G03-CQ.dyr"
 # -- A DIFFERENT DECK FOR ONE PROJECT'S RUNS -------------------------------------
-# When one project's base (or project) case will not converge on the deck above,
-# name the deck ITS runs read here. Matched by project name; a bare name is a file
-# in that case's folder (Base\ or Projects\). Every other project keeps the deck
-# above. The build files (.cnv/.snp) and the fault list follow the deck, so a
-# project on its own deck never shares a snapshot with the others.
+
 #     BASE_SAV_BY_PROJECT = {"EastFork": "DIS2201-25SP-G03-CQ_F_EastFork.sav"}
 BASE_SAV_BY_PROJECT = {}#{"EastFork": "DIS2201-25SP-G03-CQ_F_EF.sav"}   # EastFork base deck, in Base\ -- comment out to use the shared base
 BASE_DYR_BY_PROJECT = {}#{"EastFork": "DIS2201-25SP-G03-CQ_EF.dyr"}
@@ -424,32 +420,7 @@ PROJ_SAV_BY_PROJECT = {}
 PROJ_DYR_BY_PROJECT = {}
 ADD_PROJECTS = []                           # A project lived only in BESS_PROJECTS inside BOTH study scripts ...
 
-# ---- HOW MANY CORES -- RUNS, REPORTS AND PLOTS, ALL IN ONE PLACE -------------
-#                                           # ^ this is now the REAL cap on scoring shards. With SCORE_NO_CASE
-#                                           #   a shard is light (no case), so scoring parallelises hard: with
-#                                           #   REPORT_WORKERS="auto" the report role runs
-#                                           #   min(CORES_FOR_REPORTS, cores-CORES_SPARE) // cases  shards per
-#                                           #   case. Raise this to use more cores for a rescore (it is bounded
-#                                           #   by the physical core count, so it never oversubscribes).
-#                                           # simulations for scoring and plotting.
-# WHAT THIS RESERVES, AND WHY IT IS A RESERVATION RATHER THAN AN EXTRA.
-#
-# The simulations and the scoring/plotting run AT THE SAME TIME -- a worker that
-# finishes a scenario asks for a plot child and goes straight on to the next
-# scenario -- so both were drawing from the same machine with only the
-# simulations counted. CORES_MAX = 7 meant 7 PSS/E sessions PLUS up to
-# PLOT_TOTAL_MAX plot children, and each plot child holds ~540 MB of a .out
-# while it reads. That is how a machine ends up with more heavy processes on it
-# than anybody asked for, and the plotters are what get killed.
-#
-# So the budget is now split rather than exceeded:
-#
-#     simulations   CORES_MAX - CORES_FOR_REPORTS      (at least 1)
-#     scoring/plots CORES_FOR_REPORTS
-#     -----------------------------------------------
-#     total         CORES_MAX, running in parallel
-#
-# 0 restores the old behaviour: every core to the simulations, and the plot
+
 # fleet sized by PLOT_TOTAL_MAX on top of them.
 PLOT_ROUNDS_MAX   = 3                       # retry the plot pass this many times, halving the fleet each round
 PLOT_RESTART_MAX  = 20                      # how many times one plotter slot may be restarted
@@ -471,91 +442,13 @@ STUDY_TIMEOUT_S = 0                         # kill a study that has run this lon
 COMPILE_LOCK = True                         # True = one dsusr.dll build at a time, across both cases
 COMPILE_LOCK_WAIT_S = 900                   # seconds to wait for the compile lock before giving up
 
-# ---- WHAT THIS RUN DOES ------------------------------------------------------
-# PROJECTS AND MODES NAME A FOLDER, AND THE FOLDER HAS TO BE THERE.
-#
-#     results_dir = <case>\results\<project>_<mode>
-#
-# so PROJECTS = ["SantaFe"] with MODES = ["custom"] looks for
-# Base\results\SantaFe_custom and Projects\results\SantaFe_custom. What is on
-# disk is EmpirePrairie_spp, 143 .out files a side. Neither folder existed, so
-# nothing was comparable and the run ended "*** nothing was compared ***" --
-# having printed a table of the EmpirePrairie_spp results it had just found,
-# which is a different scan and is why the two did not seem to agree.
-#
-# FRESH_START = False MATTERS FOR A READ-ONLY PASS. It removes the .done
-# markers, and the report uses those markers to decide which .out finished
-# properly. Clearing them before a pass that simulates nothing produces an
-# empty report out of a complete set of results. (z4_lch_b_con.py ignores
-# FRESH_START entirely while REPORT_ONLY is on, for exactly this reason.)
-#
-# FORCE_RESCORE IS TRUE, AND NOTHING IS LOST BY IT. Scoring normally happens in
-# the worker as each scenario finishes and is cached in the folder's parts\, so
-# False is usually right. Here the campaign plan says 0 of 142 scored: there is
-# nothing cached to reuse, so True costs nothing today -- and it guarantees the
-# report is not built from a partial cache left by the runs where 101 .out
-# files were being wrongly condemned. Put it back to False once a full report
-# exists and the criteria have not changed.
-#
-# PLOT_MISSING_OUTS = False DRAWS THE PDFs IN THIS SAME PASS. The order is
-# plots, then the comparison, and a plot pass that fails does NOT stop the
-# comparison -- that was already true when 0 of 284 were drawn and the run went
-# on to the plan and the compare step. So asking for both costs nothing if the
-# plots go wrong again; the reports still come out.
-# ---- REBUILD EVERY REPORT FROM parts\, WITHOUT RE-SCORING ANYTHING --------
-# True = do NOTHING but the merge, for every project and both cases: read the
-# per-scenario parts already on disk and rewrite every report from them. No
-# PSS/E session, no case loaded, no .out opened, no scoring, no simulation, no
-# plotting -- and parts\ is only READ, never changed.
-#
-# WHY. The root reports (02_VIOLATIONS, 00_WHAT_FAILED, SPP_CRITERIA_REPORT,
-# the compliance table, 00_ALL_RESULTS, the measurements workbook) are written
-# by the merge, and the merge runs only after EVERY scoring shard for that case
-# has finished. One shard wedged on a diverged .out holds all of them back --
-# for an hour or more -- while forty-odd scored scenarios sit in parts\
-# complete and unread. The merge itself takes about twenty seconds a folder.
-#
-# Use it to:
-#   * get the reports NOW from whatever has been scored so far
-#   * rebuild every report after a criteria change, re-reading no .out at all
-#   * recover the reports when a shard died and the merge never ran
-#
-# It covers PROJECTS x MODES x both cases, so one run refreshes all of them.
-# Safe beside a live study: it opens nothing the run holds. The comparison is
-# written afterwards from the reports it has just rebuilt.
+
 MERGE_ONLY = False
 
-# ---- THE REPORT THAT WAS WRITTEN TOO EARLY -----------------------------------
-# A scoring pass writes each scenario's part as it finishes, and rewrites the
-# folder's reports as it goes. Stop reading at the wrong moment -- or let the
-# last scenario land a few seconds after the last rewrite -- and the reports in
-# that folder DISAGREE with each other and with parts\:
-#
-#     05_CONVERGED   F03 FAIL          (written 15:54:53)
-#     02_VIOLATIONS  F03 absent        (written 15:54:17, 36 s earlier)
-#
-# Nothing was wrong with the scoring; the report simply predates it. Chasing
-# that by hand costs an afternoon and looks exactly like a scoring bug.
-#
-# True = before anything is read, any results folder whose reports are OLDER
-# than the parts\ they should describe is rebuilt from those parts first. It is
-# the MERGE step only -- no PSS/E, no case, no .out is opened, a few seconds a
-# folder -- so it is cheap enough to do unconditionally. Sweep and capacity
-# folders (..._dyr_Kqv2, ..._cap50) are checked too.
+
 AUTO_REMERGE_STALE_PARTS = True
 
-# ---- EVERY .out MUST HAVE A VERDICT BEFORE ANYTHING IS COMPARED --------------
-# The timestamp check above catches a report written too early. This catches the
-# result of it, whatever the cause: an .out sitting in the folder with NO verdict
-# anywhere in the report beside it. That is the difference between
-#
-#     "F04 passed"                     and     "F04 was never judged"
-#
-# and the comparison cannot tell them apart -- an unscored fault reads as a fault
-# with nothing wrong. True = list every such scenario, rebuild the folder from
-# parts\ in case the parts already hold it, and say plainly which ones are still
-# unscored afterwards (those need SCORING, not merging -- the message names the
-# setting). Costs one directory listing per folder.
+
 VERIFY_SCORING_COVERAGE = True
 
 # PIPELINE, MODES -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
@@ -581,7 +474,7 @@ RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-m
 RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
 TRUNCATED_FRAC = 0.80                       # short = under this fraction of the folder's median .out size
 ONLY_EVENTS = []                            # [] = every event
-ONLY_FAULTS = []                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
+ONLY_FAULTS = ["F02"]                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
 SEARCH_DEPTH = 4                            # how many folder levels below SEARCH_ROOT to look
 
 # ---- HOW MUCH EACH PLANT PUTS ON THE SYSTEM ----------------------------------
@@ -9475,7 +9368,19 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
             # CRASHED cannot resolve inside a fresh variant folder -- the
             # launcher stops with "resolved to NOTHING". An explicit empty
             # selection here is "run the whole list", which is what "all" means.
-            env["SPP_ONLY_FAULTS"] = ""
+            #
+            # -- UNLESS ONLY_FAULTS is a plain list of ids. ["F02"] resolves in
+            # any folder, and a sweep launched with it set was running all
+            # 291 faults per value while the panel said F02. Ids are passed
+            # through; keywords are still dropped.
+            _ids_only = [str(f).strip() for f in (ONLY_FAULTS or [])
+                         if re.match(r"^F\d+$", str(f).strip(), re.I)]
+            if ONLY_FAULTS and len(_ids_only) == len(ONLY_FAULTS):
+                env["SPP_ONLY_FAULTS"] = ",".join(_ids_only)
+                print("[dyr-sweep] ONLY_FAULTS = %s applies to this sweep value too"
+                      % ", ".join(_ids_only))
+            else:
+                env["SPP_ONLY_FAULTS"] = ""
             env.pop("SPP_REPORT_FAULTS", None)
         rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
         if rc not in (0, None):
@@ -17101,8 +17006,7 @@ def main():
                     # A FAULT WITHOUT ITS .done MARKER IS NOT FINISHED, scored or
                     # not. Deleting F02.done to run F02 again used to change
                     # nothing here, because F02 still had a verdict on disk and
-                    # "missing" only asked about verdicts; the launcher was then
-                    # handed nothing to simulate and wrote a report instead.
+                    # "missing" only asked about verdicts.
                     try:
                         _dn = set(os.path.basename(p)[:-5]
                                   for p in glob.glob(os.path.join(rdir, "outs", "*.done")))
