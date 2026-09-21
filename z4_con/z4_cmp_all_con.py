@@ -12495,7 +12495,7 @@ def _plan_campaign(rows):
     # printed "the concurrency is not known here" and gave PSS/E-hours instead
     # of a finish time -- while _total_sessions() had the answer all along, and
     # is the same function that decides how many sessions actually start.
-    _ncase = len(_cases_to_run()) if RUN_IN_PARALLEL else 1
+    _ncase = _live_case_count() if RUN_IN_PARALLEL else 1
     try:
         conc = _total_sessions(N_WORKERS, _ncase)
     except Exception:
@@ -13606,8 +13606,9 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False)
     # HOW MANY SESSIONS THIS CASE GETS. Resolved here, from the machine and from
     # how many cases are running at once -- both cases at N each is 2N sessions,
     # and that total is what the cores, the RAM and the licence count see.
-    _ncase = len(_cases_to_run()) if RUN_IN_PARALLEL else 1
+    _ncase = _live_case_count() if RUN_IN_PARALLEL else 1
     env["SPP_LAUNCH_WORKERS"] = str(_workers_for(case["key"], N_WORKERS, _ncase))
+    env["SPP_SLOTS_FILE"] = _slots_file_for(case["key"])
     if CORES_MAX_INCLUDES_REPORTS:
         # THE SAME SHARE, NOT A SECOND ONE. The scoring may use every session
         # this case was given, and not one more -- and it may not run while the
@@ -14734,6 +14735,60 @@ def _live_compare_start():
     print("[compare] live comparison every %ds -> %s"
           % (LIVE_COMPARE_EVERY, COMPARE_DIR))
     return stop.set
+
+
+# WHICH CASES ARE STILL SIMULATING. With RUN_IN_PARALLEL the two case threads
+# start together and the base one finishes hours earlier. The session split
+# used to be "both cases" for the whole sweep; it is now "the cases still
+# running": a launcher started after the base finished gets every usable
+# session, and the launcher already running is told to grow through its
+# handover file (see _case_thread_end and the launchers' SPP_SLOTS_FILE).
+_CASES_LIVE = set()
+_CASES_LIVE_LOCK = threading.Lock()
+
+
+def _live_case_count():
+    with _CASES_LIVE_LOCK:
+        return len(_CASES_LIVE) if _CASES_LIVE else len(_cases_to_run())
+
+
+def _slots_file_for(case_key):
+    return os.path.join(STUDY_ROOT, ".spp_slots_%s.txt" % str(case_key).upper())
+
+
+def _clear_slots_files():
+    for c in (CASE_BASE, CASE_TEST):
+        try:
+            os.remove(_slots_file_for(c["key"]))
+        except Exception:
+            pass
+
+
+def _case_thread_begin(case_key):
+    with _CASES_LIVE_LOCK:
+        _CASES_LIVE.add(str(case_key).upper())
+
+
+def _case_thread_end(case_key):
+    """This case is done simulating: tell every case still running to take
+       the sessions it is giving back. The running launcher reads the file
+       within SLOTS_CHECK_S and grows; a launcher started later is sized by
+       _live_case_count() and needs no file."""
+    with _CASES_LIVE_LOCK:
+        _CASES_LIVE.discard(str(case_key).upper())
+        left = sorted(_CASES_LIVE)
+    if not left or not RUN_IN_PARALLEL:
+        return
+    total = _total_sessions(N_WORKERS, len(left))
+    shares = _split_sessions(total, len(left))
+    for k, share in zip(left, shares):
+        try:
+            with open(_slots_file_for(k), "w") as fh:
+                fh.write("%d\n" % int(share))
+            print("[compare] HANDOVER: %s has finished simulating -- %s may now run %d "
+                  "session(s) instead of sharing the machine" % (case_key, k, share))
+        except Exception as e:
+            print("[compare] could not write the handover file for %s (%s)" % (k, e))
 
 
 def _cases_to_run():
@@ -16928,9 +16983,15 @@ def main():
                 print("[compare] launch, it is the licence count -- lower N_WORKERS in")
                 print("[compare] each launcher, or set RUN_IN_PARALLEL = False.")
             res, ths, t_go = {}, [], time.time()
+            _clear_slots_files()
+            for case in _cases_to_run():
+                _case_thread_begin(case["key"])      # both registered BEFORE either starts
             for case in _cases_to_run():
                 def _go(c=case):
-                    res[c["key"]] = run_study(c, projects=pjs, modes=MODES)
+                    try:
+                        res[c["key"]] = run_study(c, projects=pjs, modes=MODES)
+                    finally:
+                        _case_thread_end(c["key"])
                     # ONE CASE FINISHING LONG BEFORE THE OTHER IS THE SYMPTOM.
                     # Both cases run the same events on the same machine, so a
                     # base case that exits in four minutes while the project
@@ -17075,13 +17136,19 @@ def main():
             # BOTH CASES AT ONCE, as PIPELINE = "all" does. One after the other
             # doubled the wall clock for no reason.
             _res, _ths = {}, []
+            _clear_slots_files()
+            for key, case in _runs:
+                _case_thread_begin(key)              # both registered BEFORE either starts
             for key, case in _runs:
                 pjs = _in_panel_order(set(x[0] for x in todo[key]))
                 mds = sorted(set(x[1] for x in todo[key]))
                 _banner("%s is missing %s -- running it" % (case["label"], ", ".join(pjs)))
 
                 def _go(c=case, k=key, p=pjs, m=mds):
-                    _res[k] = run_study(c, projects=p, modes=m)
+                    try:
+                        _res[k] = run_study(c, projects=p, modes=m)
+                    finally:
+                        _case_thread_end(k)
                 th = threading.Thread(target=_go)
                 th.start()
                 _ths.append(th)

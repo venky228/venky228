@@ -739,6 +739,8 @@ try:
 except Exception:
     pass
 POLL_SECS        = 5         # how often to poll the running workers
+SLOTS_CHECK_S    = 30        # how often to look for a HANDOVER target (SPP_SLOTS_FILE) from the panel
+_LAUNCHER_T0     = time.time()   # a handover file older than this process is stale and ignored
 # THE CATCH-UP PLOT PASS HAS A CLOCK. It is one child process the launcher waits
 # for between the last worker and the report, and it had no limit at all: a
 # plotter that wedged -- a modal dialog, a reader stuck in a 2 GB address space
@@ -3856,9 +3858,53 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
     t_start = time.time()
     _phase("simulate (%d worker(s))%s" % (n, (" retry round %d" % _round) if _round else ""))
     t_next_status = t_start + LIVE_STATUS_EVERY
+    # TAKE OVER THE OTHER CASE'S SESSIONS WHEN IT FINISHES. z4_cmp_all_con.py
+    # splits the machine between the base and the project launcher; the base
+    # side finishes hours earlier and its sessions used to die with it, so
+    # the project ran the tail of the sweep on half the cores. When a case
+    # finishes, the panel writes the new session count for the other case to
+    # SPP_SLOTS_FILE. Every SLOTS_CHECK_S this loop reads it; a target above
+    # n adds workers n..target-1, each through the licence gate, and with
+    # DYNAMIC_WORK they take whatever scenarios are still free. Only a file
+    # written AFTER this launcher process started counts, so a stale one from
+    # last week cannot double the session count on a machine that is full;
+    # the panel also deletes both files when it starts a parallel sweep.
+    _slots_file = (os.environ.get("SPP_SLOTS_FILE") or "").strip()
+    _slots_next = [0.0]            # look at once: a handover written between two projects still counts
+
+    def _maybe_grow():
+        nonlocal n
+        if not _slots_file or _round or not DYNAMIC_WORK:
+            return
+        now = time.time()
+        if now < _slots_next[0]:
+            return
+        _slots_next[0] = now + SLOTS_CHECK_S
+        try:
+            if not os.path.isfile(_slots_file) or os.path.getmtime(_slots_file) < _LAUNCHER_T0:
+                return
+            with open(_slots_file) as fh:
+                target = int((fh.read() or "0").strip() or "0")
+        except Exception:
+            return
+        if target <= n:
+            return
+        _banner("HANDOVER: the other case has finished -- growing from %d to %d worker(s) "
+                "(%s)" % (n, target, os.path.basename(_slots_file)))
+        _old = n
+        for i in range(_old, target):
+            launches[i] = 0
+            lic_fails[i] = 0
+            _clear(_sentinel("_w%d" % i))
+        n = target
+        for i in range(_old, target):
+            start(i)
+        _phase("simulate (%d worker(s)) after handover" % n)
+
     while len(done) < n:
         time.sleep(POLL_SECS)
         now = time.time()
+        _maybe_grow()
         if LIVE_STATUS_EVERY and now >= t_next_status:
             t_next_status = now + LIVE_STATUS_EVERY
             try: _live_status(launches, done, t_start, selected)
