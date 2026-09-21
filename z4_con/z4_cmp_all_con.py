@@ -312,7 +312,7 @@ def _panel_projects():
         return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
     return list(PROJECTS)
 MODES      = ["spp"]                        # spp | con | table | custom | manual
-PIPELINE   = "all"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
+PIPELINE   = "compare"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
                                             #   "all"     simulate each value, then compare
                                             #   "compare" only reads disk -- SKIPS the sweep
 
@@ -377,11 +377,11 @@ ONE_PROJECT_AT_A_TIME = True    # with RUN_IN_PARALLEL = False: base THEN projec
 N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
 CORES_SPARE     = 2             # cores kept free for Windows / Excel / you (0-4)
 CORES_MAX       = 22            # ceiling on PSS/E sessions across BOTH cases; 0 = none; auto-clamped to the PC
-CORES_FOR_REPORTS = 4          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
+CORES_FOR_REPORTS = 12          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
-FORCE_RESCORE   = False       # True = re-score every folder every launch (only after a criterion change)
+FORCE_RESCORE   = True       # True = re-score every folder every launch (only after a criterion change)
 RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
 SCORE_NO_CASE   = True          # True = shards score without loading the case (32-bit memory fix) -- keep
 # -- PLOTS: PDFs --
@@ -392,7 +392,7 @@ FORCE_REPLOT    = False        # True = REDRAW every PDF from the .out files on 
 PLOT_SCOPE      = "compact"     # "compact" = SPP set + every violation (~5x fewer panels) | "full" = every kept channel
 PLOT_INRUN      = 1             # plotters trailing each running folder (1 = the old single plotter)
 PLOT_WORKERS    = 2             # plotters per case in the catch-up pass (0/1 = one)
-PLOT_TOTAL_MAX  = 3             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
+PLOT_TOTAL_MAX  = 4             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
 PLOT_ONE_PROJECT_AT_A_TIME = True   # True = finish one project's PDFs (base, then project case) before starting the next project's
 PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out stops before the end of the simulation (it did not run); False = draw it for diagnosis
 # ============================================================================
@@ -460,8 +460,8 @@ LIVE_STATUS_ALL = "LIVE_STATUS.txt"         # both cases' live table in one file
 CLAIM_STALE_S = 3600                        # backstop age for a stale claim; liveness decides first
 NEVER_KILL_WORKERS = False                  # True = no watchdog ever kills a running process. FALSE NOW: on 2026-09-16 F166 held a worker 18h 33m behind a CodeMeter dialog and nothing was allowed to end it
 SCENARIO_MAX_MIN = 75                       # a scenario RUNNING longer than this is killed and requeued, printing or not -- 3x the slowest ever measured (24 min); 0 = off
-LICENCE_COOLDOWN_MIN = 15                   # a worker that hit MAX_LICENCE_FAILS is PARKED this long and relaunched, not retired -- six of seven slots retired for good on 2026-09-16 during a licence outage
-LICENCE_STARTS_PER_MIN = 3                  # PSS/E process starts per minute across BOTH cases (shared gate beside the cases); ~170/h flooded CodeMeter into "Error 100". 0 = off
+LICENCE_COOLDOWN_MIN = 10                   # a worker that hit MAX_LICENCE_FAILS is PARKED this long and relaunched, not retired -- six of seven slots retired for good on 2026-09-16 during a licence outage
+LICENCE_STARTS_PER_MIN = 6                  # PSS/E process starts per minute across BOTH cases (shared gate beside the cases); ~170/h flooded CodeMeter into "Error 100". 0 = off
 LAUNCH_STAGGER_S = 20                       # worker i starts PSS/E i x this many s after launch, so N licence requests do not hit CodeMeter at once
 CLOSE_PSSE_DIALOGS = True                   # True = close modal PSS/E boxes ("CodeMeter runtime system is currently busy") shown by this launch's own processes
 LICENCE_BACKOFF_S = 60                      # pause before relaunching a worker whose PSS/E could not take a licence (doubles each time, max 15 min)
@@ -576,7 +576,7 @@ PLOT_CLEAR_STALE_CLAIMS = True              # before a plot pass, free every cla
 FRESH_START    = False                     # True = START OVER: clears every .done/.attempts marker so all 1,100 faults simulate again with the 20-area monitoring. SET BACK TO False ONCE THE RUN IS GOING, or a relaunch starts over again
 SKIP_DONE      = True                       # skip scenarios that already have a .done and a .out
 FORCE_REBUILD = None                        # True = rebuild the snapshot even if the flat run is done
-MAX_SCENARIO_ATTEMPTS = 2                   # give up on a scenario after this many crashes
+MAX_SCENARIO_ATTEMPTS = 3                   # give up on a scenario after this many crashes
 RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-machine labels differ from the newest group to *.oldbuild (guesswork; a PDF older than its .out is redrawn anyway)
 RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
 TRUNCATED_FRAC = 0.80                       # short = under this fraction of the folder's median .out size

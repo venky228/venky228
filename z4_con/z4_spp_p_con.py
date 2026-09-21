@@ -17436,6 +17436,19 @@ def _nan_window(p, tclear):
                   "floating-point exceptions could not be masked, so dyntools "
                   "cannot be asked safely -- falling back to the byte count")
             return None
+        if SPP_ROLE == "report" and not _env_bool("SPP_NAN_DYNTOOLS", False):
+            # NOT IN A SCORING SHARD. dyntools on an 88 MB .out that holds NaN
+            # took 10 minutes on base F36 and killed the IronStar shard with an
+            # access violation on F18 -- six relaunches, each one costing the
+            # pass. The .out is diverged either way; the shard records it as
+            # non-finite (location not established) and moves on. Set
+            # SPP_NAN_DYNTOOLS=1 to have the shards locate the window anyway.
+            print("  [nan] the packed reader is not calibrated for %s and this is a "
+                  "scoring shard -- NOT reading it with dyntools (slow, and it has "
+                  "crashed the shard); the run is recorded as non-finite, window not "
+                  "established. SPP_NAN_DYNTOOLS=1 restores the dyntools read."
+                  % os.path.basename(p))
+            return None
         print("  [nan] the packed reader is not calibrated for %s -- reading it "
               "with dyntools instead to find WHERE the non-finite values are "
               "(the exceptions are masked, so this cannot trap)"
@@ -23059,6 +23072,25 @@ def read_part_rows(part):
               "restored from this shard's own parts"
               % (len(SPP_VIOLATIONS), len(SPP_MEASURE)))
     return rows, verds
+
+
+def _scen_parts_since(t0):
+    """read_scenario_parts() restricted to the SCEN_<id>.csv files written at or
+       after t0 -- the ones this scoring pass produced under the current rules."""
+    import glob as _g
+    keep = set()
+    for f in _g.glob(os.path.join(PARTS_DIR, "SCEN_*.csv")):
+        if f.endswith("_MEAS.csv"):
+            continue
+        try:
+            if os.path.getmtime(f) >= t0:
+                keep.add(os.path.basename(f)[5:-4])
+        except Exception:
+            pass
+    if not keep:
+        return {}
+    allp = read_scenario_parts()
+    return dict((k, v) for k, v in allp.items() if k in keep)
 
 
 def read_scenario_parts():
@@ -30271,7 +30303,11 @@ def finalize_report(produced, part=None, claim=False):
         # The parts are cleared rather than ignored, so the merge cannot pick
         # the old rows up either.
         _done_cases = set()
-        if part is not None and _env_bool("SPP_FORCE_RESCORE", False):
+        # SPP_RESCORE_RESUME: the launcher relaunched this shard after a crash
+        # inside a forced rescore. The rows in its part were written by THIS
+        # pass under the current rules; keep them, re-read the rest.
+        if (part is not None and _env_bool("SPP_FORCE_RESCORE", False)
+                and not _env_bool("SPP_RESCORE_RESUME", False)):
             _n_cleared = 0
             # The per-scenario parts as well (SCEN_<id>.csv / _MEAS.csv):
             # the merge fills gaps from them, so left in place they would
@@ -30283,6 +30319,13 @@ def finalize_report(produced, part=None, claim=False):
                        + glob.glob(_part_path(part, "OUTSTAMP"))
                        + glob.glob(os.path.join(PARTS_DIR, "SCEN_*.csv"))):
                 try:
+                    # A SCEN part written since this pass began belongs to a
+                    # shard that started a moment earlier -- current rules,
+                    # keep it. Only the previous pass's files go.
+                    _t0p = float(os.environ.get("SPP_RESCORE_T0") or "0")
+                    if (_t0p > 0 and os.path.basename(_f).startswith("SCEN_")
+                            and os.path.getmtime(_f) >= _t0p):
+                        continue
                     os.remove(_f)
                     _n_cleared += 1
                 except Exception:
@@ -30417,7 +30460,23 @@ def finalize_report(produced, part=None, claim=False):
             # scenario only when it is about to read it, so a shard that starts
             # late still finds work and a shard that dies mid-file releases only
             # that one. See the note at the collection loop.
-            if claim and not _rclaim_mine(_sid):
+            # RE-SCORED BY ANOTHER SHARD IN THIS PASS? Under FORCE_RESCORE the
+            # worker-time parts are ignored (old rule), but a SCEN_<id>.csv
+            # newer than SPP_RESCORE_T0 was written by a shard of THIS pass,
+            # under the current rule. Six shards used to re-read the same
+            # .out because a finished shard's claims read as "gone quiet".
+            if (_sid not in _pre and _env_bool("SPP_FORCE_RESCORE", False)
+                    and _sid not in _done_cases):
+                try:
+                    _t0p = float(os.environ.get("SPP_RESCORE_T0") or "0")
+                    _spp_ = _scen_part_path(_sid)
+                    if (_t0p > 0 and os.path.isfile(_spp_)
+                            and os.path.isfile(_scen_meas_path(_sid))
+                            and os.path.getmtime(_spp_) >= _t0p):
+                        _pre.update(_scen_parts_since(_t0p))
+                except Exception:
+                    pass
+            if claim and _sid not in _pre and not _rclaim_mine(_sid):
                 continue
             if _sid in _pre:
                 _rows, _v = _pre[_sid]

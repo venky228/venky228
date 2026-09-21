@@ -3523,6 +3523,12 @@ def _run_report_sharded(n, selected=None):
     _banner("REPORT: %d shard(s) scoring in parallel, then one merge" % n)
     _phase("report shards (%d)" % n)
     clear_badout(OUT_DIR)
+    # WHEN THIS SCORING PASS BEGAN. Every shard and every relaunch gets the
+    # same stamp (SPP_RESCORE_T0): under FORCE_RESCORE a per-scenario part
+    # newer than it was written by THIS pass under the current rules, so a
+    # shard that reaches a scenario another shard has already re-scored takes
+    # the rows instead of reading the .out a second time.
+    _t0_pass = time.time()
     # WIPE THE OLD STATUS FILES FIRST. They are rewritten by each shard as it
     # starts a scenario, and they are NOT cleared between runs -- so a new run
     # displayed the previous run's positions until each shard happened to write
@@ -3568,10 +3574,19 @@ def _run_report_sharded(n, selected=None):
         # parts\ empty. That happened -- six shards, 8 minutes, zero parts,
         # "no report parts -- nothing to merge". The rescore was asked for
         # once; the relaunch is a resume.
+        # ...BUT NOT BY TURNING FORCE_RESCORE OFF. That was the previous fix,
+        # and it swapped one wrong report for another: with the flag off the
+        # relaunched shard took every remaining scenario "from the worker's
+        # score" -- the OLD rule's verdicts -- so one crash left half a
+        # project rescored and half not, in the same workbook. Now the flag
+        # stays on and SPP_RESCORE_RESUME=1 tells the shard to KEEP its part
+        # (the scenarios it already re-scored) while still reading every
+        # other .out afresh.
+        _e["SPP_RESCORE_T0"] = repr(_t0_pass)
         if launches[i] > 1 and _e.get("SPP_FORCE_RESCORE", "0") not in ("", "0", "false", "no", "off"):
-            _e["SPP_FORCE_RESCORE"] = "0"
-            print("[parallel] shard %d relaunch: FORCE_RESCORE is OFF for it -- it "
-                  "resumes from its part file instead of discarding it" % i)
+            _e["SPP_RESCORE_RESUME"] = "1"
+            print("[parallel] shard %d relaunch: FORCE_RESCORE stays ON -- it keeps the "
+                  "scenarios it already re-scored and reads the rest from the .out" % i)
         procs[i] = subprocess.Popen([PYTHON, "-u", STUDY_SCRIPT], cwd=STUDY_DIR,
                                     env=_e,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
