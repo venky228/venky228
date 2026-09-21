@@ -14747,8 +14747,14 @@ _CASES_LIVE_LOCK = threading.Lock()
 
 
 def _live_case_count():
+    """How many cases are simulating right now. Every parallel dispatch
+       registers its cases before it starts them; a launch that registered
+       nothing is running alone -- a sweep value, a size run, a re-run of one
+       side -- and gets the whole machine, not half of it. (It used to fall
+       back to the number of cases CONFIGURED, so every project-only sweep
+       after a both-case run was sized for a base run that was not there.)"""
     with _CASES_LIVE_LOCK:
-        return len(_CASES_LIVE) if _CASES_LIVE else len(_cases_to_run())
+        return len(_CASES_LIVE) if _CASES_LIVE else 1
 
 
 def _slots_file_for(case_key):
@@ -16531,9 +16537,14 @@ def ensure_reports(mode_list):
         print("[compare] scoring both cases at once -- REPORT_WORKERS shards each")
         res, ths = {}, []
         for case, need in jobs:
+            _case_thread_begin(case["key"])      # both registered BEFORE either starts
+        for case, need in jobs:
             def _go(c=case, nd=need):
-                res[c["key"]] = run_study(c, projects=nd, modes=mode_list,
-                                          extra_env=env_extra)
+                try:
+                    res[c["key"]] = run_study(c, projects=nd, modes=mode_list,
+                                              extra_env=env_extra)
+                finally:
+                    _case_thread_end(c["key"])
             th = threading.Thread(target=_go)
             th.start()
             ths.append(th)
