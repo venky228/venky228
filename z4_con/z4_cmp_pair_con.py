@@ -156,18 +156,24 @@ def _merge_folder(z4, case, rdir, suffix):
     parts = os.path.join(rdir, "parts")
     if not os.path.isdir(parts) or not glob.glob(os.path.join(parts, "*.csv")):
         return False
-    spp = z4._study_script_for(case)
+    # THE SETTINGS FOLLOW THE FOLDER'S OWN CASE, not its role in this pair: a
+    # project folder used as the reference is still a project folder, and its
+    # merge needs the project deck names and the project study script.
+    mcase = dict(case)
+    mcase["key"] = "PROJ" if case.get("_kind") == "p" else "BASE"
+    mcase["script"] = "z4_lch_%s_con.py" % ("p" if case.get("_kind") == "p" else "b")
+    spp = z4._study_script_for(mcase)
     if not spp:
         print("[pair]     no study script beside %s -- cannot re-merge, comparing "
               "the reports as they are" % rdir)
         return False
     env = dict(os.environ)
     try:
-        z4._push_settings(env, case)
+        z4._push_settings(env, mcase)
     except Exception as e:
         print("[pair]     could not pass the run settings to the merge (%s)" % e)
     env["SPP_MERGE_ONLY"] = "1"
-    env["SPP_STUDY_DIR"] = case["dir"]
+    env["SPP_STUDY_DIR"] = mcase["dir"]
     for k in ("SPP_ONLY", "SPP_ONLY_FAULTS", "SPP_REPORT_FAULTS", "SPP_ONLY_EVENTS",
               "SPP_CAP_TAG", "SPP_RUN_TAG"):
         env.pop(k, None)
