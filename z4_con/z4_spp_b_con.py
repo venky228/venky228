@@ -13517,6 +13517,88 @@ def _fast_bits(path):
 _FAST_PREFIX = {}          # ("last": (path, samples read, samples available, last t))
 
 
+def _fast_resync(raw, t_off, stride, n, t0col, n_s, trailer, step_hint=None):
+    """[(delta, samples)] -- the time column read PAST a break in its grid.
+
+       WHY. A complete run can fail the grid walk: PSS/E's reclose sequence
+       lands records off the plotting interval and the words after them no
+       longer sit at the calibrated stride, so the walk stopped at ~5.5 s of a
+       25 s file and the file went to dyntools -- which, on an 88 MB 20-area
+       .out in a 32-bit shard, dies with 0xC0000005. The continuation of the
+       time series is still in the file, a few words further on. This finds
+       it: from where the next sample was expected it scans outward for a
+       word that reads as t_prev..t_prev+jump AND is followed, at the same
+       stride, by eight more samples that keep stepping like time, then walks
+       on from there. Each such find is one segment with its own word shift.
+       Anything a random channel could imitate for eight consecutive samples
+       at the right stride is not worth guarding against further."""
+    segs = [(0, n_s)]
+    total = n_s
+    delta = 0
+    t_prev = t0col[n_s - 1]
+    step = step_hint or ((t0col[n_s - 1] - t0col[0]) / float(max(1, n_s - 1)))
+    if not (step == step and step > 0):
+        return segs, total
+    jump = max(10.0 * step, 1.0)
+
+    def fval(i):
+        if i < 0 or i >= n:
+            return None
+        x = raw[i]
+        if (x >> 23) & 0xFF == 0xFF:
+            return None
+        return _struct_g.unpack("<f", _struct_g.pack("<I", x))[0]
+
+    tries = 0
+    while tries < 400:
+        tries += 1
+        pos_last = t_off + delta + (total - 1) * stride
+        if n - (pos_last + 1) <= trailer + stride:
+            break
+        expect = pos_last + stride
+        found = None
+        span = 8 * stride
+        for d in range(0, span + 1):
+            for cand in ((expect + d, expect - d) if d else (expect,)):
+                if cand <= pos_last or cand + 8 * stride >= n:
+                    continue
+                v = fval(cand)
+                if v is None or not (t_prev <= v <= t_prev + jump):
+                    continue
+                ok, prev, moved = True, v, 0
+                for j in range(1, 9):
+                    w = fval(cand + j * stride)
+                    if w is None or w < prev or (w - prev) > 4.0 * step:
+                        ok = False
+                        break
+                    if (w - prev) >= 0.25 * step:
+                        moved += 1
+                    prev = w
+                if ok and moved >= 6:
+                    found = cand
+                    break
+            if found is not None:
+                break
+        if found is None:
+            break
+        delta = found - (t_off + total * stride)
+        n_max2 = (n - 1 - found) // stride + 1
+        k, prev = 1, fval(found)
+        while k < n_max2:
+            w = fval(found + k * stride)
+            if w is None or w < prev or (w - prev) > jump:
+                break
+            prev = w
+            k += 1
+        if k < 2:
+            break
+        segs.append((delta, k))
+        total += k
+        t_prev = prev
+    return segs, total
+
+
+
 def _fast_read(path, cid, layout, lenient=False):
     """(t, {key: (title, series)}) or None -- the same shape get_data() gives.
 
@@ -13583,6 +13665,7 @@ def _fast_read(path, cid, layout, lenient=False):
     leftover = n - (t_off + (n_s - 1) * stride + 1)
     if leftover < 0:
         return None
+    segs = [(0, n_s)]
     if leftover > trailer + stride:
         if not lenient:
             _FAST_TITLE_WHY[0] = ("time column regular for %d of %d sample(s) (to t=%.4f), then "
@@ -13590,28 +13673,58 @@ def _fast_read(path, cid, layout, lenient=False):
                                   % (n_s, n_max, t_all[n_s - 1], n_s - 1, t_all[n_s - 1],
                                      n_s, t_all[n_s] if n_s < len(t_all) else "?", leftover))
             return None
-        print("  [fast] %s: the time column is regular for %d of %d sample(s) (to t=%.4f) "
-              "and irregular after that (t[%d]=%s, t[%d]=%s) -- the run diverged or was "
-              "cut there; the %d regular sample(s) are read packed, the rest is not a "
-              "time series"
-              % (os.path.basename(path), n_s, n_max, t_all[n_s - 1], n_s - 1, t_all[n_s - 1],
-                 n_s, t_all[n_s] if n_s < len(t_all) else "?", n_s))
-    # WHAT THIS READ ACTUALLY COVERS, for the caller to judge. A lenient read
-    # returns the REGULAR PREFIX of the time column and silently drops whatever
-    # follows it; nothing downstream could tell that from a whole file, so a
-    # trace cut at 5.6 s was scored as though the run ended there -- "Final"
-    # became a sample from the middle of the swing. The caller now checks.
-    _FAST_PREFIX["last"] = (path, n_s, n_max, t_all[n_s - 1])
-    t = t_all[:n_s]
+        # RE-SYNCHRONISE PAST THE BREAK before giving up on the rest of the
+        # file -- see _fast_resync. A diverged run finds nothing and keeps its
+        # prefix; a complete run with reclose records off the grid reads to
+        # its end, packed, and never meets dyntools.
+        try:
+            segs, _ntot = _fast_resync(raw, t_off, stride, n, t_all, n_s, trailer)
+        except Exception:
+            segs, _ntot = [(0, n_s)], n_s
+        if _ntot > n_s:
+            print("  [fast] %s: the time column breaks at t=%.4f (%d of %d sample(s)); "
+                  "re-synchronised %d time(s) and read on to %d sample(s) packed"
+                  % (os.path.basename(path), t_all[n_s - 1], n_s, n_max, len(segs) - 1, _ntot))
+        else:
+            print("  [fast] %s: the time column is regular for %d of %d sample(s) (to t=%.4f) "
+                  "and irregular after that (t[%d]=%s, t[%d]=%s) -- the run diverged or was "
+                  "cut there; the %d regular sample(s) are read packed, the rest is not a "
+                  "time series"
+                  % (os.path.basename(path), n_s, n_max, t_all[n_s - 1], n_s - 1, t_all[n_s - 1],
+                     n_s, t_all[n_s] if n_s < len(t_all) else "?", n_s))
     t_all = None
+    n_tot = sum(k for _d, k in segs)
+
+    def colseg(o):
+        """One channel across every segment, each read at its own word shift."""
+        if len(segs) == 1:
+            return col(o, n_tot)
+        vals, s0 = [], 0
+        for _d, k in segs:
+            start = o + _d + s0 * stride
+            if start < 0 or start + (k - 1) * stride >= n:
+                return None
+            vals.extend(col(start, k))
+            s0 += k
+        return vals
+    t = colseg(t_off)
+    if t is None:
+        return None
+    # WHAT THIS READ ACTUALLY COVERS, for the caller to judge. A lenient read
+    # returns what the time column yielded and nothing after it; the caller
+    # checks that it reaches the end of the run before trusting "Final".
+    _FAST_PREFIX["last"] = (path, n_tot, n_max, t[-1])
     out = {}
     for k in cid:
         if k == "time":
             continue
         o = offs.get(k)
-        if o is None or o + (n_s - 1) * stride >= n:
+        if o is None or o + (n_tot - 1) * stride >= n:
             return None
-        out[k] = (str(cid[k]).strip(), col(o, n_s))
+        v = colseg(o)
+        if v is None:
+            return None
+        out[k] = (str(cid[k]).strip(), v)
     return t, out
 
 
@@ -14109,7 +14222,7 @@ def _nan_window(p, tclear):
     if isinstance(_cid, dict) and _fast_ensure(p):
         try:
             _lay, _c2 = _fast_pick(p, _FAST_LAYOUT["layouts"])
-            got = _fast_read(p, _cid, _lay) if _lay else None
+            got = _fast_read(p, _cid, _lay, lenient=True) if _lay else None
             if got is not None:
                 t, by = got
         except Exception as e:
@@ -14718,6 +14831,16 @@ def load_out(p, cache=True):
                                   "describe t=%.2f s, NOT the end of the run."
                                   % (os.path.basename(p), float(out[0][-1]), _pwhy,
                                      float(out[0][-1])))
+                        elif SPP_ROLE == "report" and not _env_bool("SPP_NAN_DYNTOOLS", False):
+                            print("  [fast] %s: that prefix ends at t=%.2f s (%d of %d "
+                                  "sample(s)), short of the run, and re-synchronising found "
+                                  "no continuation. This is a scoring shard: dyntools on this "
+                                  "file has crashed the process before (0xC0000005), so the "
+                                  "prefix is scored as a diverged run -- Final and "
+                                  "min-after-clearing describe t=%.2f s, NOT the end. "
+                                  "SPP_NAN_DYNTOOLS=1 restores the dyntools read."
+                                  % (os.path.basename(p), float(out[0][-1]),
+                                     _pf[1], _pf[2], float(out[0][-1])))
                         else:
                             print("  [fast] %s: that prefix ends at t=%.2f s (%d of %d "
                                   "sample(s)), short of the run -- the file is not marked "
