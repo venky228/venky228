@@ -17098,7 +17098,18 @@ def main():
                         _lines.append("  %-5s %-16s %d scored (no fault list to measure against)"
                                       % (key, pj, len(scored)))
                         continue
-                    left = [f for f in exp if f not in scored and f not in gave]
+                    # A FAULT WITHOUT ITS .done MARKER IS NOT FINISHED, scored or
+                    # not. Deleting F02.done to run F02 again used to change
+                    # nothing here, because F02 still had a verdict on disk and
+                    # "missing" only asked about verdicts; the launcher was then
+                    # handed nothing to simulate and wrote a report instead.
+                    try:
+                        _dn = set(os.path.basename(p)[:-5]
+                                  for p in glob.glob(os.path.join(rdir, "outs", "*.done")))
+                    except Exception:
+                        _dn = None
+                    left = [f for f in exp if f not in gave
+                            and (f not in scored or (_dn is not None and f not in _dn))]
                     if left:
                         todo[key].add((pj, mode))
                         _lines.append("  %-5s %-16s %d of %d still to run%s"
