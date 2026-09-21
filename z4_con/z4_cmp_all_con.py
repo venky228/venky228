@@ -573,7 +573,7 @@ EXPORT_PDF_PUREPY = True                    # the pure-Python PDF writer -- what
 EXPORT_CSV      = False                     # one CSV per run beside the plots: time, then a column per channel
 EXPORT_SVG      = False                     # one SVG per run; open in a browser, print to PDF if you want one
 PLOT_CLEAR_STALE_CLAIMS = True              # before a plot pass, free every claim whose plotter is no longer running
-FRESH_START    = True                      # True = START OVER: clears every .done/.attempts marker so all 1,100 faults simulate again with the 20-area monitoring. SET BACK TO False ONCE THE RUN IS GOING, or a relaunch starts over again
+FRESH_START    = False                     # True = START OVER: clears every .done/.attempts marker so all 1,100 faults simulate again with the 20-area monitoring. SET BACK TO False ONCE THE RUN IS GOING, or a relaunch starts over again
 SKIP_DONE      = True                       # skip scenarios that already have a .done and a .out
 FORCE_REBUILD = None                        # True = rebuild the snapshot even if the flat run is done
 MAX_SCENARIO_ATTEMPTS = 3                   # give up on a scenario after this many crashes
@@ -2830,6 +2830,132 @@ def _note_wanted_elements(proj, rows):
     return w
 
 
+def _part_meas_files(rdir):
+    """{fault id: path} of parts\SCEN_<id>_MEAS.csv under one result folder."""
+    out = {}
+    for pp in glob.glob(os.path.join(rdir, "parts", "SCEN_*_MEAS.csv")):
+        m = re.match(r"SCEN_(.+)_MEAS\.csv$", os.path.basename(pp), re.I)
+        if m:
+            out[m.group(1).strip()] = pp
+    return out
+
+
+def _fallback_from_parts(rdir, out, want, keep_all):
+    """Fill out["volts"/"angles"/"machines"/"poi"] for every fault that has a
+       part file but no rows in the merged table. Part rows are
+       Case,table,c1..c16 in the merged tables' column order (Scenario first):
+         volts    c1 Signal c2 Bus c3 name c4 Area c5 area name c6 kV
+                  c7 Recovery min c8 at c9 Post-clear max c10 at c11 Settled
+                  c12 limit c13 Limits broken c14 exemption c15 above-total s
+         angles   c1 Signal c2 Bus c3 type c4 Deviation (deg)
+         machines c1 Signal c2 Bus c3 type c4 P0 c5 Pend c6 Pmin c7 E0 c8 Eend
+                  c9 Tripped c10 Evidence
+         poi      c1 POI c2 Quantity c3 Component c4 Pre c5 Min c6 Max c7 Final
+                  c8 Source
+       Returns the number of faults that got anything from a part."""
+    parts = _part_meas_files(rdir)
+    if not parts:
+        return 0
+    have = {"volts": set(k[0] for k in out["volts"]),
+            "angles": set(k[0] for k in out["angles"]),
+            "machines": set(k[0] for k in (out.get("machines") or {})),
+            "poi": set(out.get("poi") or {})}
+    def _f(x):
+        try:
+            v = float(x)
+            return v if v == v else None
+        except (TypeError, ValueError):
+            return None
+    n_f = 0
+    for fid in sorted(parts, key=_fault_key):
+        need = [t for t in ("volts", "angles", "machines", "poi") if fid not in have[t]]
+        if not need:
+            continue
+        got = False
+        try:
+            with csv_open(parts[fid]) as fh:
+                rd = csv.reader(fh)
+                hdr = next(rd, None) or []
+                H = dict((h.strip(), i) for i, h in enumerate(hdr))
+                if "Case" not in H or "table" not in H:
+                    continue
+                ic, it = H["Case"], H["table"]
+                def c(r, i):
+                    j = H.get("c%d" % i)
+                    try:
+                        return (r[j] or "").strip() if j is not None else ""
+                    except IndexError:
+                        return ""
+                for r in rd:
+                    try:
+                        case, tbl = r[ic].strip(), r[it].strip()
+                    except IndexError:
+                        continue
+                    if case != fid or tbl not in need:
+                        continue
+                    if tbl == "volts":
+                        bus = c(r, 2).split(".")[0]
+                        if not bus:
+                            continue
+                        flag = c(r, 13)
+                        if not keep_all and bus not in want and flag in ("", "OK"):
+                            continue
+                        key = (fid, bus)
+                        rec = (_f(c(r, 7)), _f(c(r, 9)), _f(c(r, 10)), _f(c(r, 11)), _f(c(r, 15)))
+                        old = out["volts"].get(key)
+                        if old is None or ((rec[1] or -1) > (old[1] or -1)):
+                            out["volts"][key] = rec
+                        if key not in out["area"] and c(r, 4):
+                            out["area"][key] = c(r, 4)
+                        got = True
+                    elif tbl == "angles":
+                        bus = c(r, 2).split(".")[0]
+                        dev = _f(c(r, 4))
+                        if not bus or dev is None:
+                            continue
+                        key = (fid, bus)
+                        if dev > out["angles"].get(key, -1.0):
+                            out["angles"][key] = dev
+                        got = True
+                    elif tbl == "machines":
+                        tr = _f(c(r, 9))
+                        rec = {"p0": _f(c(r, 4)), "pend": _f(c(r, 5)), "pmin": _f(c(r, 6)),
+                               "e0": _f(c(r, 7)), "eend": _f(c(r, 8)),
+                               "tripped": bool(tr is not None and tr > 0),
+                               "why": c(r, 10), "label": c(r, 1)}
+                        keys = []
+                        b = c(r, 2).split(".")[0]
+                        if b:
+                            keys.append((fid, b))
+                        lb = re.search(r"\d{3,}", rec["label"])
+                        if lb and (fid, lb.group(0)) not in keys:
+                            keys.append((fid, lb.group(0)))
+                        mm = out.setdefault("machines", {})
+                        for key in keys:
+                            old = mm.get(key)
+                            if (old is None or (rec["tripped"] and not old["tripped"])
+                                    or (rec["tripped"] == old["tripped"]
+                                        and abs(rec["p0"] or 0.0) > abs(old["p0"] or 0.0))):
+                                mm[key] = rec
+                        got = True
+                    elif tbl == "poi":
+                        out.setdefault("poi", {}).setdefault(fid, {})[(c(r, 2), c(r, 3))] = {
+                            "poi": c(r, 1), "p0": _f(c(r, 4)), "min": _f(c(r, 5)),
+                            "max": _f(c(r, 6)), "end": _f(c(r, 7)), "src": c(r, 8)}
+                        got = True
+        except Exception as e:
+            print("[compare] could not read %s (%s)" % (parts[fid], _err_text(e)))
+            continue
+        if got:
+            n_f += 1
+    if n_f:
+        print("[compare] %s: %d fault(s) missing from the merged measurement files "
+              "were read from parts\\SCEN_<id>_MEAS.csv -- the merge there is "
+              "incomplete; the comparison is not" % (os.path.basename(rdir), n_f))
+        out.pop("_faults", None)
+    return n_f
+
+
 def measured_fault_ids(rdir, proj):
     """The set of scenario ids that have ANY measurement row on one side --
        volts, machines or POI -- read by STREAMING, storing nothing but the ids.
@@ -2860,6 +2986,7 @@ def measured_fault_ids(rdir, proj):
                         ids.add(s)
         except Exception as e:
             print("[compare] could not count scenarios in %s (%s)" % (fp, _err_text(e)))
+    ids |= set(_part_meas_files(rdir))      # a scored part counts even before the merge catches up
     return ids
 
 
@@ -3122,6 +3249,25 @@ def read_measurements(rdir, proj, full=False):
             out["partial"] = True
             print("[compare] *** could not read %s (%s) -- base/project VOLTAGE values "
                   "from this side will be missing ***" % (vp, _err_text(e)))
+    # FAULTS THE MERGED FILES DO NOT HOLD ARE READ FROM THEIR PART FILE.
+    #
+    # SPP_MEASURE_*.csv are built by the merge from parts\SCEN_<id>_MEAS.csv.
+    # A merge that ran before a scenario was scored, or that died partway
+    # through the 1M-row voltage table on this 32-bit python, leaves a file
+    # that is newer than the report yet holds nothing for that fault -- and
+    # EastFork F10 then read "base measurements file has no rows for this
+    # fault" while parts\SCEN_F10_MEAS.csv sat there with all 6,000 rows.
+    # The part is the primary record; per fault it is small. So: every
+    # scenario with a part file and no rows in a table gets that table read
+    # from the part, with the same selective keep rule for voltages.
+    try:
+        _n_fb = _fallback_from_parts(rdir, out, _want, _keep_all)
+    except Exception as e:
+        _n_fb = 0
+        print("[compare] *** could not read the per-fault parts in %s (%s) ***"
+              % (os.path.basename(rdir), _err_text(e)))
+    if _n_fb:
+        out["src"].append("parts\\SCEN_*_MEAS.csv (%d fault(s))" % _n_fb)
     if out["src"]:
         print("[compare] measurements read from %s: %d bus-voltage, %d rotor-angle, "
               "%d machine record(s) (%s)"
@@ -4044,12 +4190,27 @@ def cmp_detail():
     return d
 
 
+def _cmp_scope_tag():
+    """What the root files are ABOUT, in their name: 00_COMPARISON_REPORT_EastFork
+       inside comparison\EastFork, 00_COMPARISON_REPORT_ALL_PROJECTS for the one
+       that covers every project. Every folder used to hold a file called
+       00_COMPARISON_REPORT.xlsx, and Excel refuses to open two files of the
+       same name at once."""
+    sub = [x for x in _CMP_SUB if x]
+    if sub:
+        return "_" + "_".join(str(x) for x in sub)
+    projs = [str(p).strip() for p in (_panel_projects() or []) if str(p).strip()]
+    if len(projs) == 1:
+        return "_" + projs[0]
+    return "_ALL_PROJECTS" if projs else ""
+
+
 def cmp_path(stem, ext):
     d = cmp_dir()
     if stem in CMP_ROOT_FILES:
-        return os.path.join(d, "%s%s%s.%s"
+        return os.path.join(d, "%s%s%s%s.%s"
                             % (CMP_ROOT_NUMBER.get(stem, ""), stem,
-                               _sel_tag(), ext))
+                               _cmp_scope_tag(), _sel_tag(), ext))
     d = os.path.join(d, CMP_DETAIL_SUBDIR)
     try:
         os.makedirs(d)
