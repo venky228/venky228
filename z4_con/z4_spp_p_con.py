@@ -4430,6 +4430,18 @@ else:
 #
 # Read from the panel and from SPP_NEW_PLANT, because z4_cmp_all_con.py switches it
 # on through the environment and this runs long before _np_cfg() exists.
+# A VARIANT RUN BUILDS ITS OWN CASE. SPP_RUN_TAG / SPP_CAP_TAG put the results
+# in their own folder, but the .sav/.snp/.cnv were named without the tag --
+# so a POI-level or capacity run REBUILT the as-studied case files in place
+# with its own dispatch, and the next as-studied launch (the flat run being
+# done, so no rebuild) ran on them. The tag goes into the case name too.
+try:
+    if _CAP_TAG_DIR:
+        CASE_TAG += "_cap%s" % _CAP_TAG_DIR
+    if _RUN_TAG_DIR:
+        CASE_TAG += "_%s" % _RUN_TAG_DIR
+except NameError:
+    pass
 _NP_ON = bool((NEW_PLANT or {}).get("enabled"))
 try:
     _npe = (os.environ.get("SPP_NEW_PLANT") or "").strip()

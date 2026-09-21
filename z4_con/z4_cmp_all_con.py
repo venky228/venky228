@@ -8572,7 +8572,15 @@ def _poi_levels(proj=None):
        projects whose interconnections differ by a factor of five. Both may be
        set; the two are merged."""
     out = []
-    for x in (POI_P_LEVELS or []):
+    # A DICT IS PER PROJECT: {"SantaFe": [502], "IronStar": [214]} -- the
+    # plant's own GIA capacity at the POI for each, in one line. A project
+    # not named gets no absolute levels. A list still applies to every project.
+    _lv = POI_P_LEVELS or []
+    if isinstance(_lv, dict):
+        _lv = _lv.get(proj) or _lv.get(str(proj)) or []
+        if not isinstance(_lv, (list, tuple)):
+            _lv = [_lv]
+    for x in _lv:
         try:
             out.append(float(x))
         except (TypeError, ValueError):
