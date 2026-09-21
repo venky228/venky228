@@ -1027,15 +1027,15 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 	
  /High Voltage Protections PRC-24	
   99900001   'VTGTPAT'     999000    999000  '1'
-         -1.0000       1.2000       1.000       0.1000      /
+         -1.0000       1.2000        0.5       0.1000      /
   99900002   'VTGTPAT'     999000    999000  '1'
-          -1.0000       1.15000       10       0.1000      /
+          -1.0000       1.15000       2       0.1000      /
   
   /Low Voltage Protections PRC-24		 
   99900003   'VTGTPAT'     999000    999000  '1'
          0.3000       5.000       1.100       0.1000      /
   99900004   'VTGTPAT'     999000    999000  '1'
-          0.8       5.000       8       0.1000      /
+          0.8       5.000       5       0.1000      /
 
 	  
   /High Frequency Protections PRC-24		  
@@ -1046,7 +1046,7 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 
   /Low Frequency Protections PRC-24	  
   99900007   'FRQDCAT'     999000    999000  '1'
-         55.000     100.0000       0.200       0.1000      /
+         56.000     100.0000       0.200       0.1000      /
   99900008   'FRQDCAT'     999000    999000  '1'
          58.0000     100.0000       299.0000       0.1000      / 
 
@@ -1074,7 +1074,7 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 # measures at the high side of the main transformer, so the monitored bus is
 # POIBUS, substituted per project in _bess_clone_models(); the machine bus
 # stays the feeder. Set False to run the supplied block instead.
-BESS_PRC029_CURVE = True
+BESS_PRC029_CURVE = False   # False = run the supplied PRC-24 block above exactly as edited; True = the PRC-029-1 table below, measured at the POI
 BESS_RELAY_BLOCK_PRC029 = r"""/High Voltage Protections PRC-029-1 (all other IBR) -- measured at the POI
   99900001   'VTGTPAT'     POIBUS    999000  '1'
          -1.0000       1.2000       0.100       0.1000      /
