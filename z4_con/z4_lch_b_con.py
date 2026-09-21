@@ -3812,7 +3812,16 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
         _LAST_ACTIVITY[i] = time.time()
         launched_at[i] = time.time()
         pending.pop(i, None)
-        _delay = (i * LAUNCH_STAGGER_S) if (first and LAUNCH_STAGGER_S > 0) else 0.0
+        # ONE PACER, NOT TWO. The stagger (worker i waits i x LAUNCH_STAGGER_S
+        # before psseinit) predates the licence gate, which now spaces every
+        # PSS/E start at 60 / LICENCE_STARTS_PER_MIN seconds. Both together
+        # put worker 15 on the machine at 10 x 15 + 20 x 15 = 450 s: sixteen
+        # sessions took seven and a half minutes to fill on every project.
+        # With the gate on, the gate alone paces the starts; the stagger is
+        # only used when the gate is switched off (LICENCE_STARTS_PER_MIN = 0).
+        _delay = ((i * LAUNCH_STAGGER_S)
+                  if (first and LAUNCH_STAGGER_S > 0 and LICENCE_STARTS_PER_MIN <= 0)
+                  else 0.0)
         _banner("WORK: worker %d launch %d/%d  (tag [W%d])%s"
                 % (i, launches[i], MAX_LAUNCHES_PER, i,
                    ("  -- starts PSS/E after %ds (LAUNCH_STAGGER_S)" % _delay) if _delay else ""))
