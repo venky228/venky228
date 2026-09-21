@@ -2733,7 +2733,25 @@ def _part_meas_files(rdir):
     return out
 
 
-def _fallback_from_parts(rdir, out, want, keep_all):
+def _refresh_fault_from_part(meas, fid):
+    """Re-read ONE fault's tables from its part file into an already-loaded
+       measurement set. For the case where the merged table HAS rows for the
+       fault but not the row asked for (768484 on SantaFe F44 was in the part
+       and absent from the merged machines table). Once per fault per set."""
+    try:
+        rdir = meas.get("_rdir")
+        done = meas.setdefault("_refreshed", set())
+        if not rdir or fid in done:
+            return False
+        done.add(fid)
+        return bool(_fallback_from_parts(rdir, meas, _want_buses(meas.get("_proj") or ""),
+                                         bool(meas.get("_full")),
+                                         only_fid=fid, force=True))
+    except Exception:
+        return False
+
+
+def _fallback_from_parts(rdir, out, want, keep_all, only_fid=None, force=False):
     """Fill out["volts"/"angles"/"machines"/"poi"] for every fault that has a
        part file but no rows in the merged table. Part rows are
        Case,table,c1..c16 in the merged tables' column order (Scenario first):
@@ -2761,7 +2779,10 @@ def _fallback_from_parts(rdir, out, want, keep_all):
             return None
     n_f = 0
     for fid in sorted(parts, key=_fault_key):
-        need = [t for t in ("volts", "angles", "machines", "poi") if fid not in have[t]]
+        if only_fid is not None and fid != only_fid:
+            continue
+        need = [t for t in ("volts", "angles", "machines", "poi")
+                if force or fid not in have[t]]
         if not need:
             continue
         got = False
@@ -2927,7 +2948,8 @@ def read_measurements(rdir, proj, full=False):
         if _c.get("_full") or (not full and _c.get("_want_n", -1) >= len(_want)):
             return _c
     out = {"volts": {}, "angles": {}, "machines": {}, "area": {}, "src": [], "poi": {},
-           "_full": bool(full), "_want_n": len(_want), "partial": False}
+           "_full": bool(full), "_want_n": len(_want), "partial": False,
+           "_rdir": rdir, "_refreshed": set(), "_proj": proj}
     _keep_all = bool(full)
 
     def _f(x):
@@ -6646,6 +6668,20 @@ def _report_rows(results):
                         # known: a machine the trip list does not name did not
                         # trip. Both are said; neither cell is left empty.
                         if _mb_rec is None and not b_state:
+                            if _refresh_fault_from_part(meas_b, r["fault"]):
+                                _mb_rec = machine_state(meas_b, r["fault"], el)
+                                if _mb_rec is not None:
+                                    b_state = _trip_state_text(_mb_rec, bv)
+                                    if _mb_rec.get("p0") is not None:
+                                        bv_show = _mb_rec["p0"]
+                                        if bv is None and _mb_rec.get("tripped"):
+                                            bv = _mb_rec["p0"]
+                        _el_bus = re.search(r"\d{3,}", str(el))
+                        if (_mb_rec is None and not b_state and _el_bus
+                                and _project_only_bus(_el_bus.group(0))):
+                            b_state = ("machine exists only with the project (new plant) "
+                                       "-- NEW by construction")
+                        if _mb_rec is None and not b_state:
                             _p0b, _fromb = _machine_p0_any_fault(meas_b, el)
                             if _p0b is not None:
                                 bv_show = _p0b
@@ -6658,6 +6694,15 @@ def _report_rows(results):
                                               "this fault yet)"))
                             else:
                                 b_state = "base not scored for this fault"
+                        if _mt_rec is None and not t_state:
+                            if _refresh_fault_from_part(meas_t, r["fault"]):
+                                _mt_rec = machine_state(meas_t, r["fault"], el)
+                                if _mt_rec is not None:
+                                    t_state = _trip_state_text(_mt_rec, tv)
+                                    if _mt_rec.get("p0") is not None:
+                                        tv_show = _mt_rec["p0"]
+                                        if tv is None and _mt_rec.get("tripped"):
+                                            tv = _mt_rec["p0"]
                         if _mt_rec is None and not t_state:
                             _p0t, _fromt = _machine_p0_any_fault(meas_t, el)
                             if _p0t is not None:
