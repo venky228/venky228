@@ -265,7 +265,7 @@ def _print_phase_times(total):
 #   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
 #   dyr_<value>\                              <- a full comparison per value
 
-PROJECTS   = ["SantaFe"]                    # one project at a time for a sweep
+PROJECTS   = ["SantaFe","IronStar","EmpirePrairie","EastFork"]                  # one project at a time for a sweep
                                             # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
 # -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
 # "each"      one study per project in PROJECTS, each alone in the case (as before)
@@ -319,7 +319,7 @@ PIPELINE   = "all"                          # ***SET TO "all" TO RUN THE SWEEP**
 # -- THE Kqv SWEEP ITSELF ----------------------------------------------------
 # model -> constant -> list of values. One study per value, each vs the base.
 # Replace REECCU1 with the model in YOUR .dyr that carries Kqv.
-DYR_SWEEP            = {"REECCU1": {"Kqv": [0.0, 2.0]},}#{"REECCU1": {"Kqv": [2.0, 4.0]}, "REPCAU1": {"Ki": [10.0, 25.0 ]}}   # ONE key per model, values as a LIST: {"REECCU1": {"Kqv": [2.0, 4.0]}}. Two keys with the same model name keep only the last one (Python). Model names bare -- REPCAU1, not 'REPCAU1'. Every combination of the lists is one run.
+DYR_SWEEP            = {}#{"REECCU1": {"Kqv": [0.0, 2.0]},}#{"REECCU1": {"Kqv": [2.0, 4.0]}, "REPCAU1": {"Ki": [10.0, 25.0 ]}}   # ONE key per model, values as a LIST: {"REECCU1": {"Kqv": [2.0, 4.0]}}. Two keys with the same model name keep only the last one (Python). Model names bare -- REPCAU1, not 'REPCAU1'. Every combination of the lists is one run.
 DYR_SWEEP_BY_PROJECT = {}                    # per-project override, e.g.
                                             #   {"SantaFe": {"REECCU1": {"Kqv": [0.5, 1.5]}}}
 DYR_SWEEP_PROJECTS   = []                    # [] = every project in PROJECTS
@@ -377,7 +377,7 @@ ONE_PROJECT_AT_A_TIME = True    # with RUN_IN_PARALLEL = False: base THEN projec
 N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
 CORES_SPARE     = 2             # cores kept free for Windows / Excel / you (0-4)
 CORES_MAX       = 22            # ceiling on PSS/E sessions across BOTH cases; 0 = none; auto-clamped to the PC
-CORES_FOR_REPORTS = 12          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
+CORES_FOR_REPORTS = 6          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
@@ -392,7 +392,7 @@ FORCE_REPLOT    = False        # True = REDRAW every PDF from the .out files on 
 PLOT_SCOPE      = "compact"     # "compact" = SPP set + every violation (~5x fewer panels) | "full" = every kept channel
 PLOT_INRUN      = 1             # plotters trailing each running folder (1 = the old single plotter)
 PLOT_WORKERS    = 2             # plotters per case in the catch-up pass (0/1 = one)
-PLOT_TOTAL_MAX  = 4             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
+PLOT_TOTAL_MAX  = 3             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
 PLOT_ONE_PROJECT_AT_A_TIME = True   # True = finish one project's PDFs (base, then project case) before starting the next project's
 PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out stops before the end of the simulation (it did not run); False = draw it for diagnosis
 # ============================================================================
@@ -401,7 +401,7 @@ PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out s
 ROOT = ""                                   # "" = the folder this file is in; everything else follows it
 BASE_FOLDER = "Base"                        # the folder holding the BASE case (projects NOT modelled)
 PROJ_FOLDER = "Projects"                    # the folder holding the case WITH the projects
-CMP_FOLDER  = "comparison_all"                  # where the comparison output goes (created if absent)
+CMP_FOLDER  = "comparison_SGF"                  # where the comparison output goes (created if absent)
 # PROJECTS -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
 # ---- THE DECK EACH CASE READS ------------------------------------------------
 SHARED_DECK     = ""                        # "" = NO SHARED FILES: each case reads its own deck, in its own ...
@@ -415,7 +415,7 @@ PROJ_DYR = "DIS2201-25SP-G03-CQ.dyr"
 
 #     BASE_SAV_BY_PROJECT = {"EastFork": "DIS2201-25SP-G03-CQ_F_EastFork.sav"}
 BASE_SAV_BY_PROJECT = {}#{"EastFork": "DIS2201-25SP-G03-CQ_F_EF.sav"}   # EastFork base deck, in Base\ -- comment out to use the shared base
-BASE_DYR_BY_PROJECT = {}#{"EastFork": "DIS2201-25SP-G03-CQ_EF.dyr"}
+BASE_DYR_BY_PROJECT = {}#{"EastFork": "DIS2201-25SP-G03-CQ_EF.dyr"} 
 PROJ_SAV_BY_PROJECT = {}
 PROJ_DYR_BY_PROJECT = {}
 ADD_PROJECTS = []                           # A project lived only in BESS_PROJECTS inside BOTH study scripts ...
@@ -452,7 +452,7 @@ AUTO_REMERGE_STALE_PARTS = True
 VERIFY_SCORING_COVERAGE = True
 
 # PIPELINE, MODES -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
-RUN_CASES  = "both"                         # "both" | "base" | "proj" -- which case to SIMULATE
+RUN_CASES  = "proj"                         # "both" | "base" | "proj" -- which case to SIMULATE
 RUN_STUDIES = False                         # kept for the older settings; PIPELINE wins
 RUN_MISSING = False                         # same as PIPELINE = "missing"
 RUN_FLAT   = None                           # the no-fault initial-condition check (leave it on)
@@ -474,18 +474,22 @@ RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-m
 RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
 TRUNCATED_FRAC = 0.80                       # short = under this fraction of the folder's median .out size
 ONLY_EVENTS = []                            # [] = every event
-ONLY_FAULTS = ["F02"]                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
+ONLY_FAULTS = []                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
 SEARCH_DEPTH = 4                            # how many folder levels below SEARCH_ROOT to look
 
 # ---- HOW MUCH EACH PLANT PUTS ON THE SYSTEM ----------------------------------
 PROJECT_MW = {                              # a LIST = one complete study per size, each in its own folder
    # "EmpirePrairie": [604, 769],            # 604 MW, and the full 769 MW that fills the POI on its own
 }
+
+
+
+
 POI_P_TARGET_MW  = {
-    "SantaFe":        984.2,      # 502 MW BESS + the rest from 765912/765922/765932/765935
-    "IronStar":       290.5,      # 214 MW BESS + the rest from 587313/587317
-    "EastFork":       193.5,      # 112 MW BESS + the rest from 531620/531607
-    "EmpirePrairie":  769,      # BESS + the rest from 761379/761382/761400/761403
+    "SantaFe":        502,      # 984.2, 502 MW BESS + the rest from 765912/765922/765932/765935
+    "IronStar":       214,      # 290.5, 214 MW BESS + the rest from 587313/587317
+    "EastFork":       112,      # 193.5, 112 MW BESS + the rest from 531620/531607
+    "EmpirePrairie":  604,      # 769, 604, BESS + the rest from 761379/761382/761400/761403
 }
 POI_P_LEVELS     = []                       # [] = off. [1000, 1200] = one COMPLETE study per level, each in ...
 POI_P_LEVELS_PCT = []                       # [] = off. [100, 80, 60, 40, 20] = the SAME sweep as
