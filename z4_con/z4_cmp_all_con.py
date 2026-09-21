@@ -8849,6 +8849,43 @@ def write_poi_p_table(proj, mode, rows, levels, path):
         print("[poi-p] could not write %s (%s)" % (path, e))
 
 
+def write_project_mw_comparisons(proj, mode):
+    """A FULL comparison per plant size in PROJECT_MW[proj], each in its own
+       folder -- comparison\<project>\mw504\00_COMPARISON_REPORT_<project>_mw504.*
+       against the same base case. The size sweep used to write only the
+       PASS/FAIL table (PROJECT_MW_LEVELS.txt); a size run had no workbook."""
+    for mw in _project_mw_levels(proj):
+        tag = _mw_tag(mw)
+        suffix = "_%s" % tag
+        rt = results_dir(CASE_TEST, proj, mode) + suffix
+        if not os.path.isdir(rt):
+            print("[mw] no results at %.0f MW (%s) -- no comparison written" % (mw, rt))
+            continue
+        try:
+            res = compare_project(proj, mode, test_suffix=suffix)
+        except Exception as e:
+            print("[mw] could not compare the %.0f MW run (%s)" % (mw, e))
+            continue
+        with _cmp_into(proj if COMPARE_BY_PROJECT else "", tag):
+            _banner("COMPARISON AT %.0f MW PLANT SIZE -- %s (%s)" % (mw, proj, mode))
+            _RUN_OUTPUT[0] = "%.0f MW plant" % mw
+            try:
+                if ONE_REPORT:
+                    write_one_report([res], [], [])
+                else:
+                    write_summary([res], [], [])
+                    write_project_report(res)
+                    write_project_csv(res)
+                    write_elements(res)
+                write_spp_event_tables([res])
+                if not SIMPLE_OUTPUT:
+                    write_runtime_comparison(proj, mode, test_suffix=suffix)
+            except Exception as e:
+                print("[mw] the %.0f MW comparison could not be written (%s)" % (mw, e))
+            finally:
+                _RUN_OUTPUT[0] = ""
+
+
 def write_poi_p_comparisons(proj, mode):
     """A FULL comparison per POI level, each in its own folder.
 
@@ -17389,19 +17426,28 @@ def main():
     # PROJECT_MW carrying a LIST for a project is two studies, not two numbers.
     # EmpirePrairie is the case it exists for: 604 MW, and the full 769 MW that
     # fills the POI on its own.
-    if results and pipeline != "compare":
+    if results:
         for res in results:
             if not _project_mw_levels(res["project"]):
                 continue
-            try:
-                rows, levels = run_project_mw_sweep(res["project"], res["mode"])
-                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
-                    write_project_mw_table(res["project"], res["mode"], rows, levels,
-                                           os.path.join(os.getcwd(),
-                                                        "PROJECT_MW_LEVELS.txt"))
-            except Exception as e:
-                print("[mw] the size sweep failed (%s) -- the comparison above is "
-                      "unaffected" % e)
+            if pipeline != "compare":
+                try:
+                    rows, levels = run_project_mw_sweep(res["project"], res["mode"])
+                    with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                        write_project_mw_table(res["project"], res["mode"], rows, levels,
+                                               os.path.join(os.getcwd(),
+                                                            "PROJECT_MW_LEVELS.txt"))
+                except Exception as e:
+                    print("[mw] the size sweep failed (%s) -- the comparison above is "
+                          "unaffected" % e)
+            # THE FULL COMPARISON PER SIZE, against the same base -- on the
+            # sweep launch and on a later PIPELINE = "compare" alike, so a
+            # size folder already on disk gets its workbook rebuilt too.
+            if POI_P_COMPARE:
+                try:
+                    write_project_mw_comparisons(res["project"], res["mode"])
+                except Exception as e:
+                    print("[mw] the per-size comparisons failed (%s)" % e)
 
     # ---- TOTAL P AT THE POI, one complete study per level --------------------
     if results and (POI_P_LEVELS or POI_P_LEVELS_PCT) and pipeline != "compare":
