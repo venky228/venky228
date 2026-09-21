@@ -460,8 +460,8 @@ LIVE_STATUS_ALL = "LIVE_STATUS.txt"         # both cases' live table in one file
 CLAIM_STALE_S = 3600                        # backstop age for a stale claim; liveness decides first
 NEVER_KILL_WORKERS = False                  # True = no watchdog ever kills a running process. FALSE NOW: on 2026-09-16 F166 held a worker 18h 33m behind a CodeMeter dialog and nothing was allowed to end it
 SCENARIO_MAX_MIN = 75                       # a scenario RUNNING longer than this is killed and requeued, printing or not -- 3x the slowest ever measured (24 min); 0 = off
-LICENCE_COOLDOWN_MIN = 10                   # a worker that hit MAX_LICENCE_FAILS is PARKED this long and relaunched, not retired -- six of seven slots retired for good on 2026-09-16 during a licence outage
-LICENCE_STARTS_PER_MIN = 6                  # PSS/E process starts per minute across BOTH cases (shared gate beside the cases); ~170/h flooded CodeMeter into "Error 100". 0 = off
+LICENCE_COOLDOWN_MIN = 15                   # a worker that hit MAX_LICENCE_FAILS is PARKED this long and relaunched, not retired -- six of seven slots retired for good on 2026-09-16 during a licence outage
+LICENCE_STARTS_PER_MIN = 3                  # PSS/E process starts per minute across BOTH cases (shared gate beside the cases); ~170/h flooded CodeMeter into "Error 100". 0 = off
 LAUNCH_STAGGER_S = 20                       # worker i starts PSS/E i x this many s after launch, so N licence requests do not hit CodeMeter at once
 CLOSE_PSSE_DIALOGS = True                   # True = close modal PSS/E boxes ("CodeMeter runtime system is currently busy") shown by this launch's own processes
 LICENCE_BACKOFF_S = 60                      # pause before relaunching a worker whose PSS/E could not take a licence (doubles each time, max 15 min)
@@ -576,7 +576,7 @@ PLOT_CLEAR_STALE_CLAIMS = True              # before a plot pass, free every cla
 FRESH_START    = False                     # True = START OVER: clears every .done/.attempts marker so all 1,100 faults simulate again with the 20-area monitoring. SET BACK TO False ONCE THE RUN IS GOING, or a relaunch starts over again
 SKIP_DONE      = True                       # skip scenarios that already have a .done and a .out
 FORCE_REBUILD = None                        # True = rebuild the snapshot even if the flat run is done
-MAX_SCENARIO_ATTEMPTS = 3                   # give up on a scenario after this many crashes
+MAX_SCENARIO_ATTEMPTS = 2                   # give up on a scenario after this many crashes
 RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-machine labels differ from the newest group to *.oldbuild (guesswork; a PDF older than its .out is redrawn anyway)
 RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
 TRUNCATED_FRAC = 0.80                       # short = under this fraction of the folder's median .out size
