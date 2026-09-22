@@ -16201,8 +16201,11 @@ def fault_run(fault, idx=None, total=None):
         # documented way to clear an initialisation PSS/E did not accept.
         print("  [%s] pre-fault RUN refused (ierr=%s) straight after strt_2 -- "
               "running STRT once more" % (_ts(), _rc0)); sys.stdout.flush()
+        # WITH THE CONVERGENCE MONITOR ON (options[0] = 1): when the network
+        # solution inside STRT fails, this is the only way PSS/E names the
+        # bus and the mismatch it could not solve.
         with capture_psse("FAULT_%s_strt2" % fid):
-            rc = psspy.strt_2([0, 1], out)
+            rc = psspy.strt_2([1, 1], out)
         print("  [%s] second strt_2 returned (ierr=%s)" % (_ts(), rc))
         _assert_init_ok("FAULT_%s_strt2" % fid, rc); _set_out(out)
         _set_sim_clock(0.0)
