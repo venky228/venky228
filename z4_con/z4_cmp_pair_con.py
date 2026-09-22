@@ -50,10 +50,12 @@ import subprocess
 # ============================================================================
 #  SETTINGS
 # ============================================================================
-REFERENCE = r"C:\KV\Base\results_base\SantaFe_spp"          # the folder every scenario is compared AGAINST
-SCENARIOS = [            # the folders to compare against it, one report each -- list every run you want in
-    r"C:\KV\Projects\results_proj\SantaFe_spp",
-    r"C:\KV\Projects\results_proj\Sep21_full gia\SantaFe_spp",
+REFERENCE = r"C:\KV\Base\results_base\BASE_CQ_F"           # the folder every scenario is compared AGAINST: one project's
+                                                              # results folder (...\SantaFe_spp) OR a parent holding all of them
+SCENARIOS = [            # the folders to compare against it -- results folders, or parents holding one per project
+                         # (matched by name: SantaFe_spp with SantaFe_spp, IronStar_spp with IronStar_spp ...)
+    r"C:\KV\Projects\results_proj",
+    r"C:\KV\Projects\results_proj\Sep21_full gia",
     # r"C:\KV\Projects\results_proj\SantaFe_spp_poi502",
     # r"C:\KV\Base\results_base_OLDBASE\SantaFe_spp",            # another base run works too
 ]
@@ -1157,11 +1159,65 @@ def _auto_pairs(z4):
     return pairs
 
 
+def _project_folders(z4, parent):
+    """{'SantaFe_spp': path, ...}: the results folders directly inside a
+       parent folder (one per project), or {} when the folder is itself a
+       results folder."""
+    out = {}
+    if _has_outs(parent):
+        return out
+    for m in list(z4.MODES) or ["spp"]:
+        for d in sorted(glob.glob(os.path.join(parent, "*_%s*" % m))):
+            if os.path.isdir(d) and _has_outs(d) and not _skip_dir(d):
+                out[_base(d)] = _norm(d)
+    return out
+
+
+def _expand_parents(z4, pairs):
+    """A PARENT folder on either side -- Base\results_base\BASE_CQ_F, or
+       Projects\results_proj\Sep21_full gia, holding SantaFe_spp, IronStar_spp
+       ... -- stands for every project inside it. The pair is expanded to one
+       pair per project, matched by folder NAME on both sides, so all four
+       projects are compared folder by folder in one run. A results folder
+       given directly is used as it is."""
+    out = []
+    for ref, test, label in pairs:
+        rp = _project_folders(z4, _norm(ref))
+        tp = _project_folders(z4, _norm(test))
+        if not rp and not tp:
+            out.append((ref, test, label))
+            continue
+        if rp and tp:
+            names = [n for n in rp if n in tp]
+            missing = sorted(set(rp) - set(tp)) + sorted(set(tp) - set(rp))
+            if missing:
+                print("[pair] %s vs %s: no match for %s -- skipped"
+                      % (_base(ref), _base(test), ", ".join(missing)))
+            for n in names:
+                out.append((rp[n], tp[n], ("%s_%s" % (label, n.split("_")[0])) if label else None))
+        elif rp:
+            n = _base(test)
+            if n in rp:
+                out.append((rp[n], test, label))
+            else:
+                print("[pair] %s has no %s to compare with %s -- skipped" % (ref, n, test))
+        else:
+            n = _base(ref)
+            if n in tp:
+                out.append((ref, tp[n], label))
+            else:
+                print("[pair] %s has no %s to compare with %s -- skipped" % (test, n, ref))
+        print("[pair] %s vs %s -> %d project folder pair(s) so far" % (_base(ref), _base(test), len(out)))
+    return out
+
+
 def main(argv):
     pairs = _pairs_from_settings(argv)
     z4 = _load_panel()
     if pairs is None:
         pairs = _auto_pairs(z4)
+    if pairs:
+        pairs = _expand_parents(z4, pairs)
     if not pairs:
         print("[pair] nothing to compare. Fill in REFERENCE + SCENARIOS or PAIRS, give "
               "two folders on the command line, or leave REFERENCE empty with "
