@@ -30827,7 +30827,12 @@ def finalize_report(produced, part=None, claim=False):
                     # resumed case with no measurement rows is dropped from the
                     # skip list -- and its stale criteria rows and verdict with
                     # it, so re-scoring replaces rather than duplicates.
-                    _nomeas = sorted(c for c in _done_cases if not SPP_MEASURE.get(c))
+                    # ONLY THE CASES THIS PASS WAS ASKED FOR. A pass restricted
+                    # by SPP_ONLY / REPORT_FAULTS never reaches the others, so
+                    # dropping them here would erase their rows from this
+                    # shard's part for nothing.
+                    _nomeas = sorted(c for c in _done_cases
+                                     if not SPP_MEASURE.get(c) and _wanted(c))
                     if _nomeas:
                         print("[score] shard %d: %d resumed scenario(s) have no saved "
                               "measurements and will be RE-SCORED so the workbook "
@@ -30878,6 +30883,8 @@ def finalize_report(produced, part=None, claim=False):
                         _vt = 0.0
                     _stale = set()
                     for _c in list(_done_cases):
+                        if not _wanted(_c):
+                            continue          # not this pass's to re-score
                         _op = os.path.join(OUT_DIR, "%s.out" % _c)
                         try:
                             if not os.path.isfile(_op):

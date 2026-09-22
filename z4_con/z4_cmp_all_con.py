@@ -16969,6 +16969,7 @@ def ensure_reports(mode_list):
        it started."""
     n = 0
     jobs = []
+    env_extra_base = {"SPP_REPORT_ONLY": "1"}
     for case in (CASE_BASE, CASE_TEST):
         need, stale, thin, nomeas, gaps = [], [], [], [], []
         for nm, proj, md, rep, n_out, _when in inventory(case):
@@ -17182,24 +17183,56 @@ def ensure_reports(mode_list):
                 "older than them" % (case["label"], len(set(need))))
         print("[compare] %s" % ", ".join(need))
         print("[compare] this reads .out files and runs NO simulation.")
-        jobs.append((case, sorted(set(need))))
+        # WHAT EACH FOLDER GETS. A folder that needs scoring for any of the
+        # older reasons (forced, stale, thin, no measurements) gets the full
+        # pass: every shard walks every .out. A folder whose ONLY reason is a
+        # few unscored runs gets a pass restricted to those ids
+        # (SPP_REPORT_FAULTS), so six shards read four files instead of each
+        # replaying a 270-row part and then reading four files. The launcher
+        # names that pass's own reports _SELECTED; the auto-merge that follows
+        # rebuilds the full reports from every part, the new ones included.
+        _gap_ids = dict(gaps)
+        _full = sorted(set(p for p in need
+                           if p not in _gap_ids or need.count(p) > 1))
+        _runs = []
+        if _full:
+            _runs.append((_full, dict(env_extra_base)))
+        for proj in sorted(_gap_ids):
+            if proj in _full:
+                continue
+            _e = dict(env_extra_base)
+            _e["SPP_REPORT_FAULTS"] = ",".join(sorted(_gap_ids[proj]))
+            _runs.append(([proj], _e))
+            print("[compare] %s %-16s shards read ONLY %d scenario(s): %s"
+                  % (case["key"], proj, len(_gap_ids[proj]),
+                     ", ".join(sorted(_gap_ids[proj])[:12])
+                     + (" ..." if len(_gap_ids[proj]) > 12 else "")))
+        jobs.append((case, _runs))
         n += 1
     if not jobs:
         return 0
     # THE SAME CONCURRENCY RULE AS PHASE 1. Scoring is the slow half of this
     # study -- minutes per .out -- so running the two cases one after the other
     # here would take as long as phase 1 did, on a machine sized for both.
-    env_extra = {"SPP_REPORT_ONLY": "1"}
+    def _run_case(c, runs):
+        """Every pass this case needs, one after the other; the first non-zero
+           exit code is the case's."""
+        _rc = 0
+        for _projs, _env in runs:
+            _r = run_study(c, projects=_projs, modes=mode_list, extra_env=_env)
+            if _r not in (0, None) and _rc in (0, None):
+                _rc = _r
+        return _rc
+
     if RUN_IN_PARALLEL and len(jobs) > 1:
         print("[compare] scoring both cases at once -- REPORT_WORKERS shards each")
         res, ths = {}, []
-        for case, need in jobs:
+        for case, runs in jobs:
             _case_thread_begin(case["key"])      # both registered BEFORE either starts
-        for case, need in jobs:
-            def _go(c=case, nd=need):
+        for case, runs in jobs:
+            def _go(c=case, rs=runs):
                 try:
-                    res[c["key"]] = run_study(c, projects=nd, modes=mode_list,
-                                              extra_env=env_extra)
+                    res[c["key"]] = _run_case(c, rs)
                 finally:
                     _case_thread_end(c["key"])
             th = threading.Thread(target=_go)
@@ -17210,10 +17243,8 @@ def ensure_reports(mode_list):
         rcs = list(res.items())
     else:
         rcs = []
-        for case, need in jobs:
-            rcs.append((case["key"],
-                        run_study(case, projects=need, modes=mode_list,
-                                  extra_env=env_extra)))
+        for case, runs in jobs:
+            rcs.append((case["key"], _run_case(case, runs)))
     # THE MEASUREMENTS JUST CHANGED ON DISK. Anything read before this pass --
     # the live comparison's thread, the coverage test above -- is out of date.
     _MEAS_CACHE.clear()
