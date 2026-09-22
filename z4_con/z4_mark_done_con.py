@@ -58,7 +58,8 @@ HOW TO USE
      the report phase scores the rest.
 
   Other switches:
-      --only SantaFe,IronStar     just these projects
+      --only SantaFe,IronStar     just these projects (no prompt)
+      --all                       every project (no prompt)
       --base / --proj             just one case
       --use-size                  allow the size test where nothing better exists
       --undo                      remove only the markers THIS script wrote
@@ -82,6 +83,14 @@ BASE_DIR   = os.path.join(STUDY_ROOT, "Base")
 PROJ_DIR   = os.path.join(STUDY_ROOT, "Projects")
 RESULTS_BASE = "results_base"          # folder under BASE_DIR
 RESULTS_PROJ = "results_proj"          # folder under PROJ_DIR
+
+PROJECTS = []                          # WHICH PROJECTS TO MARK. Leave it empty
+                                       # and the script lists what it found and
+                                       # asks. Name them here to skip the
+                                       # question, e.g. ["IronStar"] or
+                                       # ["SantaFe", "IronStar"]. --only on the
+                                       # command line wins over this, --all
+                                       # takes every project without asking.
 
 SIM_END_S        = 25.2                # the run length the study asked for
 END_TOL_S        = 0.11                # within this of SIM_END_S = finished
@@ -381,14 +390,65 @@ def results_folders(only_projects=None, want_base=True, want_proj=True):
                 # one level deeper: a dated or tagged copy
                 for sub in sorted(os.listdir(rdir) if os.path.isdir(rdir) else []):
                     d2 = os.path.join(rdir, sub)
-                    if os.path.isdir(os.path.join(d2, "outs")):
-                        out.append((key, sub, d2))
+                    if not os.path.isdir(os.path.join(d2, "outs")):
+                        continue
+                    # THE FILTER APPLIES HERE TOO. A tagged copy such as
+                    # results_proj\Sep21_full gia\SantaFe_spp is still SantaFe.
+                    if only_projects and sub.split("_")[0].lower() not in only_projects:
+                        continue
+                    out.append((key, sub, d2))
                 continue
             proj = name.split("_")[0]
             if only_projects and proj.lower() not in only_projects:
                 continue
             out.append((key, name, rdir))
     return out
+
+
+def project_names(want_base=True, want_proj=True):
+    """Every project that has a results folder, in the spelling the folder uses."""
+    seen = {}
+    for _key, name, _rdir in results_folders(None, want_base, want_proj):
+        p = name.split("_")[0]
+        seen.setdefault(p.lower(), p)
+    return [seen[k] for k in sorted(seen)]
+
+
+def ask_projects(want_base, want_proj):
+    """List the projects found and let the user pick. Returns a lower-case set,
+       or None for 'every project'. Anything other than a live console -- a
+       scheduled run, a pipe -- takes every project rather than hanging."""
+    names = project_names(want_base, want_proj)
+    if not names:
+        return None
+    print("")
+    print(" PROJECTS FOUND:")
+    for i, p in enumerate(names, 1):
+        print("     %d. %s" % (i, p))
+    print("     0. all of them")
+    try:
+        if not sys.stdin.isatty():
+            raise EOFError
+        raw = input(" Which project? (number, name, or several separated by commas) ")
+    except (EOFError, KeyboardInterrupt, AttributeError):
+        print(" (no console -- taking every project)")
+        return None
+    raw = (raw or "").strip()
+    if not raw or raw == "0" or raw.lower() in ("all", "a", "*"):
+        return None
+    picked = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.isdigit() and 1 <= int(tok) <= len(names):
+            picked.add(names[int(tok) - 1].lower())
+        else:
+            picked.add(tok.lower())
+    unknown = sorted(p for p in picked if p not in set(n.lower() for n in names))
+    if unknown:
+        print(" [mark] no results folder for: %s" % ", ".join(unknown))
+    return picked or None
 
 
 # -------------------------------------------------------------- the decision --
@@ -525,15 +585,28 @@ def main(argv):
     want_base = "--proj" not in argv
     want_proj = "--base" not in argv
     only = None
+    asked = False
     for i, a in enumerate(argv):
         if a == "--only" and i + 1 < len(argv):
             only = set(x.strip().lower() for x in argv[i + 1].split(",") if x.strip())
+            asked = True
+    if only is None and "--all" in argv:
+        asked = True                       # every project, no question
+    if only is None and not asked and PROJECTS:
+        only = set(str(p).strip().lower() for p in PROJECTS if str(p).strip())
+        asked = True
+    if only is None and not asked:
+        only = ask_projects(want_base, want_proj)
 
     folders = results_folders(only, want_base, want_proj)
     if not folders:
         print("[mark] no results folders found under %s / %s"
               % (os.path.join(BASE_DIR, RESULTS_BASE),
                  os.path.join(PROJ_DIR, RESULTS_PROJ)))
+        if only:
+            print("[mark] the pick was: %s -- the folders present are: %s"
+                  % (", ".join(sorted(only)),
+                     ", ".join(project_names(want_base, want_proj)) or "(none)"))
         return 1
 
     print("")
@@ -542,6 +615,10 @@ def main(argv):
                                          else "DRY RUN, nothing is written"))
     print(" run length %.2f s, finished at %.2f s or later, partial from %.2f s"
           % (SIM_END_S, SIM_END_S - END_TOL_S, PARTIAL_MIN_FRAC * SIM_END_S))
+    print(" projects: %s   case: %s   folders: %d"
+          % ("all" if not only else ", ".join(sorted(only)),
+             "base + project" if (want_base and want_proj)
+             else ("base only" if want_base else "project only"), len(folders)))
     print("=" * 96)
 
     if undo:
