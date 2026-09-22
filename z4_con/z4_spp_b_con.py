@@ -29937,6 +29937,27 @@ def plot_missing_outs():
                 pass
         print("[plot-one] %s alone, prescan and strike count OFF (this process is "
               "the isolation)" % _only_one)
+    # NAMED FAULTS ONLY. The pass reads every .out in the folder in turn, and
+    # with hundreds of them and a handful of plotters it gets through what it
+    # can before the round ends -- so a particular scenario can wait several
+    # passes for its turn. SPP_PLOT_FAULTS (the panel sends ONLY_FAULTS) puts
+    # the named ones at the front by making them the whole list. Every gate
+    # below still applies: this chooses WHICH files are considered, not what
+    # is decided about them.
+    _pf = [x.strip().upper() for x in
+           (os.environ.get("SPP_PLOT_FAULTS") or "").replace(";", ",").split(",")
+           if x.strip()]
+    if _pf and not _only_one:
+        _keep = [o for o in outs
+                 if os.path.splitext(os.path.basename(o))[0].upper() in _pf]
+        print("[plot-missing] SPP_PLOT_FAULTS: %d of %d .out file(s) selected (%s)"
+              % (len(_keep), len(outs), ", ".join(sorted(_pf))[:120]))
+        _miss = [x for x in _pf
+                 if not any(os.path.splitext(os.path.basename(o))[0].upper() == x
+                            for o in outs)]
+        if _miss:
+            print("[plot-missing]   not in this folder: %s" % ", ".join(sorted(_miss)))
+        outs = _keep
 
     todo = []
     for p in outs:

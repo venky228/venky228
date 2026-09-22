@@ -15093,6 +15093,17 @@ def _start_plotter(case, proj, mode, slot, rdir=None):
     if RUN_NPLT is not None:
         env["SPP_RUN_NPLT"] = str(int(RUN_NPLT))
     _push_settings(env, case)              # criteria thresholds, radius, the rest
+    # ONLY_FAULTS REACHES THE PLOT PASS TOO. Without this the selection
+    # narrowed the simulation and the comparison but not the drawing/scoring,
+    # so "plot and score F26 and F28" had no way to be said: the pass read the
+    # folder in its own order and those two waited for their turn.
+    try:
+        _sel = [str(x).strip().upper() for x in (ONLY_FAULTS or [])
+                if re.match(r"^F\d+$", str(x).strip(), re.I)]
+        if _sel and len(_sel) == len(ONLY_FAULTS or []):
+            env["SPP_PLOT_FAULTS"] = ",".join(_sel)
+    except Exception:
+        pass
     env["SPP_PLOT_MISSING"] = "1"          # draw and exit; never reaches main()
     env["SPP_PLOT_FLEET"] = "1"            # per-file claims, not one-at-a-time
     env["SPP_PLOT_SLOT"] = str(slot)
