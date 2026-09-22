@@ -398,30 +398,42 @@ def _sbs_faults(z4, ref, group, tags, rk):
                 head[fid] = r
             per[fid][t] = r
     proj = group[0]["proj"]
-    header = ["fault", "planning_event", "fault_source", "project", "reference", "verdict_" + rk]
-    widths = [8, 12, 9, 12, 22, 12]
+    # ATTRIBUTE-MAJOR: verdict | base, studied, gia ... then class | studied,
+    # gia ... -- the numbers to be compared sit in ADJACENT columns.
+    _w = {"verdict": 11, "class": 14, "worst_criterion": 24, "value": 10, "limit": 8,
+          "unit": 6, "past_limit": 10, "new_criteria": 18, "violating_buses": 40, "cause": 50}
+    header = ["fault", "planning_event", "fault_source", "project", "reference"]
+    widths = [8, 12, 9, 12, 22]
+    header.append("verdict | %s" % rk); widths.append(11)
     for t in tags:
-        for nm, _c in _SBS_PER:
-            header.append("%s | %s" % (t, nm))
-            widths.append({"verdict": 11, "class": 14, "worst_criterion": 24, "ref_value": 10,
-                           "value": 10, "limit": 8, "unit": 6, "past_limit": 10,
-                           "new_criteria": 18, "violating_buses": 40, "cause": 50}[nm])
-    header += ["worst_across_scenarios", "description"]
-    widths += [22, 60]
+        header.append("verdict | %s" % t); widths.append(11)
+    header += ["worst_across_scenarios"]; widths += [22]
+    _attrs = [("class", "classification"), ("worst_criterion", "worst_criterion"),
+              ("value", None), ("limit", "limit"), ("unit", "unit"), ("past_limit", "past_limit"),
+              ("new_criteria", "new_criteria"), ("violating_buses", "violating_buses"),
+              ("cause", "cause")]
+    for nm, _c in _attrs:
+        if nm == "value":
+            header.append("value | %s" % rk); widths.append(_w[nm])
+        for t in tags:
+            header.append("%s | %s" % (nm, t)); widths.append(_w[nm])
+    header += ["description"]; widths += [60]
     rows = []
     for fid in sorted(order, key=lambda x: (len(x), x)):
         h = head[fid]
         row = [fid, h[SC["planning_event"]], h[SC["fault_source"]], proj, _base(ref),
                h[SC["verdict_base"]]]
         worst, act, allpass = "", False, True
+        cells = {}
         for t in tags:
             r = per[fid].get(t)
             if r is None:
-                row += ["not compared"] + [""] * (len(_SBS_PER) - 1)
+                cells[t] = None
+                row.append("not compared")
                 allpass = False
                 continue
-            for _nm, c in _SBS_PER:
-                row.append(r[SC[c]])
+            cells[t] = r
+            row.append(r[SC["verdict_projects"]])
             cls = str(r[SC["classification"]])
             if str(r[SC["action"]]).startswith("ACT"):
                 act = True
@@ -430,9 +442,24 @@ def _sbs_faults(z4, ref, group, tags, rk):
                 worst = "%s: %s" % (t, cls)
             if str(r[SC["verdict_projects"]]).upper() != "PASS":
                 allpass = False
-        row += [worst or ("all PASS" if allpass else "mixed / see element sheet"), h[SC["description"]]]
+        row.append(worst or ("all PASS" if allpass else "mixed / see element sheet"))
+        # the reference value of the worst criterion: from the first scenario that has it
+        _bv = ""
+        for t in tags:
+            if cells[t] is not None and str(cells[t][SC["base_value"]]).strip() not in ("", "-"):
+                _bv = cells[t][SC["base_value"]]
+                break
+        for nm, c in _attrs:
+            if nm == "value":
+                row.append(_bv)
+                for t in tags:
+                    row.append(cells[t][SC["project_value"]] if cells[t] is not None else "not compared")
+                continue
+            for t in tags:
+                row.append(cells[t][SC[c]] if cells[t] is not None else "-")
+        row.append(h[SC["description"]])
         rows.append([("-" if (v is None or str(v).strip() == "") else v) for v in row])
-    nw = len(header) - 2
+    nw = header.index("worst_across_scenarios")
 
     def _style(row):
         w = str(row[nw])
@@ -527,16 +554,25 @@ def _sbs_elements(z4, ref, group, tags, rk):
     except Exception as e:
         print("[pair]   measurements for the element sheet could not be read (%s) -- "
               "cells with no report row show '-'" % e)
+    # ATTRIBUTE-MAJOR: value | base, studied, gia ... side by side, then the
+    # states, then the classes, changes and past-limit -- one glance per row.
+    _w = {"value": 11, "state": 22, "class": 26, "change": 9, "past_limit": 10}
     header = ["fault", "planning_event", "fault_source", "project", "criterion", "measured",
               "element", "bus_number", "area", "hops_from_fault", "hops_from_poi",
-              "limit", "unit", "%s | value" % rk, "%s | state" % rk, "%s | note" % rk]
-    widths = [8, 12, 9, 12, 22, 15, 18, 10, 6, 8, 8, 8, 6, 11, 22, 30]
+              "limit", "unit"]
+    widths = [8, 12, 9, 12, 22, 15, 18, 10, 6, 8, 8, 8, 6]
+    header.append("value | %s" % rk); widths.append(_w["value"])
     for t in tags:
-        for nm, _c in _SBS_EL:
-            header.append("%s | %s" % (t, nm))
-            widths.append({"value": 11, "state": 22, "class": 26, "change": 9, "past_limit": 10}[nm])
-    header += ["worst_across_scenarios", "description"]
-    widths += [26, 40]
+        header.append("value | %s" % t); widths.append(_w["value"])
+    header.append("worst_across_scenarios"); widths.append(26)
+    header.append("state | %s" % rk); widths.append(_w["state"])
+    for t in tags:
+        header.append("state | %s" % t); widths.append(_w["state"])
+    for nm in ("class", "change", "past_limit"):
+        for t in tags:
+            header.append("%s | %s" % (nm, t)); widths.append(_w[nm])
+    header += ["note | %s" % rk, "description"]
+    widths += [30, 40]
     rows = []
 
     def _fkey(k):
@@ -563,7 +599,8 @@ def _sbs_elements(z4, ref, group, tags, rk):
                 bstate = st2
         row = [fid, h[RC["planning_event"]], h[RC["fault_source"]], proj, crit, h[RC["measured"]],
                el, bus, h[RC["area"]], h[RC["hops_from_fault"]], h[RC["hops_from_poi"]],
-               h[RC["limit"]], h[RC["unit"]], bval, bstate, bnote]
+               h[RC["limit"]], h[RC["unit"]]]
+        got = {}                                  # tag -> [value, state, class, change, past]
         worst, rank = "", -1
         for t in tags:
             r = per[k].get(t)
@@ -594,15 +631,25 @@ def _sbs_elements(z4, ref, group, tags, rk):
                         cells[0] = v2
                     if str(cells[1]).strip() == "":
                         cells[1] = st2
-            row += cells
+            got[t] = cells
             rk2 = _order.get(cls, 1 if ("over the limit" in cls or "under the limit" in cls
                                         or cls not in (z4.CLS_EL_OK, "", "within limit here (measured)",
                                                        "not measured in this run")) else 0)
             if rk2 > rank:
                 rank, worst = rk2, ("%s: %s" % (t, cls) if rk2 > 0 else cls)
-        row += [worst or "-", h[RC["description"]]]
+        row.append(bval)
+        for t in tags:
+            row.append(got[t][0])
+        row.append(worst or "-")
+        row.append(bstate)
+        for t in tags:
+            row.append(got[t][1])
+        for ix in (2, 3, 4):
+            for t in tags:
+                row.append(got[t][ix])
+        row += [bnote, h[RC["description"]]]
         rows.append([("-" if (v is None or str(v).strip() == "") else v) for v in row])
-    nw = len(header) - 2
+    nw = header.index("worst_across_scenarios")
 
     def _style(row):
         w = str(row[nw])
