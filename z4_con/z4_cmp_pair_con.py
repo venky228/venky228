@@ -319,6 +319,75 @@ def _discover_scenarios(z4, ref):
     return found
 
 
+def _fault_ids_of(z4, proj):
+    """Every fault id in the project's shared list (the one the study ran)."""
+    import csv
+    ids = []
+    for p in (os.path.join(z4.STUDY_ROOT, "SPP_FAULTS_CON_%s.csv" % proj),):
+        try:
+            with open(p, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    fid = (r.get("fault_id") or "").strip()
+                    if fid:
+                        ids.append(fid)
+        except Exception:
+            continue
+        if ids:
+            break
+    return ids
+
+
+def _idsort(ids):
+    return sorted(set(ids), key=lambda x: (len(x), x))
+
+
+def _unrun(z4, folder, proj):
+    """(never run, run but no verdict) for one results folder: ids from the
+       fault list with no .out, and .out files that carry no verdict (crashed,
+       non-finite, unscored)."""
+    try:
+        outs, scored = z4._out_and_scored_sets(folder, proj)
+    except Exception:
+        outs, scored = set(), set()
+    outs = set(str(x) for x in outs)
+    scored = set(str(x) for x in scored)
+    listed = _fault_ids_of(z4, proj)
+    never = [f for f in listed if f not in outs] if listed else []
+    novote = [f for f in outs if f not in scored and not f.upper().startswith("FLAT")]
+    return _idsort(never), _idsort(novote)
+
+
+def _rerun_lines(z4, tag, folder, proj):
+    never, novote = _unrun(z4, folder, proj)
+    L = ["%s   %s" % (tag, folder),
+         "   %d fault(s) with NO .out (never run) : %s" % (len(never), ", ".join(never) or "-"),
+         "   %d .out(s) with NO verdict (crashed / non-finite / unscored): %s"
+         % (len(novote), ", ".join(novote) or "-")]
+    both = _idsort(never + novote)
+    L.append("   RUN_ONLY_FAULTS = [%s]" % ", ".join('"%s"' % x for x in both))
+    return L, both
+
+
+def write_rerun_list(z4, path, entries):
+    """RERUN_*.txt: per folder, the faults with no result and the
+       RUN_ONLY_FAULTS line to paste into z4_cmp_all_con.py to re-run them
+       (RUN_CASES = "base" or "proj" for that side)."""
+    L = ["FAULTS WITH NO RESULT -- what to re-run in z4_cmp_all_con.py",
+         "generated %s" % time.strftime("%Y-%m-%d %H:%M"),
+         "Paste the RUN_ONLY_FAULTS line into the panel with PIPELINE = \"all\" and RUN_CASES",
+         "set to the side named; RUN_ONLY_MISSING_OUT must be False for a fault that has an",
+         "unscorable .out to be simulated again (the file is replaced).", ""]
+    for tag, folder, proj in entries:
+        lines, _b = _rerun_lines(z4, tag, folder, proj)
+        L += lines + [""]
+    try:
+        with open(path, "w") as fh:
+            fh.write("\n".join(L) + "\n")
+        print("[pair] re-run list -> %s" % path)
+    except Exception as e:
+        print("[pair] could not write %s: %s" % (path, e))
+
+
 def _label_for(ref, test):
     proj, _m, _s = _split_name(test, None)
     rk = "base" if "results_base" in _parts(ref) else _folder_tag(ref)
@@ -412,6 +481,8 @@ def compare_pair(z4, ref, test, label=None):
     print("[pair] %d fault(s) compared: %d NEW with the test folder, %d pre-existing "
           "-- %.0f s" % (len(rows), n_new, n_pre, time.time() - t0))
     print("[pair] -> %s" % folder)
+    write_rerun_list(z4, os.path.join(folder, "RERUN_%s.txt" % label),
+                     [("REFERENCE", ref, proj_t), ("TEST", test, proj_t)])
     # EVERY SHEET THE PANEL WRITES, kept for the side-by-side workbook -- the
     # same builders, the same rows, so the two never disagree.
     def _safe(fn, *a):
@@ -906,6 +977,8 @@ def write_side_by_side(z4, ref, group):
                z4._POI_WIDTHS + [16], z4._xl_style_poi),
               ("10 Runs", uh, ur, uw, us)]
     z4.write_xlsx_multi(xp, sheets, legend=z4._XL_LEGEND, title_rows=title)
+    write_rerun_list(z4, os.path.join(d, "RERUN_%s.txt" % proj),
+                     [(rk, ref, proj)] + [(t, g["test"], proj) for g, t in zip(group, tags)])
     import csv
     for stem, hdr, rws in (("FAULTS", fh, fr), ("ELEMENTS", eh, er), ("POI", ph, pr),
                            ("SUMMARY_ALL", z4._SUMMARY_COLS + ["scenario"], _sum),
