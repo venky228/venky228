@@ -4451,6 +4451,20 @@ def _title_is_watched(title):
     nums = set(int(x) for x in re.findall(r"\d{3,}", title))
     return bool(nums & _watch_buses())
 
+def _strt_network_not_converged(tag):
+    """The 'Network not converged at TIME = ...' line PSS/E wrote during this
+       STRT, or "" when the initial network solution converged."""
+    pf = os.path.join(LOG_DIR, "%s-prog.txt" % tag)
+    try:
+        with open(pf, errors="replace") as fh:
+            for ln in fh:
+                if "Network not converged" in ln:
+                    return ln.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _suspect_counts(tag):
     pf = os.path.join(LOG_DIR, "%s-prog.txt" % tag)
     try:
@@ -4613,6 +4627,20 @@ def _assert_init_ok(tag, rc):
                 "computed on states that are not numbers"
                 % (len(nan), tag,
                    ", ".join("%s bus %s" % (m, b) for (m, b, _n, _w, _c) in nan[:4])))
+    # THE NETWORK SOLUTION INSIDE STRT DID NOT CONVERGE. PSS/E still returns
+    # ierr=0, but it does not flag STRT as executed, so every RUN afterwards
+    # is refused ("activity STRT needs to be executed", 003495) -- the fault,
+    # the trips and the reclose all "happen" against a dead simulation and
+    # the .out holds a header and nothing else. That is what 231 IronStar
+    # files were. The message is in the STRT progress output, so it is read
+    # here and the scenario fails at once, with the line PSS/E wrote.
+    _nc = _strt_network_not_converged(tag)
+    if _nc:
+        raise RuntimeError("STRT's network solution did NOT converge in %s -- \"%s\". "
+                           "PSS/E will refuse every RUN. This is the CASE (a machine, load or "
+                           "model that cannot be initialised on this dispatch), not the run: "
+                           "see logs\\%s-prog.txt and 00_INIT_NOT_CONVERGED.txt, and compare "
+                           "with the base case's own STRT output." % (tag, _nc, tag))
     total, watched = _suspect_counts(tag)
     if total:
         print("  [%s] %d system-wide INITIAL CONDITIONS SUSPECT (other regions -- informational)"
