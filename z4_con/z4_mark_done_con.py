@@ -841,6 +841,7 @@ def main(argv):
             proj = str(name or "").split("_")[0]
             rows = fault_rows(rdir, proj)
             sigfn = _row_sig_fn(key) if rows else None
+            tcl = tclear_of(rdir)
             hits = [x for x in _named
                     if os.path.isfile(os.path.join(od, x + ".out"))]
             if not hits:
@@ -861,7 +862,12 @@ def main(argv):
                       % (sid, mb))
                 if not write:
                     continue
-                txt = "tend=%.3f" % (float(PARTIAL_MIN_FRAC) * float(SIM_END_S))
+                # THE CLEARING TIME FIRST, as .done carries it. Without it
+                # the report phase has nothing to measure the fault criteria
+                # from: it refuses the file, or raises inside evaluate_case
+                # and takes the scoring shard down with it.
+                txt = ("" if tcl.get(sid) is None else repr(float(tcl[sid]))) + "\n"
+                txt += "tend=%.3f" % (float(PARTIAL_MIN_FRAC) * float(SIM_END_S))
                 if sigfn is not None and sid in rows:
                     try:
                         txt += "\nsig=%s" % sigfn(rows[sid])

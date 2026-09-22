@@ -22949,10 +22949,21 @@ def _mark_done(scen_id, tclear, tend=None):
         pass
     _write_text(_state_path(scen_id, "done"), txt)
 
-def _mark_partial(scen_id, tend):
+def _mark_partial(scen_id, tend, tclear=None):
     """<id>.partial: this run stopped early but is drawn and scored (see
-       SCORE_PARTIAL_RUNS). It is NOT a .done: SKIP_DONE still re-runs it."""
-    txt = "tend=%.3f" % float(tend)
+       SCORE_PARTIAL_RUNS). It is NOT a .done: SKIP_DONE still re-runs it.
+
+       THE CLEARING TIME GOES IN FIRST, exactly as .done carries it. Every
+       fault criterion is measured from that instant, and a marker without it
+       left the report phase with tclear=None -- which excluded the file, or
+       raised inside evaluate_case and took the whole scoring shard with it."""
+    if tclear is None:
+        try:
+            tclear = _tclear_from_faultlist(scen_id)
+        except Exception:
+            tclear = None
+    txt = ("" if tclear is None else repr(float(tclear))) + "\n"
+    txt += "tend=%.3f" % float(tend)
     if scen_id in _FAULT_SIG:
         txt += "\nsig=%s" % _FAULT_SIG[scen_id]
     _write_text(_state_path(scen_id, "partial"), txt)
@@ -28881,6 +28892,23 @@ def main():
             # loop, on the file about to be read.
             kind = "flat" if sid == "FLAT_RUN" else "fault"
             tc = None if kind == "flat" else _read_done_tclear(sid)
+            # A PARTIAL RUN HAS NO .done, SO IT HAS NO CLEARING TIME THERE.
+            #
+            # Every fault criterion is measured from the instant of clearing,
+            # and the marker that carries it is the .done. A scenario marked
+            # .partial has none, so tc came back None and the scorer either
+            # refused the file ("no recorded clearing time, falling back to the
+            # byte count") or died on it:
+            #     i_clr = idx_after(t, tclear + V_OVERSHOOT_BLANK_S)
+            #     TypeError: unsupported operand for +: 'NoneType' and 'float'
+            # -- which killed the whole shard, cost a full re-init, and left the
+            # same file waiting to kill it again. IronStar's F04..F07, F44 and
+            # F130 took shard 0 down nine times in ninety minutes that way.
+            #
+            # The fault list has the clearing time for every fault in it, which
+            # is where the plot pass already looks. So does this.
+            if kind != "flat" and tc is None:
+                tc = _tclear_from_faultlist(sid)
 
             # GATE 0 -- KNOWN-BAD FILES ONLY, and only by their marker.
             #

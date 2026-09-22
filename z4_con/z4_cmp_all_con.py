@@ -265,7 +265,7 @@ def _print_phase_times(total):
 #   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
 #   dyr_<value>\                              <- a full comparison per value
 
-PROJECTS   = ["SantaFe","IronStar","EmpirePrairie","EastFork"]                  # one project at a time for a sweep
+PROJECTS   = ["SantaFe","IronStar","EmpirePrairie","EastFork"]                # one project at a time for a sweep
                                             # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
 # -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
 # "each"      one study per project in PROJECTS, each alone in the case (as before)
