@@ -312,7 +312,7 @@ def _panel_projects():
         return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
     return list(PROJECTS)
 MODES      = ["spp"]                        # spp | con | table | custom | manual
-PIPELINE   = "all"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
+PIPELINE   = "compare"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
                                             #   "all"     simulate each value, then compare
                                             #   "compare" only reads disk -- SKIPS the sweep
 
@@ -377,16 +377,16 @@ ONE_PROJECT_AT_A_TIME = True    # with RUN_IN_PARALLEL = False: base THEN projec
 N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
 CORES_SPARE     = 2             # cores kept free for Windows / Excel / you (0-4)
 CORES_MAX       = 22            # ceiling on PSS/E sessions across BOTH cases; 0 = none; auto-clamped to the PC
-CORES_FOR_REPORTS = 6          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
+CORES_FOR_REPORTS = 12         # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
-FORCE_RESCORE   = True       # True = re-score every folder every launch (only after a criterion change)
+FORCE_RESCORE   = False      # True = re-score every folder every launch (only after a criterion change)
 RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
 SCORE_NO_CASE   = True          # True = shards score without loading the case (32-bit memory fix) -- keep
 # -- PLOTS: PDFs --
 MAKE_PLOTS      = None          # None = engine default (draw) | False = no PDFs (much faster)
-PLOT_MISSING_OUTS = True        # compare/missing run: draw PDFs for .out files that have none (slower)
+PLOT_MISSING_OUTS = False       # compare/missing run: draw PDFs for .out files that have none (slower)
 _LAUNCH_T0 = __import__("time").time()          # when this launch started (FORCE_REPLOT)
 FORCE_REPLOT    = False        # True = REDRAW every PDF from the .out files on this launch (PIPELINE = "compare" redraws without simulating)
 PLOT_SCOPE      = "compact"     # "compact" = SPP set + every violation (~5x fewer panels) | "full" = every kept channel
