@@ -1318,7 +1318,7 @@ def _cpu_count():
         return 4
 
 
-def _sim_core_budget():
+def _sim_core_budget(n_cases=2):
     """The ceiling on SIMULATION sessions: CORES_MAX less the reservation.
 
        Returns 0 when CORES_MAX is 0, which means "no ceiling" as before. Never
@@ -1326,6 +1326,15 @@ def _sim_core_budget():
        machine has would leave nothing running."""
     if not CORES_MAX:
         return 0
+    # THE RESERVE IS FOR THE OTHER CASE'S SCORING. CORES_FOR_REPORTS holds
+    # cores back so the base case can score its shards while the project case
+    # is still simulating. With ONE case on the machine -- a project-only run,
+    # a base-only run, or the case left after the handover -- nothing else can
+    # use those cores during the simulations, and 6 of 22 sat idle for hours.
+    # So a lone case simulates on the whole ceiling; scoring and plotting come
+    # after its runs and take their own budget then.
+    if int(n_cases or 1) <= 1:
+        return max(1, int(CORES_MAX))
     return max(1, int(CORES_MAX) - max(0, int(CORES_FOR_REPORTS or 0)))
 
 
@@ -1350,7 +1359,7 @@ def _plot_core_budget():
 def _total_sessions(setting, n_cases):
     """How many PSS/E sessions to run AT ONCE, across every case together."""
     n_cases = max(1, int(n_cases))
-    cap = _sim_core_budget()
+    cap = _sim_core_budget(n_cases)
     if isinstance(setting, str) and setting.strip().lower() == "auto":
         usable = _cpu_count() - max(0, int(CORES_SPARE))
         if cap:
@@ -16983,7 +16992,7 @@ def main():
                   "plotting" % (CORES_MAX, CORES_FOR_REPORTS))
             print("[compare]           -> %s simulation session(s) + %d scoring/plot "
                   "process(es), running together"
-                  % (_sim_core_budget() or "unlimited", _plot_core_budget()))
+                  % (_sim_core_budget(_nc) or "unlimited", _plot_core_budget()))
         # SAY THE PEAK, NOT THE SETTING. The number that matters is how many
         # PSS/E sessions can exist at one moment, and until CORES_MAX covered
         # the scoring that number was not the one in the panel.
