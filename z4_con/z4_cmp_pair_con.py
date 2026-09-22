@@ -387,7 +387,7 @@ def write_side_by_side(z4, ref, group):
     _rank = {z4.CLS_NEW: 3}
     for fid in sorted(order, key=lambda x: (len(x), x)):
         h = head[fid]
-        row = [fid, h[SC["planning_event"]], h[SC["fault_source"]], proj, os.path.basename(ref),
+        row = [fid, h[SC["planning_event"]], h[SC["fault_source"]], proj, _base(ref),
                h[SC["verdict_base"]]]
         worst, act, pre, allpass = "", False, False, True
         for t in tags:
