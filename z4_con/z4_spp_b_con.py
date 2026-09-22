@@ -29834,19 +29834,27 @@ def _plot_only_current(sid, out_path):
             return False
         if os.path.isfile(out_path) and os.path.getmtime(p) + 1.0 < os.path.getmtime(out_path):
             return False                      # re-simulated since: draw it again
-        # A MARKER LEFT BY THE OLD RULE. Before SCORE_PARTIAL_RUNS, an
-        # incomplete run was marked "NOT drawn" so no plotter picked it again.
-        # With partial scoring on, that same file is now wanted: the marker
-        # steps aside once, and the pass writes a fresh one after drawing it.
-        if SCORE_PARTIAL_RUNS:
+        # A MARKER LEFT BEFORE PARTIAL SCORING EXISTED STEPS ASIDE, ONCE.
+        #
+        # A scenario that stopped early was drawn (or refused) and marked
+        # .plotted so no plotter would pick it again. That marker is why a
+        # file with a PDF and no .done was never re-read once partial scoring
+        # arrived: F26 and F28 had their pages and no verdict, for ever.
+        #
+        # So a marker that does not carry the token below is ignored when the
+        # scenario has neither .done nor .partial -- one more read decides
+        # which it is. Every marker written after that read carries the token,
+        # so no file is re-read a second time and the pass cannot loop.
+        if (SCORE_PARTIAL_RUNS
+                and not os.path.isfile(_state_path(sid, "done"))
+                and not os.path.isfile(_state_path(sid, "partial"))):
             try:
                 with open(p) as _fh:
                     _txt = _fh.read()
-                if "incomplete run" in _txt and not os.path.isfile(
-                        os.path.join(PLOT_DIR, "%s_plots.pdf" % sid)):
+                if "partial-checked" not in _txt:
                     return False
             except Exception:
-                pass
+                return False
         _rb = float(os.environ.get("SPP_REPLOT_BEFORE") or 0)
         if _rb and os.path.getmtime(p) < _rb:
             return False                      # FORCE_REPLOT on a later launch
@@ -30025,6 +30033,7 @@ def plot_missing_outs():
                     try:
                         _write_text(_state_path(sid, "plotted"),
                                     "%s  NOT drawn: gave up after %d attempt(s), short .out"
+                                    "  [partial-checked]"
                                     % (time.strftime("%Y-%m-%d %H:%M:%S"), _att))
                     except Exception:
                         pass
@@ -30446,7 +30455,7 @@ def plot_missing_outs():
                 # queue for this study; deleting the .readfail gives it
                 # another chance.
                 _write_text(_state_path(sid, "plotted"),
-                            "NOT drawn: could not be read (%s)" % e)
+                            "NOT drawn: could not be read (%s)  [partial-checked]" % e)
                 _refused.append((sid, "could not be read: %s" % e,
                                  "delete %s.readfail and %s.plotted to try it again"
                                  % (os.path.basename(p), sid)))
@@ -30486,6 +30495,7 @@ def plot_missing_outs():
                     try:
                         _write_text(_state_path(sid, "plotted"),
                                     "%s  NOT drawn: incomplete run (t=%.2f of %.2f s)"
+                                    "  [partial-checked]"
                                     % (time.strftime("%Y-%m-%d %H:%M:%S"), t_end,
                                        float(SIM_END_S)))
                     except Exception:
@@ -30635,6 +30645,7 @@ def plot_missing_outs():
             try:
                 _write_text(_state_path(sid, "plotted"),
                             "%s  PDF written; no .done (incomplete or non-finite run)"
+                            "  [partial-checked]"
                             % time.strftime("%Y-%m-%d %H:%M:%S"))
                 print("[plot-missing] %s has its PDF but cannot be scored -- marked "
                       ".plotted so it is not picked again" % sid)
