@@ -16970,7 +16970,7 @@ def ensure_reports(mode_list):
     n = 0
     jobs = []
     for case in (CASE_BASE, CASE_TEST):
-        need, stale, thin, nomeas = [], [], [], []
+        need, stale, thin, nomeas, gaps = [], [], [], [], []
         for nm, proj, md, rep, n_out, _when in inventory(case):
             if md not in mode_list or not n_out:
                 continue
@@ -17075,6 +17075,54 @@ def ensure_reports(mode_list):
                 if 0 <= _n_meas and _n_den and _n_meas < REPORT_COVERAGE_MIN * _n_den:
                     nomeas.append((proj, _n_meas, _n_den))
                     need.append(proj)
+            # A SCORABLE SCENARIO WITH NO VERDICT IS UNFINISHED WORK, WHATEVER
+            # THE RATIO. The coverage test above asks "is at least 90 % scored";
+            # project SantaFe was at 268 of 292 and its six partial runs (a
+            # .partial marker, a full-size .out, no verdict) never got a
+            # scoring pass -- the folder was only re-merged, launch after
+            # launch, and every one of them read "not run in projects" in the
+            # comparison. Here every .out that carries a .done or .partial and
+            # has no verdict asks for a pass. Once, per version of the file:
+            # a scenario that a pass then still cannot score (NaN in its
+            # project channels, no clearing time anywhere) is stamped with the
+            # .out's mtime and not asked for again until the .out changes.
+            try:
+                _gap = []
+                _rd2 = results_dir(case, proj, md)
+                _od = os.path.join(_rd2, "outs")
+                _verd = read_criteria(_rd2, proj)[0] or {}
+                for _q in glob.glob(os.path.join(_od, "*.out")):
+                    _sid = os.path.splitext(os.path.basename(_q))[0]
+                    if _sid.upper().startswith("FLAT"):
+                        continue
+                    if _sel_tag() and not _id_selected(_sid):
+                        continue
+                    if not (os.path.isfile(os.path.join(_od, _sid + ".done"))
+                            or os.path.isfile(os.path.join(_od, _sid + ".partial"))):
+                        continue
+                    if os.path.isfile(_q + ".badout"):
+                        continue
+                    if norm_verdict((_verd.get(_sid) or {}).get("verdict")):
+                        continue
+                    _stamp = os.path.join(_od, _sid + ".scoretry")
+                    _omt = "%.0f" % os.path.getmtime(_q)
+                    try:
+                        if os.path.isfile(_stamp) and open(_stamp).read().strip() == _omt:
+                            continue          # asked once already for this .out
+                    except Exception:
+                        pass
+                    _gap.append((_sid, _stamp, _omt))
+            except Exception:
+                _gap = []
+            if _gap:
+                gaps.append((proj, [g[0] for g in _gap]))
+                for _sid, _stamp, _omt in _gap:
+                    try:
+                        with open(_stamp, "w") as _fh:
+                            _fh.write(_omt)
+                    except Exception:
+                        pass
+                need.append(proj)
         if FORCE_RESCORE and need:
             print("")
             print("[compare] FORCE_RESCORE: scoring all %d %s folder(s) again, however "
@@ -17116,6 +17164,18 @@ def ensure_reports(mode_list):
             print("[compare]     few scenarios it reached. Every base value, machine MW and POI")
             print("[compare]     power in the workbook comes from those files. Re-scoring the")
             print("[compare]     scenarios that have no measurements -- no simulation.")
+        if gaps:
+            print("")
+            print("[compare] %s: %d folder(s) hold finished or partial runs that have NO "
+                  "verdict yet:" % (case["key"], len(gaps)))
+            for proj, ids in gaps:
+                print("[compare]     %-16s %d scenario(s): %s%s"
+                      % (proj, len(ids), ", ".join(sorted(ids)[:10]),
+                         " ..." if len(ids) > 10 else ""))
+            print("[compare]     Each carries a .done or .partial marker and a .out, and the")
+            print("[compare]     report has nothing for it. Scoring them now -- no simulation.")
+            print("[compare]     One that still cannot be scored afterwards is not asked for")
+            print("[compare]     again until its .out changes (outs\\<id>.scoretry).")
         if not need:
             continue
         _banner("%s: %d project(s) need scoring -- .out with no report, or a report "
