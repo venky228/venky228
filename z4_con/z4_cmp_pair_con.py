@@ -247,7 +247,7 @@ def _folder_tag(folder):
     if parent and parent.lower() not in _STD_PARENTS and not re.match(r"^[A-Za-z]:$", parent):
         bits.append(parent)
     bits.append(sfx.strip("_") if sfx else "studied")
-    return "_".join(bits)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", "_".join(bits))
 
 
 def _label_for(ref, test):
