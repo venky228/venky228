@@ -684,6 +684,13 @@ def judge_folder(key, name, rdir, write=False, use_size=False):
         if os.path.isfile(os.path.join(outs_dir, sid + ".done")):
             n["already"] += 1
             continue
+        # A .partial IS A JUDGEMENT ALREADY MADE, and a stronger one than any
+        # test here: something read that file and found where it stopped. The
+        # size fallback would call a 91 MB run "full" and write .done over it,
+        # losing the PARTIAL label the report puts against it.
+        if os.path.isfile(os.path.join(outs_dir, sid + ".partial")):
+            n["already"] += 1
+            continue
         is_flat = sid.upper().startswith("FLAT")
         try:
             mb = os.path.getsize(p) / 1e6
