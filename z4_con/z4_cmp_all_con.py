@@ -2377,6 +2377,117 @@ _CRIT_TXT_CASE = re.compile(r"^CASE:\s+(\S+)\s+RESULT:\s+(\S+)")
 _CRIT_TXT_ROW  = re.compile(r"^\s+\[(\w+)\s*\]\s+(.+?)\s+:\s+(.*)$")
 
 
+
+# ---- THE WORKER'S OWN SCORE, WHEN THE MERGED REPORT LACKS THE FAULT ----------
+#
+# Every process that scores a scenario writes parts\SCEN_<id>.csv: the verdict,
+# the criterion rows and the violating elements, exactly what the merged
+# SPP_CRITERIA_REPORT / SPP_VIOLATIONS carry for that fault. A merged report can
+# lack a fault the folder has scored -- a forced rescore that ran while the
+# fault's .done marker was retired skipped it, and rewrote the report without
+# it. 190 base faults then read "CRASHED (no .done)" on the Not compared sheet
+# while their SCEN parts sat on disk with a verdict in the first line.
+#
+# So the criteria and violations readers fall back to the part for any fault
+# with an .out and no row in the merged file, the same way read_measurements
+# already falls back to SCEN_<id>_MEAS.csv. The part is used only when it is
+# at least as new as the .out it scored: a re-run .out with an older part is a
+# fault whose score is genuinely missing.
+_SCEN_PART_CACHE = {}
+
+
+def _scen_parts_for(rdir):
+    """{fault: (rows[(criterion, result, detail)], verdict, {kind: {element: value}})}
+       from parts\\SCEN_<id>.csv, for parts at least as new as their .out."""
+    if not rdir:
+        return {}
+    k = _side_key(rdir)
+    if k in _SCEN_PART_CACHE:
+        return _SCEN_PART_CACHE[k]
+    out = {}
+    pdir = os.path.join(rdir, "parts")
+    odir = os.path.join(rdir, "outs")
+    for p in glob.glob(os.path.join(pdir, "SCEN_*.csv")):
+        nm = os.path.basename(p)
+        if nm.upper().endswith("_MEAS.CSV") or ".tmp" in nm:
+            continue
+        sid = nm[len("SCEN_"):-len(".csv")]
+        try:
+            op = os.path.join(odir, sid + ".out")
+            if os.path.isfile(op) and os.path.getmtime(p) + 2.0 < os.path.getmtime(op):
+                continue                    # the .out was re-run after this score
+        except Exception:
+            pass
+        rows, verdict, vio, case = [], None, {}, None
+        try:
+            with csv_open(p) as fh:
+                rd = csv.reader(fh)
+                next(rd, None)
+                for r in rd:
+                    if len(r) < 3:
+                        continue
+                    kind = (r[0] or "").strip()
+                    case = case or (r[1] or "").strip() or sid
+                    if kind == "verdict":
+                        verdict = (r[2] or "").strip().upper()
+                    elif kind == "crit":
+                        rows.append(((r[2] or "").strip(), (r[3] or "").strip().upper()
+                                     if len(r) > 3 else "", (r[4] or "").strip() if len(r) > 4 else ""))
+                    elif kind.startswith("vio:"):
+                        el = (r[2] or "").strip()
+                        try:
+                            val = float((r[3] or "").strip()) if len(r) > 3 and (r[3] or "").strip() else float("nan")
+                        except ValueError:
+                            val = float("nan")
+                        if el:
+                            vio.setdefault(kind[4:], {})[el] = val
+        except Exception:
+            continue
+        if not rows:
+            continue
+        if norm_verdict(verdict) is None:
+            verdict = "PASS" if all(x[1] != "FAIL" for x in rows) else "FAIL"
+        out[case or sid] = (rows, verdict, vio)
+        if (case or sid) != sid:
+            out[sid] = out[case or sid]
+    _SCEN_PART_CACHE[k] = out
+    return out
+
+
+def _criteria_from_parts(rdir, proj, out):
+    """Add to `out` (read_criteria's table) every fault with an .out that the
+       merged report lacks but a SCEN part scores. Returns how many."""
+    parts = _scen_parts_for(rdir)
+    if not parts:
+        return 0
+    n = 0
+    have_out = _out_faults_in(rdir)
+    for fid, (rows, verdict, _vio) in parts.items():
+        if fid in out or (have_out and fid not in have_out):
+            continue
+        out[fid] = {"verdict": verdict, "rows": list(rows), "from_part": True}
+        n += 1
+    if n:
+        print("[compare] %s: %d fault(s) missing from the merged criteria report were "
+              "read from parts\\SCEN_<id>.csv -- the worker's own score, written when "
+              "the fault ran; the merged report there is incomplete, the comparison is not"
+              % (os.path.basename(rdir), n))
+    return n
+
+
+def _violations_from_parts(rdir, out):
+    """Add to `out` (read_violations' table) the violating elements of every
+       fault the merged violations file lacks but a SCEN part records."""
+    parts = _scen_parts_for(rdir)
+    n = 0
+    for fid, (_rows, _verdict, vio) in parts.items():
+        if fid in out or not vio:
+            continue
+        out[fid] = dict((k, dict(v)) for k, v in vio.items())
+        n += 1
+    return n
+
+
 def read_criteria(rdir, proj):
     """{fault: {"verdict": .., "rows": [(criterion, result, detail), ..]}}
 
@@ -2408,7 +2519,8 @@ def read_criteria(rdir, proj):
                                                       for x in out[case]["rows"])
                                         else "FAIL")
             if out:
-                return out, os.path.basename(csvp)
+                _np = _criteria_from_parts(rdir, proj, out)
+                return out, os.path.basename(csvp) + ((" + parts\\SCEN_*.csv (%d fault(s))" % _np) if _np else "")
         except Exception as e:
             print("[compare] could not read %s (%s) -- falling back to the .txt"
                   % (csvp, e))
@@ -2416,7 +2528,9 @@ def read_criteria(rdir, proj):
 
     txtp = rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj)
     if not txtp:
-        return {}, ""
+        out = {}
+        _np = _criteria_from_parts(rdir, proj, out)
+        return (out, "parts\\SCEN_*.csv (%d fault(s))" % _np) if _np else ({}, "")
     cur = None
     for line in _read_text(txtp).splitlines():
         m = _CRIT_TXT_CASE.match(line)
@@ -2442,7 +2556,8 @@ def read_criteria(rdir, proj):
                                                   for r in out[case]["rows"])
                                     else "FAIL")
             out[case]["recovered"] = True
-    return out, os.path.basename(txtp)
+    _np = _criteria_from_parts(rdir, proj, out)
+    return out, os.path.basename(txtp) + ((" + parts\\SCEN_*.csv (%d fault(s))" % _np) if _np else "")
 
 
 _VIO_TITLES = [
@@ -2572,6 +2687,7 @@ def read_violations(rdir, proj):
                         _VIO_EXTRA.setdefault(_side_key(rdir), {})[(fid, kind, el)] = (
                             _tm, _ab)
             if out:
+                _violations_from_parts(rdir, out)
                 return out, os.path.basename(csvp)
         except Exception as e:
             print("[compare] could not read %s (%s) -- falling back to the .txt"
@@ -2580,7 +2696,8 @@ def read_violations(rdir, proj):
 
     txtp = rfile(rdir, "SPP_VIOLATIONS", "txt", proj)
     if not txtp:
-        return {}, ""
+        out = {}
+        return (out, "parts\\SCEN_*.csv") if _violations_from_parts(rdir, out) else ({}, "")
     fid, kind = None, None
     for line in _read_text(txtp).splitlines():
         m = _VIO_TXT_FAULT.match(line)
@@ -2606,6 +2723,7 @@ def read_violations(rdir, proj):
                 except ValueError:
                     val = float("nan")
                 out[fid].setdefault(kind, {})[m.group(1)] = val
+    _violations_from_parts(rdir, out)
     return out, os.path.basename(txtp)
 
 
@@ -16080,6 +16198,7 @@ def verify_scoring_coverage(quiet=False):
                     # THE PARTS MAY ALREADY HOLD THEM -- merge and look again.
                     if _merge_one_folder(case, rdir):
                         _MEAS_CACHE.clear()
+                        _SCEN_PART_CACHE.clear()
                         outs, scored = _out_and_scored_sets(rdir, proj)
                         _after = sorted(outs - scored, key=_fault_key)
                         if len(_after) < len(missing):
@@ -16627,6 +16746,7 @@ def ensure_reports(mode_list):
     # THE MEASUREMENTS JUST CHANGED ON DISK. Anything read before this pass --
     # the live comparison's thread, the coverage test above -- is out of date.
     _MEAS_CACHE.clear()
+    _SCEN_PART_CACHE.clear()
     for key, rc in rcs:
         if rc not in (0, None):
             print("[compare] *** the %s report pass ended rc=%s -- anything it did"

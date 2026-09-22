@@ -308,7 +308,7 @@ def compare_pair(z4, ref, test, label=None):
     z4.results_dir = lambda case, p, m: ref if str(case.get("key")) == "BASE" else test
     z4._res_root = lambda case: os.path.dirname(ref if str(case.get("key")) == "BASE" else test)
     z4.discover_projects = lambda m: ([proj_t], [], [])
-    for name in ("_MEAS_CACHE", "_WANT_BUSES", "_WHERE"):
+    for name in ("_MEAS_CACHE", "_WANT_BUSES", "_WHERE", "_SCEN_PART_CACHE"):
         d = getattr(z4, name, None)
         if isinstance(d, dict):
             d.clear()
@@ -328,7 +328,7 @@ def compare_pair(z4, ref, test, label=None):
         print("[pair]   the .done marker check failed (%s) -- comparing as the folders are" % e)
     _prepare(z4, case_b, ref, sfx_r)
     _prepare(z4, case_t, test, sfx_t)
-    for name in ("_MEAS_CACHE", "_WANT_BUSES", "_WHERE", "_OUT_SET_CACHE"):
+    for name in ("_MEAS_CACHE", "_WANT_BUSES", "_WHERE", "_OUT_SET_CACHE", "_SCEN_PART_CACHE"):
         d = getattr(z4, name, None)
         if isinstance(d, dict):
             d.clear()
