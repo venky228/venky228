@@ -31166,6 +31166,16 @@ def finalize_report(produced, part=None, claim=False):
                                          "Result": "FAIL", "Detail": _d_div})
                                     verdicts[_sid] = "FAIL"
                                     all_rows.extend(_rows2)
+                                    # ON DISK LIKE ANY OTHER VERDICT. Without
+                                    # its SCEN_<id>.csv this scenario read
+                                    # "simulated, not scored" in the campaign
+                                    # grid and the comparison, and every later
+                                    # pass read the 88 MB file again.
+                                    try:
+                                        _save_scen_part(_sid, _rows2, "FAIL")
+                                    except Exception as _e:
+                                        print("  [score] could not save the per-scenario "
+                                              "part for %s (%s)" % (_sid, _e))
                                     if part is not None:
                                         try:
                                             write_report_part(part, all_rows,
@@ -31209,6 +31219,11 @@ def finalize_report(produced, part=None, claim=False):
                             _rows.append({"Case": _sid, "Criterion": _crit,
                                           "Result": _res, "Detail": _d_div})
                         all_rows.extend(_rows)
+                        try:
+                            _save_scen_part(_sid, _rows, "FAIL")
+                        except Exception as _e:
+                            print("  [score] could not save the per-scenario "
+                                  "part for %s (%s)" % (_sid, _e))
                         if part is not None:
                             try:
                                 write_report_part(part, all_rows, verdicts,
