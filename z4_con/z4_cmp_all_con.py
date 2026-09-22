@@ -15097,13 +15097,9 @@ def _start_plotter(case, proj, mode, slot, rdir=None):
     # narrowed the simulation and the comparison but not the drawing/scoring,
     # so "plot and score F26 and F28" had no way to be said: the pass read the
     # folder in its own order and those two waited for their turn.
-    try:
-        _sel = [str(x).strip().upper() for x in (ONLY_FAULTS or [])
-                if re.match(r"^F\d+$", str(x).strip(), re.I)]
-        if _sel and len(_sel) == len(ONLY_FAULTS or []):
-            env["SPP_PLOT_FAULTS"] = ",".join(_sel)
-    except Exception:
-        pass
+    _sel = _plot_selection()
+    if _sel:
+        env["SPP_PLOT_FAULTS"] = ",".join(sorted(_sel))
     env["SPP_PLOT_MISSING"] = "1"          # draw and exit; never reaches main()
     env["SPP_PLOT_FLEET"] = "1"            # per-file claims, not one-at-a-time
     env["SPP_PLOT_SLOT"] = str(slot)
@@ -15200,15 +15196,38 @@ def _pdf_is_current(out_path, pdf_path):
     return True
 
 
+def _plot_selection():
+    """The fault ids the plot pass is restricted to (ONLY_FAULTS, plain ids
+       only), or None for the whole folder. The plotters are told the same
+       list, so this and they must agree -- see _count_unplotted."""
+    try:
+        sel = [str(x).strip().upper() for x in (ONLY_FAULTS or [])
+               if re.match(r"^F\d+$", str(x).strip(), re.I)]
+        if sel and len(sel) == len(ONLY_FAULTS or []):
+            return set(sel)
+    except Exception:
+        pass
+    return None
+
+
 def _count_unplotted(rdir):
     """How many .out files in this results folder still need a PDF -- none,
-       an out-of-date one, or (FORCE_REPLOT) one drawn before this launch."""
+       an out-of-date one, or (FORCE_REPLOT) one drawn before this launch.
+
+       COUNTED OVER THE SAME FILES THE PLOTTERS ARE GIVEN. With ONLY_FAULTS
+       set the plotters see only those ids, so counting the whole folder left
+       the pass waiting for a PDF its own plotters were forbidden to draw:
+       three slots exited "without drawing" and retried to their cap while
+       the selected faults had already been dealt with."""
     od = os.path.join(rdir, "outs")
     pd = os.path.join(rdir, "plots")
+    sel = _plot_selection()
     n = 0
     try:
         for p in glob.glob(os.path.join(od, "*.out")):
             sid = os.path.splitext(os.path.basename(p))[0]
+            if sel is not None and sid.upper() not in sel:
+                continue
             if not _pdf_is_current(p, os.path.join(pd, "%s_plots.pdf" % sid)):
                 n += 1
     except Exception:
