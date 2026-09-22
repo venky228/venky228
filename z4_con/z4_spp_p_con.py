@@ -26379,23 +26379,60 @@ def _tclear_from_faultlist(scen_id):
        Returns None if the list cannot be read or the scenario is not in it."""
     if not _FAULT_CYCLES_CACHE["loaded"]:
         _FAULT_CYCLES_CACHE["loaded"] = True
+        # THE COLUMN IS clear_cycles. The lists this study writes and reads
+        # (load_faults_csv, the shared DISIS list) call the fault duration
+        # clear_cycles; this read "cycles", a column no list has, so it found
+        # nothing for any fault and every marker without a clearing time stayed
+        # without one -- "F91 partial, no clearing time" in the plot pass, and
+        # a TypeError on F158 that took the scoring shard down nine times.
+        #
+        # THE SHARED LIST FIRST, then the folder's own copy -- the order the
+        # launcher reads them. The copy can be empty (base EmpirePrairie's had
+        # 0 rows) while the shared list at the study root has every fault.
+        # The first list that names a fault decides it.
+        _lists = []
         try:
-            _p = os.path.join(FAULTS_DIR, "SPP_FAULTS.csv")
-            with open(_p, newline="") as _fh:
-                for _r in csv.DictReader(_fh):
-                    _fid = (_r.get("fault_id") or "").strip().upper()
-                    _cyc = (_r.get("cycles") or "").strip()
-                    if _fid and _cyc:
-                        try:
-                            _FAULT_CYCLES_CACHE["map"][_fid] = float(_cyc)
-                        except Exception:
-                            pass
+            if FAULTS_CSV:
+                _lists.append(FAULTS_CSV)
         except Exception:
             pass
+        _lists.append(os.path.join(FAULTS_DIR, "SPP_FAULTS.csv"))
+        for _p in _lists:
+            try:
+                if not os.path.isfile(_p):
+                    continue
+                with open(_p, newline="") as _fh:
+                    for _r in csv.DictReader(_fh):
+                        _fid = (_r.get("fault_id") or "").strip().upper()
+                        if not _fid or _fid in _FAULT_CYCLES_CACHE["map"]:
+                            continue
+                        _val = None
+                        for _k in ("tclear_s", "tclear"):        # seconds, if a list has it
+                            _s = (_r.get(_k) or "").strip()
+                            if _s:
+                                try:
+                                    _val = ("t", float(_s))
+                                except Exception:
+                                    _val = None
+                                break
+                        if _val is None:
+                            _cyc = ((_r.get("clear_cycles") or _r.get("cycles") or "")
+                                    .strip())
+                            if _cyc:
+                                try:
+                                    _val = ("c", float(_cyc))
+                                except Exception:
+                                    _val = None
+                        if _val is not None:
+                            _FAULT_CYCLES_CACHE["map"][_fid] = _val
+            except Exception:
+                continue
     _c = _FAULT_CYCLES_CACHE["map"].get(str(scen_id).strip().upper())
     if _c is None:
         return None
-    return float(PRE_FAULT_S) + _c / 60.0
+    if _c[0] == "t":
+        return float(_c[1])
+    return float(PRE_FAULT_S) + float(_c[1]) / 60.0
 
 
 def _read_done_tclear(scen_id):
@@ -26455,8 +26492,34 @@ def _reset_resume_state():
     # start that left them behind would hand the new run a queue where every
     # scenario is already taken by a worker that no longer exists -- and it
     # would sit out CLAIM_STALE_S per scenario discovering that.
-    for p in (glob.glob(os.path.join(OUT_DIR, "*.done"))
-              + glob.glob(os.path.join(OUT_DIR, "*.attempts"))
+    # THE FINISHED WORK STAYS UNLESS A FRESH START WAS ASKED FOR.
+    #
+    # This ran on EVERY snapshot rebuild -- FORCE_REBUILD, a flat run whose
+    # marker was missing, a collector change -- and a rebuild is not a decision
+    # to throw the study away. The base case rebuilt its snapshot on one launch
+    # (one worker, so the guard above let it through) and every .done in the
+    # folder went with it: 397 finished scenarios in EmpirePrairie alone read
+    # as never run, while the project case, which reused its snapshot, kept
+    # every marker. The .out files were still there; only the record that they
+    # were finished was gone, and the next launch set out to simulate them all
+    # again.
+    #
+    # z4_cmp_all_con.py says what it wants in SPP_FRESH_START -- "1" when its
+    # FRESH_START is on, "0" otherwise -- and only that explicit "1" clears the
+    # .done markers and .attempts counters here. The claims and .returns
+    # counters are this process's bookkeeping and are cleared regardless.
+    _fresh = ((os.environ.get("SPP_FRESH_START") or "").strip().lower()
+              in ("1", "true", "yes", "on"))
+    if _fresh:
+        _wipe = (glob.glob(os.path.join(OUT_DIR, "*.done"))
+                 + glob.glob(os.path.join(OUT_DIR, "*.attempts")))
+    else:
+        _wipe = []
+        print("[resume] snapshot rebuild: %d .done marker(s) and the .attempts counters "
+              "are KEPT -- no fresh start was asked for (SPP_FRESH_START is not 1), so "
+              "every scenario already finished stays finished"
+              % len(glob.glob(os.path.join(OUT_DIR, "*.done"))))
+    for p in (_wipe
               + glob.glob(os.path.join(OUT_DIR, "*.claim"))
               + glob.glob(os.path.join(OUT_DIR, "*.claim.stale*"))
               + glob.glob(os.path.join(OUT_DIR, "*.returns"))):
@@ -31234,6 +31297,24 @@ def finalize_report(produced, part=None, claim=False):
                       "channel set and are not re-audited (REPORT_AUDIT_MAX = %d; -1 = audit "
                       "every one)." % (REPORT_AUDIT_MAX, len(produced) - REPORT_AUDIT_MAX,
                                        REPORT_AUDIT_MAX))
+            # NO CLEARING TIME, NO SCORE -- AND NO CRASH. Every fault criterion
+            # is measured from the instant of clearing, and evaluate_case adds
+            # to tc; a None there was a TypeError that killed this shard, which
+            # was relaunched and died on the same file again (base EmpirePrairie
+            # F158, nine relaunches in ninety minutes). The fault lists are
+            # asked once more here, and a scenario none of them knows is set
+            # aside on the record with the reason -- not scored as anything.
+            if kind != "flat" and tc is None:
+                try:
+                    tc = _tclear_from_faultlist(_sid)
+                except Exception:
+                    tc = None
+            if kind != "flat" and tc is None:
+                print("  [score] %s: no clearing time in its marker or in any fault "
+                      "list -- set aside, not scored" % _sid)
+                nan_excluded.append((_sid, "no clearing time recorded anywhere (marker "
+                                           "and fault lists) -- cannot be scored"))
+                continue
             try:
                 rows, verdict = evaluate_case(p, kind, tc, kb)
                 if _nan_drop and rows:

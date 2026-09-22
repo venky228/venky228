@@ -339,6 +339,17 @@ if _envfs in ("1", "true", "yes", "on"):
 elif _envfs in ("0", "false", "no", "off"):
     FRESH_START = False
     print("[parallel] FRESH_START forced OFF from the environment -- resuming")
+# A LAUNCH DRIVEN BY z4_cmp_all_con.py STARTS OVER ONLY WHEN THE PANEL SAYS SO.
+# The panel sends SPP_STUDY_DIR with every launch, and SPP_FRESH_START=1 only
+# when its own FRESH_START is on. A True in THIS file cannot override that: the
+# base case once started over because of it while the project case resumed, and
+# that is a comparison of two different amounts of work.
+if (FRESH_START and (os.environ.get("SPP_STUDY_DIR") or "").strip()
+        and _envfs not in ("1", "true", "yes", "on")):
+    FRESH_START = False
+    print("[parallel] FRESH_START is on in this file, but the launch is driven by")
+    print("[parallel] z4_cmp_all_con.py and it did not ask for a fresh start -- resuming;")
+    print("[parallel] the .done/.attempts markers are kept")
 # ---- NEVER KILL A WORKER THAT IS STILL RUNNING -----------------------------------
 # A 30 s simulation with ~7,800 channels can take 30-45 minutes of wall clock, and
 # longer on a loaded machine or a machine with fewer cores. Every watchdog below

@@ -101,6 +101,8 @@ PROJECTS = []                          # WHICH PROJECTS TO MARK. Leave it empty
                                        # takes every project without asking.
 
 SIM_END_S        = 25.2                # the run length the study asked for
+PRE_FAULT_S      = 5.0                 # the fault is applied here; it clears
+                                       # PRE_FAULT_S + clear_cycles/60 later
 END_TOL_S        = 0.11                # within this of SIM_END_S = finished
 PARTIAL_MIN_FRAC = 0.80                # of SIM_END_S; shorter = no marker
 USE_SIZE         = False               # --use-size: allow the size fallback
@@ -450,20 +452,23 @@ def restore_stale(outs_dir, write=False):
     return n
 
 
-def tclear_of(rdir):
-    """{fault id: clearing time} from this folder's own fault list, so a marker
-       this script writes lets the report score the fault without re-reading
-       anything. PRE_FAULT_S + cycles/60, the study's own arithmetic."""
+def tclear_of(rdir, proj=""):
+    """{fault id: clearing time} from the fault lists in the order the launcher
+       reads them (the shared list at the study root, then the folder's own
+       copy; the first list that names a fault decides it), so a marker this
+       script writes lets the report score the fault without re-reading
+       anything. PRE_FAULT_S + clear_cycles/60, the study's own arithmetic.
+
+       The column is clear_cycles -- what the study writes and reads. This
+       read "cycles", which no list has, so every marker it wrote carried no
+       clearing time and the report had none to score the partial runs with."""
     out = {}
-    for name in ("SPP_FAULTS.csv",):
-        p = os.path.join(rdir, "faults", name)
-        if not os.path.isfile(p):
-            continue
+    for p in _fault_list_paths(rdir, proj):
         try:
             with open(p, newline="") as fh:
                 for r in csv.DictReader(fh):
                     fid = (r.get("fault_id") or "").strip()
-                    if not fid:
+                    if not fid or fid in out:
                         continue
                     for k in ("tclear_s", "tclear"):
                         v = (r.get(k) or "").strip()
@@ -474,10 +479,9 @@ def tclear_of(rdir):
                                 pass
                             break
                     else:
-                        cyc = (r.get("cycles") or "").strip()
-                        pre = (r.get("pre_fault_s") or "").strip() or "5.0"
+                        cyc = (r.get("clear_cycles") or r.get("cycles") or "").strip()
                         try:
-                            out[fid] = float(pre) + float(cyc) / 60.0
+                            out[fid] = float(PRE_FAULT_S) + float(cyc) / 60.0
                         except ValueError:
                             pass
         except Exception:
@@ -606,8 +610,8 @@ def judge_folder(key, name, rdir, write=False, use_size=False):
     lays = _layouts_in(outs_dir)
     scored = scored_ids(rdir)
     progd = progress_done_ids(rdir)
-    tcl = tclear_of(rdir)
     proj = str(name or "").split("_")[0]
+    tcl = tclear_of(rdir, proj)
     rows = fault_rows(rdir, proj)
     sigfn = _row_sig_fn(key) if rows else None
     med, tight = size_reference(outs_dir)
@@ -848,7 +852,7 @@ def main(argv):
             proj = str(name or "").split("_")[0]
             rows = fault_rows(rdir, proj)
             sigfn = _row_sig_fn(key) if rows else None
-            tcl = tclear_of(rdir)
+            tcl = tclear_of(rdir, proj)
             hits = [x for x in _named
                     if os.path.isfile(os.path.join(od, x + ".out"))]
             if not hits:
