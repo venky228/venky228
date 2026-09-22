@@ -385,11 +385,28 @@ def restore_stale(outs_dir, write=False):
         if prev is None or stamp > prev[0]:
             best[plain] = (stamp, p)
     n = 0
+    held = []
     for plain in sorted(best):
         stamp, p = best[plain]
         tgt = os.path.join(outs_dir, plain)
         if os.path.exists(tgt):
             continue
+        # A MARKER IS NOT RESTORED ON TOP OF A DIFFERENT RUN'S .out.
+        #
+        # The sweep that moved these aside then started simulating them again,
+        # and an interrupted run leaves a HALF-WRITTEN .out under the plain
+        # name. Its scenario's .out is therefore skipped above (the target
+        # exists) while its .done would come back -- a marker from the old
+        # COMPLETE run sitting beside a new truncated one, which every later
+        # step reads as a finished result. So a marker is held back whenever
+        # the .out beside it is not the one it was moved aside with.
+        stem, ext = os.path.splitext(plain)
+        if ext.lower() != ".out":
+            out_now = os.path.join(outs_dir, stem + ".out")
+            out_back = os.path.join(outs_dir, stem + ".out.stale_" + stamp)
+            if os.path.isfile(out_now) and not os.path.isfile(out_back):
+                held.append(plain)
+                continue
         print("   %-28s <- %s" % (plain, os.path.basename(p)))
         if write:
             try:
@@ -397,6 +414,14 @@ def restore_stale(outs_dir, write=False):
                 n += 1
             except Exception as e:
                 print("   %-28s could not be restored: %s" % (plain, e))
+    if held:
+        print("")
+        print("   HELD BACK -- their .out was re-simulated after the move, so this")
+        print("   marker describes a different run and is left where it is:")
+        for plain in held:
+            print("       %s" % plain)
+        print("   Those .out files are judged on their own time axis by an ordinary")
+        print("   run of this script (no --restore-stale).")
     return n
 
 
