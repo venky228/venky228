@@ -4246,6 +4246,8 @@ PLOT_SKIP_INCOMPLETE = _env_bool("SPP_PLOT_SKIP_INCOMPLETE", PLOT_SKIP_INCOMPLET
 # is judged on the record that exists; nothing after the stop is invented.
 SCORE_PARTIAL_RUNS = True
 SCORE_PARTIAL_RUNS = _env_bool("SPP_SCORE_PARTIAL", SCORE_PARTIAL_RUNS)
+KEEP_PARTIAL_RUNS  = True        # do not re-simulate a scenario that already has a scorable partial run
+KEEP_PARTIAL_RUNS  = _env_bool("SPP_KEEP_PARTIAL", KEEP_PARTIAL_RUNS)
 PARTIAL_MIN_FRAC   = 0.80        # of SIM_END_S: a run shorter than this has no post-clearing record worth judging
 PARTIAL_MIN_FRAC   = _env_float("SPP_PARTIAL_MIN_FRAC", PARTIAL_MIN_FRAC)
 PLOT_SKIP_GAVEUP = _env_bool("SPP_PLOT_SKIP_GAVEUP", PLOT_SKIP_GAVEUP)
@@ -26306,6 +26308,22 @@ def _is_done(scen_id, out_path):
        it, so an existing .done must not short-circuit the run."""
     if ONLY_MODE_RERUNS_DONE and _only_mode() and _wanted(scen_id):
         return False
+    # A SCORABLE PARTIAL RUN IS A RESULT, AND RE-RUNNING DESTROYS IT.
+    #
+    # .partial says this run stopped early but got past PARTIAL_MIN_FRAC of
+    # SIM_END_S, so it is drawn, scored and compared. It is not .done, so a
+    # PIPELINE = "all" sweep would simulate it again -- writing over the only
+    # copy of that record. The attempts these scenarios have left are the ones
+    # that already failed, so the likely outcome is a 23.7 s run replaced by an
+    # .out that dies at init, and a scored PARTIAL turned back into CRASHED.
+    # KEEP_PARTIAL_RUNS = False in the panel to try them again anyway.
+    if (KEEP_PARTIAL_RUNS and _is_partial(scen_id)
+            and os.path.isfile(out_path)
+            and not (ONLY_MODE_RERUNS_DONE and _only_mode() and _wanted(scen_id))):
+        print("  [resume] %s has a PARTIAL run on disk (%.2f s) -- kept and scored, "
+              "NOT re-run (KEEP_PARTIAL_RUNS)"
+              % (scen_id, _partial_tend(scen_id) or 0.0))
+        return True
     if not (RESUME_ON_RESTART and os.path.isfile(_state_path(scen_id, "done"))
             and os.path.isfile(out_path)):
         return False

@@ -265,7 +265,7 @@ def _print_phase_times(total):
 #   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
 #   dyr_<value>\                              <- a full comparison per value
 
-PROJECTS   = ["SantaFe"]                  # one project at a time for a sweep
+PROJECTS   = ["SantaFe","IronStar","EmpirePrairie","EastFork"]                  # one project at a time for a sweep
                                             # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
 # -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
 # "each"      one study per project in PROJECTS, each alone in the case (as before)
@@ -312,7 +312,7 @@ def _panel_projects():
         return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
     return list(PROJECTS)
 MODES      = ["spp"]                        # spp | con | table | custom | manual
-PIPELINE   = "compare"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
+PIPELINE   = "all"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
                                             #   "all"     simulate each value, then compare
                                             #   "compare" only reads disk -- SKIPS the sweep
 
@@ -377,7 +377,7 @@ ONE_PROJECT_AT_A_TIME = True    # with RUN_IN_PARALLEL = False: base THEN projec
 N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
 CORES_SPARE     = 2             # cores kept free for Windows / Excel / you (0-4)
 CORES_MAX       = 22            # ceiling on PSS/E sessions across BOTH cases; 0 = none; auto-clamped to the PC
-CORES_FOR_REPORTS = 16          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
+CORES_FOR_REPORTS = 6          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
@@ -392,7 +392,7 @@ FORCE_REPLOT    = False        # True = REDRAW every PDF from the .out files on 
 PLOT_SCOPE      = "compact"     # "compact" = SPP set + every violation (~5x fewer panels) | "full" = every kept channel
 PLOT_INRUN      = 1             # plotters trailing each running folder (1 = the old single plotter)
 PLOT_WORKERS    = 2             # plotters per case in the catch-up pass (0/1 = one)
-PLOT_TOTAL_MAX  = 6             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
+PLOT_TOTAL_MAX  = 3             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
 PLOT_ONE_PROJECT_AT_A_TIME = True   # True = finish one project's PDFs (base, then project case) before starting the next project's
 PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out stops before the end of the simulation (it did not run); False = draw it for diagnosis
 # ============================================================================
@@ -452,7 +452,7 @@ AUTO_REMERGE_STALE_PARTS = True
 VERIFY_SCORING_COVERAGE = True
 
 # PIPELINE, MODES -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
-RUN_CASES  = "proj"                         # "both" | "base" | "proj" -- which case to SIMULATE
+RUN_CASES  = "both"                         # "both" | "base" | "proj" -- which case to SIMULATE
 RUN_STUDIES = False                         # kept for the older settings; PIPELINE wins
 RUN_MISSING = False                         # same as PIPELINE = "missing"
 RUN_FLAT   = None                           # the no-fault initial-condition check (leave it on)
@@ -476,11 +476,10 @@ TRUNCATED_FRAC = 0.80                       # NO LONGER USED: a run's completene
 RESTORE_TRUNCATED_DONE = True               # give back every .done.truncated the old size rule took, unless its marker itself records a short run (tend=)
 SCORE_PARTIAL_RUNS = True                   # a run that stopped early but reached PARTIAL_MIN_FRAC of SIM_END_S is drawn and scored, and marked PARTIAL in the PDF, the criteria report and every comparison sheet
 PARTIAL_MIN_FRAC   = 0.80                   # of SIM_END_S; shorter runs stay CRASHED (no post-clearing record worth judging)
+KEEP_PARTIAL_RUNS  = True                   # PIPELINE = "all": do NOT simulate over a scenario that already holds a scorable PARTIAL run -- re-running overwrites its .out, and an attempt that dies at init replaces a 23.7 s record with nothing. False = try it again and accept that
 OUT_EMPTY_BYTES = 1048576                   # an .out under this holds no samples at all (a header at most) -- its .done is retired; this is 'the file is empty', not a size rule
 ONLY_EVENTS = []                            # [] = every event
-ONLY_FAULTS   = ["F02_previous","F15","F16","F26","F28","F33","F39","F62","F84",
-                 "F86","F87","F88","F89","F90","F91","F92","F93","F136","F159",
-                 "F162","F163","F164","F173","F174","F257","F258","F259","F262","F267"]                             # [] = every fault -- see the ONLY_FAULTS warning in the comparison
+ONLY_FAULTS   = []                             # [] = every fault -- see the ONLY_FAULTS warning in the comparison
 SEARCH_DEPTH = 4                            # how many folder levels below SEARCH_ROOT to look
 
 # ---- HOW MUCH EACH PLANT PUTS ON THE SYSTEM ----------------------------------
@@ -13814,6 +13813,7 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False)
     env["SPP_SLOTS_FILE"] = _slots_file_for(case["key"])
     env["SPP_SCORE_PARTIAL"] = "1" if SCORE_PARTIAL_RUNS else "0"
     env["SPP_PARTIAL_MIN_FRAC"] = repr(float(PARTIAL_MIN_FRAC))
+    env["SPP_KEEP_PARTIAL"] = "1" if KEEP_PARTIAL_RUNS else "0"
     if CORES_MAX_INCLUDES_REPORTS:
         # THE SAME SHARE, NOT A SECOND ONE. The scoring may use every session
         # this case was given, and not one more -- and it may not run while the

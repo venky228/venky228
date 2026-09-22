@@ -568,6 +568,9 @@ LICENCE_BACKOFF_MAX_S = 900.0
 MAX_LICENCE_FAILS     = 30      # per worker; after this it gives up with a note on what to do
 STARTUP_SILENT_S      = 900.0   # 15 min silent with NO claim = stuck at start (dialog / dead licence)
 OUT_MIN_BYTES         = 1048576  # an .out under this holds no samples (a header at most): not a finished run, whatever its marker says
+KEEP_PARTIAL_RUNS     = str(os.environ.get("SPP_KEEP_PARTIAL", "1")).strip().lower() \
+                        not in ("0", "false", "no", "off")
+                                # a scenario with a scorable .partial run is kept, not simulated over
 MAX_GROW_WORKERS      = 32      # hard cap on workers a handover may grow to (guards a stale/edited .spp_slots_*.txt)
 STARTUP_DEAD_S        = 600.0   # died within this many s of launch with no claim = a start failure
                                 # (was 180: the psseng.dll licence timeout is ~180 s, so
@@ -2126,9 +2129,20 @@ def _apply_skip_done(selected):
             continue
         if sigs:
             break
-    todo, done, gave_up, stale, empty = [], [], [], [], []
+    todo, done, gave_up, stale, empty, partial = [], [], [], [], [], []
     for sid in ids:
         _op = os.path.join(OUT_DIR, "%s.out" % sid)
+        # A SCORABLE PARTIAL RUN IS KEPT, NOT RE-RUN. Re-running writes over
+        # the only copy of a run that reached most of SIM_END_S and is already
+        # scored and compared, and the attempts left to it are the ones that
+        # already failed. KEEP_PARTIAL_RUNS = False in the panel to try again.
+        if (KEEP_PARTIAL_RUNS
+                and os.path.isfile(os.path.join(OUT_DIR, "%s.partial" % sid))
+                and os.path.isfile(_op)
+                and not os.path.isfile(os.path.join(OUT_DIR, "%s.done" % sid))):
+            partial.append(sid)
+            done.append(sid)
+            continue
         if (os.path.isfile(os.path.join(OUT_DIR, "%s.done" % sid))
                 and os.path.isfile(_op)):
             # AN EMPTY .out IS NOT A RESULT. IronStar came back with 231 .out
@@ -2159,6 +2173,10 @@ def _apply_skip_done(selected):
         print("[parallel] SKIP_DONE: %d scenario(s) carried a .done marker but their .out holds NO DATA"
               " (under %d KB) -- the run wrote nothing; moved aside as .stale and re-run: %s%s"
               % (len(empty), OUT_MIN_BYTES // 1024, ", ".join(empty[:8]), " ..." if len(empty) > 8 else ""))
+    if partial:
+        print("[parallel] SKIP_DONE: %d scenario(s) hold a PARTIAL run that is scored and compared"
+              " -- kept as they are, NOT re-run (KEEP_PARTIAL_RUNS): %s%s"
+              % (len(partial), ", ".join(partial[:8]), " ..." if len(partial) > 8 else ""))
     if stale:
         print("[parallel] SKIP_DONE: %d finished scenario(s) on disk were run for a DIFFERENT fault list"
               " (renumbered, or markers without a fingerprint) -- moved aside as .stale and re-run: %s%s"
