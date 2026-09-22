@@ -12838,7 +12838,36 @@ def fault_run(fault, idx=None, total=None):
     sys.stdout.flush()
     _assert_init_ok("FAULT_%s_strt" % fid, rc); _set_out(out)
     _set_sim_clock(0.0)
-    chk(_run_to(PRE_FAULT_S, SIM_END_S, "%s pre-flt" % fid), "run pre-fault")
+    _rc0 = _run_to(PRE_FAULT_S, SIM_END_S, "%s pre-flt" % fid)
+    _rc0 = _rc0[0] if isinstance(_rc0, (list, tuple)) else _rc0
+    if _rc0 not in (0, None):
+        # ONE MORE STRT BEFORE GIVING UP. The states are already at their
+        # initialised values, so a second STRT is seconds, and it is the
+        # documented way to clear an initialisation PSS/E did not accept.
+        print("  [%s] pre-fault RUN refused (ierr=%s) straight after strt_2 -- "
+              "running STRT once more" % (_ts(), _rc0)); sys.stdout.flush()
+        with capture_psse("FAULT_%s_strt2" % fid):
+            rc = psspy.strt_2([0, 1], out)
+        print("  [%s] second strt_2 returned (ierr=%s)" % (_ts(), rc))
+        _assert_init_ok("FAULT_%s_strt2" % fid, rc); _set_out(out)
+        _set_sim_clock(0.0)
+        _rc0 = _run_to(PRE_FAULT_S, SIM_END_S, "%s pre-flt" % fid)
+        _rc0 = _rc0[0] if isinstance(_rc0, (list, tuple)) else _rc0
+    if _rc0 not in (0, None):
+        # STRT SAID 0 AND RUN SAYS STRT NEVER HAPPENED. PSS/E reports strt_2
+        # as successful and then refuses every RUN with "activity STRT needs
+        # to be executed" (003495): the initialisation did not take -- the
+        # channel output file could not be set up, or the case would not
+        # initialise. Carrying on used to apply the fault, trip, reclose and
+        # "finish" with every step returning ierr=1 and an .out holding a
+        # header and nothing else, which the day's code then marked done.
+        # 231 IronStar faults came back that way. This is a failed
+        # initialisation, and it is reported as one.
+        raise RuntimeError("pre-fault RUN failed (ierr=%s) right after strt_2 -- the "
+                           "initialisation did not take (PSS/E 003495). See "
+                           "logs\\FAULT_%s_strt-prog.txt and FAULT_%s_strt2-prog.txt "
+                           "for STRT's own message." % (_rc0, fid, fid))
+    chk(_rc0, "run pre-fault")
 
     ftype  = (fault.get("type") or "3PH").upper()
     fault_cyc = float(fault.get("cycles", 16))
@@ -29300,7 +29329,7 @@ def main():
                       "a partial run and will be run again" % (_ts(), scen_id, _SIM_T, SIM_END_S))
                 _progress_record(scen_id, "INCOMPLETE", att,
                                  "stopped at t=%.2f s of %.2f s" % (_SIM_T, SIM_END_S))
-                _claim_release(scen_id)
+                _claim_release(scen_id, keep=False)     # back to the queue
                 fail_n += 1; return None, None
             if out and os.path.isfile(out):
                 _mark_done(scen_id, tc, tend=_SIM_T)          # <-- only NOW is it 'done'
