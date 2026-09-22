@@ -31017,7 +31017,20 @@ def finalize_report(produced, part=None, claim=False):
             _nan_drop, _nan_drop_note = [], ""
             if _nbf < 0 or _nbf > OUT_NAN_BYTES_MAX:
                 # WHERE the non-finite values are, not how many. See _nan_window.
-                _win = _nan_window(p, _read_done_tclear(_sid))
+                # THE CLEARING TIME THE LOOP ALREADY HAS, not the .done's alone.
+                # A .partial run has no .done, so this read None, _nan_window
+                # fell back to the byte count, and every base partial (SantaFe
+                # F86..F91, F162) was EXCLUDED as "non-finite, location not
+                # established" -- while the same window, measured from the
+                # clearing time the fault list gives, locates the non-finite
+                # tail after the run stopped and scores the record before it.
+                _tc_nan = tc
+                if _tc_nan is None and kind != "flat":
+                    try:
+                        _tc_nan = _tclear_from_faultlist(_sid)
+                    except Exception:
+                        _tc_nan = None
+                _win = _nan_window(p, _tc_nan)
                 if _win and _win[1] == 0:
                     print("  [score] %s holds %d non-finite value(s), ALL of them "
                           "inside the fault window and none at or after clearing. "
