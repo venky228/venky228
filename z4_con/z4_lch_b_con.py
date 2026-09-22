@@ -567,6 +567,7 @@ LICENCE_BACKOFF_S     = 60.0
 LICENCE_BACKOFF_MAX_S = 900.0
 MAX_LICENCE_FAILS     = 30      # per worker; after this it gives up with a note on what to do
 STARTUP_SILENT_S      = 900.0   # 15 min silent with NO claim = stuck at start (dialog / dead licence)
+OUT_MIN_BYTES         = 1048576  # an .out under this holds no samples (a header at most): not a finished run, whatever its marker says
 MAX_GROW_WORKERS      = 32      # hard cap on workers a handover may grow to (guards a stale/edited .spp_slots_*.txt)
 STARTUP_DEAD_S        = 600.0   # died within this many s of launch with no claim = a start failure
                                 # (was 180: the psseng.dll licence timeout is ~180 s, so
@@ -2056,7 +2057,7 @@ def _stale_aside(out_dir, sid, why):
     # the fault list was renumbered comes back carrying the previous list's
     # attempts -- at the cap it is refused on sight and reported GAVE-UP
     # without ever being simulated.
-    for ext in ("out", "done", "attempts"):
+    for ext in ("out", "done", "attempts", "plotted", "readfail", "badout"):
         p = os.path.join(out_dir, "%s.%s" % (sid, ext))
         if os.path.isfile(p):
             try:
@@ -2125,12 +2126,26 @@ def _apply_skip_done(selected):
             continue
         if sigs:
             break
-    todo, done, gave_up, stale = [], [], [], []
+    todo, done, gave_up, stale, empty = [], [], [], [], []
     for sid in ids:
+        _op = os.path.join(OUT_DIR, "%s.out" % sid)
         if (os.path.isfile(os.path.join(OUT_DIR, "%s.done" % sid))
-                and os.path.isfile(os.path.join(OUT_DIR, "%s.out" % sid))):
+                and os.path.isfile(_op)):
+            # AN EMPTY .out IS NOT A RESULT. IronStar came back with 231 .out
+            # files of 0 MB, every one carrying a .done marker: the writer
+            # produced nothing (a full disk, or a failed channel file) and the
+            # run of the day marked them done because the file existed. This is
+            # not a size rule -- no run of any length fits in under 1 MB, that
+            # is at most a header -- it is "the file has no data in it".
+            try:
+                _nodata = os.path.getsize(_op) < OUT_MIN_BYTES
+            except Exception:
+                _nodata = False
             want = sigs.get(sid)
-            if want and _done_sig(os.path.join(OUT_DIR, "%s.done" % sid)) != want:
+            if _nodata:
+                _stale_aside(OUT_DIR, sid, "empty")
+                empty.append(sid)
+            elif want and _done_sig(os.path.join(OUT_DIR, "%s.done" % sid)) != want:
                 _stale_aside(OUT_DIR, sid, "sig")
                 stale.append(sid)
             else:
@@ -2140,6 +2155,10 @@ def _apply_skip_done(selected):
         st = (prog.get(sid) or ("",))[0]
         if st in ("GAVE-UP", "ERROR", "FAILED"):
             gave_up.append(sid)
+    if empty:
+        print("[parallel] SKIP_DONE: %d scenario(s) carried a .done marker but their .out holds NO DATA"
+              " (under %d KB) -- the run wrote nothing; moved aside as .stale and re-run: %s%s"
+              % (len(empty), OUT_MIN_BYTES // 1024, ", ".join(empty[:8]), " ..." if len(empty) > 8 else ""))
     if stale:
         print("[parallel] SKIP_DONE: %d finished scenario(s) on disk were run for a DIFFERENT fault list"
               " (renumbered, or markers without a fingerprint) -- moved aside as .stale and re-run: %s%s"

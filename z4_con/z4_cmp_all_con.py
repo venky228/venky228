@@ -474,6 +474,7 @@ RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-m
 RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
 TRUNCATED_FRAC = 0.80                       # NO LONGER USED: a run's completeness is read from its .done marker (tend=), never from the .out size
 RESTORE_TRUNCATED_DONE = True               # give back every .done.truncated the old size rule took, unless its marker itself records a short run (tend=)
+OUT_EMPTY_BYTES = 1048576                   # an .out under this holds no samples at all (a header at most) -- its .done is retired; this is 'the file is empty', not a size rule
 ONLY_EVENTS = []                            # [] = every event
 ONLY_FAULTS = []                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
 SEARCH_DEPTH = 4                            # how many folder levels below SEARCH_ROOT to look
@@ -7481,6 +7482,10 @@ def _side_state(rdir, fid):
         mb = os.path.getsize(os.path.join(od, sid + ".out")) / 1048576.0
     except Exception:
         mb = 0.0
+    if mb * 1048576.0 < OUT_EMPTY_BYTES:
+        return "crashed", ("%s attempt(s), " % att if att else "") + (
+            "EMPTY .out (%d KB) -- the run wrote no data; it is re-run on the next launch"
+            % int(mb * 1024))
     if os.path.isfile(os.path.join(od, sid + ".done.truncated")):
         return "crashed", ("%s attempt(s), " % att if att else "") + (
             "%.0f MB .out, its .done was retired as short (.done.truncated) -- "
@@ -16460,7 +16465,10 @@ def retire_truncated_done(quiet=False):
             sid = os.path.splitext(os.path.basename(p))[0]
             if sid.upper().startswith("FLAT"):
                 continue                      # the flat run is meant to be short
-            sizes[sid] = True
+            try:
+                sizes[sid] = os.path.getsize(p)
+            except Exception:
+                sizes[sid] = None
         # THE FILE'S SIZE SAYS NOTHING. A folder holds runs monitored over 14
         # areas (~111 MB) beside the same runs over 20 areas (~90 MB), a
         # project run beside a base run, and every one is complete. Judged
@@ -16471,7 +16479,13 @@ def retire_truncated_done(quiet=False):
         # written by an engine that only ever marked a run it had completed.
 
         def _judge(sid, marker):
-            """(complete?, how) for one run -- from the marker alone."""
+            """(complete?, how) for one run -- from the marker, after one test
+               that is not a size rule: an .out with NO DATA in it (under 1 MB
+               is at most a header) is not a run, whatever the marker says.
+               IronStar had 231 of them, all marked done."""
+            z = sizes.get(sid)
+            if z is not None and z < OUT_EMPTY_BYTES:
+                return False, "no data in the .out (%d KB)" % (z // 1024)
             te = _marker_tend(marker)
             if te is not None and _t_full is not None:
                 return te >= _t_full, "tend=%.2f s" % te

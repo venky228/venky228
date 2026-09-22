@@ -14952,10 +14952,18 @@ def load_out(p, cache=True):
             _note_read_path(p, "dyntools-failed", time.time() - _t0)
             _why = str(_de)
             if "expected str instance" in _why:
-                _why += (" -- the .out header carries two channels with the SAME "
-                         "identifier, which this dyntools cannot decode. The engine "
-                         "now writes unique identifiers: re-simulate this fault "
-                         "(delete its .out and .done, or RUN_ONLY_FAULTS)")
+                try:
+                    _sz = os.path.getsize(p)
+                except Exception:
+                    _sz = -1
+                if 0 <= _sz < 1048576:
+                    _why += (" -- the file is EMPTY (%d bytes): the run wrote no data "
+                             "(a full disk, or the channel file failed to open). Its "
+                             ".done is void; the launcher re-runs it" % _sz)
+                else:
+                    _why += (" -- the header cannot be decoded: a truncated header, or "
+                             "two channels with the same identifier (the engine now "
+                             "writes unique ones). Re-simulate this fault")
             raise RuntimeError("dyntools could not read %s: %s" % (os.path.basename(p), _why))
         t = cd["time"]
         out = (t, {k: (str(cid[k]).strip(), cd[k]) for k in cid if k != "time"})
