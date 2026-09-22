@@ -889,11 +889,34 @@ def _wide_sheet(z4, group, tags, key, cols, rk):
             for c in shared:
                 if str(h[ix[c]]).strip() in ("", z4.EMPTY_CELL, "-") and str(r[ix[c]]).strip() not in ("", z4.EMPTY_CELL, "-"):
                     h[ix[c]] = r[ix[c]]
+    # THE BASE COLUMN SITS RIGHT BEFORE ITS OWN PROJECT COLUMNS: base_value |
+    # base, project_value | studied, project_value | gia ... so the numbers to
+    # be compared -- a bus voltage, a rotor angle, a machine's MW -- are read
+    # across one stretch of cells. A base column with no project counterpart
+    # (base_value_note) stays with the fault's own columns up front.
+    def _base_of(c):
+        for a, b in (("verdict_projects", "verdict_base"), ("projects_state", "base_state"),
+                     ("project_state", "base_state"), ("project_value", "base_value"),
+                     ("above_1.20_project_s", "above_1.20_base_s"),
+                     ("secs_above_1_20_project", "secs_above_1_20_base")):
+            if c == a and b in ix:
+                return b
+        if c.startswith("project ") and c.replace("project ", "base ", 1) in ix:
+            return c.replace("project ", "base ", 1)
+        return None
+    paired = set(b for b in (_base_of(c) for c in perrun) if b)
+    front = [c for c in shared if c not in paired]
     header = list(keys) + [("%s | %s" % (c, rk)) if (c.startswith("base") or c == "verdict_base") else c
-                           for c in shared]
+                           for c in front]
+    layout = []                                   # (column, None) or (base column, None) per cell
     for c in perrun:
+        b = _base_of(c)
+        if b:
+            header.append("%s | %s" % (b, rk))
+            layout.append((b, None))
         for t in tags:
             header.append("%s | %s" % (c, t))
+            layout.append((c, t))
     rows = []
 
     def _k(k):
@@ -901,13 +924,15 @@ def _wide_sheet(z4, group, tags, key, cols, rk):
         return ((m.group(1), int(m.group(2))) if m else ("~", 0),) + tuple(k)
     for k in sorted(order, key=_k):
         h = head[k]
-        row = list(k) + [h[ix[c]] for c in shared]
-        for c in perrun:
-            for t in tags:
+        row = list(k) + [h[ix[c]] for c in front]
+        for c, t in layout:
+            if t is None:
+                row.append(h[ix[c]])
+            else:
                 r = per[k].get(t)
                 row.append(r[ix[c]] if r is not None else "not in this run")
         rows.append([(z4.EMPTY_CELL if v in ("", None) else v) for v in row])
-    widths = [10] * len(keys) + [14] * len(shared) + [14] * (len(perrun) * len(tags))
+    widths = [10] * len(keys) + [14] * len(front) + [14] * len(layout)
     cls_cols = [i for i, hh in enumerate(header)
                 if hh.split(" | ")[0] in ("classification", "element_classification", "fault_classification", "who_caused_it")]
 
