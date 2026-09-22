@@ -848,6 +848,79 @@ def _long_sheet(z4, group, tags, key, cols):
     return rows
 
 
+# Columns that describe the fault / element or the REFERENCE side -- the same
+# in every run, so they appear once. Everything else is per run and is laid
+# out attribute-major: attr | run1, attr | run2 ... in adjacent columns.
+_SHARED = set(["project", "planning_event", "fault_source", "area", "hops_from_fault",
+               "hops_from_poi", "limit", "unit", "description", "POI", "measured",
+               "criterion", "element", "bus_number"])
+_KEYS = {"summary": ["fault"], "notrun": ["fault"], "poi": ["fault"],
+         "new_el": ["fault", "criterion", "element", "bus_number"],
+         "pre_el": ["fault", "criterion", "element", "bus_number"],
+         "detail": ["fault", "criterion", "element", "bus_number"]}
+
+
+def _is_shared(c):
+    c = str(c)
+    return c in _SHARED or c.startswith("base_") or c.startswith("base ") or c == "verdict_base" \
+        or c.startswith("above_1.20_base") or c.startswith("secs_above_1_20_base")
+
+
+def _wide_sheet(z4, group, tags, key, cols, rk):
+    """One panel sheet, every run side by side: the key and the shared /
+       reference columns once, then each per-run column repeated per run,
+       adjacent. A run that has no row for that key reads 'not in this run'."""
+    ix = dict((c, i) for i, c in enumerate(cols))
+    keys = _KEYS.get(key, ["fault"])
+    shared = [c for c in cols if c not in keys and _is_shared(c)]
+    perrun = [c for c in cols if c not in keys and not _is_shared(c)]
+    per, order, head = {}, [], {}
+    for g, t in zip(group, tags):
+        for r in (g.get(key) or []):
+            r = list(r) + [z4.EMPTY_CELL] * (len(cols) - len(r))
+            k = tuple(str(r[ix[c]]).strip() for c in keys)
+            if k not in per:
+                per[k] = {}
+                order.append(k)
+                head[k] = [z4.EMPTY_CELL] * len(cols)
+            per[k][t] = r
+            # the shared cells: the first run that has a real value fills them
+            h = head[k]
+            for c in shared:
+                if str(h[ix[c]]).strip() in ("", z4.EMPTY_CELL, "-") and str(r[ix[c]]).strip() not in ("", z4.EMPTY_CELL, "-"):
+                    h[ix[c]] = r[ix[c]]
+    header = list(keys) + [("%s | %s" % (c, rk)) if (c.startswith("base") or c == "verdict_base") else c
+                           for c in shared]
+    for c in perrun:
+        for t in tags:
+            header.append("%s | %s" % (c, t))
+    rows = []
+
+    def _k(k):
+        m = re.match(r"^([A-Za-z]*)(\d+)$", k[0])
+        return ((m.group(1), int(m.group(2))) if m else ("~", 0),) + tuple(k)
+    for k in sorted(order, key=_k):
+        h = head[k]
+        row = list(k) + [h[ix[c]] for c in shared]
+        for c in perrun:
+            for t in tags:
+                r = per[k].get(t)
+                row.append(r[ix[c]] if r is not None else "not in this run")
+        rows.append([(z4.EMPTY_CELL if v in ("", None) else v) for v in row])
+    widths = [10] * len(keys) + [14] * len(shared) + [14] * (len(perrun) * len(tags))
+    cls_cols = [i for i, hh in enumerate(header)
+                if hh.split(" | ")[0] in ("classification", "element_classification", "fault_classification", "who_caused_it")]
+
+    def _style(row):
+        vals = [str(row[i]) for i in cls_cols]
+        if any(v == z4.CLS_NEW or v.startswith(z4.CLS_NEW) for v in vals):
+            return 2
+        if any(v == z4.CLS_PRE or v.startswith(z4.CLS_PRE) for v in vals):
+            return 3
+        return None
+    return header, rows, widths, _style
+
+
 def _sbs_poi(z4, ref, group, tags, rk):
     """POI power per fault, wide: the reference totals, then each scenario's
        totals, new-plant and existing MW and the post-clearing minimum."""
@@ -940,15 +1013,14 @@ def write_side_by_side(z4, ref, group):
     eh, er, ew, es = _sbs_elements(z4, ref, group, tags, rk)
     ph, pr, pw, ps = _sbs_poi(z4, ref, group, tags, rk)
     uh, ur, uw, us = _sbs_runs(z4, ref, group, tags, rk)
-    # AND EVERY SHEET OF EVERY PAIR WORKBOOK, STACKED -- nothing the panel
-    # writes for one pair is missing from the workbook that holds them all.
-    # Same columns, same colour rules, plus the scenario tag in the last column.
-    _sum = _long_sheet(z4, group, tags, "summary", z4._SUMMARY_COLS)
-    _new = _long_sheet(z4, group, tags, "new_el", z4._COMPACT_COLS)
-    _pre = _long_sheet(z4, group, tags, "pre_el", z4._COMPACT_COLS)
-    _nc = _long_sheet(z4, group, tags, "notrun", z4._NOTRUN_COLS)
-    _det = _long_sheet(z4, group, tags, "detail", z4._REPORT_COLS)
-    _poi = _long_sheet(z4, group, tags, "poi", z4._POI_COLS)
+    # AND EVERY SHEET OF EVERY PAIR WORKBOOK, SIDE BY SIDE -- nothing the
+    # panel writes for one pair is missing from the workbook that holds them
+    # all, and every run's value sits next to the others' on the same row.
+    W = {}
+    for key, cols in (("summary", z4._SUMMARY_COLS), ("new_el", z4._COMPACT_COLS),
+                      ("pre_el", z4._COMPACT_COLS), ("notrun", z4._NOTRUN_COLS),
+                      ("detail", z4._REPORT_COLS)):
+        W[key] = _wide_sheet(z4, group, tags, key, cols, rk)
     out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
     lab = re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_SIDE_BY_SIDE_vs_%s" % (proj, rk))
     d = os.path.join(out_root, lab)
@@ -963,30 +1035,22 @@ def write_side_by_side(z4, ref, group):
     sheets = [("1 Faults", fh, fr, fw, fs),
               ("2 Elements", eh, er, ew, es),
               ("3 POI power", ph, pr, pw, ps),
-              ("4 Summary all runs", z4._SUMMARY_COLS + ["scenario"], _sum,
-               z4._SUMMARY_WIDTHS + [16], z4._xl_style_of_summary),
-              ("5 Introduces all runs", z4._COMPACT_COLS + ["scenario"], _new,
-               z4._COMPACT_WIDTHS + [16], z4._xl_style_compact),
-              ("6 Pre-existing all runs", z4._COMPACT_COLS + ["scenario"], _pre,
-               z4._COMPACT_WIDTHS + [16], z4._xl_style_compact),
-              ("7 Not compared all runs", z4._NOTRUN_COLS + ["scenario"], _nc,
-               z4._NOTRUN_WIDTHS + [16], z4._xl_style_of_notrun),
-              ("8 All detail all runs", z4._REPORT_COLS + ["scenario"], _det,
-               z4._REPORT_WIDTHS + [16], z4._xl_style_of),
-              ("9 POI power all runs", z4._POI_COLS + ["scenario"], _poi,
-               z4._POI_WIDTHS + [16], z4._xl_style_poi),
-              ("10 Runs", uh, ur, uw, us)]
+              ("4 Summary",) + W["summary"],
+              ("5 Project introduces",) + W["new_el"],
+              ("6 Pre-existing",) + W["pre_el"],
+              ("7 Not compared",) + W["notrun"],
+              ("8 All detail",) + W["detail"],
+              ("9 Runs", uh, ur, uw, us)]
     z4.write_xlsx_multi(xp, sheets, legend=z4._XL_LEGEND, title_rows=title)
     write_rerun_list(z4, os.path.join(d, "RERUN_%s.txt" % proj),
                      [(rk, ref, proj)] + [(t, g["test"], proj) for g, t in zip(group, tags)])
     import csv
     for stem, hdr, rws in (("FAULTS", fh, fr), ("ELEMENTS", eh, er), ("POI", ph, pr),
-                           ("SUMMARY_ALL", z4._SUMMARY_COLS + ["scenario"], _sum),
-                           ("INTRODUCES_ALL", z4._COMPACT_COLS + ["scenario"], _new),
-                           ("PREEXISTING_ALL", z4._COMPACT_COLS + ["scenario"], _pre),
-                           ("NOTCOMPARED_ALL", z4._NOTRUN_COLS + ["scenario"], _nc),
-                           ("DETAIL_ALL", z4._REPORT_COLS + ["scenario"], _det),
-                           ("POI_ALL", z4._POI_COLS + ["scenario"], _poi),
+                           ("SUMMARY", W["summary"][0], W["summary"][1]),
+                           ("INTRODUCES", W["new_el"][0], W["new_el"][1]),
+                           ("PREEXISTING", W["pre_el"][0], W["pre_el"][1]),
+                           ("NOTCOMPARED", W["notrun"][0], W["notrun"][1]),
+                           ("DETAIL", W["detail"][0], W["detail"][1]),
                            ("RUNS", uh, ur)):
         cp = os.path.join(d, "SIDE_BY_SIDE_%s_%s.csv" % (stem, lab))
         try:
@@ -998,9 +1062,9 @@ def write_side_by_side(z4, ref, group):
         except Exception as e:
             print("[pair] could not write %s: %s" % (cp, e))
     print("[pair] side by side (%s): %d fault row(s), %d element row(s), %d POI row(s), "
-          "%d summary / %d detail / %d not-compared row(s) across all runs -> %s"
-          % (" | ".join([rk] + tags), len(fr), len(er), len(pr), len(_sum), len(_det),
-             len(_nc), xp))
+          "%d summary / %d detail / %d not-compared row(s), every run in adjacent columns -> %s"
+          % (" | ".join([rk] + tags), len(fr), len(er), len(pr), len(W["summary"][1]),
+             len(W["detail"][1]), len(W["notrun"][1]), xp))
     return xp
 
 
