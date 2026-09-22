@@ -50,13 +50,12 @@ import subprocess
 # ============================================================================
 #  SETTINGS
 # ============================================================================
-REFERENCE = r""          # the folder every scenario is compared AGAINST, e.g. r"C:\KV\Base\results_base\SantaFe_spp"
-                         # "" with ALL_PROJECTS = True below: every Base\results_base\<proj>_spp in turn
-SCENARIOS = [            # the folders to compare against it, one report each; EMPTY with AUTO_SCENARIOS = True
-                         # below: every run of the project is found on its own, e.g.
-    # r"C:\KV\Projects\results_proj\SantaFe_spp",
-    # r"C:\KV\Projects\results_proj\Sep21_full gia\SantaFe_spp",
+REFERENCE = r"C:\KV\Base\results_base\SantaFe_spp"          # the folder every scenario is compared AGAINST
+SCENARIOS = [            # the folders to compare against it, one report each -- list every run you want in
+    r"C:\KV\Projects\results_proj\SantaFe_spp",
+    r"C:\KV\Projects\results_proj\Sep21_full gia\SantaFe_spp",
     # r"C:\KV\Projects\results_proj\SantaFe_spp_poi502",
+    # r"C:\KV\Base\results_base_OLDBASE\SantaFe_spp",            # another base run works too
 ]
 PAIRS = [                # explicit pairs when the reference differs per pair:
     # (r"C:\KV\Base\results_base\IronStar_spp", r"C:\KV\Projects\results_proj\IronStar_spp_poi214", "IronStar_GIA"),
@@ -64,10 +63,10 @@ PAIRS = [                # explicit pairs when the reference differs per pair:
 ]
 OUT_DIR = r""            # "" = <panel folder>\comparison_pairs
 SIDE_BY_SIDE = True      # also one workbook with every scenario that shares a reference side by side: reference | as studied | GIA | ... per fault
-AUTO_SCENARIOS = True    # SCENARIOS empty -> every results folder of the reference's project is compared:
+AUTO_SCENARIOS = False   # OFF: only the folders listed above are compared. True + SCENARIOS empty -> every results folder of the reference's project:
                          #   Projects\results_proj\<proj>_<mode>*, Projects\results_proj\<anything>\<proj>_<mode>*
                          #   and every other Base\results_base*\<proj>_<mode> (another base run) -- .old / __run copies skipped
-ALL_PROJECTS = True      # REFERENCE empty -> every Base\results_base\<proj>_<mode> is a reference in turn (all projects, all runs)
+ALL_PROJECTS = False     # OFF. True + REFERENCE empty + AUTO_SCENARIOS -> every Base\results_base\<proj>_<mode> is a reference in turn
 SCAN_ROOTS = [           # extra folders to look in for runs of the same project (each scanned one and two levels deep)
     # r"D:\archive\results_proj",
 ]
