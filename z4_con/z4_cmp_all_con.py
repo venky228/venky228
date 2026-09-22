@@ -265,7 +265,7 @@ def _print_phase_times(total):
 #   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
 #   dyr_<value>\                              <- a full comparison per value
 
-PROJECTS   = ["IronStar"]                  # one project at a time for a sweep
+PROJECTS   = ["SantaFe"]                  # one project at a time for a sweep
                                             # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
 # -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
 # "each"      one study per project in PROJECTS, each alone in the case (as before)
@@ -312,7 +312,7 @@ def _panel_projects():
         return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
     return list(PROJECTS)
 MODES      = ["spp"]                        # spp | con | table | custom | manual
-PIPELINE   = "all"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
+PIPELINE   = "compare"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
                                             #   "all"     simulate each value, then compare
                                             #   "compare" only reads disk -- SKIPS the sweep
 
@@ -377,11 +377,11 @@ ONE_PROJECT_AT_A_TIME = True    # with RUN_IN_PARALLEL = False: base THEN projec
 N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
 CORES_SPARE     = 2             # cores kept free for Windows / Excel / you (0-4)
 CORES_MAX       = 22            # ceiling on PSS/E sessions across BOTH cases; 0 = none; auto-clamped to the PC
-CORES_FOR_REPORTS = 6          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
+CORES_FOR_REPORTS = 16          # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
-FORCE_RESCORE   = False       # True = re-score every folder every launch (only after a criterion change)
+FORCE_RESCORE   = True       # True = re-score every folder every launch (only after a criterion change)
 RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
 SCORE_NO_CASE   = True          # True = shards score without loading the case (32-bit memory fix) -- keep
 # -- PLOTS: PDFs --
@@ -392,7 +392,7 @@ FORCE_REPLOT    = False        # True = REDRAW every PDF from the .out files on 
 PLOT_SCOPE      = "compact"     # "compact" = SPP set + every violation (~5x fewer panels) | "full" = every kept channel
 PLOT_INRUN      = 1             # plotters trailing each running folder (1 = the old single plotter)
 PLOT_WORKERS    = 2             # plotters per case in the catch-up pass (0/1 = one)
-PLOT_TOTAL_MAX  = 3             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
+PLOT_TOTAL_MAX  = 6             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
 PLOT_ONE_PROJECT_AT_A_TIME = True   # True = finish one project's PDFs (base, then project case) before starting the next project's
 PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out stops before the end of the simulation (it did not run); False = draw it for diagnosis
 # ============================================================================
@@ -478,7 +478,9 @@ SCORE_PARTIAL_RUNS = True                   # a run that stopped early but reach
 PARTIAL_MIN_FRAC   = 0.80                   # of SIM_END_S; shorter runs stay CRASHED (no post-clearing record worth judging)
 OUT_EMPTY_BYTES = 1048576                   # an .out under this holds no samples at all (a header at most) -- its .done is retired; this is 'the file is empty', not a size rule
 ONLY_EVENTS = []                            # [] = every event
-ONLY_FAULTS = []                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
+ONLY_FAULTS   = ["F02_previous","F15","F16","F26","F28","F33","F39","F62","F84",
+                 "F86","F87","F88","F89","F90","F91","F92","F93","F136","F159",
+                 "F162","F163","F164","F173","F174","F257","F258","F259","F262","F267"]                             # [] = every fault -- see the ONLY_FAULTS warning in the comparison
 SEARCH_DEPTH = 4                            # how many folder levels below SEARCH_ROOT to look
 
 # ---- HOW MUCH EACH PLANT PUTS ON THE SYSTEM ----------------------------------
@@ -15230,6 +15232,37 @@ def _count_unplotted(rdir):
                 continue
             if not _pdf_is_current(p, os.path.join(pd, "%s_plots.pdf" % sid)):
                 n += 1
+                continue
+            # A DRAWN FILE CAN STILL HAVE NO VERDICT, AND THAT IS ALSO WORK.
+            #
+            # F26 and F28 had .out, .done and a PDF, and no SCEN_<id>.csv. The
+            # count only ever asked about the PDF, so the folder looked
+            # finished, no plot/score pass was started on it, and both faults
+            # read "simulated, not scored" in the comparison every launch --
+            # including the launches made with FORCE_RESCORE = True, because
+            # nothing ever opened them.
+            #
+            # The condition matches the plot pass's own: a scenario with a
+            # marker, no part file, and a .plotted note that predates the
+            # partial/end-time rule (no token) is one more read away from a
+            # verdict. Once that read happens the note carries the token, so
+            # this cannot spin on a file that genuinely cannot be scored.
+            try:
+                if (os.path.isfile(os.path.join(od, sid + ".done"))
+                        or os.path.isfile(os.path.join(od, sid + ".partial"))):
+                    if not os.path.isfile(os.path.join(rdir, "parts",
+                                                       "SCEN_%s.csv" % sid)):
+                        _pl = os.path.join(od, sid + ".plotted")
+                        _tok = ""
+                        if os.path.isfile(_pl):
+                            try:
+                                _tok = open(_pl).read()
+                            except Exception:
+                                _tok = "endtime-checked"
+                        if "endtime-checked" not in _tok:
+                            n += 1
+            except Exception:
+                pass
     except Exception:
         pass
     return n
@@ -16479,6 +16512,207 @@ def retire_stale_pdfs(quiet=False):
     return n_moved
 
 
+_PART_LAY_CACHE = {}
+
+
+def _out_layouts_in(od):
+    """The packed reader's description of every channel set in this outs folder:
+       (stride, base, time offset, trailer), from its own OUT_LAYOUT*.txt."""
+    if od not in _PART_LAY_CACHE:
+        lays = []
+        try:
+            for q in sorted(glob.glob(os.path.join(od, "OUT_LAYOUT*.txt"))):
+                try:
+                    txt = open(q).read()
+                except Exception:
+                    continue
+                if not re.search(r"^verified\s*=\s*yes", txt, re.M):
+                    continue
+                m_s = re.search(r"^stride\s*=\s*(\d+)", txt, re.M)
+                m_b = re.search(r"^base\s*=\s*(\d+)", txt, re.M)
+                m_t = re.search(r"^off\s+time\s*=\s*(\d+)", txt, re.M)
+                m_r = re.search(r"^trailer\s*=\s*(\d+)", txt, re.M)
+                if m_s and m_b and m_t:
+                    lays.append((int(m_s.group(1)), int(m_b.group(1)),
+                                 int(m_t.group(1)),
+                                 int(m_r.group(1)) if m_r else 0))
+        except Exception:
+            pass
+        _PART_LAY_CACHE[od] = lays
+    return _PART_LAY_CACHE[od]
+
+
+def _out_end_seconds(od, path):
+    """The last simulated second in this .out, read with a few seeks, or None
+       when no layout of the folder fits it.
+
+       THE BYTE COUNT IS NOT A CRASH TEST. The project side carries more
+       channels than the base side, so an 87 MB run that reached 23.7 of
+       25.2 s is 'full size' in one folder and 'short' in the other, and
+       SantaFe's F86..F91 read CRASHED on the project side against PARTIAL on
+       the base side of the SAME fault. The time axis says what happened."""
+    import struct as _st
+    _f32 = _st.Struct("<f")
+    _u32 = _st.Struct("<I")
+
+    def _w(fh, idx):
+        try:
+            fh.seek(4 * idx)
+            b = fh.read(4)
+            if len(b) < 4:
+                return None
+            if (_u32.unpack(b)[0] >> 23) & 0xFF == 0xFF:      # NaN / Inf
+                return None
+            return _f32.unpack(b)[0]
+        except Exception:
+            return None
+
+    def _is_time(vals):
+        if len(vals) < 4 or any(v is None for v in vals):
+            return False
+        if not (-1.0 <= vals[0] <= 1.0):
+            return False
+        step = vals[1] - vals[0]
+        if not (1e-6 < step < 10.0):
+            return False
+        for a, b in zip(vals, vals[1:]):
+            d = b - a
+            if d < -1e-9 or d > max(10.0 * step, 1.0):
+                return False
+        return True
+
+    try:
+        words = os.path.getsize(path) // 4
+    except Exception:
+        return None
+    for stride, base, t_off, trailer in _out_layouts_in(od):
+        if stride <= 0:
+            continue
+        try:
+            fh = open(path, "rb")
+        except Exception:
+            continue
+        try:
+            head = [_w(fh, base + t_off + i * stride) for i in range(8)]
+            if not _is_time(head):
+                continue
+            step = head[1] - head[0]
+            n = (words - trailer - base - t_off) // stride
+            i = int(n) - 1
+            tries = 0
+            while i >= 0 and tries < 4096:
+                v = _w(fh, base + t_off + i * stride)
+                if v is not None and -1.0 <= v <= 1e6:
+                    p = _w(fh, base + t_off + (i - 1) * stride) if i else v - step
+                    if p is not None and -1e-6 <= (v - p) <= max(10.0 * step, 1.0):
+                        return v
+                i -= 1
+                tries += 1
+        finally:
+            try:
+                fh.close()
+            except Exception:
+                pass
+    return None
+
+
+def mark_partial_runs(quiet=False):
+    """Give a .partial marker to every .out that has no marker at all but whose
+       TIME AXIS shows it ran past PARTIAL_MIN_FRAC of SIM_END_S.
+
+       WITHOUT THIS the report reads "CRASHED (no .done: 87 MB partial .out)"
+       for a run that reached 23.7 of 25.2 s. The engine marks a partial run
+       when its plot pass reads the file, but a run the launcher gave up on
+       after MAX_SCENARIO_ATTEMPTS was refused by the old size gate and never
+       read, so no marker was ever written and the comparison dropped the
+       fault. The marker is what the scoring pass and every sheet look at, so
+       it is written here, from the data, before anything is scored.
+
+       Only files with NO .done and NO .partial are touched, and the marker
+       says who wrote it. Nothing is deleted and no .done is ever created --
+       a run that reached the end without a marker is the .done pass's job."""
+    if not SCORE_PARTIAL_RUNS:
+        return 0
+    try:
+        _end = float(SIM_END_S)
+    except Exception:
+        return 0
+    if not _end:
+        return 0
+    need = float(PARTIAL_MIN_FRAC) * _end
+    n_new = 0
+    n_full = 0
+    folders = []
+    for case in (CASE_BASE, CASE_TEST):
+        for proj in (list(PROJECTS) or [""]):
+            for mode in (list(MODES) or ["spp"]):
+                try:
+                    _dirs = _result_folders_for(case, proj, mode) or []
+                except Exception:
+                    _dirs = []
+                _dirs = list(_dirs) + [results_dir(case, proj, mode)]
+                _seen = set()
+                for _d in _dirs:
+                    if not _d or _d in _seen:
+                        continue
+                    _seen.add(_d)
+                    od = os.path.join(_d, "outs")
+                    if os.path.isdir(od) and od not in [f[1] for f in folders]:
+                        folders.append((case, od))
+    for case, od in folders:
+        found = []
+        for p in sorted(glob.glob(os.path.join(od, "*.out"))):
+            sid = os.path.splitext(os.path.basename(p))[0]
+            if sid.upper().startswith("FLAT"):
+                continue
+            if (os.path.isfile(os.path.join(od, sid + ".done"))
+                    or os.path.isfile(os.path.join(od, sid + ".partial"))):
+                continue
+            te = _out_end_seconds(od, p)
+            if te is None or te < need:
+                continue
+            if te >= _end - 0.11:
+                # A COMPLETE RUN IS NOT A PARTIAL ONE. Calling it PARTIAL in
+                # every sheet would be a lie, and .done has to carry the
+                # fault's fingerprint (sig=) or the launcher treats it as a
+                # marker for some other fault list and re-runs it. The plot
+                # pass writes that marker itself when it reads the file, and
+                # z4_mark_done_con.py writes it without PSS/E.
+                n_full += 1
+                continue
+            found.append((sid, te))
+        if not found:
+            continue
+        if not quiet:
+            print("")
+            print("[compare] %s: %d run(s) stopped early but got past %.0f%% of the"
+                  % (case.get("key", "?"), len(found), 100.0 * float(PARTIAL_MIN_FRAC)))
+            print("[compare] %.1f s run -- marked PARTIAL so they are scored and compared:"
+                  % _end)
+        for sid, te in found:
+            try:
+                with open(os.path.join(od, sid + ".partial"), "w") as fh:
+                    fh.write("tend=%.3f\nby=z4_cmp_all_con (time axis)\n" % te)
+                n_new += 1
+                if not quiet:
+                    print("[compare]     %-10s reached %.2f s of %.2f s" % (sid, te, _end))
+            except Exception as e:
+                if not quiet:
+                    print("[compare]     %-10s could not be marked: %s" % (sid, e))
+    if n_new and not quiet:
+        print("[compare] %d run(s) marked PARTIAL. They are scored on the record that"
+              % n_new)
+        print("[compare] exists and every sheet says PARTIAL RUN against them.")
+        print("")
+    if n_full and not quiet:
+        print("[compare] %d .out file(s) reach the end of the run but carry NO marker."
+              % n_full)
+        print("[compare] The plot pass writes their .done when it reads them; to mark")
+        print("[compare] them now, without PSS/E:  python z4_mark_done_con.py --write")
+        print("")
+    return n_new
+
+
 def retire_truncated_done(quiet=False):
     """Take back the .done markers that were written for runs which stopped early
        -- and give back the ones an earlier rule took by mistake.
@@ -17618,6 +17852,11 @@ def main():
         retire_truncated_done()
     except Exception as _e:
         print("[compare] could not check the .done markers against the .out sizes: %s" % _e)
+    # AND THE RUNS THAT STOPPED EARLY BUT GOT FAR ENOUGH TO JUDGE.
+    try:
+        mark_partial_runs()
+    except Exception as _e:
+        print("[compare] could not mark the partial runs: %s" % _e)
     n = ensure_reports(MODES)
     if not n:
         print("[compare] every folder with .out files already has its criteria report.")

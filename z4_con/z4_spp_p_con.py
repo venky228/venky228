@@ -33182,13 +33182,29 @@ def _plot_only_current(sid, out_path):
         # scenario has neither .done nor .partial -- one more read decides
         # which it is. Every marker written after that read carries the token,
         # so no file is re-read a second time and the pass cannot loop.
-        if (SCORE_PARTIAL_RUNS
-                and not os.path.isfile(_state_path(sid, "done"))
-                and not os.path.isfile(_state_path(sid, "partial"))):
+        _unjudged = (SCORE_PARTIAL_RUNS
+                     and not os.path.isfile(_state_path(sid, "done"))
+                     and not os.path.isfile(_state_path(sid, "partial")))
+        # AND A FINISHED RUN THAT WAS NEVER SCORED STEPS ASIDE TOO.
+        #
+        # F26 and F28 had .out, .done and a PDF -- and no verdict. The plotted
+        # marker said "nothing more to be got from this file", so every pass
+        # skipped them, FORCE_RESCORE never reached them (it deletes the part
+        # files of the scenarios a pass PRODUCES, and this one was never
+        # produced), and both read "simulated, not scored" in the comparison
+        # launch after launch. A scenario with no SCEN_<id>.csv has no verdict,
+        # whatever its PDF says, so it is read once more.
+        _unscored = False
+        try:
+            _unscored = (SCORE_AT_RUN_TIME
+                         and not os.path.isfile(_scen_part_path(sid)))
+        except Exception:
+            _unscored = False
+        if _unjudged or _unscored:
             try:
                 with open(p) as _fh:
                     _txt = _fh.read()
-                if "partial-checked" not in _txt:
+                if "endtime-checked" not in _txt:
                     return False
             except Exception:
                 return False
@@ -33198,6 +33214,117 @@ def _plot_only_current(sid, out_path):
     except Exception:
         return False
     return True
+
+
+_OUT_TIME_LAY = {"lays": None}
+
+
+def _out_layouts_quick():
+    """The packed reader's own description of every channel set in this folder:
+       (stride, base, time offset, trailer). Parsed from OUT_LAYOUT*.txt, which
+       a plot pass writes once a file of that set has been read in full."""
+    if _OUT_TIME_LAY["lays"] is None:
+        lays = []
+        try:
+            for q in sorted(glob.glob(os.path.join(OUT_DIR, "OUT_LAYOUT*.txt"))):
+                try:
+                    txt = open(q).read()
+                except Exception:
+                    continue
+                if not re.search(r"^verified\s*=\s*yes", txt, re.M):
+                    continue
+                m_s = re.search(r"^stride\s*=\s*(\d+)", txt, re.M)
+                m_b = re.search(r"^base\s*=\s*(\d+)", txt, re.M)
+                m_t = re.search(r"^off\s+time\s*=\s*(\d+)", txt, re.M)
+                m_r = re.search(r"^trailer\s*=\s*(\d+)", txt, re.M)
+                if m_s and m_b and m_t:
+                    lays.append((int(m_s.group(1)), int(m_b.group(1)),
+                                 int(m_t.group(1)),
+                                 int(m_r.group(1)) if m_r else 0))
+        except Exception:
+            pass
+        _OUT_TIME_LAY["lays"] = lays
+    return _OUT_TIME_LAY["lays"]
+
+
+def _out_end_seconds(path):
+    """THE LAST SIMULATED SECOND IN THIS .out, READ WITH A FEW SEEKS -- or None
+       when no layout of this folder fits the file.
+
+       SIZE IS NOT A CRASH TEST. A folder holds more than one channel set (a
+       14-area run and a 20-area run of the same fault differ by 20 MB, both
+       complete), and the project side carries more channels than the base
+       side, so the same 87 MB file is 'full' in one folder and 'short' in the
+       other. Judged on the median, SantaFe's 85-88 MB project runs -- which
+       had reached 23.7 of 25.2 s -- were refused unread and reported CRASHED
+       against a base side that read PARTIAL for the same fault. The time axis
+       says what actually happened, and costs a handful of seeks."""
+    import struct as _st
+    _f32 = _st.Struct("<f")
+    _u32 = _st.Struct("<I")
+
+    def _w(fh, idx):
+        try:
+            fh.seek(4 * idx)
+            b = fh.read(4)
+            if len(b) < 4:
+                return None
+            if (_u32.unpack(b)[0] >> 23) & 0xFF == 0xFF:      # NaN / Inf
+                return None
+            return _f32.unpack(b)[0]
+        except Exception:
+            return None
+
+    def _is_time(vals):
+        if len(vals) < 4 or any(v is None for v in vals):
+            return False
+        if not (-1.0 <= vals[0] <= 1.0):
+            return False
+        step = vals[1] - vals[0]
+        if not (1e-6 < step < 10.0):
+            return False
+        for a, b in zip(vals, vals[1:]):
+            d = b - a
+            if d < -1e-9 or d > max(10.0 * step, 1.0):
+                return False
+        return True
+
+    try:
+        words = os.path.getsize(path) // 4
+    except Exception:
+        return None
+    for stride, base, t_off, trailer in _out_layouts_quick():
+        if stride <= 0:
+            continue
+        try:
+            fh = open(path, "rb")
+        except Exception:
+            continue
+        try:
+            head = [_w(fh, base + t_off + i * stride) for i in range(8)]
+            if not _is_time(head):
+                continue                      # this layout is not this file's
+            step = head[1] - head[0]
+            n = (words - trailer - base - t_off) // stride
+            i = int(n) - 1
+            tries = 0
+            # Walk back over the trailer and the half-written record the run
+            # was cut off inside; the sample before the last must be one step
+            # behind it, or it is not the time column.
+            while i >= 0 and tries < 4096:
+                v = _w(fh, base + t_off + i * stride)
+                if v is not None and -1.0 <= v <= 1e6:
+                    p = _w(fh, base + t_off + (i - 1) * stride) if i else v - step
+                    if p is not None and -1e-6 <= (v - p) <= max(10.0 * step, 1.0):
+                        return v
+                i -= 1
+                tries += 1
+        finally:
+            try:
+                fh.close()
+            except Exception:
+                pass
+    return None
 
 
 def _out_looks_complete(path, frac=0.90):
@@ -33310,7 +33437,20 @@ def plot_missing_outs():
         pdf = os.path.join(PLOT_DIR, "%s_plots.pdf" % sid)
         had_done = os.path.isfile(_state_path(sid, "done"))
         had_pdf = _pdf_current(sid)
-        if had_pdf and (had_done or _plot_only_current(sid, p)):
+        # DONE AND DRAWN IS NOT THE SAME AS SCORED. F26 and F28 sat here with
+        # .out, .done and a PDF and no SCEN_<id>.csv: this line skipped them
+        # before any gate below could look, so "simulated, not scored" survived
+        # every launch, FORCE_RESCORE included (it re-scores what a pass
+        # PRODUCES, and these were never produced). A finished run with no
+        # verdict is read once more; _plot_only_current's token then stops it
+        # being read again if that read still cannot score it.
+        _done_and_scored = had_done
+        try:
+            if had_done and SCORE_AT_RUN_TIME and not os.path.isfile(_scen_part_path(sid)):
+                _done_and_scored = False
+        except Exception:
+            _done_and_scored = had_done
+        if had_pdf and (_done_and_scored or _plot_only_current(sid, p)):
             # NOTHING LEFT FOR THIS ONE.
             #
             # A .done marker is not the only way to be finished. A scenario
@@ -33328,7 +33468,13 @@ def plot_missing_outs():
             print("[plot-missing] %-10s no .done marker -- PLOT_ONLY_DONE is on, "
                   "skipped" % sid)
             continue
-        if not had_done and PLOT_SKIP_GAVEUP:
+        if (not had_done and PLOT_SKIP_GAVEUP and SCORE_PARTIAL_RUNS
+                and _is_partial(sid)):
+            # ALREADY JUDGED A PARTIAL. A .partial marker is a read of the time
+            # axis that said this run went far enough to score. The attempt
+            # counter below must not take that back.
+            pass
+        elif not had_done and PLOT_SKIP_GAVEUP:
             # GIVEN UP means the study tried MAX_SCENARIO_ATTEMPTS times and
             # stopped. Its .out is whatever had been written when the last
             # attempt died -- a partial simulation, and a PDF of one sitting
@@ -33352,8 +33498,26 @@ def plot_missing_outs():
                 # CRASHED while the base side of the same fault read PARTIAL,
                 # because the project .out files are bigger (more channels) so
                 # the same 85 MB is a smaller fraction of their median.
-                _frac = min(0.90, float(PARTIAL_MIN_FRAC)) if SCORE_PARTIAL_RUNS else 0.90
-                _full = _out_looks_complete(p, frac=_frac)
+                # THE TIME AXIS FIRST, THE BYTE COUNT ONLY IF IT CANNOT BE READ.
+                # The size test compares against the median of the files that
+                # ARE marked done in this folder, and in a folder where most
+                # runs crashed at 21 MB, or which holds two channel sets, that
+                # median means nothing. _out_end_seconds reads the run's own
+                # last second with a few seeks.
+                _te = _out_end_seconds(p)
+                if _te is not None:
+                    _need = (float(PARTIAL_MIN_FRAC) if SCORE_PARTIAL_RUNS
+                             else 1.0) * float(SIM_END_S) - 0.11
+                    _full = ("time axis reaches %.2f s of %.2f s"
+                             % (_te, float(SIM_END_S))) if _te >= _need else ""
+                    if not _full:
+                        print("[plot-missing] %-10s stopped at %.2f s of %.2f s -- "
+                              "under the %.0f%% partial rule"
+                              % (sid, _te, float(SIM_END_S),
+                                 100.0 * float(PARTIAL_MIN_FRAC)))
+                else:
+                    _frac = min(0.90, float(PARTIAL_MIN_FRAC)) if SCORE_PARTIAL_RUNS else 0.90
+                    _full = _out_looks_complete(p, frac=_frac)
                 if _full:
                     print("[plot-missing] %-10s GAVE UP after %d attempt(s) but its .out is "
                           "full size (%s) -- read, and marked done if the time axis "
@@ -33370,7 +33534,7 @@ def plot_missing_outs():
                     try:
                         _write_text(_state_path(sid, "plotted"),
                                     "%s  NOT drawn: gave up after %d attempt(s), short .out"
-                                    "  [partial-checked]"
+                                    "  [endtime-checked]"
                                     % (time.strftime("%Y-%m-%d %H:%M:%S"), _att))
                     except Exception:
                         pass
@@ -33792,7 +33956,7 @@ def plot_missing_outs():
                 # queue for this study; deleting the .readfail gives it
                 # another chance.
                 _write_text(_state_path(sid, "plotted"),
-                            "NOT drawn: could not be read (%s)  [partial-checked]" % e)
+                            "NOT drawn: could not be read (%s)  [endtime-checked]" % e)
                 _refused.append((sid, "could not be read: %s" % e,
                                  "delete %s.readfail and %s.plotted to try it again"
                                  % (os.path.basename(p), sid)))
@@ -33832,7 +33996,7 @@ def plot_missing_outs():
                     try:
                         _write_text(_state_path(sid, "plotted"),
                                     "%s  NOT drawn: incomplete run (t=%.2f of %.2f s)"
-                                    "  [partial-checked]"
+                                    "  [endtime-checked]"
                                     % (time.strftime("%Y-%m-%d %H:%M:%S"), t_end,
                                        float(SIM_END_S)))
                     except Exception:
@@ -33982,7 +34146,7 @@ def plot_missing_outs():
             try:
                 _write_text(_state_path(sid, "plotted"),
                             "%s  PDF written; no .done (incomplete or non-finite run)"
-                            "  [partial-checked]"
+                            "  [endtime-checked]"
                             % time.strftime("%Y-%m-%d %H:%M:%S"))
                 print("[plot-missing] %s has its PDF but cannot be scored -- marked "
                       ".plotted so it is not picked again" % sid)
