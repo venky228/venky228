@@ -15257,6 +15257,26 @@ def _unplotted_list(rdir):
 
 
 @_timed("plotting")
+def _plot_cases(pipeline):
+    """The cases the plot/score pass must visit.
+
+       RUN_CASES SAYS WHICH CASE TO *SIMULATE*, AND NOTHING IS SIMULATED IN A
+       COMPARE PASS. Scoping the plot pass by it meant that with
+       RUN_CASES = "proj" the BASE folders were never drawn or scored: their
+       partial runs kept no marker, so the comparison read them as CRASHED
+       while the project side of the same fault read PARTIAL. The comparison
+       reads BOTH sides, so both sides are scored -- in compare mode always,
+       and elsewhere for whichever case is being run."""
+    if str(pipeline or "").strip().lower() == "compare":
+        return [CASE_BASE, CASE_TEST]
+    cases = []
+    if RUN_CASES in ("both", "base"):
+        cases.append(CASE_BASE)
+    if RUN_CASES in ("both", "proj"):
+        cases.append(CASE_TEST)
+    return cases or [CASE_BASE, CASE_TEST]
+
+
 def plot_missing_everywhere(pipeline, after_runs=False):
     """Draw every missing PDF, in ROUNDS, with fewer plotters each time.
 
@@ -15448,17 +15468,13 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None):
         # So the pass runs again once the simulations are over, where "every
         # .out without a PDF" means exactly what it says.
         n = 0
-        for _c in ([CASE_BASE] if RUN_CASES in ("both", "base") else []) + \
-                  ([CASE_TEST] if RUN_CASES in ("both", "proj") else []):
+        for _c in _plot_cases(pipeline):
             for _p in (list(PROJECTS) or [""]):
                 for _m in (list(MODES) or ["spp"]):
                     n += _count_unplotted(results_dir(_c, _p, _m))
         if not n:
             return 0
-    cases = []
-    if RUN_CASES in ("both", "base"): cases.append(CASE_BASE)
-    if RUN_CASES in ("both", "proj"): cases.append(CASE_TEST)
-    if not cases: cases = [CASE_BASE, CASE_TEST]
+    cases = _plot_cases(pipeline)
     projs = list(PROJECTS) or [""]
     modes = list(MODES) or ["spp"]
     print("")
