@@ -477,6 +477,7 @@ RESTORE_TRUNCATED_DONE = True               # give back every .done.truncated th
 SCORE_PARTIAL_RUNS = True                   # a run that stopped early but reached PARTIAL_MIN_FRAC of SIM_END_S is drawn and scored, and marked PARTIAL in the PDF, the criteria report and every comparison sheet
 PARTIAL_MIN_FRAC   = 0.80                   # of SIM_END_S; shorter runs stay CRASHED (no post-clearing record worth judging)
 KEEP_PARTIAL_RUNS  = True                   # PIPELINE = "all": do NOT simulate over a scenario that already holds a scorable PARTIAL run -- re-running overwrites its .out, and an attempt that dies at init replaces a 23.7 s record with nothing. False = try it again and accept that
+RUN_ONLY_MISSING_OUT = True                 # PIPELINE = "all": simulate ONLY the faults with NO .out file at all. Anything with a result on disk -- complete, partial or short -- is left exactly as it is and scored from what is there
 OUT_EMPTY_BYTES = 1048576                   # an .out under this holds no samples at all (a header at most) -- its .done is retired; this is 'the file is empty', not a size rule
 ONLY_EVENTS = []                            # [] = every event
 ONLY_FAULTS   = []                             # [] = every fault -- see the ONLY_FAULTS warning in the comparison
@@ -13814,6 +13815,7 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False)
     env["SPP_SCORE_PARTIAL"] = "1" if SCORE_PARTIAL_RUNS else "0"
     env["SPP_PARTIAL_MIN_FRAC"] = repr(float(PARTIAL_MIN_FRAC))
     env["SPP_KEEP_PARTIAL"] = "1" if KEEP_PARTIAL_RUNS else "0"
+    env["SPP_ONLY_MISSING_OUT"] = "1" if RUN_ONLY_MISSING_OUT else "0"
     if CORES_MAX_INCLUDES_REPORTS:
         # THE SAME SHARE, NOT A SECOND ONE. The scoring may use every session
         # this case was given, and not one more -- and it may not run while the

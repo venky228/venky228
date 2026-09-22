@@ -571,6 +571,9 @@ OUT_MIN_BYTES         = 1048576  # an .out under this holds no samples (a header
 KEEP_PARTIAL_RUNS     = str(os.environ.get("SPP_KEEP_PARTIAL", "1")).strip().lower() \
                         not in ("0", "false", "no", "off")
                                 # a scenario with a scorable .partial run is kept, not simulated over
+ONLY_MISSING_OUT      = str(os.environ.get("SPP_ONLY_MISSING_OUT", "0")).strip().lower() \
+                        in ("1", "true", "yes", "on")
+                                # simulate only the faults with no .out file at all
 MAX_GROW_WORKERS      = 32      # hard cap on workers a handover may grow to (guards a stale/edited .spp_slots_*.txt)
 STARTUP_DEAD_S        = 600.0   # died within this many s of launch with no claim = a start failure
                                 # (was 180: the psseng.dll licence timeout is ~180 s, so
@@ -2129,13 +2132,29 @@ def _apply_skip_done(selected):
             continue
         if sigs:
             break
-    todo, done, gave_up, stale, empty, partial = [], [], [], [], [], []
+    todo, done, gave_up, stale, empty, partial, have_out = [], [], [], [], [], [], []
     for sid in ids:
         _op = os.path.join(OUT_DIR, "%s.out" % sid)
         # A SCORABLE PARTIAL RUN IS KEPT, NOT RE-RUN. Re-running writes over
         # the only copy of a run that reached most of SIM_END_S and is already
         # scored and compared, and the attempts left to it are the ones that
         # already failed. KEEP_PARTIAL_RUNS = False in the panel to try again.
+        # ONLY THE FAULTS WITH NO RESULT AT ALL.
+        #
+        # A result on disk is a result: complete, partial, or stopped early.
+        # Simulating over it spends hours to replace a record that is already
+        # there -- and an attempt that dies at init replaces it with nothing.
+        # With this on, the sweep fills the GAPS and the scoring pass decides
+        # what the existing files are worth.
+        if ONLY_MISSING_OUT and os.path.isfile(_op):
+            try:
+                _has_data = os.path.getsize(_op) >= OUT_MIN_BYTES
+            except Exception:
+                _has_data = False
+            if _has_data:
+                have_out.append(sid)
+                done.append(sid)
+                continue
         if (KEEP_PARTIAL_RUNS
                 and os.path.isfile(os.path.join(OUT_DIR, "%s.partial" % sid))
                 and os.path.isfile(_op)
@@ -2173,6 +2192,10 @@ def _apply_skip_done(selected):
         print("[parallel] SKIP_DONE: %d scenario(s) carried a .done marker but their .out holds NO DATA"
               " (under %d KB) -- the run wrote nothing; moved aside as .stale and re-run: %s%s"
               % (len(empty), OUT_MIN_BYTES // 1024, ", ".join(empty[:8]), " ..." if len(empty) > 8 else ""))
+    if have_out:
+        print("[parallel] RUN_ONLY_MISSING_OUT: %d scenario(s) already have an .out file"
+              " -- not simulated again; the scoring pass judges what is there: %s%s"
+              % (len(have_out), ", ".join(have_out[:8]), " ..." if len(have_out) > 8 else ""))
     if partial:
         print("[parallel] SKIP_DONE: %d scenario(s) hold a PARTIAL run that is scored and compared"
               " -- kept as they are, NOT re-run (KEEP_PARTIAL_RUNS): %s%s"

@@ -629,6 +629,41 @@ def judge_folder(key, name, rdir, write=False, use_size=False):
         print("       python %s --restore-stale --write" % os.path.basename(__file__))
         return {"done": 0, "partial": 0, "short": 0, "nothing": 0, "already": 0}
 
+    # IS THE TIME AXIS ACTUALLY READABLE IN THIS FOLDER?
+    #
+    # A .out is not one flat grid of records -- the engine's own reader has a
+    # RESYNC step for it -- so a layout that fits the head can stop fitting
+    # further in. When it does, the search for the last sample stops at the
+    # first break and every file in the folder reports the SAME end time:
+    # 0.97 s for 21 MB crashes and 95 MB complete runs alike, and 194 finished
+    # runs judged "too short".
+    #
+    # That agreement is the tell. Runs that stop at their own instant do not
+    # land on one value. So the end times are read first, and if a quarter of
+    # the folder shares one, the reader is wrong HERE and is not used: the
+    # scored parts and the progress record decide instead, and nothing is
+    # marked on a number this script does not trust.
+    if lays:
+        _seen = {}
+        for _p in glob.glob(os.path.join(outs_dir, "*.out")):
+            _t, _ = end_time_of(_p, lays)
+            if _t is not None:
+                _k = round(_t, 2)
+                _seen[_k] = _seen.get(_k, 0) + 1
+        _n_read = sum(_seen.values())
+        if _n_read >= 8:
+            _top, _cnt = max(_seen.items(), key=lambda kv: kv[1])
+            if _cnt >= max(4, int(0.25 * _n_read)):
+                print("   TIME AXIS NOT USED HERE: %d of %d .out file(s) all read "
+                      "%.2f s." % (_cnt, _n_read, _top))
+                print("         Files of every size cannot have stopped at the same "
+                      "instant, so")
+                print("         the layout stops fitting part way through this "
+                      "folder's files.")
+                print("         Deciding on the scored parts and the progress record "
+                      "instead.")
+                lays = []
+
     n = {"done": 0, "partial": 0, "short": 0, "nothing": 0, "already": 0}
     table = []
     for p in sorted(glob.glob(os.path.join(outs_dir, "*.out")),
