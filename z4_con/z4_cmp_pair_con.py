@@ -61,6 +61,7 @@ PAIRS = [                # explicit pairs when the reference differs per pair:
     # (r"C:\KV\Projects\results_proj\SantaFe_spp", r"C:\KV\Projects\results_proj\SantaFe_spp_poi502", "SantaFe_GIA_vs_studied"),
 ]
 OUT_DIR = r""            # "" = <panel folder>\comparison_pairs
+SIDE_BY_SIDE = True      # also one sheet with every scenario that shares a reference side by side: reference | as studied | GIA | ... per fault
 REMERGE_STALE = True     # rebuild a folder's reports from parts\ when the parts are newer (same as the panel)
 ASK_IF_EMPTY = True      # nothing above and nothing on the command line -> folder pickers
 PANEL = "z4_cmp_all_con.py"
@@ -325,8 +326,123 @@ def compare_pair(z4, ref, test, label=None):
     print("[pair] %d fault(s) compared: %d NEW with the test folder, %d pre-existing "
           "-- %.0f s" % (len(rows), n_new, n_pre, time.time() - t0))
     print("[pair] -> %s" % folder)
-    return {"label": label, "ref": ref, "test": test, "folder": folder,
-            "faults": len(rows), "new": n_new, "pre": n_pre}
+    try:
+        summ = z4._summary_rows([res])
+    except Exception:
+        summ = []
+    return {"label": label, "ref": ref, "test": test, "folder": folder, "proj": proj_t,
+            "faults": len(rows), "new": n_new, "pre": n_pre, "summary": summ,
+            "tag": _folder_tag(test)}
+
+
+_SBS_PER = [("verdict", "verdict_projects"), ("class", "classification"),
+            ("worst_criterion", "worst_criterion"), ("ref_value", "base_value"),
+            ("value", "project_value"), ("limit", "limit"), ("unit", "unit"),
+            ("past_limit", "past_limit"), ("new_criteria", "new_criteria"),
+            ("violating_buses", "violating_buses"), ("cause", "cause")]
+
+
+def write_side_by_side(z4, ref, group):
+    """ONE SHEET, EVERY SCENARIO. One row per fault: the reference's verdict,
+       then for each scenario compared against that reference its verdict,
+       classification, worst criterion, both values, limit and the buses --
+       base | as studied | GIA | ... read across, instead of one workbook each.
+       Built from the same summary rows the pair workbooks hold, so the two
+       never disagree."""
+    group = [g for g in group if g.get("summary")]
+    if len(group) < 2:
+        return None
+    SC = dict((c, i) for i, c in enumerate(z4._SUMMARY_COLS))
+    tags = []
+    for g in group:
+        t = g["tag"]
+        n = 2
+        while t in tags:
+            t = "%s_%d" % (g["tag"], n)
+            n += 1
+        tags.append(t)
+    per = {}                                   # fault -> {tag: summary row}
+    order, head = [], {}
+    for g, t in zip(group, tags):
+        for r in g["summary"]:
+            fid = str(r[SC["fault"]]).strip()
+            if fid not in per:
+                per[fid] = {}
+                order.append(fid)
+                head[fid] = r
+            per[fid][t] = r
+    proj = group[0]["proj"]
+    rk = "base" if "results_base" in _parts(ref) else _folder_tag(ref)
+    header = ["fault", "planning_event", "fault_source", "project", "reference", "verdict_" + rk]
+    widths = [8, 12, 9, 12, 22, 12]
+    for t in tags:
+        for nm, _c in _SBS_PER:
+            header.append("%s | %s" % (t, nm))
+            widths.append({"verdict": 11, "class": 14, "worst_criterion": 24, "ref_value": 10,
+                           "value": 10, "limit": 8, "unit": 6, "past_limit": 10,
+                           "new_criteria": 18, "violating_buses": 40, "cause": 50}[nm])
+    header += ["worst_across_scenarios", "description"]
+    widths += [22, 60]
+    rows = []
+    _rank = {z4.CLS_NEW: 3}
+    for fid in sorted(order, key=lambda x: (len(x), x)):
+        h = head[fid]
+        row = [fid, h[SC["planning_event"]], h[SC["fault_source"]], proj, os.path.basename(ref),
+               h[SC["verdict_base"]]]
+        worst, act, pre, allpass = "", False, False, True
+        for t in tags:
+            r = per[fid].get(t)
+            if r is None:
+                row += ["not compared"] + [""] * (len(_SBS_PER) - 1)
+                allpass = False
+                continue
+            for _nm, c in _SBS_PER:
+                row.append(r[SC[c]])
+            cls = str(r[SC["classification"]])
+            if str(r[SC["action"]]).startswith("ACT"):
+                act = True
+                worst = "%s: %s" % (t, cls)
+            elif cls == z4.CLS_PRE:
+                pre = True
+                if not act:
+                    worst = "%s: %s" % (t, cls)
+            if str(r[SC["verdict_projects"]]).upper() != "PASS":
+                allpass = False
+        row += [worst or ("all PASS" if allpass else ""), h[SC["description"]]]
+        rows.append(row)
+
+    def _style(row):
+        w = str(row[len(header) - 2])
+        if w.endswith(": " + z4.CLS_NEW):
+            return 2                            # a scenario introduced it
+        if w.endswith(": " + z4.CLS_PRE):
+            return 3                            # fails with and without
+        if w == "all PASS":
+            return 5
+        return 0
+
+    out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
+    lab = re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_SIDE_BY_SIDE_vs_%s" % (proj, rk))
+    d = os.path.join(out_root, lab)
+    if not os.path.isdir(d):
+        os.makedirs(d)
+    xp = os.path.join(d, "00_SIDE_BY_SIDE_%s.xlsx" % lab)
+    title = ["%s -- every scenario against %s, one row per fault" % (proj, ref)]
+    for g, t in zip(group, tags):
+        title.append("%s = %s" % (t, g["test"]))
+    z4.write_xlsx(xp, header, rows, widths, _style, legend=z4._XL_LEGEND, title_rows=title)
+    cp = os.path.join(d, "00_SIDE_BY_SIDE_%s.csv" % lab)
+    try:
+        import csv
+        with open(cp, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(header)
+            for r in rows:
+                w.writerow([("" if v is None else v) for v in r])
+    except Exception as e:
+        print("[pair] could not write %s: %s" % (cp, e))
+    print("[pair] side by side (%s) -> %s" % (" | ".join([rk] + tags), xp))
+    return xp
 
 
 def _pick(title):
@@ -401,6 +517,17 @@ def main(argv):
             got = None
         if got:
             done.append(got)
+    if done and SIDE_BY_SIDE:
+        groups = {}
+        for g in done:
+            groups.setdefault((g["ref"], g["proj"]), []).append(g)
+        for (ref, _p), grp in sorted(groups.items()):
+            try:
+                write_side_by_side(z4, ref, grp)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print("[pair] *** the side-by-side sheet failed: %s ***" % e)
     if done:
         out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
         idx = os.path.join(out_root, "PAIRS_INDEX.txt")
