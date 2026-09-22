@@ -33314,7 +33314,17 @@ def plot_missing_outs():
                 # -- 16 of SantaFe's 150 were dropped that way. A file at least
                 # as large as the finished ones goes through; the full read
                 # below still decides .done from the time axis.
-                _full = _out_looks_complete(p)
+                # THE TWO THRESHOLDS HAVE TO AGREE. This gate is a SIZE test
+                # at 90 % of the folder's median; the partial-run rule below is
+                # a TIME test at PARTIAL_MIN_FRAC of SIM_END_S. With the size
+                # gate the stricter of the two, a run that stopped at 23.7 of
+                # 25.2 s -- squarely inside the partial rule -- was skipped
+                # here and never read: SantaFe's project side kept reading
+                # CRASHED while the base side of the same fault read PARTIAL,
+                # because the project .out files are bigger (more channels) so
+                # the same 85 MB is a smaller fraction of their median.
+                _frac = min(0.90, float(PARTIAL_MIN_FRAC)) if SCORE_PARTIAL_RUNS else 0.90
+                _full = _out_looks_complete(p, frac=_frac)
                 if _full:
                     print("[plot-missing] %-10s GAVE UP after %d attempt(s) but its .out is "
                           "full size (%s) -- read, and marked done if the time axis "
