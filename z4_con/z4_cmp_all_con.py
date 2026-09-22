@@ -15760,7 +15760,7 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None):
                     print("[compare] plotter slot %d has drawn nothing on %s/%s in %d "
                           "launch(es) -- moving it to %s/%s"
                           % (sl["slot"], sl["case"].get("key", "?"), sl["proj"] or "-",
-                             _j3[0].get("key", "?"), _j3[1] or "-"))
+                             sl["nogain"], _j3[0].get("key", "?"), _j3[1] or "-"))
                     _plotter_log_tail(sl, 12)
                     sl["case"], sl["proj"], sl["mode"], sl["rdir"] = _j3
                     sl["nogain"] = 0
