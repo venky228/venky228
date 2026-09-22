@@ -62,6 +62,9 @@ HOW TO USE
       --all                       every project (no prompt)
       --base / --proj             just one case
       --use-size                  allow the size test where nothing better exists
+      --restore-stale             put back <id>.out.stale_<stamp> and its
+                                  markers (the launcher moves a scenario aside
+                                  when its marker does not match the fault list)
       --undo                      remove only the markers THIS script wrote
                                   (each one it writes is signed)
 
@@ -292,21 +295,109 @@ def _row_sig_fn(case_key):
     return None
 
 
-def fault_rows(rdir):
-    """{fault id: the row as the study read it} from this folder's fault list."""
-    out = {}
-    p = os.path.join(rdir, "faults", "SPP_FAULTS.csv")
-    if not os.path.isfile(p):
-        return out
-    try:
-        with open(p, newline="") as fh:
-            for r in csv.DictReader(fh):
-                fid = (r.get("fault_id") or "").strip()
-                if fid:
-                    out[fid] = r
-    except Exception:
-        pass
-    return out
+def _fault_list_paths(rdir, proj):
+    """The fault lists in the order the LAUNCHER reads them. It prefers the
+       shared DISIS list at the study root and falls back to the folder's own
+       copy -- and the two can differ. A fingerprint computed from the wrong
+       one does not match the marker the launcher expects, and the launcher
+       then moves the .out ASIDE as .stale and simulates the fault again."""
+    paths = []
+    if proj:
+        paths.append(os.path.join(STUDY_ROOT, "SPP_FAULTS_CON_%s.csv" % proj))
+    paths.append(os.path.join(rdir, "faults", "SPP_FAULTS.csv"))
+    return [p for p in paths if os.path.isfile(p)]
+
+
+def fault_rows(rdir, proj=""):
+    """{fault id: the row as the study read it}, from the first list that has
+       rows -- the same order the launcher uses."""
+    for p in _fault_list_paths(rdir, proj):
+        out = {}
+        try:
+            with open(p, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    fid = (r.get("fault_id") or "").strip()
+                    if fid:
+                        out[fid] = r
+        except Exception:
+            continue
+        if out:
+            return out
+    return {}
+
+
+def sig_self_check(outs_dir, rows, sig_fn):
+    """(ok, message). Recompute the fingerprint of a fault the ENGINE already
+       marked, and compare it with what the engine wrote.
+
+       THIS IS NOT OPTIONAL. A marker whose sig= does not match what the
+       launcher computes is treated as a marker for a DIFFERENT fault list:
+       the launcher moves the .out, the .done and the attempts aside as
+       .stale_<stamp> and simulates the fault again. Writing a whole folder of
+       such markers takes a finished study apart. So if the check fails,
+       nothing is written and the reason is printed."""
+    if not rows or sig_fn is None:
+        return True, "no fault list or no fingerprint function -- markers carry no sig="
+    for p in sorted(glob.glob(os.path.join(outs_dir, "*.done"))):
+        sid = os.path.basename(p)[:-len(".done")]
+        if sid not in rows:
+            continue
+        have = ""
+        try:
+            for ln in open(p):
+                if ln.startswith("sig="):
+                    have = ln[4:].strip()
+                    break
+        except Exception:
+            continue
+        if not have:
+            continue
+        try:
+            want = sig_fn(rows[sid])
+        except Exception as e:
+            return False, "the fingerprint function raised on %s: %s" % (sid, e)
+        if want == have:
+            return True, "checked against %s -- the fingerprint matches" % sid
+        return False, ("%s was marked by the engine with sig=%s, but this fault "
+                       "list gives sig=%s. The list this folder was RUN with is "
+                       "not the list being read here, so every marker written "
+                       "now would be rejected and its .out moved aside as "
+                       ".stale. Point STUDY_ROOT at the right study, or delete "
+                       "the stale SPP_FAULTS_CON_*.csv." % (sid, have, want))
+    return True, "no engine-written marker carries a sig= to check against"
+
+
+def restore_stale(outs_dir, write=False):
+    """Bring back <id>.out.stale_<stamp> and its markers.
+
+       The launcher moves a scenario aside when its marker does not match the
+       fault list. Nothing is deleted, so a folder emptied that way is put
+       back exactly: the NEWEST stamp of each scenario wins, and a file that
+       already exists under its plain name is left alone."""
+    best = {}
+    for p in glob.glob(os.path.join(outs_dir, "*.stale_*")):
+        base = os.path.basename(p)
+        i = base.rfind(".stale_")
+        if i < 0:
+            continue
+        plain, stamp = base[:i], base[i + len(".stale_"):]
+        prev = best.get(plain)
+        if prev is None or stamp > prev[0]:
+            best[plain] = (stamp, p)
+    n = 0
+    for plain in sorted(best):
+        stamp, p = best[plain]
+        tgt = os.path.join(outs_dir, plain)
+        if os.path.exists(tgt):
+            continue
+        print("   %-28s <- %s" % (plain, os.path.basename(p)))
+        if write:
+            try:
+                os.rename(p, tgt)
+                n += 1
+            except Exception as e:
+                print("   %-28s could not be restored: %s" % (plain, e))
+    return n
 
 
 def tclear_of(rdir):
@@ -459,7 +550,8 @@ def judge_folder(key, name, rdir, write=False, use_size=False):
     scored = scored_ids(rdir)
     progd = progress_done_ids(rdir)
     tcl = tclear_of(rdir)
-    rows = fault_rows(rdir)
+    proj = str(name or "").split("_")[0]
+    rows = fault_rows(rdir, proj)
     sigfn = _row_sig_fn(key) if rows else None
     med, tight = size_reference(outs_dir)
     t_full = float(SIM_END_S) - float(END_TOL_S)
@@ -479,6 +571,18 @@ def judge_folder(key, name, rdir, write=False, use_size=False):
         print("   size reference: %s"
               % (("%.0f MB median, one channel set" % (med / 1e6)) if (med and tight)
                  else "not usable (the marked files do not agree within 5 %)"))
+    # THE FINGERPRINT IS CHECKED BEFORE ANYTHING IS WRITTEN.
+    ok_sig, why_sig = sig_self_check(outs_dir, rows, sigfn)
+    print("   fingerprint: %s" % why_sig)
+    if not ok_sig:
+        print("")
+        print("   *** NO MARKER IS WRITTEN IN THIS FOLDER ***")
+        print("   A marker the launcher does not recognise is worse than no marker:")
+        print("   it moves the .out, the .done and the .attempts aside as")
+        print("   .stale_<stamp> and simulates the fault again. To put back a")
+        print("   folder that has already been emptied that way:")
+        print("       python %s --restore-stale --write" % os.path.basename(__file__))
+        return {"done": 0, "partial": 0, "short": 0, "nothing": 0, "already": 0}
 
     n = {"done": 0, "partial": 0, "short": 0, "nothing": 0, "already": 0}
     table = []
@@ -620,6 +724,21 @@ def main(argv):
              "base + project" if (want_base and want_proj)
              else ("base only" if want_base else "project only"), len(folders)))
     print("=" * 96)
+
+    if "--restore-stale" in argv:
+        tot = 0
+        for key, name, rdir in folders:
+            od = os.path.join(rdir, "outs")
+            print("")
+            print("=" * 96)
+            print(" %-5s %-28s %s" % (key, name, od))
+            print("=" * 96)
+            tot += restore_stale(od, write=write)
+        if write:
+            print("\n[mark] %d file(s) restored." % tot)
+        else:
+            print("\n[mark] nothing was moved. Add --write to restore them.")
+        return 0
 
     if undo:
         tot = 0

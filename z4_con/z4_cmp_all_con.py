@@ -17518,6 +17518,19 @@ def main():
                 except Exception:
                     pass
             print("[compare] live status (both cases): %s" % _lsa)
+        # BEFORE THE STUDIES START, NOT ONLY AFTER THEM.
+        #
+        # Each launcher runs its OWN report step at the end of its own run, and
+        # that step excludes a scenario with no marker: "no .done marker --
+        # crashed or never finished (3 attempt(s))". Marking the partial runs
+        # only in phase 2 was too late -- the launchers had already written
+        # their reports without them, and every 80 %+ record was dropped from
+        # the comparison again. Marked here, the launchers' own report steps
+        # include them, and KEEP_PARTIAL_RUNS stops the sweep running over them.
+        try:
+            mark_partial_runs()
+        except Exception as _e:
+            print("[compare] could not mark the partial runs: %s" % _e)
         _banner("PHASE 1 of 3 -- SIMULATING BOTH CASES")
         print("[compare] This is the long part: two complete studies. Everything after")
         print("[compare] it reads files and takes seconds, so if this is interrupted you")
