@@ -6732,7 +6732,18 @@ def _report_rows(results):
                         if mv is not None:
                             bv = mv
                             bv_show = mv
-                            src = "base measurement (bus within limit in base)"
+                            # SAY WHAT THE NUMBER SAYS. This read "within limit
+                            # in base" beside a base value of 1.331 pu against a
+                            # 1.20 limit: the note assumed a measured base value
+                            # meant no base violation, which is only so when the
+                            # base SCORED the fault. Judge it.
+                            _amt_b, _t_b = exceedance(kind, mv, lim)
+                            if _amt_b is not None and _amt_b > 0.0:
+                                src = ("base measurement (bus OVER the limit in base%s)"
+                                       % ("" if base_scored else
+                                          " -- base fault not scored; verdict from the value"))
+                            else:
+                                src = "base measurement (bus within limit in base)"
                         elif base_scored and _project_only_bus(_bus_of_element(el)):
                             src = ("bus exists only with the project (new plant) -- "
                                    "NEW by construction")
@@ -6761,11 +6772,17 @@ def _report_rows(results):
                         # difference between them is the dispatch (the area hold
                         # moved it), not a change in the violation.
                         chg = ""
-                    if r.get("one_sided"):
+                    # THE ELEMENT IS JUDGED ON ITS OWN TWO VALUES FIRST. A fault
+                    # the base did not SCORE (its report lacks the fault: a
+                    # retired marker, a rescore that skipped it) still has the
+                    # base run's measurements in parts\SCEN_<id>_MEAS.csv, and
+                    # a bus at 1.331 pu there against 1.20 is a PRE-EXISTING
+                    # overvoltage, not "TEST ONLY". Only an element with no
+                    # base evidence at all takes the fault's one-sided class.
+                    ecls = _element_class(fam, kind, bv, tv, lim, base_scored,
+                                          _project_only_bus(_bus_of_element(el)))
+                    if r.get("one_sided") and ecls == CLS_EL_UNKNOWN:
                         ecls = r["class"]
-                    else:
-                        ecls = _element_class(fam, kind, bv, tv, lim, base_scored,
-                                              _project_only_bus(_bus_of_element(el)))
                     # NO MEASUREMENTS FILE ON THE BASE SIDE (a study written
                     # before it existed), but the base violations list covers
                     # this fault and does not name the bus: that list is the
