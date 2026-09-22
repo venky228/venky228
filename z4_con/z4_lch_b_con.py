@@ -567,6 +567,7 @@ LICENCE_BACKOFF_S     = 60.0
 LICENCE_BACKOFF_MAX_S = 900.0
 MAX_LICENCE_FAILS     = 30      # per worker; after this it gives up with a note on what to do
 STARTUP_SILENT_S      = 900.0   # 15 min silent with NO claim = stuck at start (dialog / dead licence)
+MAX_GROW_WORKERS      = 32      # hard cap on workers a handover may grow to (guards a stale/edited .spp_slots_*.txt)
 STARTUP_DEAD_S        = 600.0   # died within this many s of launch with no claim = a start failure
                                 # (was 180: the psseng.dll licence timeout is ~180 s, so
                                 #  a licence death landed just outside it and was filed as a crash)
@@ -2051,7 +2052,11 @@ def _stale_aside(out_dir, sid, why):
     import time as _t
     stamp = _t.strftime("%Y%m%d_%H%M%S")
     moved = 0
-    for ext in ("out", "done"):
+    # THE ATTEMPT COUNT GOES TOO. Left behind, a scenario moved aside because
+    # the fault list was renumbered comes back carrying the previous list's
+    # attempts -- at the cap it is refused on sight and reported GAVE-UP
+    # without ever being simulated.
+    for ext in ("out", "done", "attempts"):
         p = os.path.join(out_dir, "%s.%s" % (sid, ext))
         if os.path.isfile(p):
             try:
@@ -3915,15 +3920,29 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
             return
         _banner("HANDOVER: the other case has finished -- growing from %d to %d worker(s) "
                 "(%s)" % (n, target, os.path.basename(_slots_file)))
+        # CAPPED, AND ONE AT A TIME.
+        #
+        # The file is written by the panel, but a stale or hand-edited value
+        # would start that many PSS/E sessions on top of the running ones, so
+        # it is bounded by the machine. And the starts go through the licence
+        # gate, which BLOCKS: growing 4 -> 16 in this loop held the supervisor
+        # for minutes, during which no worker was polled, no hang watchdog ran
+        # and a worker that died was not relaunched. One per poll costs a few
+        # seconds of ramp and keeps every watchdog live.
+        target = min(int(target), MAX_GROW_WORKERS)
+        if selected:
+            target = min(target, max(n, len(selected)))
+        if target <= n:
+            return
         _old = n
-        for i in range(_old, target):
-            launches[i] = 0
-            lic_fails[i] = 0
-            _clear(_sentinel("_w%d" % i))
-        n = target
-        for i in range(_old, target):
-            start(i)
-        _phase("simulate (%d worker(s)) after handover" % n)
+        _next_i = n
+        launches[_next_i] = 0
+        lic_fails[_next_i] = 0
+        _clear(_sentinel("_w%d" % _next_i))
+        n = _next_i + 1
+        start(_next_i, first=(LICENCE_STARTS_PER_MIN <= 0))
+        _slots_next[0] = time.time() + max(2.0, min(SLOTS_CHECK_S, LAUNCH_STAGGER_S or 5.0))
+        _phase("simulate (%d of %d worker(s)) after handover" % (n, target))
 
     while len(done) < n:
         time.sleep(POLL_SECS)
@@ -3947,7 +3966,12 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
             # Kill it (it holds no scenario) and relaunch after the backoff.
             # This does not consult NEVER_KILL_WORKERS -- there is nothing
             # running in that process to protect.
-            _lic = _licence_hit("w%d" % i, launched_at.get(i, 0))
+            # ...AND ONLY WHILE IT IS STILL STARTING. _DIALOG_HITS is never
+            # pruned, so a box closed 3 s after launch -- which PSS/E then
+            # retried past -- matched for the rest of the run and killed a
+            # worker in the middle of a solve, with a scenario claimed.
+            _lic = (None if _holds(i) or (now - launched_at.get(i, now)) >= STARTUP_DEAD_S
+                    else _licence_hit("w%d" % i, launched_at.get(i, 0)))
             if _lic:
                 kill(i)
                 _schedule(i, "PSS/E licence box '%s'" % _lic[0])
@@ -4005,7 +4029,9 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
             rc = p.poll()
             if os.path.isfile(_sentinel("_w%d" % i)):
                 _banner("worker %d COMPLETE (sentinel present)" % i); done.add(i)
-            elif rc == EXIT_LICENCE_BUSY or _licence_hit("w%d" % i, launched_at.get(i, 0)):
+            elif (rc == EXIT_LICENCE_BUSY
+                  or ((now - launched_at.get(i, now)) < STARTUP_DEAD_S
+                      and _licence_hit("w%d" % i, launched_at.get(i, 0)))):
                 _worker_exit_note(i, _exit_reason(EXIT_LICENCE_BUSY))
                 _schedule(i, _exit_reason(rc))
             elif (now - launched_at.get(i, now)) < STARTUP_DEAD_S and not _holds(i) and rc != 0:
@@ -5248,7 +5274,12 @@ def _run_one_study():
         # Sharded reports run HERE rather than in the background: they occupy
         # REPORT_WORKERS sessions at once, and letting several projects do that
         # concurrently would multiply the PSS/E session count without bound.
-        _run_report_sharded(REPORT_WORKERS, _report_selection() or None)
+        _rsel = _report_selection()
+        if _rsel == []:
+            print("[parallel] REPORT_FAULTS resolves to no scenario in this study -- "
+                  "scoring NOTHING rather than silently scoring everything.")
+        else:
+            _run_report_sharded(REPORT_WORKERS, _rsel)
     elif REPORT_IN_BACKGROUND:
         _start_report_bg(_CUR_PROJECT, _CUR_MODE, RESULTS)
         el = time.time() - t0

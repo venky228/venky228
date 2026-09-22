@@ -474,11 +474,28 @@ def _sbs_faults(z4, ref, group, tags, rk):
 
 
 def _num(v):
+    """The number in a cell, whether it is a bare value or a limit phrase.
+
+       The limit column carries the panel's own wording -- "max 1.20 pu",
+       "0.95 - 1.05 pu", "max 16 deg" -- so float() on it always raised and
+       every measured-only cell was called "within limit" whatever it read."""
+    if v is None:
+        return None
+    txt = str(v).strip()
+    if txt in ("", "-"):
+        return None
     try:
-        if v is None or str(v).strip() in ("", "-"):
-            return None
-        return float(str(v).replace("pu", "").replace("MW", "").strip())
+        return float(txt)
     except (TypeError, ValueError):
+        pass
+    m = re.findall(r"-?\d+(?:\.\d+)?", txt)
+    if not m:
+        return None
+    try:
+        # a band ("0.95 - 1.05 pu") is judged on its upper bound, which is the
+        # one an overvoltage passes; a "max"/"min" phrase has one number.
+        return float(m[-1] if len(m) > 1 else m[0])
+    except ValueError:
         return None
 
 
@@ -503,8 +520,11 @@ def _meas_fill(z4, meas, fam, fid, element):
             rec = None
         if rec is None:
             return "-", "not measured in this run"
-        pe = rec.get("pend")
-        return _fmt(pe, fam), z4._trip_state_text(rec, None)
+        # THE PRE-FAULT MW, like the panel's own report rows. pend is what the
+        # machine ended at; putting it in the same column as the report's p0
+        # compared two different quantities side by side.
+        p0 = rec.get("p0")
+        return _fmt(p0, fam), z4._trip_state_text(rec, None)
     try:
         v = z4.measured_value(meas, fam, fid, element)
     except Exception:

@@ -18399,7 +18399,12 @@ def _decimate_panels(panels, t, st):
     return out, idxs
 
 def categorize(title):
-    T = title.upper()
+    # " #2" IS A DISAMBIGUATOR, NOT PART OF THE NAME. Two channels may not
+    # share an identifier (this dyntools cannot decode such a file), so the
+    # second use of a name is written "POI560080 V #2" -- and a classifier
+    # matching on the ENDING then recognised neither the voltage nor the
+    # angle, dropping that trace from every plot and every criterion.
+    T = re.sub(r"\s*#\d+$", "", str(title).upper()).strip()
     if any(s in T for s in ("AVERAGE", "LARGEST", "SMALLEST", "SPREAD", "BUS WITH")): return None
     if "PELEC" in T or "POWR" in T: return "PELEC"
     if "QELEC" in T or "VARS" in T: return "QELEC"
@@ -30548,6 +30553,17 @@ def finalize_report(produced, part=None, claim=False):
         if (part is not None and _env_bool("SPP_FORCE_RESCORE", False)
                 and not _env_bool("SPP_RESCORE_RESUME", False)):
             _n_cleared = 0
+            # ONLY THE SCENARIOS THIS PASS WILL SCORE. The glob used to take
+            # every SCEN_*.csv in the shared parts\ folder, so a scenario this
+            # shard never reaches -- one whose .done was retired, or which is
+            # marked .badout -- lost its saved verdict AND its measurements and
+            # then appeared in no report at all.
+            _rescore_sids = []
+            for _pp, _k, _t in (produced or []):
+                try:
+                    _rescore_sids.append(os.path.splitext(os.path.basename(_pp))[0])
+                except Exception:
+                    pass
             # The per-scenario parts as well (SCEN_<id>.csv / _MEAS.csv):
             # the merge fills gaps from them, so left in place they would
             # put old verdicts back for any scenario a shard did not reach.
@@ -30556,7 +30572,8 @@ def finalize_report(produced, part=None, claim=False):
                        + glob.glob(_part_path(part, "VIOLATIONS"))
                        + glob.glob(_part_path(part, "MEASURE"))
                        + glob.glob(_part_path(part, "OUTSTAMP"))
-                       + glob.glob(os.path.join(PARTS_DIR, "SCEN_*.csv"))):
+                       + [_scen_part_path(_s) for _s in _rescore_sids]
+                       + [_scen_meas_path(_s) for _s in _rescore_sids]):
                 try:
                     # A SCEN part written since this pass began belongs to a
                     # shard that started a moment earlier -- current rules,
@@ -32599,8 +32616,23 @@ def main():
             globals()["_CLAIM_ALIVE"] = scen_id   # ...and keep saying so, from the heartbeat
             _keeper = _claim_keeper_start()       # ...including while it scores, not only while it solves
             out, tc = _run_with_solver_retry(scen_id, runner)
+            # A RUN THAT STOPPED EARLY IS NOT DONE. An .out exists from the
+            # first sample on, and a solver that gives up mid-run still
+            # returns its path -- so "the file is there" marked a fault
+            # complete at t=4 s of 25 s, and the report role, whose only test
+            # is that the marker exists, scored a mid-transient sample as the
+            # final value. The clock says how far it actually got; the plot
+            # role has always used this same rule.
+            _reached = (kind == "flat") or (float(_SIM_T) >= float(SIM_END_S) - 0.11)
+            if out and os.path.isfile(out) and not _reached:
+                print("  [%s] %s stopped at t=%.2f s of %.2f s -- NOT marked done; it is "
+                      "a partial run and will be run again" % (_ts(), scen_id, _SIM_T, SIM_END_S))
+                _progress_record(scen_id, "INCOMPLETE", att,
+                                 "stopped at t=%.2f s of %.2f s" % (_SIM_T, SIM_END_S))
+                _claim_release(scen_id)
+                fail_n += 1; return None, None
             if out and os.path.isfile(out):
-                _mark_done(scen_id, tc)                       # <-- only NOW is it 'done'
+                _mark_done(scen_id, tc, tend=_SIM_T)          # <-- only NOW is it 'done'
                 produced.append((out, kind, tc)); ok_n += 1
                 _progress_record(scen_id, "DONE", att,
                                  ("solver: %s" % SOLVER_FIX[scen_id][0])
@@ -33564,12 +33596,17 @@ def plot_missing_outs():
                     pass
             except Exception as e:
                 print("               could not read it (%s) -- skipped" % e)
-                try:
-                    os.remove(p + ".readfail")   # a raised error is not a process death
-                except Exception:
-                    pass
+                # THE STRIKE STAYS. Deleting it meant a file that raises on
+                # every read never reached OUT_READ_STRIKES, was never
+                # condemned, and was offered to every plotter of every
+                # relaunch for ever. The marker below takes it out of the
+                # queue for this study; deleting the .readfail gives it
+                # another chance.
+                _write_text(_state_path(sid, "plotted"),
+                            "NOT drawn: could not be read (%s)" % e)
                 _refused.append((sid, "could not be read: %s" % e,
-                                 "the strike was voided -- running again retries it"))
+                                 "delete %s.readfail and %s.plotted to try it again"
+                                 % (os.path.basename(p), sid)))
                 continue
             complete = is_flat or (t_end >= float(SIM_END_S) - 0.11)
             if not had_done and complete:

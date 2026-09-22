@@ -2490,7 +2490,10 @@ def _violations_from_parts(rdir, out):
     parts = _scen_parts_for(rdir)
     n = 0
     for fid, (_rows, _verdict, vio) in parts.items():
-        if fid in out or not vio:
+        # out.get(fid) rather than "fid in out": read_violations' text reader
+        # creates an EMPTY dict for every FAULT header it sees, so "fid in out"
+        # was true for faults with no elements and the part was never used.
+        if out.get(fid) or not vio:
             continue
         out[fid] = dict((k, dict(v)) for k, v in vio.items())
         n += 1
@@ -16208,6 +16211,7 @@ def verify_scoring_coverage(quiet=False):
                     if _merge_one_folder(case, rdir):
                         _MEAS_CACHE.clear()
                         _SCEN_PART_CACHE.clear()
+                        _OUT_SET_CACHE.clear()
                         outs, scored = _out_and_scored_sets(rdir, proj)
                         _after = sorted(outs - scored, key=_fault_key)
                         if len(_after) < len(missing):
@@ -16403,9 +16407,19 @@ def retire_truncated_done(quiet=False):
     for case in (CASE_BASE, CASE_TEST):
         for proj in (list(PROJECTS) or [""]):
             for mode in (list(MODES) or ["spp"]):
-                od = os.path.join(results_dir(case, proj, mode), "outs")
-                if os.path.isdir(od):
-                    folders.append((case, od, proj, mode))
+                try:
+                    _dirs = _result_folders_for(case, proj, mode) or []
+                except Exception:
+                    _dirs = []
+                _dirs = list(_dirs) + [results_dir(case, proj, mode)]
+                _seen = set()
+                for _d in _dirs:
+                    if not _d or _d in _seen:
+                        continue
+                    _seen.add(_d)
+                    od = os.path.join(_d, "outs")
+                    if os.path.isdir(od):
+                        folders.append((case, od, proj, mode))
     def _marker_tend(path):
         """tend= of a .done (or .done.truncated) marker, or None for a marker
            written before the engine recorded the run's last simulated second."""
@@ -16418,7 +16432,12 @@ def retire_truncated_done(quiet=False):
             pass
         return None
 
-    _t_full = float(SIM_END_S) - 0.11
+    try:
+        _t_full = float(SIM_END_S) - 0.11
+    except (TypeError, ValueError):
+        # SIM_END_S = None means "the study's own setting". Nothing here can
+        # read it, so no marker is judged short -- but the restore still runs.
+        _t_full = None
     n_back = 0
     for case, od, _proj, _mode in folders:
         sizes = {}
@@ -16439,8 +16458,10 @@ def retire_truncated_done(quiet=False):
         def _judge(sid, marker):
             """(complete?, how) for one run -- from the marker alone."""
             te = _marker_tend(marker)
-            if te is not None:
+            if te is not None and _t_full is not None:
                 return te >= _t_full, "tend=%.2f s" % te
+            if te is not None:
+                return True, "tend=%.2f s (SIM_END_S is the study's own -- not judged here)" % te
             return True, "marker carries no tend= (written on completion)"
 
         short = []
@@ -16529,8 +16550,19 @@ def retire_truncated_done(quiet=False):
     for key, proj, mode in sorted(_retired):
         _c = CASE_BASE if key == CASE_BASE.get("key") else CASE_TEST
         try:
-            _rep = rfile(results_dir(_c, proj, mode), "SPP_CRITERIA_REPORT", "txt")
+            _rd = results_dir(_c, proj, mode)
+            # WITH THE PROJECT, AND NEVER AN EMPTY PATH. Without proj the
+            # per-project name (SPP_CRITERIA_REPORT_BASE_SantaFe.txt) matched
+            # nothing, rfile returned "", and glob("" + "*") is glob("*") --
+            # every file in the panel's own folder was stamped to 1970 while
+            # the report itself was never back-dated.
+            _rep = (rfile(_rd, "SPP_CRITERIA_REPORT", "txt", proj)
+                    or rfile(_rd, "SPP_CRITERIA_REPORT", "csv", proj)
+                    or rfile(_rd, "SPP_CRITERIA_REPORT", "txt")
+                    or rfile(_rd, "SPP_CRITERIA_REPORT", "csv"))
         except Exception:
+            continue
+        if not _rep:
             continue
         for _f in glob.glob(os.path.splitext(_rep)[0] + "*"):
             try:
@@ -16756,6 +16788,7 @@ def ensure_reports(mode_list):
     # the live comparison's thread, the coverage test above -- is out of date.
     _MEAS_CACHE.clear()
     _SCEN_PART_CACHE.clear()
+    _OUT_SET_CACHE.clear()
     for key, rc in rcs:
         if rc not in (0, None):
             print("[compare] *** the %s report pass ended rc=%s -- anything it did"
