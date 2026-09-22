@@ -4235,6 +4235,19 @@ PLOT_SKIP_GAVEUP = True
 # diagnosis, marked as incomplete.
 PLOT_SKIP_INCOMPLETE = True
 PLOT_SKIP_INCOMPLETE = _env_bool("SPP_PLOT_SKIP_INCOMPLETE", PLOT_SKIP_INCOMPLETE)
+# >>> A RUN THAT STOPPED EARLY BUT GOT MOST OF THE WAY IS STILL WORTH READING.
+# A scenario that crashed at 23 s of 25.2 after three attempts has its fault,
+# its clearing, its recovery window and most of its damping on record. With
+# this on, such a run is drawn and scored like any other and MARKED PARTIAL
+# everywhere it appears: a <id>.partial marker beside the .out (never a
+# .done, so a later run still re-simulates it and a real finish replaces
+# it), a banner on every PDF page, an INFO line in its criteria report, and
+# a "PARTIAL RUN" prefix on its description in the comparison. The verdict
+# is judged on the record that exists; nothing after the stop is invented.
+SCORE_PARTIAL_RUNS = True
+SCORE_PARTIAL_RUNS = _env_bool("SPP_SCORE_PARTIAL", SCORE_PARTIAL_RUNS)
+PARTIAL_MIN_FRAC   = 0.80        # of SIM_END_S: a run shorter than this has no post-clearing record worth judging
+PARTIAL_MIN_FRAC   = _env_float("SPP_PARTIAL_MIN_FRAC", PARTIAL_MIN_FRAC)
 PLOT_SKIP_GAVEUP = _env_bool("SPP_PLOT_SKIP_GAVEUP", PLOT_SKIP_GAVEUP)
 # Stricter still: draw ONLY scenarios that already carry a .done marker. This
 # also switches off the rescue above, so a finished run whose worker died before
@@ -19050,6 +19063,14 @@ def make_plots(path, is_flat, kb, tclear=None):
     name = os.path.splitext(os.path.basename(path))[0]
     fbus = _fault_bus_of(name)
     t, ch = load_out(path)
+    _partial_note = ""
+    try:
+        if (not is_flat and len(t)
+                and float(t[-1]) < float(SIM_END_S) - 0.11):
+            _partial_note = ("   *** PARTIAL RUN: stopped at %.2f of %.2f s ***"
+                             % (float(t[-1]), float(SIM_END_S)))
+    except Exception:
+        _partial_note = ""
     panels = _panel_list(ch, kb, fbus, tclear, t)
     if not panels:
         print("  %s: nothing to plot" % name)
@@ -19272,7 +19293,7 @@ def make_plots(path, is_flat, kb, tclear=None):
                             # +1 for the study-parameter page, which the index
                             # now counts too -- header and index must agree.
                             pg + 1 + _n_idx + 1, npages + _n_idx + 1,
-                            _fault_subtitle(fbus)), fontsize=10)
+                            _fault_subtitle(fbus) + _partial_note), fontsize=10)
             # tight_layout would undo the hspace the tables need, so the
             # margins are set directly.
             # BOTTOM LEAVES ROOM FOR THE LAST PANEL'S TABLE. With the old
@@ -21963,6 +21984,17 @@ def evaluate_case(path, kind, tclear, kb):
         i_clr = i_clr if i_clr is not None else max(0, len(t) - 1)
         i_rec = i_rec if i_rec is not None else max(0, len(t) - 1)
         i_ss = i_ss if i_ss is not None else max(0, len(t) - 1)
+    # SAID IN THE REPORT, NOT ONLY IN A MARKER. A run that stopped early is
+    # judged on what it recorded; the reader has to be able to tell that from
+    # a run that finished, in the report itself and in every table built from
+    # it. INFO, not FAIL: stopping early is not a criterion.
+    if (kind != "flat" and len(t)
+            and float(t[-1]) < float(SIM_END_S) - 0.11):
+        add("*** PARTIAL RUN -- the simulation stopped before its end ***", None,
+            "stopped at t=%.2f s of %.2f s (%.0f%%). Every criterion in this report "
+            "is judged on the record that exists; nothing after %.2f s was simulated."
+            % (float(t[-1]), float(SIM_END_S), 100.0 * float(t[-1]) / float(SIM_END_S),
+               float(t[-1])))
 
     def _worst(vals, idx, lo=True):
         """(value, time) of the min/max of vals[idx:], with its time stamp."""
@@ -26235,7 +26267,37 @@ def _mark_done(scen_id, tclear, tend=None):
             tend = None
     if tend is not None and tend > 0:
         txt += "\ntend=%.3f" % float(tend)
+    # A REAL FINISH REPLACES A PARTIAL: the marker that said "stopped early"
+    # must not outlive the run that did not.
+    try:
+        os.remove(_state_path(scen_id, "partial"))
+    except Exception:
+        pass
     _write_text(_state_path(scen_id, "done"), txt)
+
+def _mark_partial(scen_id, tend):
+    """<id>.partial: this run stopped early but is drawn and scored (see
+       SCORE_PARTIAL_RUNS). It is NOT a .done: SKIP_DONE still re-runs it."""
+    txt = "tend=%.3f" % float(tend)
+    if scen_id in _FAULT_SIG:
+        txt += "\nsig=%s" % _FAULT_SIG[scen_id]
+    _write_text(_state_path(scen_id, "partial"), txt)
+
+
+def _is_partial(scen_id):
+    return bool(SCORE_PARTIAL_RUNS) and os.path.isfile(_state_path(scen_id, "partial"))
+
+
+def _partial_tend(scen_id):
+    try:
+        with open(_state_path(scen_id, "partial")) as fh:
+            for ln in fh:
+                if ln.startswith("tend="):
+                    return float(ln[5:].strip())
+    except Exception:
+        pass
+    return None
+
 
 def _is_done(scen_id, out_path):
     """A scenario counts as done only if BOTH its .done marker and a real .out exist.
@@ -31724,6 +31786,8 @@ def write_run_summary(verdicts):
         att    = _read_int(_state_path(sid, "attempts"))
         if os.path.isfile(_state_path(sid, "done")) and out_ok:
             st = "DONE"; nd += 1
+        elif _is_partial(sid) and out_ok:
+            st = "PARTIAL"; nd += 1          # scored on the record that exists
         elif att >= MAX_SCENARIO_ATTEMPTS:
             # >= , not > . With the attempt counted only for a REAL attempt (see
             # _run_one), the counter now stops AT the cap instead of running one
@@ -32156,11 +32220,15 @@ def main():
                 # truncated .out has aborted this phase at the Fortran level
                 # ("Invalid Floating-Point number."), taking the whole report
                 # with it. The attempts count says how hard it was tried.
-                if not os.path.isfile(_state_path(sid, "done")):
+                if not os.path.isfile(_state_path(sid, "done")) and not _is_partial(sid):
                     att = _read_int(_state_path(sid, "attempts"))
                     excluded.append((sid, "no .done marker -- crashed or never finished"
                                           " (%d attempt(s))" % att))
                     continue
+                if _is_partial(sid) and not os.path.isfile(_state_path(sid, "done")):
+                    print("  [report] %s is a PARTIAL run (stopped at %.2f s) -- scored on "
+                          "the record that exists, and said so in its report"
+                          % (sid, _partial_tend(sid) or 0.0))
                 # GATE 2 -- is the data usable? Same NaN test fault_run() applies
                 # to the PROJECT/POI channels. A run can finish, write .done and
                 # still be garbage; an unreadable or empty .out lands here too.
@@ -33103,6 +33171,19 @@ def _plot_only_current(sid, out_path):
             return False
         if os.path.isfile(out_path) and os.path.getmtime(p) + 1.0 < os.path.getmtime(out_path):
             return False                      # re-simulated since: draw it again
+        # A MARKER LEFT BY THE OLD RULE. Before SCORE_PARTIAL_RUNS, an
+        # incomplete run was marked "NOT drawn" so no plotter picked it again.
+        # With partial scoring on, that same file is now wanted: the marker
+        # steps aside once, and the pass writes a fresh one after drawing it.
+        if SCORE_PARTIAL_RUNS:
+            try:
+                with open(p) as _fh:
+                    _txt = _fh.read()
+                if "incomplete run" in _txt and not os.path.isfile(
+                        os.path.join(PLOT_DIR, "%s_plots.pdf" % sid)):
+                    return False
+            except Exception:
+                pass
         _rb = float(os.environ.get("SPP_REPLOT_BEFORE") or 0)
         if _rb and os.path.getmtime(p) < _rb:
             return False                      # FORCE_REPLOT on a later launch
@@ -33690,7 +33771,14 @@ def plot_missing_outs():
                 # to do about it -- re-run it -- and marked .plotted so the
                 # next plotter does not pick it up again.
                 # False draws it for diagnosis, as before.
-                if PLOT_SKIP_INCOMPLETE:
+                _min_t = float(PARTIAL_MIN_FRAC) * float(SIM_END_S)
+                if SCORE_PARTIAL_RUNS and not is_flat and t_end >= _min_t:
+                    _mark_partial(sid, t_end)
+                    print("               PARTIAL RUN: stopped at t=%.2f of %.2f s (%.0f%%) -- "
+                          "drawn and scored on the record that exists, marked .partial "
+                          "(NOT .done: a re-run still replaces it)"
+                          % (t_end, float(SIM_END_S), 100.0 * t_end / float(SIM_END_S)))
+                elif PLOT_SKIP_INCOMPLETE:
                     _why = ("the run stopped at t=%.2f s of %.2f s -- it did not "
                             "finish, so there is nothing to judge"
                             % (t_end, float(SIM_END_S)))
@@ -33749,19 +33837,22 @@ def plot_missing_outs():
                             and not _env_bool("SPP_FORCE_RESCORE", False))
             except Exception:
                 _already = False
+            # A PARTIAL RUN IS SCORED LIKE A COMPLETE ONE (marked as such in
+            # its report); see SCORE_PARTIAL_RUNS.
+            _scorable = complete or _is_partial(sid)
             if _nonfinite:
                 print("               not scored -- the run holds non-finite "
                       "values, so no criterion can be evaluated on it")
-            elif complete and SCORE_AT_RUN_TIME and _already:
+            elif _scorable and SCORE_AT_RUN_TIME and _already:
                 print("               already scored (%s is newer than the .out) "
                       "-- drawing only" % os.path.basename(_scen_part_path(sid)))
-            elif complete and SCORE_AT_RUN_TIME and (is_flat or tc is not None):
+            elif _scorable and SCORE_AT_RUN_TIME and (is_flat or tc is not None):
                 try:
                     _score_now(sid, p, "flat" if is_flat else "fault", tc)
                     print("               scored")
                 except Exception as e:
                     print("               could not score here (%s) -- the report phase will" % e)
-            elif complete and SCORE_AT_RUN_TIME:
+            elif _scorable and SCORE_AT_RUN_TIME:
                 # No clearing time from the marker OR the fault list. Every
                 # fault criterion is measured from that instant, so calling
                 # the scorer would only crash it with None arithmetic --
@@ -33846,7 +33937,7 @@ def plot_missing_outs():
         # SPP_PLOT_ALL_IN_ONE=1 restores the old loop-until-done behaviour.
         # DRAWN, AND IT CANNOT BE SCORED. Remember that, or the next plotter
         # picks the same file again -- see _plot_only_current().
-        if not os.path.isfile(_state_path(sid, "done")):
+        if not os.path.isfile(_state_path(sid, "done")) and not _is_partial(sid):
             try:
                 _write_text(_state_path(sid, "plotted"),
                             "%s  PDF written; no .done (incomplete or non-finite run)"

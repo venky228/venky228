@@ -265,7 +265,7 @@ def _print_phase_times(total):
 #   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
 #   dyr_<value>\                              <- a full comparison per value
 
-PROJECTS   = ["SantaFe","IronStar","EmpirePrairie","EastFork"]                  # one project at a time for a sweep
+PROJECTS   = ["IronStar"]                  # one project at a time for a sweep
                                             # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
 # -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
 # "each"      one study per project in PROJECTS, each alone in the case (as before)
@@ -474,6 +474,8 @@ RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-m
 RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
 TRUNCATED_FRAC = 0.80                       # NO LONGER USED: a run's completeness is read from its .done marker (tend=), never from the .out size
 RESTORE_TRUNCATED_DONE = True               # give back every .done.truncated the old size rule took, unless its marker itself records a short run (tend=)
+SCORE_PARTIAL_RUNS = True                   # a run that stopped early but reached PARTIAL_MIN_FRAC of SIM_END_S is drawn and scored, and marked PARTIAL in the PDF, the criteria report and every comparison sheet
+PARTIAL_MIN_FRAC   = 0.80                   # of SIM_END_S; shorter runs stay CRASHED (no post-clearing record worth judging)
 OUT_EMPTY_BYTES = 1048576                   # an .out under this holds no samples at all (a header at most) -- its .done is retired; this is 'the file is empty', not a size rule
 ONLY_EVENTS = []                            # [] = every event
 ONLY_FAULTS = []                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
@@ -489,7 +491,7 @@ PROJECT_MW = {                              # a LIST = one complete study per si
 
 POI_P_TARGET_MW  = {
     "SantaFe":        502,      # 984.2, 502 MW BESS + the rest from 765912/765922/765932/765935
-    "IronStar":       214,      # 290.5, 214 MW BESS + the rest from 587313/587317
+    "IronStar":       216,      # 290.5, 214 MW BESS + the rest from 587313/587317
     "EastFork":       112,      # 193.5, 112 MW BESS + the rest from 531620/531607
     "EmpirePrairie":  604,      # 769, 604, BESS + the rest from 761379/761382/761400/761403
 }
@@ -4510,6 +4512,23 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
                           "direction": direction, "worse_within": worse_within,
                           "detail_base": db_, "detail_test": dt_})
 
+        # A RUN THAT STOPPED EARLY SAYS SO ON EVERY SHEET. The study writes an
+        # INFO line into the criteria report of a partial run; here it becomes
+        # a prefix on the fault's description, which every sheet carries, so
+        # a verdict judged on 23 of 25 seconds is never read as one judged on
+        # the whole run.
+        _pp = []
+        for c in crits:
+            if "PARTIAL RUN" not in str(c.get("criterion") or "").upper():
+                continue
+            for _side, _dk in (("base", "detail_base"), ("project", "detail_test")):
+                _d = str(c.get(_dk) or "")
+                _m = re.search(r"stopped at t=([\d.]+) s of ([\d.]+) s", _d)
+                if _m:
+                    _pp.append("%s stopped at %s of %s s" % (_side, _m.group(1), _m.group(2)))
+        if _pp and not str(descs.get(fid, "")).startswith("PARTIAL RUN ("):
+            descs = dict(descs)              # never write into a shared table
+            descs[fid] = "PARTIAL RUN (%s) -- %s" % ("; ".join(_pp), descs.get(fid, ""))
         # A fault that fails on both sides but on DIFFERENT criteria carries a
         # new problem inside a pre-existing failure. Fault level cannot show it;
         # this is what makes it visible.
@@ -7472,6 +7491,15 @@ def _side_state(rdir, fid):
     od = os.path.join(rdir, "outs")
     if os.path.isfile(os.path.join(od, sid + ".done")):
         return "scored-less", ""
+    if os.path.isfile(os.path.join(od, sid + ".partial")):
+        _te = ""
+        try:
+            for _ln in open(os.path.join(od, sid + ".partial")):
+                if _ln.startswith("tend="):
+                    _te = "%.1f s" % float(_ln[5:].strip())
+        except Exception:
+            pass
+        return "partial", ("stopped at %s" % _te) if _te else "stopped early"
     att = ""
     try:
         with open(os.path.join(od, sid + ".attempts")) as fh:
@@ -7499,6 +7527,8 @@ def _side_state_words(rdir, fid):
         return "simulated, not scored"
     if st == "crashed":
         return "CRASHED (no .done%s)" % ((": " + det) if det else "")
+    if st == "partial":
+        return "PARTIAL run (%s) -- scored on the record that exists" % det
     return "not run"
 
 
@@ -13780,6 +13810,8 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False)
     _ncase = _live_case_count() if RUN_IN_PARALLEL else 1
     env["SPP_LAUNCH_WORKERS"] = str(_workers_for(case["key"], N_WORKERS, _ncase))
     env["SPP_SLOTS_FILE"] = _slots_file_for(case["key"])
+    env["SPP_SCORE_PARTIAL"] = "1" if SCORE_PARTIAL_RUNS else "0"
+    env["SPP_PARTIAL_MIN_FRAC"] = repr(float(PARTIAL_MIN_FRAC))
     if CORES_MAX_INCLUDES_REPORTS:
         # THE SAME SHARE, NOT A SECOND ONE. The scoring may use every session
         # this case was given, and not one more -- and it may not run while the

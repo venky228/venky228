@@ -2057,7 +2057,7 @@ def _stale_aside(out_dir, sid, why):
     # the fault list was renumbered comes back carrying the previous list's
     # attempts -- at the cap it is refused on sight and reported GAVE-UP
     # without ever being simulated.
-    for ext in ("out", "done", "attempts", "plotted", "readfail", "badout"):
+    for ext in ("out", "done", "attempts", "plotted", "readfail", "badout", "partial"):
         p = os.path.join(out_dir, "%s.%s" % (sid, ext))
         if os.path.isfile(p):
             try:
