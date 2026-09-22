@@ -50,10 +50,12 @@ import subprocess
 # ============================================================================
 #  SETTINGS
 # ============================================================================
-REFERENCE = r"C:\KV\Base\results_base\SantaFe_spp"          # the folder every scenario is compared AGAINST, e.g. r"C:\KV\Base\results_base\SantaFe_spp"
-SCENARIOS = [    r"C:\KV\Projects\results_proj\SantaFe_spp" ,
-                 r"C:\KV\Projects\results_proj\Sep21_full gia\SantaFe_spp",       # the folders to compare against it, one report each, e.g.
+REFERENCE = r""          # the folder every scenario is compared AGAINST, e.g. r"C:\KV\Base\results_base\SantaFe_spp"
+                         # "" with ALL_PROJECTS = True below: every Base\results_base\<proj>_spp in turn
+SCENARIOS = [            # the folders to compare against it, one report each; EMPTY with AUTO_SCENARIOS = True
+                         # below: every run of the project is found on its own, e.g.
     # r"C:\KV\Projects\results_proj\SantaFe_spp",
+    # r"C:\KV\Projects\results_proj\Sep21_full gia\SantaFe_spp",
     # r"C:\KV\Projects\results_proj\SantaFe_spp_poi502",
 ]
 PAIRS = [                # explicit pairs when the reference differs per pair:
@@ -61,7 +63,14 @@ PAIRS = [                # explicit pairs when the reference differs per pair:
     # (r"C:\KV\Projects\results_proj\SantaFe_spp", r"C:\KV\Projects\results_proj\SantaFe_spp_poi502", "SantaFe_GIA_vs_studied"),
 ]
 OUT_DIR = r""            # "" = <panel folder>\comparison_pairs
-SIDE_BY_SIDE = True      # also one sheet with every scenario that shares a reference side by side: reference | as studied | GIA | ... per fault
+SIDE_BY_SIDE = True      # also one workbook with every scenario that shares a reference side by side: reference | as studied | GIA | ... per fault
+AUTO_SCENARIOS = True    # SCENARIOS empty -> every results folder of the reference's project is compared:
+                         #   Projects\results_proj\<proj>_<mode>*, Projects\results_proj\<anything>\<proj>_<mode>*
+                         #   and every other Base\results_base*\<proj>_<mode> (another base run) -- .old / __run copies skipped
+ALL_PROJECTS = True      # REFERENCE empty -> every Base\results_base\<proj>_<mode> is a reference in turn (all projects, all runs)
+SCAN_ROOTS = [           # extra folders to look in for runs of the same project (each scanned one and two levels deep)
+    # r"D:\archive\results_proj",
+]
 REMERGE_STALE = True     # rebuild a folder's reports from parts\ when the parts are newer (same as the panel)
 ASK_IF_EMPTY = True      # nothing above and nothing on the command line -> folder pickers
 PANEL = "z4_cmp_all_con.py"
@@ -256,6 +265,61 @@ def _folder_tag(folder):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", "_".join(bits))
 
 
+def _has_outs(d):
+    try:
+        return bool(glob.glob(os.path.join(d, "outs", "*.out")))
+    except Exception:
+        return False
+
+
+def _skip_dir(d):
+    n = _base(d).lower()
+    return n.endswith(".old") or "__run" in n or n.startswith("_")
+
+
+def _all_references(z4):
+    """Every Base\results_base\<proj>_<mode> that holds .out files."""
+    out = []
+    root = os.path.join(z4.STUDY_ROOT, "Base", "results_base")
+    for m in list(z4.MODES) or ["spp"]:
+        for d in sorted(glob.glob(os.path.join(root, "*_%s" % m))):
+            if os.path.isdir(d) and _has_outs(d) and not _skip_dir(d):
+                out.append(_norm(d))
+    return out
+
+
+def _discover_scenarios(z4, ref):
+    """Every OTHER results folder of the reference's project: the project
+       runs (as studied, GIA, capacity, .dyr edits, dated sub-folders) and any
+       other base run. Nothing is compared twice and the reference is never
+       compared with itself."""
+    proj, mode, _sfx = _split_name(ref, z4.MODES)
+    pat = "%s_%s*" % (proj, mode)
+    roots = [os.path.join(z4.STUDY_ROOT, "Projects", "results_proj")]
+    for d in sorted(glob.glob(os.path.join(z4.STUDY_ROOT, "Base", "results_base*"))):
+        if os.path.isdir(d):
+            roots.append(d)
+    roots += [r for r in SCAN_ROOTS if r]
+    found, seen = [], set([_norm(ref)])
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        cands = sorted(glob.glob(os.path.join(root, pat)))
+        cands += sorted(glob.glob(os.path.join(root, "*", pat)))
+        for d in cands:
+            if not os.path.isdir(d) or _skip_dir(d) or _skip_dir(os.path.dirname(d)):
+                continue
+            p2, m2, _s2 = _split_name(d, z4.MODES)
+            if p2 != proj or m2 != mode or not _has_outs(d):
+                continue
+            n = _norm(d)
+            if n in seen:
+                continue
+            seen.add(n)
+            found.append(n)
+    return found
+
+
 def _label_for(ref, test):
     proj, _m, _s = _split_name(test, None)
     rk = "base" if "results_base" in _parts(ref) else _folder_tag(ref)
@@ -349,17 +413,32 @@ def compare_pair(z4, ref, test, label=None):
     print("[pair] %d fault(s) compared: %d NEW with the test folder, %d pre-existing "
           "-- %.0f s" % (len(rows), n_new, n_pre, time.time() - t0))
     print("[pair] -> %s" % folder)
+    # EVERY SHEET THE PANEL WRITES, kept for the side-by-side workbook -- the
+    # same builders, the same rows, so the two never disagree.
+    def _safe(fn, *a):
+        try:
+            return fn(*a) or []
+        except Exception as e:
+            print("[pair]   %s failed (%s) -- that sheet will be short" % (getattr(fn, "__name__", "?"), e))
+            return []
+    summ = _safe(z4._summary_rows, [res])
+    detail = _safe(z4._report_rows, [res])
+    notrun = _safe(z4._notrun_rows, [res])
+    poi = _safe(z4._poi_power_rows, [res])
+    new_el = _safe(lambda d: z4._compact_view(z4._project_caused_rows(d)), detail)
+    pre_el = _safe(lambda d: z4._compact_view(z4._pre_existing_element_rows(d)), detail)
     try:
-        summ = z4._summary_rows([res])
+        outs_r, scored_r = z4._out_and_scored_sets(ref, proj_t)
+        outs_t, scored_t = z4._out_and_scored_sets(test, proj_t)
     except Exception:
-        summ = []
-    try:
-        detail = z4._report_rows([res])
-    except Exception:
-        detail = []
+        outs_r = scored_r = outs_t = scored_t = set()
     return {"label": label, "ref": ref, "test": test, "folder": folder, "proj": proj_t,
             "faults": len(rows), "new": n_new, "pre": n_pre, "summary": summ,
-            "detail": detail, "tag": _folder_tag(test)}
+            "detail": detail, "notrun": notrun, "poi": poi, "new_el": new_el,
+            "pre_el": pre_el, "tag": _folder_tag(test),
+            "n_out_ref": len(outs_r), "n_scored_ref": len(scored_r),
+            "n_out": len(outs_t), "n_scored": len(scored_t),
+            "only_ref": sorted(only_b or []), "only_test": sorted(only_t or [])}
 
 
 _SBS_PER = [("verdict", "verdict_projects"), ("class", "classification"),
@@ -685,6 +764,96 @@ def _sbs_elements(z4, ref, group, tags, rk):
     return header, rows, widths, _style
 
 
+def _long_sheet(z4, group, tags, key, cols):
+    """Every scenario's rows of one panel sheet, stacked, with the scenario
+       tag as the LAST column -- last so the panel's own colour rules, which
+       index columns from the left, still apply."""
+    rows = []
+    for g, t in zip(group, tags):
+        for r in (g.get(key) or []):
+            r = list(r)
+            while len(r) < len(cols):
+                r.append(z4.EMPTY_CELL)
+            rows.append([(z4.EMPTY_CELL if v in ("", None) else v) for v in r[:len(cols)]] + [t])
+    return rows
+
+
+def _sbs_poi(z4, ref, group, tags, rk):
+    """POI power per fault, wide: the reference totals, then each scenario's
+       totals, new-plant and existing MW and the post-clearing minimum."""
+    PC = dict((c, i) for i, c in enumerate(z4._POI_COLS))
+    per, order, poi_of = {}, [], {}
+    for g, t in zip(group, tags):
+        for r in (g.get("poi") or []):
+            fid = str(r[PC["fault"]]).strip()
+            if fid not in per:
+                per[fid] = {}
+                order.append(fid)
+                poi_of[fid] = r[PC["POI"]]
+            per[fid][t] = r
+    proj = group[0]["proj"]
+    header = ["fault", "project", "POI", "total P0 (MW) | %s" % rk, "total end (MW) | %s" % rk,
+              "total Q0 (MVAr) | %s" % rk]
+    widths = [8, 12, 9, 16, 16, 16]
+    for nm, w in (("total P0 (MW)", 14), ("total end (MW)", 14), ("new plant P0 (MW)", 16),
+                  ("new plant end (MW)", 16), ("existing P0 (MW)", 16), ("existing end (MW)", 16),
+                  ("total Q0 (MVAr)", 14), ("total Q end (MVAr)", 14),
+                  ("min P after clearing (MW)", 18), ("how measured", 40)):
+        for t in tags:
+            header.append("%s | %s" % (nm, t)); widths.append(w)
+    src = ["project total P0 (MW)", "project total end (MW)", "project new plant P0 (MW)",
+           "project new plant end (MW)", "project existing P0 (MW)", "project existing end (MW)",
+           "project total Q0 (MVAr)", "project total Q end (MVAr)",
+           "project min P after clearing (MW)", "how the project total was measured"]
+    rows = []
+    for fid in sorted(order, key=lambda x: (len(x), x)):
+        first = None
+        for t in tags:
+            if per[fid].get(t) is not None:
+                first = per[fid][t]
+                break
+        row = [fid, proj, poi_of[fid],
+               first[PC["base total P0 (MW)"]] if first is not None else "-",
+               first[PC["base total end (MW)"]] if first is not None else "-",
+               first[PC["base total Q0 (MVAr)"]] if first is not None else "-"]
+        for c in src:
+            for t in tags:
+                r = per[fid].get(t)
+                row.append(r[PC[c]] if r is not None else "not compared")
+        rows.append([("-" if (v is None or str(v).strip() == "") else v) for v in row])
+
+    def _style(row):
+        # red when any scenario's POI total did not come back to 90 % of P0
+        try:
+            n = len(tags)
+            for i in range(n):
+                p0 = float(row[6 + i]); pe = float(row[6 + n + i])
+                if p0 > 1.0 and pe < 0.9 * p0:
+                    return 2
+        except (TypeError, ValueError, IndexError):
+            pass
+        return None
+    return header, rows, widths, _style
+
+
+def _sbs_runs(z4, ref, group, tags, rk):
+    """One line per run: where it is, how much it holds, how it compared."""
+    header = ["tag", "role", "folder", ".out files", "with a verdict", "faults compared",
+              "NEW", "pre-existing", "only in this run", "only in the reference",
+              "pair report"]
+    widths = [16, 10, 70, 10, 12, 14, 8, 12, 40, 40, 70]
+    g0 = group[0]
+    rows = [[rk, "reference", ref, g0.get("n_out_ref", "-"), g0.get("n_scored_ref", "-"),
+             "-", "-", "-", "-", "-", "-"]]
+    for g, t in zip(group, tags):
+        rows.append([t, "scenario", g["test"], g.get("n_out", "-"), g.get("n_scored", "-"),
+                     g["faults"], g["new"], g["pre"],
+                     ", ".join(g.get("only_test") or []) or "-",
+                     ", ".join(g.get("only_ref") or []) or "-",
+                     os.path.join(g["folder"], "00_COMPARISON_REPORT_%s.xlsx" % g["label"])])
+    return header, rows, widths, None
+
+
 def write_side_by_side(z4, ref, group):
     """ONE WORKBOOK, EVERY SCENARIO THAT SHARES THIS REFERENCE.
          1 Faults    one row per fault: base | as studied | GIA | ... verdicts
@@ -699,6 +868,17 @@ def write_side_by_side(z4, ref, group):
     rk = "base" if "results_base" in _parts(ref) else _folder_tag(ref)
     fh, fr, fw, fs = _sbs_faults(z4, ref, group, tags, rk)
     eh, er, ew, es = _sbs_elements(z4, ref, group, tags, rk)
+    ph, pr, pw, ps = _sbs_poi(z4, ref, group, tags, rk)
+    uh, ur, uw, us = _sbs_runs(z4, ref, group, tags, rk)
+    # AND EVERY SHEET OF EVERY PAIR WORKBOOK, STACKED -- nothing the panel
+    # writes for one pair is missing from the workbook that holds them all.
+    # Same columns, same colour rules, plus the scenario tag in the last column.
+    _sum = _long_sheet(z4, group, tags, "summary", z4._SUMMARY_COLS)
+    _new = _long_sheet(z4, group, tags, "new_el", z4._COMPACT_COLS)
+    _pre = _long_sheet(z4, group, tags, "pre_el", z4._COMPACT_COLS)
+    _nc = _long_sheet(z4, group, tags, "notrun", z4._NOTRUN_COLS)
+    _det = _long_sheet(z4, group, tags, "detail", z4._REPORT_COLS)
+    _poi = _long_sheet(z4, group, tags, "poi", z4._POI_COLS)
     out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
     lab = re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_SIDE_BY_SIDE_vs_%s" % (proj, rk))
     d = os.path.join(out_root, lab)
@@ -709,10 +889,33 @@ def write_side_by_side(z4, ref, group):
              "reference (%s) = %s" % (rk, ref)]
     for g, t in zip(group, tags):
         title.append("%s = %s" % (t, g["test"]))
-    z4.write_xlsx_multi(xp, [("1 Faults", fh, fr, fw, fs), ("2 Elements", eh, er, ew, es)],
-                        legend=z4._XL_LEGEND, title_rows=title)
+    title.append("generated %s" % time.strftime("%Y-%m-%d %H:%M"))
+    sheets = [("1 Faults", fh, fr, fw, fs),
+              ("2 Elements", eh, er, ew, es),
+              ("3 POI power", ph, pr, pw, ps),
+              ("4 Summary all runs", z4._SUMMARY_COLS + ["scenario"], _sum,
+               z4._SUMMARY_WIDTHS + [16], z4._xl_style_of_summary),
+              ("5 Introduces all runs", z4._COMPACT_COLS + ["scenario"], _new,
+               z4._COMPACT_WIDTHS + [16], z4._xl_style_compact),
+              ("6 Pre-existing all runs", z4._COMPACT_COLS + ["scenario"], _pre,
+               z4._COMPACT_WIDTHS + [16], z4._xl_style_compact),
+              ("7 Not compared all runs", z4._NOTRUN_COLS + ["scenario"], _nc,
+               z4._NOTRUN_WIDTHS + [16], z4._xl_style_of_notrun),
+              ("8 All detail all runs", z4._REPORT_COLS + ["scenario"], _det,
+               z4._REPORT_WIDTHS + [16], z4._xl_style_of),
+              ("9 POI power all runs", z4._POI_COLS + ["scenario"], _poi,
+               z4._POI_WIDTHS + [16], z4._xl_style_poi),
+              ("10 Runs", uh, ur, uw, us)]
+    z4.write_xlsx_multi(xp, sheets, legend=z4._XL_LEGEND, title_rows=title)
     import csv
-    for stem, hdr, rws in (("FAULTS", fh, fr), ("ELEMENTS", eh, er)):
+    for stem, hdr, rws in (("FAULTS", fh, fr), ("ELEMENTS", eh, er), ("POI", ph, pr),
+                           ("SUMMARY_ALL", z4._SUMMARY_COLS + ["scenario"], _sum),
+                           ("INTRODUCES_ALL", z4._COMPACT_COLS + ["scenario"], _new),
+                           ("PREEXISTING_ALL", z4._COMPACT_COLS + ["scenario"], _pre),
+                           ("NOTCOMPARED_ALL", z4._NOTRUN_COLS + ["scenario"], _nc),
+                           ("DETAIL_ALL", z4._REPORT_COLS + ["scenario"], _det),
+                           ("POI_ALL", z4._POI_COLS + ["scenario"], _poi),
+                           ("RUNS", uh, ur)):
         cp = os.path.join(d, "SIDE_BY_SIDE_%s_%s.csv" % (stem, lab))
         try:
             with open(cp, "w", newline="") as fhh:
@@ -722,8 +925,10 @@ def write_side_by_side(z4, ref, group):
                     w.writerow([("" if v is None else v) for v in r])
         except Exception as e:
             print("[pair] could not write %s: %s" % (cp, e))
-    print("[pair] side by side (%s): %d fault row(s), %d element row(s) -> %s"
-          % (" | ".join([rk] + tags), len(fr), len(er), xp))
+    print("[pair] side by side (%s): %d fault row(s), %d element row(s), %d POI row(s), "
+          "%d summary / %d detail / %d not-compared row(s) across all runs -> %s"
+          % (" | ".join([rk] + tags), len(fr), len(er), len(pr), len(_sum), len(_det),
+             len(_nc), xp))
     return xp
 
 
@@ -756,6 +961,8 @@ def _pairs_from_settings(argv):
             pairs.append((REFERENCE, s, None))
     if pairs or not ASK_IF_EMPTY:
         return pairs
+    if AUTO_SCENARIOS:
+        return None                      # resolved once the panel is loaded -- see main()
     print("[pair] no folders given -- pick them (reference first, then the one to test)")
     ref = _pick("REFERENCE results folder (e.g. Base\\results_base\\SantaFe_spp)")
     if not ref:
@@ -768,13 +975,37 @@ def _pairs_from_settings(argv):
     return pairs
 
 
+def _auto_pairs(z4):
+    """REFERENCE + every run of its project (AUTO_SCENARIOS); with REFERENCE
+       empty, every base folder is a reference in turn (ALL_PROJECTS)."""
+    refs = [_norm(REFERENCE)] if REFERENCE else (_all_references(z4) if ALL_PROJECTS else [])
+    pairs = []
+    for ref in refs:
+        if not os.path.isdir(ref):
+            print("[pair] *** reference folder not found: %s ***" % ref)
+            continue
+        scen = _discover_scenarios(z4, ref)
+        proj = _split_name(ref, z4.MODES)[0]
+        if not scen:
+            print("[pair] %-16s no other run of this project found beside %s" % (proj, ref))
+            continue
+        print("[pair] %-16s reference %s" % (proj, ref))
+        for t in scen:
+            print("[pair]                  vs %s" % t)
+            pairs.append((ref, t, None))
+    return pairs
+
+
 def main(argv):
     pairs = _pairs_from_settings(argv)
-    if not pairs:
-        print("[pair] nothing to compare. Fill in REFERENCE + SCENARIOS or PAIRS, or give "
-              "two folders on the command line.")
-        return 1
     z4 = _load_panel()
+    if pairs is None:
+        pairs = _auto_pairs(z4)
+    if not pairs:
+        print("[pair] nothing to compare. Fill in REFERENCE + SCENARIOS or PAIRS, give "
+              "two folders on the command line, or leave REFERENCE empty with "
+              "ALL_PROJECTS = True to compare every project's runs against its base.")
+        return 1
     # ONE FOLDER PER PAIR, ALWAYS. Two test folders with the same name (the
     # as-studied run and yesterday's copy of it) used to get the same label,
     # and the second report overwrote the first.
