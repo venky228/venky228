@@ -182,24 +182,44 @@ def _end_time_from_layout(path, lay):
         head = [_word(fh, base + t_off + i * stride) for i in range(8)]
         if not _looks_like_time(head):
             return None
-        # The last sample this file can hold, then walk back over the trailer
-        # and any partial record the run was cut off in the middle of.
-        n = (words - trailer - base - t_off) // stride
+        # WHICH RECORD IS THE LAST ONE, ASKED OF THE GRID ITSELF.
+        #
+        # Time is a ramp: sample i is t0 + i*step, and the first eight above
+        # give both. So a word is part of the time column only if it equals
+        # what the grid says it should be at that index -- nothing else does.
+        #
+        # THE LOOSE TEST READ VOLTAGES AS SECONDS. It accepted any value whose
+        # neighbour was within one step, and a bus voltage sitting at 0.97 pu
+        # passes that trivially: every .out in a folder, 21 MB and 95 MB
+        # alike, came back "0.97 s" and 197 complete runs were called too
+        # short. The tail of the file is where that happens -- the record
+        # count from the byte size can overshoot into the trailer, and one
+        # word past the grid the stride lands in some other channel.
+        #
+        # Binary search for the largest index that still matches the grid:
+        # inside the data it matches, past the end it does not, and index 0
+        # is known good from the head. About twenty seeks, no walk.
         step = head[1] - head[0]
-        last = None
-        i = int(n) - 1
-        tries = 0
-        while i >= 0 and tries < 4096:
+        t0 = head[0]
+        tol = max(0.5 * step, 1e-4)
+
+        def _on_grid(i):
             v = _word(fh, base + t_off + i * stride)
-            if v is not None and -1.0 <= v <= 1e6:
-                # one sample back must be one step behind it
-                p = _word(fh, base + t_off + (i - 1) * stride) if i else v - step
-                if p is not None and -1e-6 <= (v - p) <= max(10.0 * step, 1.0):
-                    last = v
-                    break
-            i -= 1
-            tries += 1
-        return last
+            return v is not None and abs(v - (t0 + i * step)) <= tol
+
+        hi = int((words - trailer - base - t_off) // stride) - 1
+        if hi < 0:
+            return None
+        if _on_grid(hi):
+            return t0 + hi * step
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _on_grid(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return t0 + lo * step if lo > 0 else None
     finally:
         try:
             fh.close()

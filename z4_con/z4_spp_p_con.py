@@ -33322,21 +33322,38 @@ def _out_end_seconds(path):
             head = [_w(fh, base + t_off + i * stride) for i in range(8)]
             if not _is_time(head):
                 continue                      # this layout is not this file's
+            # WHICH RECORD IS THE LAST ONE, ASKED OF THE GRID ITSELF.
+            #
+            # Time is a ramp: sample i is t0 + i*step, and the head gives
+            # both. A word belongs to the time column only if it equals what
+            # the grid says at that index. The old test only asked that a
+            # value be close to its neighbour, which a bus voltage resting at
+            # 0.97 pu satisfies -- so every file in a folder, 21 MB and 95 MB
+            # alike, read "0.97 s" and 197 complete runs were called short.
+            # Binary search: inside the data the grid matches, past the end
+            # it does not, and index 0 is known good from the head.
             step = head[1] - head[0]
-            n = (words - trailer - base - t_off) // stride
-            i = int(n) - 1
-            tries = 0
-            # Walk back over the trailer and the half-written record the run
-            # was cut off inside; the sample before the last must be one step
-            # behind it, or it is not the time column.
-            while i >= 0 and tries < 4096:
-                v = _w(fh, base + t_off + i * stride)
-                if v is not None and -1.0 <= v <= 1e6:
-                    p = _w(fh, base + t_off + (i - 1) * stride) if i else v - step
-                    if p is not None and -1e-6 <= (v - p) <= max(10.0 * step, 1.0):
-                        return v
-                i -= 1
-                tries += 1
+            t0 = head[0]
+            tol = max(0.5 * step, 1e-4)
+
+            def _on_grid(i, _fh=fh, _b=base, _t=t_off, _s=stride):
+                v = _w(_fh, _b + _t + i * _s)
+                return v is not None and abs(v - (t0 + i * step)) <= tol
+
+            hi = int((words - trailer - base - t_off) // stride) - 1
+            if hi < 0:
+                continue
+            if _on_grid(hi):
+                return t0 + hi * step
+            lo = 0
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if _on_grid(mid):
+                    lo = mid
+                else:
+                    hi = mid - 1
+            if lo > 0:
+                return t0 + lo * step
         finally:
             try:
                 fh.close()
