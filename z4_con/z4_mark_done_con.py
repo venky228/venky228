@@ -62,6 +62,9 @@ HOW TO USE
       --all                       every project (no prompt)
       --base / --proj             just one case
       --use-size                  allow the size test where nothing better exists
+      --partial F86,F88           mark these by hand as PARTIAL, so the report
+                                  scores them on the record that exists (for
+                                  runs whose length cannot be read here)
       --restore-stale             put back <id>.out.stale_<stamp> and its
                                   markers (the launcher moves a scenario aside
                                   when its marker does not match the fault list)
@@ -804,6 +807,69 @@ def main(argv):
              "base + project" if (want_base and want_proj)
              else ("base only" if want_base else "project only"), len(folders)))
     print("=" * 96)
+
+    _named = None
+    for i, a in enumerate(argv):
+        if a == "--partial" and i + 1 < len(argv):
+            _named = [x.strip().upper() for x in argv[i + 1].split(",") if x.strip()]
+    if _named:
+        # MARK THESE BY HAND, AS PARTIAL.
+        #
+        # For the runs whose length cannot be read here -- no scored part, no
+        # progress row, and a layout that does not fit this folder's files --
+        # nothing above can decide. But an 89 MB .out beside 94 MB complete
+        # ones plainly holds most of a run, and without SOME marker the report
+        # phase refuses to open it at all, so it is dropped from the
+        # comparison for ever. A .partial says "score this on the record that
+        # exists and label it PARTIAL", and the scoring pass -- which reads the
+        # file properly -- puts the real end time in the report.
+        #
+        # It is never a .done: a .partial is still re-run by a sweep that has
+        # attempts left, and every sheet says PARTIAL against it.
+        tot = 0
+        for key, name, rdir in folders:
+            od = os.path.join(rdir, "outs")
+            proj = str(name or "").split("_")[0]
+            rows = fault_rows(rdir, proj)
+            sigfn = _row_sig_fn(key) if rows else None
+            hits = [x for x in _named
+                    if os.path.isfile(os.path.join(od, x + ".out"))]
+            if not hits:
+                continue
+            print("")
+            print("=" * 96)
+            print(" %-5s %-28s %s" % (key, name, od))
+            print("=" * 96)
+            for sid in hits:
+                if os.path.isfile(os.path.join(od, sid + ".done")):
+                    print("   %-12s already has a .done -- left alone" % sid)
+                    continue
+                try:
+                    mb = os.path.getsize(os.path.join(od, sid + ".out")) / 1e6
+                except Exception:
+                    mb = 0.0
+                print("   %-12s %7.1f MB  -> .partial   named on the command line"
+                      % (sid, mb))
+                if not write:
+                    continue
+                txt = "tend=%.3f" % (float(PARTIAL_MIN_FRAC) * float(SIM_END_S))
+                if sigfn is not None and sid in rows:
+                    try:
+                        txt += "\nsig=%s" % sigfn(rows[sid])
+                    except Exception:
+                        pass
+                txt += ("\nby=%s %s\nwhy=named with --partial; the scoring pass reads "
+                        "the real end time" % (SIGNATURE, time.strftime("%Y-%m-%d %H:%M:%S")))
+                _write(os.path.join(od, sid + ".partial"), txt)
+                tot += 1
+        print("")
+        if write:
+            print("[mark] %d .partial marker(s) written. The report phase scores them"
+                  % tot)
+            print("[mark] and every sheet says PARTIAL RUN against them.")
+        else:
+            print("[mark] nothing was written. Add --write.")
+        return 0
 
     if "--restore-stale" in argv:
         tot = 0
