@@ -60,6 +60,8 @@ HOW TO USE
   Other switches:
       --only SantaFe,IronStar     just these projects (no prompt)
       --all                       every project (no prompt)
+      --main                      only results_<case>\<project>_spp -- skip the
+                                  dated and parameter-sweep copies beside them
       --base / --proj             just one case
       --use-size                  allow the size test where nothing better exists
       --partial F86,F88           mark these by hand as PARTIAL, so the report
@@ -512,7 +514,7 @@ def size_reference(outs_dir):
 
 
 # ------------------------------------------------------------------ folders --
-def results_folders(only_projects=None, want_base=True, want_proj=True):
+def results_folders(only_projects=None, want_base=True, want_proj=True, main_only=False):
     """Every <case>/results_*/<project>_<mode> folder that holds an outs\\."""
     out = []
     roots = []
@@ -534,6 +536,13 @@ def results_folders(only_projects=None, want_base=True, want_proj=True):
                     # THE FILTER APPLIES HERE TOO. A tagged copy such as
                     # results_proj\Sep21_full gia\SantaFe_spp is still SantaFe.
                     if only_projects and sub.split("_")[0].lower() not in only_projects:
+                        continue
+                    if main_only:
+                        # A VARIANT COPY, NOT THE STUDY THE COMPARISON READS.
+                        # results_proj\dyrsweep_F1-50\SantaFe_spp_dyr_Kqv2_Ki10 is
+                        # a parameter sweep of its own; its files are complete
+                        # for ITS channel set and calling them partial would be
+                        # wrong. --main keeps results_<case>\<project>_spp only.
                         continue
                     out.append((key, sub, d2))
                 continue
@@ -785,7 +794,7 @@ def main(argv):
     if only is None and not asked:
         only = ask_projects(want_base, want_proj)
 
-    folders = results_folders(only, want_base, want_proj)
+    folders = results_folders(only, want_base, want_proj, main_only="--main" in argv)
     if not folders:
         print("[mark] no results folders found under %s / %s"
               % (os.path.join(BASE_DIR, RESULTS_BASE),
