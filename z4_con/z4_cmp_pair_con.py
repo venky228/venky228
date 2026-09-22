@@ -523,6 +523,83 @@ _SBS_EL = [("value", "project_value"), ("state", "project_state"),
            ("past_limit", "past_limit")]
 
 
+def _free(z4, keep_want=False):
+    """Drop everything the panel cached for the last pair. A 32-bit python has
+       2 GB of address space, and three folders' measurements plus every pair's
+       detail rows filled it: the comparison then failed to read its own parts
+       ("MemoryError -- this 32-bit python ran out of its 2 GB address space")
+       and the workbook could not be built."""
+    import gc
+    for name in ("_MEAS_CACHE", "_WANT_BUSES", "_WHERE", "_OUT_SET_CACHE",
+                 "_SCEN_PART_CACHE", "_PART_LAY_CACHE"):
+        if keep_want and name == "_WANT_BUSES":
+            continue               # the element sheet's bus list must survive the read
+        d = getattr(z4, name, None)
+        if isinstance(d, dict):
+            d.clear()
+    gc.collect()
+
+
+def _write_xlsx_lowmem(z4, path, sheets, legend=None, title_rows=None):
+    """The panel's write_xlsx_multi, one sheet at a time. The panel builds every
+       sheet's XML and holds them all while it zips; here each sheet is built,
+       streamed to a temporary file and added to the zip from disk, so the
+       peak is ONE sheet, not the workbook."""
+    import zipfile, tempfile, gc
+    names = [z4._xl_sheet_name(sh[0]) for sh in sheets] + ["Key"]
+    ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+          '<Default Extension="xml" ContentType="application/xml"/>',
+          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>']
+    wb = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"',
+          ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+          '<sheets>']
+    rels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
+    for i, name in enumerate(names, start=1):
+        ct.append('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType='
+                  '"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i)
+        wb.append('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (z4._xl_esc(name), i, i))
+        rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
+                    '/officeDocument/2006/relationships/worksheet" Target="worksheets'
+                    '/sheet%d.xml"/>' % (i, i))
+    ct.append('<Override PartName="/xl/styles.xml" ContentType="application/vnd.'
+              'openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+    wb.append("</sheets></workbook>")
+    rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
+                '/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                % (len(names) + 1))
+    rels.append("</Relationships>")
+    z = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED)
+    try:
+        z.writestr("[Content_Types].xml", "".join(ct))
+        z.writestr("_rels/.rels", z4._XL_RELS)
+        z.writestr("xl/workbook.xml", "".join(wb))
+        z.writestr("xl/_rels/workbook.xml.rels", "".join(rels))
+        z.writestr("xl/styles.xml", z4._XL_STYLES)
+        for i, sh in enumerate(sheets, start=1):
+            name, header, rows, widths, style_of = (list(sh) + [None, None])[:5]
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xml")
+            try:
+                tmp.write(z4._xl_sheet_xml(header, rows, widths, style_of,
+                                           first=(i == 1)).encode("utf-8"))
+                tmp.close()
+                z.write(tmp.name, "xl/worksheets/sheet%d.xml" % i)
+            finally:
+                try:
+                    os.remove(tmp.name)
+                except Exception:
+                    pass
+            gc.collect()
+        z.writestr("xl/worksheets/sheet%d.xml" % len(names),
+                   z4._xl_legend_sheet(legend or [], title_rows or []))
+    finally:
+        z.close()
+    return path
+
+
 def _sbs_tags(group):
     tags = []
     for g in group:
@@ -707,24 +784,51 @@ def _sbs_elements(z4, ref, group, tags, rk):
                 head[k] = r
             per[k][t] = r
     proj = group[0]["proj"]
-    # EVERY FOLDER'S OWN MEASUREMENTS FOR EVERY ELEMENT ON THE SHEET.
-    meas = {}
+    # EVERY FOLDER'S OWN MEASUREMENTS FOR EVERY ELEMENT ON THE SHEET -- read
+    # ONE FOLDER AT A TIME. Holding the reference's and every run's
+    # measurements together (hundreds of thousands of records each) is what
+    # exhausted the 32-bit address space. Each folder is read, the few cells
+    # this sheet needs from it are taken as short strings, and it is dropped
+    # before the next one is opened.
+    fill = {}                          # (tag, fault, criterion, element) -> (value, state)
     try:
         want = z4._want_buses(proj)
         for k in order:
             b = z4._bus_of_element(k[2]) or z4._bus_of_element(k[3])
             if b is not None:
                 want.add(str(b))
-        for name in ("_MEAS_CACHE",):
-            d = getattr(z4, name, None)
-            if isinstance(d, dict):
-                d.clear()
-        meas[rk] = z4.read_measurements(ref, proj)
-        for g, t in zip(group, tags):
-            meas[t] = z4.read_measurements(g["test"], proj)
-    except Exception as e:
-        print("[pair]   measurements for the element sheet could not be read (%s) -- "
-              "cells with no report row show '-'" % e)
+    except Exception:
+        pass
+    _todo = {}                         # tag -> [(key, fam, element)] needing a fill
+    for k in order:
+        fid, crit, el, bus = k
+        fam = z4._criterion_family(crit)
+        _el = el if z4._bus_of_element(el) is not None else bus
+        h = head[k]
+        if str(h[RC["base_value"]]).strip() in ("", "-") or str(h[RC["base_state"]]).strip() == "":
+            _todo.setdefault(rk, []).append((k, fam, _el))
+        for t in tags:
+            r = per[k].get(t)
+            if r is None or str(r[RC["project_value"]]).strip() in ("", "-") \
+                    or str(r[RC["project_state"]]).strip() == "":
+                _todo.setdefault(t, []).append((k, fam, _el))
+    for t, folder in [(rk, ref)] + [(tg, g["test"]) for g, tg in zip(group, tags)]:
+        if not _todo.get(t):
+            continue
+        try:
+            _free(z4, keep_want=True)
+            m = z4.read_measurements(folder, proj)
+            for k, fam, _el in _todo[t]:
+                fill[(t,) + k] = _meas_fill(z4, m, fam, k[0], _el)
+            del m
+        except Exception as e:
+            print("[pair]   measurements of %s could not be read (%s) -- cells with no "
+                  "report row show '-'" % (folder, e))
+        _free(z4, keep_want=True)
+    meas = dict((t, True) for t in [rk] + tags)        # which folders were read
+
+    def _meas_fill_cached(t, k):
+        return fill.get((t,) + k, ("-", "not measured in this run"))
     # ATTRIBUTE-MAJOR: value | base, studied, gia ... side by side, then the
     # states, then the classes, changes and past-limit -- one glance per row.
     _w = {"value": 11, "state": 22, "class": 26, "change": 9, "past_limit": 10}
@@ -761,7 +865,7 @@ def _sbs_elements(z4, ref, group, tags, rk):
         _el = el if z4._bus_of_element(el) is not None else bus
         bval, bstate, bnote = h[RC["base_value"]], h[RC["base_state"]], h[RC["base_value_note"]]
         if rk in meas and (str(bval).strip() in ("", "-") or str(bstate).strip() == ""):
-            v2, st2 = _meas_fill(z4, meas[rk], fam, fid, _el)
+            v2, st2 = _meas_fill_cached(rk, k)
             if str(bval).strip() in ("", "-"):
                 bval = v2
                 if str(bnote).strip() == "" and v2 != "-":
@@ -776,11 +880,8 @@ def _sbs_elements(z4, ref, group, tags, rk):
         for t in tags:
             r = per[k].get(t)
             if r is None:
-                # NOT IN THIS SCENARIO'S REPORT: read what that run measured.
-                if t in meas:
-                    val, state = _meas_fill(z4, meas[t], fam, fid, _el)
-                else:
-                    val, state = "-", "not measured in this run"
+                # NOT IN THIS SCENARIO'S REPORT: what that run measured.
+                val, state = _meas_fill_cached(t, k)
                 v, b0 = _num(val), _num(bval)
                 if val == "-":
                     cls = "not measured in this run"
@@ -797,7 +898,7 @@ def _sbs_elements(z4, ref, group, tags, rk):
                 cells = [r[RC[c]] for _nm, c in _SBS_EL]
                 cls = str(r[RC["element_classification"]])
                 if t in meas and (str(cells[0]).strip() in ("", "-") or str(cells[1]).strip() == ""):
-                    v2, st2 = _meas_fill(z4, meas[t], fam, fid, _el)
+                    v2, st2 = _meas_fill_cached(t, k)
                     if str(cells[0]).strip() in ("", "-"):
                         cells[0] = v2
                     if str(cells[1]).strip() == "":
@@ -1068,7 +1169,7 @@ def write_side_by_side(z4, ref, group):
               ("7 Not compared",) + W["notrun"],
               ("8 All detail",) + W["detail"],
               ("9 Runs", uh, ur, uw, us)]
-    z4.write_xlsx_multi(xp, sheets, legend=z4._XL_LEGEND, title_rows=title)
+    _write_xlsx_lowmem(z4, xp, sheets, legend=z4._XL_LEGEND, title_rows=title)
     write_rerun_list(z4, os.path.join(d, "RERUN_%s.txt" % proj),
                      [(rk, ref, proj)] + [(t, g["test"], proj) for g, t in zip(group, tags)])
     import csv
@@ -1236,28 +1337,45 @@ def main(argv):
             used[lab] = 1
         uniq.append((ref, test, lab))
     pairs = uniq
-    done = []
+    # ONE REFERENCE AT A TIME. Its pairs are compared, its side-by-side
+    # workbook written, and everything is dropped before the next reference:
+    # the rows of eight pairs held together are what ran a 32-bit python out
+    # of memory part way through the third project.
+    groups, gorder = {}, []
     for ref, test, label in pairs:
-        try:
-            got = compare_pair(z4, ref, test, label)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print("[pair] *** %s vs %s failed: %s ***" % (ref, test, e))
-            got = None
-        if got:
-            done.append(got)
-    if done and SIDE_BY_SIDE:
-        groups = {}
-        for g in done:
-            groups.setdefault((g["ref"], g["proj"]), []).append(g)
-        for (ref, _p), grp in sorted(groups.items()):
+        k = _norm(ref)
+        if k not in groups:
+            groups[k] = []
+            gorder.append(k)
+        groups[k].append((ref, test, label))
+    done, n_done = [], 0
+    for k in gorder:
+        grp = []
+        for ref, test, label in groups[k]:
+            _free(z4)
             try:
-                write_side_by_side(z4, ref, grp)
+                got = compare_pair(z4, ref, test, label)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print("[pair] *** %s vs %s failed: %s ***" % (ref, test, e))
+                got = None
+            if got:
+                grp.append(got)
+        _free(z4)
+        if grp and SIDE_BY_SIDE:
+            try:
+                write_side_by_side(z4, grp[0]["ref"], grp)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 print("[pair] *** the side-by-side sheet failed: %s ***" % e)
+        n_done += len(grp)
+        # the index needs only the numbers -- the rows go
+        for g in grp:
+            done.append(dict((kk, g[kk]) for kk in ("label", "faults", "new", "pre", "ref", "test", "folder")))
+        del grp
+        _free(z4)
     if done:
         out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
         idx = os.path.join(out_root, "PAIRS_INDEX.txt")
