@@ -1,0 +1,575 @@
+# -*- coding: utf-8 -*-
+"""
+z4_mark_done_con.py -- give a finished run the .done marker it never got.
+
+WHY THIS EXISTS
+  A scenario is treated as finished only when a .done marker sits beside its
+  .out. The marker is written by the run that produced the file, or by a plot
+  pass that read it afterwards -- and a plot pass reads at minutes per file,
+  so a folder of 290 results can sit for days with its .out files complete and
+  most of them unmarked. Everything downstream then misreads the folder:
+
+      PIPELINE = "all"   re-SIMULATES every unmarked fault (hours per fault)
+      the report phase   refuses to score them -- no marker, no verdict
+      the comparison     shows them as CRASHED, or leaves the base column empty
+
+  This script decides the question the cheap way -- from the run's own
+  evidence, without PSS/E and without reading a 90 MB file end to end -- and
+  writes the marker where the evidence says the run finished.
+
+WHAT COUNTS AS EVIDENCE, strongest first
+  1. THE TIME AXIS of the .out itself. Where the folder holds an
+     OUT_LAYOUT_<n>.txt (the packed reader writes one per channel set), the
+     last sample of the time column is read with three seeks. That is the same
+     test the study makes, and it is decisive: the run either reached the end
+     of the simulation or it did not.
+  2. A SCORE ALREADY ON DISK. parts\\SCEN_<id>.csv is written by whatever
+     process scored the scenario, and nothing scores a scenario it did not
+     read to the end. Its verdict line is proof the run finished.
+  3. THE STUDY'S OWN PROGRESS RECORD. logs\\PROGRESS*.csv carries one row per
+     scenario event; a DONE row for this id is the run saying so itself.
+  4. SIZE, ONLY AS CORROBORATION AND ONLY WITH --use-size. A .out is
+     fixed-width records, so a complete run is within a few per cent of its
+     neighbours -- but a folder can hold two channel sets (14-area and 20-area
+     runs differ by ~20 MB) and judging those against one median is what
+     wrongly retired 182 complete base runs before. Off by default.
+
+WHAT IT WRITES
+  <id>.done      when the evidence says the run reached the end. The marker
+                 carries the clearing time (from the fault list, so the report
+                 can score it without re-reading anything) and tend=.
+  <id>.partial   when the run stopped early but reached PARTIAL_MIN_FRAC of
+                 the simulation -- the engine's own partial-run marker, so the
+                 result is drawn, scored and labelled PARTIAL rather than
+                 silently dropped. Never a .done: a re-run still replaces it.
+  nothing        when the evidence says the run did not get far enough, or
+                 when there is no evidence at all. Those are named on screen.
+
+  Nothing is deleted and no .out is modified. A scenario that already has a
+  .done is left exactly as it is.
+
+HOW TO USE
+  1. Put this file in C:\\KV beside z4_cmp_all_con.py.
+  2. Run it. It lists what it WOULD do and writes nothing:
+         python z4_mark_done_con.py
+  3. Look at the table. Then write the markers:
+         python z4_mark_done_con.py --write
+  4. Now PIPELINE = "all" re-simulates only what genuinely did not finish, and
+     the report phase scores the rest.
+
+  Other switches:
+      --only SantaFe,IronStar     just these projects
+      --base / --proj             just one case
+      --use-size                  allow the size test where nothing better exists
+      --undo                      remove only the markers THIS script wrote
+                                  (each one it writes is signed)
+
+Python 3.4, standard library only.
+"""
+import os
+import re
+import sys
+import csv
+import glob
+import time
+import struct
+
+# ============================================================================
+#  SETTINGS -- the defaults match z4_cmp_all_con.py
+# ============================================================================
+STUDY_ROOT = r"C:\KV"
+BASE_DIR   = os.path.join(STUDY_ROOT, "Base")
+PROJ_DIR   = os.path.join(STUDY_ROOT, "Projects")
+RESULTS_BASE = "results_base"          # folder under BASE_DIR
+RESULTS_PROJ = "results_proj"          # folder under PROJ_DIR
+
+SIM_END_S        = 25.2                # the run length the study asked for
+END_TOL_S        = 0.11                # within this of SIM_END_S = finished
+PARTIAL_MIN_FRAC = 0.80                # of SIM_END_S; shorter = no marker
+USE_SIZE         = False               # --use-size: allow the size fallback
+SIZE_FRAC        = 0.95                # of the median of the folder's OWN
+                                       # marked-done files, and only when the
+                                       # folder holds one channel set
+SIGNATURE        = "z4_mark_done_con"  # written into every marker this makes
+# ============================================================================
+
+_F32 = struct.Struct("<f")
+_U32 = struct.Struct("<I")
+
+
+# ---------------------------------------------------------------- the .out --
+def _layouts_in(outs_dir):
+    """Every OUT_LAYOUT_<n>.txt in this folder as (stride, base, time offset,
+       trailer words), the packed reader's own description of a channel set."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(outs_dir, "OUT_LAYOUT*.txt"))):
+        try:
+            txt = open(p, "r", errors="replace").read()
+        except Exception:
+            continue
+        if not re.search(r"^verified\s*=\s*yes", txt, re.M):
+            continue
+        m_s = re.search(r"^stride\s*=\s*(\d+)", txt, re.M)
+        m_b = re.search(r"^base\s*=\s*(\d+)", txt, re.M)
+        m_t = re.search(r"^off\s+time\s*=\s*(\d+)", txt, re.M)
+        m_r = re.search(r"^trailer\s*=\s*(\d+)", txt, re.M)
+        if not (m_s and m_b and m_t):
+            continue
+        out.append((int(m_s.group(1)), int(m_b.group(1)), int(m_t.group(1)),
+                    int(m_r.group(1)) if m_r else 0))
+    return out
+
+
+def _word(fh, idx):
+    """The float32 at word index idx, or None past the end / non-finite."""
+    try:
+        fh.seek(4 * idx)
+        b = fh.read(4)
+        if len(b) < 4:
+            return None
+        if (_U32.unpack(b)[0] >> 23) & 0xFF == 0xFF:      # NaN / Inf
+            return None
+        return _F32.unpack(b)[0]
+    except Exception:
+        return None
+
+
+def _looks_like_time(vals):
+    """True when these samples behave like the study's time column: starting
+       near zero and rising by one roughly constant step."""
+    if len(vals) < 4 or any(v is None for v in vals):
+        return False
+    if not (-1.0 <= vals[0] <= 1.0):
+        return False
+    step = vals[1] - vals[0]
+    if not (1e-6 < step < 10.0):
+        return False
+    for a, b in zip(vals, vals[1:]):
+        d = b - a
+        if d < -1e-9 or d > max(10.0 * step, 1.0):
+            return False
+    return True
+
+
+def _end_time_from_layout(path, lay):
+    """The last simulated second in this .out under this layout, or None when
+       the layout does not describe this file."""
+    stride, base, t_off, trailer = lay
+    if stride <= 0:
+        return None
+    try:
+        words = os.path.getsize(path) // 4
+    except Exception:
+        return None
+    try:
+        fh = open(path, "rb")
+    except Exception:
+        return None
+    try:
+        # Does the time column behave like time at the head of the file?
+        head = [_word(fh, base + t_off + i * stride) for i in range(8)]
+        if not _looks_like_time(head):
+            return None
+        # The last sample this file can hold, then walk back over the trailer
+        # and any partial record the run was cut off in the middle of.
+        n = (words - trailer - base - t_off) // stride
+        step = head[1] - head[0]
+        last = None
+        i = int(n) - 1
+        tries = 0
+        while i >= 0 and tries < 4096:
+            v = _word(fh, base + t_off + i * stride)
+            if v is not None and -1.0 <= v <= 1e6:
+                # one sample back must be one step behind it
+                p = _word(fh, base + t_off + (i - 1) * stride) if i else v - step
+                if p is not None and -1e-6 <= (v - p) <= max(10.0 * step, 1.0):
+                    last = v
+                    break
+            i -= 1
+            tries += 1
+        return last
+    finally:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
+def end_time_of(path, layouts):
+    """(seconds, how) for this .out -- the time axis under whichever layout
+       fits it -- or (None, "")."""
+    for lay in layouts:
+        t = _end_time_from_layout(path, lay)
+        if t is not None:
+            return t, "time axis (stride %d)" % lay[0]
+    return None, ""
+
+
+# ------------------------------------------------------------ other proof --
+def scored_ids(rdir):
+    """Scenarios whose parts\\SCEN_<id>.csv carries a verdict. Nothing scores
+       a scenario it did not read to the end."""
+    got = set()
+    for p in glob.glob(os.path.join(rdir, "parts", "SCEN_*.csv")):
+        nm = os.path.basename(p)
+        if nm.upper().endswith("_MEAS.CSV"):
+            continue
+        sid = nm[len("SCEN_"):-len(".csv")]
+        try:
+            with open(p) as fh:
+                for ln in fh:
+                    if ln.startswith("verdict,"):
+                        got.add(sid)
+                        break
+        except Exception:
+            continue
+    return got
+
+
+def progress_done_ids(rdir):
+    """Scenarios the study's own progress record calls DONE."""
+    got = set()
+    for p in glob.glob(os.path.join(rdir, "logs", "PROGRESS*.csv")):
+        try:
+            with open(p) as fh:
+                for row in csv.reader(fh):
+                    if len(row) >= 3 and str(row[2]).strip().upper() == "DONE":
+                        got.add(str(row[1]).strip())
+        except Exception:
+            continue
+    return got
+
+
+def _row_sig_fn(case_key):
+    """The study's OWN _fault_row_sig, lifted out of the engine script.
+
+       THE MARKER NEEDS THE FINGERPRINT OR IT IS WORSE THAN NOTHING. A .done
+       carries sig=<hash of the fault row>, and the launcher checks it before
+       trusting the marker: one without a fingerprint is moved aside as .stale
+       and the scenario is SIMULATED AGAIN -- exactly what this script exists
+       to avoid. So the hash is not reimplemented here, where it could drift
+       out of step with the study; the function is read from the engine that
+       wrote the results and executed as it stands."""
+    for d, name in ((BASE_DIR, "z4_spp_b_con.py"), (PROJ_DIR, "z4_spp_p_con.py"),
+                    (STUDY_ROOT, "z4_spp_b_con.py"), (STUDY_ROOT, "z4_spp_p_con.py")):
+        if case_key == "BASE" and "p_con" in name:
+            continue
+        if case_key == "PROJ" and "b_con" in name:
+            continue
+        p = os.path.join(d, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            src = open(p, "r", errors="replace").read()
+        except Exception:
+            continue
+        i = src.find("def _fault_row_sig(r):")
+        if i < 0:
+            continue
+        j = src.find("\ndef ", i + 1)
+        body = src[i:j if j > 0 else len(src)]
+        g = {"hashlib": __import__("hashlib")}
+        try:
+            exec(body, g)
+            fn = g.get("_fault_row_sig")
+            if fn:
+                print("   fingerprint: _fault_row_sig() read from %s" % p)
+                return fn
+        except Exception as e:
+            print("   fingerprint: could not use %s (%s)" % (p, e))
+    print("   fingerprint: NOT AVAILABLE -- markers will carry no sig=, and the")
+    print("                launcher re-runs a marker without one. Put the study")
+    print("                script beside the case folder and run this again.")
+    return None
+
+
+def fault_rows(rdir):
+    """{fault id: the row as the study read it} from this folder's fault list."""
+    out = {}
+    p = os.path.join(rdir, "faults", "SPP_FAULTS.csv")
+    if not os.path.isfile(p):
+        return out
+    try:
+        with open(p, newline="") as fh:
+            for r in csv.DictReader(fh):
+                fid = (r.get("fault_id") or "").strip()
+                if fid:
+                    out[fid] = r
+    except Exception:
+        pass
+    return out
+
+
+def tclear_of(rdir):
+    """{fault id: clearing time} from this folder's own fault list, so a marker
+       this script writes lets the report score the fault without re-reading
+       anything. PRE_FAULT_S + cycles/60, the study's own arithmetic."""
+    out = {}
+    for name in ("SPP_FAULTS.csv",):
+        p = os.path.join(rdir, "faults", name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    fid = (r.get("fault_id") or "").strip()
+                    if not fid:
+                        continue
+                    for k in ("tclear_s", "tclear"):
+                        v = (r.get(k) or "").strip()
+                        if v:
+                            try:
+                                out[fid] = float(v)
+                            except ValueError:
+                                pass
+                            break
+                    else:
+                        cyc = (r.get("cycles") or "").strip()
+                        pre = (r.get("pre_fault_s") or "").strip() or "5.0"
+                        try:
+                            out[fid] = float(pre) + float(cyc) / 60.0
+                        except ValueError:
+                            pass
+        except Exception:
+            continue
+    return out
+
+
+def _median(v):
+    v = sorted(v)
+    if not v:
+        return 0
+    return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2.0
+
+
+def size_reference(outs_dir):
+    """(median size of the files that ARE marked done, one channel set?) --
+       the size fallback is offered only when the marked files agree with each
+       other to within 5 %, which is what 'one channel set' means here."""
+    sizes = []
+    for p in glob.glob(os.path.join(outs_dir, "*.out")):
+        sid = os.path.splitext(os.path.basename(p))[0]
+        if sid.upper().startswith("FLAT"):
+            continue
+        if os.path.isfile(os.path.join(outs_dir, sid + ".done")):
+            try:
+                sizes.append(os.path.getsize(p))
+            except Exception:
+                pass
+    if len(sizes) < 3:
+        return 0, False
+    med = _median(sizes)
+    tight = all(abs(s - med) <= 0.05 * med for s in sizes)
+    return med, tight
+
+
+# ------------------------------------------------------------------ folders --
+def results_folders(only_projects=None, want_base=True, want_proj=True):
+    """Every <case>/results_*/<project>_<mode> folder that holds an outs\\."""
+    out = []
+    roots = []
+    if want_base:
+        roots.append(("BASE", os.path.join(BASE_DIR, RESULTS_BASE)))
+    if want_proj:
+        roots.append(("PROJ", os.path.join(PROJ_DIR, RESULTS_PROJ)))
+    for key, root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            rdir = os.path.join(root, name)
+            if not os.path.isdir(os.path.join(rdir, "outs")):
+                # one level deeper: a dated or tagged copy
+                for sub in sorted(os.listdir(rdir) if os.path.isdir(rdir) else []):
+                    d2 = os.path.join(rdir, sub)
+                    if os.path.isdir(os.path.join(d2, "outs")):
+                        out.append((key, sub, d2))
+                continue
+            proj = name.split("_")[0]
+            if only_projects and proj.lower() not in only_projects:
+                continue
+            out.append((key, name, rdir))
+    return out
+
+
+# -------------------------------------------------------------- the decision --
+def judge_folder(key, name, rdir, write=False, use_size=False):
+    """Decide every unmarked .out in one folder. Returns a counts dict."""
+    outs_dir = os.path.join(rdir, "outs")
+    lays = _layouts_in(outs_dir)
+    scored = scored_ids(rdir)
+    progd = progress_done_ids(rdir)
+    tcl = tclear_of(rdir)
+    rows = fault_rows(rdir)
+    sigfn = _row_sig_fn(key) if rows else None
+    med, tight = size_reference(outs_dir)
+    t_full = float(SIM_END_S) - float(END_TOL_S)
+    t_part = float(PARTIAL_MIN_FRAC) * float(SIM_END_S)
+
+    print("")
+    print("=" * 96)
+    print(" %-5s %-28s %s" % (key, name, rdir))
+    print("=" * 96)
+    print("   layouts: %d   scored parts: %d   progress DONE: %d   fault list: %d"
+          % (len(lays), len(scored), len(progd), len(tcl)))
+    if not lays:
+        print("   NOTE: no OUT_LAYOUT*.txt here, so the time axis cannot be read.")
+        print("         The other evidence still applies; run a plot pass once to")
+        print("         create a layout if you want the decisive test.")
+    if use_size:
+        print("   size reference: %s"
+              % (("%.0f MB median, one channel set" % (med / 1e6)) if (med and tight)
+                 else "not usable (the marked files do not agree within 5 %)"))
+
+    n = {"done": 0, "partial": 0, "short": 0, "nothing": 0, "already": 0}
+    table = []
+    for p in sorted(glob.glob(os.path.join(outs_dir, "*.out")),
+                    key=lambda q: (len(os.path.basename(q)), q)):
+        sid = os.path.splitext(os.path.basename(p))[0]
+        if os.path.isfile(os.path.join(outs_dir, sid + ".done")):
+            n["already"] += 1
+            continue
+        is_flat = sid.upper().startswith("FLAT")
+        try:
+            mb = os.path.getsize(p) / 1e6
+        except Exception:
+            mb = 0.0
+
+        verdict, how, tend = None, "", None
+        t, how_t = end_time_of(p, lays)
+        if t is not None:
+            tend = t
+            how = how_t
+            verdict = "done" if (is_flat or t >= t_full) else (
+                "partial" if t >= t_part else "short")
+        elif sid in scored:
+            verdict, how = "done", "already scored (parts\\SCEN_%s.csv)" % sid
+        elif sid in progd:
+            verdict, how = "done", "the study's progress record says DONE"
+        elif use_size and med and tight and os.path.getsize(p) >= SIZE_FRAC * med:
+            verdict, how = "done", "%.0f MB vs %.0f MB median (one channel set)" % (mb, med / 1e6)
+        else:
+            verdict, how = "nothing", "no evidence either way"
+
+        n[verdict] += 1
+        table.append((sid, mb, verdict, how, tend))
+
+        if not write or verdict not in ("done", "partial"):
+            continue
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        _sig = ""
+        if sigfn is not None and sid in rows:
+            try:
+                _sig = sigfn(rows[sid])
+            except Exception:
+                _sig = ""
+        if verdict == "done":
+            txt = ("" if tcl.get(sid) is None else repr(float(tcl[sid])))
+            if _sig:
+                txt += "\nsig=%s" % _sig
+            if tend is not None:
+                txt += "\ntend=%.3f" % float(tend)
+            txt += "\nby=%s %s\nwhy=%s" % (SIGNATURE, stamp, how)
+            _write(os.path.join(outs_dir, sid + ".done"), txt)
+        else:
+            txt = "tend=%.3f" % float(tend)
+            if _sig:
+                txt += "\nsig=%s" % _sig
+            txt += "\nby=%s %s\nwhy=%s" % (SIGNATURE, stamp, how)
+            _write(os.path.join(outs_dir, sid + ".partial"), txt)
+
+    for sid, mb, v, how, tend in table:
+        mark = {"done": "-> .done   ", "partial": "-> .partial",
+                "short": "   left    ", "nothing": "   left    "}[v]
+        te = ("%6.2f s" % tend) if tend is not None else "   --  "
+        print("   %-12s %7.1f MB  %s  %s  %s"
+              % (sid, mb, te, mark, how))
+    print("   %d already marked | %d -> .done | %d -> .partial | %d too short | %d no evidence"
+          % (n["already"], n["done"], n["partial"], n["short"], n["nothing"]))
+    return n
+
+
+def _write(path, text):
+    try:
+        tmp = "%s.%d" % (path, os.getpid())
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        if os.path.exists(path):
+            os.remove(path)
+        os.rename(tmp, path)
+    except Exception as e:
+        print("   *** could not write %s: %s" % (path, e))
+
+
+def undo_folder(key, name, rdir):
+    """Remove only the markers this script wrote -- each carries its name."""
+    outs_dir = os.path.join(rdir, "outs")
+    n = 0
+    for ext in ("done", "partial"):
+        for p in glob.glob(os.path.join(outs_dir, "*." + ext)):
+            try:
+                with open(p) as fh:
+                    if SIGNATURE not in fh.read():
+                        continue
+                os.remove(p)
+                n += 1
+            except Exception:
+                continue
+    print(" %-5s %-28s %d marker(s) written by this script removed" % (key, name, n))
+    return n
+
+
+def main(argv):
+    write = "--write" in argv
+    use_size = "--use-size" in argv or USE_SIZE
+    undo = "--undo" in argv
+    want_base = "--proj" not in argv
+    want_proj = "--base" not in argv
+    only = None
+    for i, a in enumerate(argv):
+        if a == "--only" and i + 1 < len(argv):
+            only = set(x.strip().lower() for x in argv[i + 1].split(",") if x.strip())
+
+    folders = results_folders(only, want_base, want_proj)
+    if not folders:
+        print("[mark] no results folders found under %s / %s"
+              % (os.path.join(BASE_DIR, RESULTS_BASE),
+                 os.path.join(PROJ_DIR, RESULTS_PROJ)))
+        return 1
+
+    print("")
+    print("=" * 96)
+    print(" MARK FINISHED RUNS -- %s" % ("WRITING markers" if write or undo
+                                         else "DRY RUN, nothing is written"))
+    print(" run length %.2f s, finished at %.2f s or later, partial from %.2f s"
+          % (SIM_END_S, SIM_END_S - END_TOL_S, PARTIAL_MIN_FRAC * SIM_END_S))
+    print("=" * 96)
+
+    if undo:
+        tot = 0
+        for key, name, rdir in folders:
+            tot += undo_folder(key, name, rdir)
+        print("\n[mark] %d marker(s) removed." % tot)
+        return 0
+
+    tot = {"done": 0, "partial": 0, "short": 0, "nothing": 0, "already": 0}
+    for key, name, rdir in folders:
+        n = judge_folder(key, name, rdir, write=write, use_size=use_size)
+        for k in tot:
+            tot[k] += n[k]
+
+    print("")
+    print("=" * 96)
+    print(" TOTAL: %d already marked | %d finished | %d partial | %d too short | %d no evidence"
+          % (tot["already"], tot["done"], tot["partial"], tot["short"], tot["nothing"]))
+    print("=" * 96)
+    if not write:
+        print(" Nothing was written. Run it again with --write to create the markers.")
+    else:
+        print(" Markers written. PIPELINE = \"all\" will now re-simulate only the runs")
+        print(" that genuinely did not finish, and the report phase can score the rest.")
+        print(" To take them back: python %s --undo" % os.path.basename(__file__))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
