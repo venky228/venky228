@@ -484,7 +484,7 @@ def _meas_fill(z4, meas, fam, fid, element):
         v = None
     if v is None:
         return "-", "not measured in this run"
-    return _fmt(v, fam), "measured (no violation here)"
+    return _fmt(v, fam), "measured in this run"
 
 
 def _sbs_elements(z4, ref, group, tags, rk):
