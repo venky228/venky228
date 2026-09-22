@@ -472,7 +472,8 @@ FORCE_REBUILD = None                        # True = rebuild the snapshot even i
 MAX_SCENARIO_ATTEMPTS = 3                   # give up on a scenario after this many crashes
 RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-machine labels differ from the newest group to *.oldbuild (guesswork; a PDF older than its .out is redrawn anyway)
 RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
-TRUNCATED_FRAC = 0.80                       # short = under this fraction of the folder's median .out size
+TRUNCATED_FRAC = 0.80                       # NO LONGER USED: a run's completeness is read from its .done marker (tend=), never from the .out size
+RESTORE_TRUNCATED_DONE = True               # give back every .done.truncated the old size rule took, unless its marker itself records a short run (tend=)
 ONLY_EVENTS = []                            # [] = every event
 ONLY_FAULTS = []                               # [] = every fault -- see the ONLY_FAULTS warning in the comparison
 SEARCH_DEPTH = 4                            # how many folder levels below SEARCH_ROOT to look
@@ -7318,6 +7319,10 @@ def _side_state(rdir, fid):
         mb = os.path.getsize(os.path.join(od, sid + ".out")) / 1048576.0
     except Exception:
         mb = 0.0
+    if os.path.isfile(os.path.join(od, sid + ".done.truncated")):
+        return "crashed", ("%s attempt(s), " % att if att else "") + (
+            "%.0f MB .out, its .done was retired as short (.done.truncated) -- "
+            "the retire/restore step re-judges it on the next launch" % mb)
     return "crashed", ("%s attempt(s), " % att if att else "") + "%.0f MB partial .out" % mb
 
 
@@ -16228,33 +16233,22 @@ def retire_stale_pdfs(quiet=False):
 
 
 def retire_truncated_done(quiet=False):
-    """Take back the .done markers that were written for runs which stopped early.
+    """Take back the .done markers that were written for runs which stopped early
+       -- and give back the ones an earlier rule took by mistake.
 
-       WHY THIS HAS TO HAPPEN HERE. The report phase's only test for "did this
-       scenario finish" is whether a .done marker exists -- deliberately, so a
-       crashed scenario's .out is never opened, because reading a truncated one
-       has taken the whole report down at the Fortran level. It does not, and
-       cannot cheaply, re-measure the run.
+       The report phase's only test for "did this scenario finish" is whether a
+       .done marker exists, so a marker written for a run that stopped short
+       (the plot pass once wrote them against the wrong SIM_END_S) had that run
+       scored as finished, and an unfinished run reads as a project FAILURE.
 
-       That test was sound until the plot pass started writing markers with the
-       wrong SIM_END_S. Against 10.0 rather than 30.2 it declared every .out
-       that reached 10.45 s complete, and wrote a marker saying so. Fourteen
-       scenarios that stopped a third of the way through are now indistinguish-
-       able, to the report, from scenarios that ran the full 30.2 s.
-
-       Scoring them is not merely inaccurate, it inverts the answer. Voltage
-       recovery is judged at tclear + V_RECOVERY_S -- about 12.6 s -- and
-       idx_after() returns the LAST sample when the file ends before that. So
-       recovery gets measured 0.3 s after the fault clears, while the voltage is
-       still down, and a scenario that was never simulated far enough to judge
-       is reported as a FAILURE of the project.
-
-       SIZE ANSWERS IT WITHOUT OPENING ANYTHING. A .out is fixed-width records:
-       same channels, same sample rate. Every scenario in a folder lands within
-       a few percent of the same size unless it stopped early, and then it is
-       short in exact proportion -- 39 MB against a 113 MB median is 10.5 s of
-       30.2. This is os.path.getsize and nothing else, so it costs milliseconds
-       on a folder of 240 files.
+       THE .OUT SIZE IS NOT USED. It was, once: a run under 80 % of the folder's
+       median size was retired as truncated. But one folder holds runs monitored
+       over 14 areas (~111 MB) beside the same runs over 20 areas (~90 MB), and
+       every complete 90 MB run was retired -- 182 base faults read as CRASHED
+       and were never compared. So each marker is judged by what it records:
+       the engine writes tend= (the last simulated second) when a run completes,
+       and a marker without tend= was written by an engine that only ever marked
+       a run it had completed.
 
        The marker is RENAMED, not deleted, and every one is named on screen."""
     if not RETIRE_TRUNCATED_DONE:
@@ -16267,34 +16261,88 @@ def retire_truncated_done(quiet=False):
                 od = os.path.join(results_dir(case, proj, mode), "outs")
                 if os.path.isdir(od):
                     folders.append((case, od, proj, mode))
+    def _marker_tend(path):
+        """tend= of a .done (or .done.truncated) marker, or None for a marker
+           written before the engine recorded the run's last simulated second."""
+        try:
+            with open(path) as fh:
+                for ln in fh:
+                    if ln.startswith("tend="):
+                        return float(ln[5:].strip())
+        except Exception:
+            pass
+        return None
+
+    _t_full = float(SIM_END_S) - 0.11
+    n_back = 0
     for case, od, _proj, _mode in folders:
         sizes = {}
         for p in glob.glob(os.path.join(od, "*.out")):
             sid = os.path.splitext(os.path.basename(p))[0]
             if sid.upper().startswith("FLAT"):
                 continue                      # the flat run is meant to be short
-            try:
-                sizes[sid] = os.path.getsize(p)
-            except Exception:
-                pass
-        if len(sizes) < 4:
-            continue                          # too few to have a meaningful median
-        v = sorted(sizes.values())
-        med = v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2.0
-        cut = med * TRUNCATED_FRAC
-        short = [sid for sid, z in sizes.items()
-                 if z < cut and os.path.isfile(os.path.join(od, sid + ".done"))]
+            sizes[sid] = True
+        # THE FILE'S SIZE SAYS NOTHING. A folder holds runs monitored over 14
+        # areas (~111 MB) beside the same runs over 20 areas (~90 MB), a
+        # project run beside a base run, and every one is complete. Judged
+        # against the folder's median size, 182 complete base faults had
+        # their markers taken and were never compared. So a marker is judged
+        # by what it records: the engine writes tend= (the run's last
+        # simulated second) when it finishes, and a marker without tend= was
+        # written by an engine that only ever marked a run it had completed.
+
+        def _judge(sid, marker):
+            """(complete?, how) for one run -- from the marker alone."""
+            te = _marker_tend(marker)
+            if te is not None:
+                return te >= _t_full, "tend=%.2f s" % te
+            return True, "marker carries no tend= (written on completion)"
+
+        short = []
+        for sid in sizes:
+            mk = os.path.join(od, sid + ".done")
+            if not os.path.isfile(mk):
+                continue
+            ok, how = _judge(sid, mk)
+            if not ok:
+                short.append((sid, how))
+        # AND THE ONES TAKEN BY THE OLD RULE ARE GIVEN BACK.
+        back = []
+        if RESTORE_TRUNCATED_DONE:
+            for tp in glob.glob(os.path.join(od, "*.done.truncated")):
+                sid = os.path.basename(tp)[:-len(".done.truncated")]
+                if sid not in sizes or os.path.isfile(os.path.join(od, sid + ".done")):
+                    continue
+                ok, how = _judge(sid, tp)
+                if ok:
+                    back.append((sid, how))
+        if back:
+            if not quiet:
+                print("")
+                print("[compare] %s: %d scenario(s) had their .done retired as 'short', but"
+                      % (case.get("key", "?"), len(back)))
+                print("[compare] each .out is a complete run -- markers restored:")
+            for sid, how in sorted(back, key=lambda x: (len(x[0]), x[0])):
+                tp = os.path.join(od, sid + ".done.truncated")
+                try:
+                    os.rename(tp, os.path.join(od, sid + ".done"))
+                    n_back += 1
+                    _retired.add((case["key"], _proj, _mode))
+                    if not quiet:
+                        print("[compare]     %-8s %s  -> .done" % (sid, how))
+                except Exception as e:
+                    if not quiet:
+                        print("[compare]     %-8s could not be restored: %s" % (sid, e))
         if not short:
             continue
         if not quiet:
             print("")
             print("[compare] %s: %d scenario(s) carry a .done marker but their .out is"
                   % (case.get("key", "?"), len(short)))
-            print("[compare] far short of the %.0f MB the rest of the folder shows --"
-                  % (med / 1048576.0))
+            print("[compare] recorded as stopping before %.2f s (tend= in the marker) --"
+                  % _t_full)
             print("[compare] they stopped early and must not be scored as finished:")
-        for sid in sorted(short, key=lambda x: (len(x), x)):
-            frac = 100.0 * sizes[sid] / med if med else 0.0
+        for sid, how in sorted(short, key=lambda x: (len(x[0]), x[0])):
             src = os.path.join(od, sid + ".done")
             try:
                 tgt = src + ".truncated"
@@ -16304,11 +16352,13 @@ def retire_truncated_done(quiet=False):
                 n_moved += 1
                 _retired.add((case["key"], _proj, _mode))
                 if not quiet:
-                    print("[compare]     %-8s %6.1f MB  (%.0f%% of a full run)  "
-                          "-> .done.truncated" % (sid, sizes[sid] / 1048576.0, frac))
+                    print("[compare]     %-8s %s  -> .done.truncated" % (sid, how))
             except Exception as e:
                 if not quiet:
                     print("[compare]     %-8s could not move its marker aside: %s" % (sid, e))
+    if n_back and not quiet:
+        print("[compare] %d marker(s) restored -- those scenarios are scored and compared again." % n_back)
+        print("")
     if n_moved and not quiet:
         print("[compare] %d marker(s) renamed -- not deleted. Those scenarios are now"
               % n_moved)
@@ -16355,7 +16405,7 @@ def retire_truncated_done(quiet=False):
               "read them.")
         print("[compare]     Set RESCORE_STALE_REPORTS = True, or re-run those "
               "scenarios.")
-    return n_moved
+    return n_moved + n_back
 
 
 def ensure_reports(mode_list):

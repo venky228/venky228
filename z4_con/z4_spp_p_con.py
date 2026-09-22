@@ -4871,6 +4871,85 @@ if _START_DELAY_S > 0:
     sys.stdout.flush()
     time.sleep(_START_DELAY_S)
 import psspy, dyntools                                 # PSS/E 34 python API + channel reader
+
+# UNIQUE CHANNEL IDENTIFIERS, ENFORCED AT THE API. Two channels with the same
+# identifier in one .out header is a file this build's dyntools cannot decode:
+# get_data() raises "sequence item 1: expected str instance, int found" on
+# every read, the packed reader can never be calibrated for that channel set
+# (calibration needs one dyntools read), and every fault of the study is left
+# "could not be read". It happened when a plant bus was channelled under two
+# roles, or a study-area machine was also the project's swing/sync pick. The
+# second and later uses of an identifier get " #2", " #3"... and the set is
+# cleared whenever a case or snapshot is loaded, because that is a new header.
+_CHAN_IDS_USED = set()
+_CHAN_IDENT_ARG = {"machine_array_channel": 2, "branch_p_and_q_channel": 2,
+                   "branch_p_channel": 2, "branch_mva_channel": 2,
+                   "voltage_and_angle_channel": 1, "voltage_channel": 1,
+                   "bus_frequency_channel": 1, "var_channel": 1, "state_channel": 1}
+
+
+def _uniq_chan_ident(s):
+    try:
+        base = str(s).strip()
+    except Exception:
+        return s
+    if not base:
+        return s
+    k = base.upper()
+    if k not in _CHAN_IDS_USED:
+        _CHAN_IDS_USED.add(k)
+        return s
+    n = 2
+    while ("%s #%d" % (k, n)) in _CHAN_IDS_USED:
+        n += 1
+    _CHAN_IDS_USED.add("%s #%d" % (k, n))
+    stem = base[:32 - len(" #%d" % n)]            # PSS/E keeps 32 characters
+    return "%s #%d" % (stem, n)
+
+
+def _uniq_chan_value(v):
+    if isinstance(v, (list, tuple)):
+        return [_uniq_chan_ident(x) if isinstance(x, str) else x for x in v]
+    return _uniq_chan_ident(v) if isinstance(v, str) else v
+
+
+def _install_unique_channel_ids():
+    for _nm, _ix in _CHAN_IDENT_ARG.items():
+        _f = getattr(psspy, _nm, None)
+        if _f is None or getattr(_f, "_uniq_wrapped", False):
+            continue
+
+        def _mk(f, ix):
+            def w(*a, **kw):
+                a = list(a)
+                if len(a) > ix:
+                    a[ix] = _uniq_chan_value(a[ix])
+                elif "ident" in kw:
+                    kw["ident"] = _uniq_chan_value(kw["ident"])
+                return f(*a, **kw)
+            w._uniq_wrapped = True
+            w.__name__ = getattr(f, "__name__", "channel")
+            return w
+        setattr(psspy, _nm, _mk(_f, _ix))
+    for _nm in ("case", "rstr", "delete_all_plot_channels"):
+        _f = getattr(psspy, _nm, None)
+        if _f is None or getattr(_f, "_uniq_wrapped", False):
+            continue
+
+        def _mk2(f):
+            def w(*a, **kw):
+                _CHAN_IDS_USED.clear()
+                return f(*a, **kw)
+            w._uniq_wrapped = True
+            w.__name__ = getattr(f, "__name__", "case")
+            return w
+        setattr(psspy, _nm, _mk2(_f))
+
+
+try:
+    _install_unique_channel_ids()
+except Exception as _ue:
+    print("[init] unique channel identifiers not installed: %s" % _ue)
 try: import redirect; redirect.psse2py()
 except Exception as e: print("[init] redirect skipped: %s" % e)
 
@@ -18192,7 +18271,19 @@ def load_out(p, cache=True):
                      len(out[0])))
             _note_read_path(p, "packed", time.time() - _t0)
     if out is None:
-        sh, cid, cd = dyntools.CHNF(p).get_data()
+        try:
+            sh, cid, cd = dyntools.CHNF(p).get_data()
+        except Exception as _de:
+            # NAMED, NOT SWALLOWED. The caller records "could not be read: ..."
+            # and the plot pass moves on; this says what the message means.
+            _note_read_path(p, "dyntools-failed", time.time() - _t0)
+            _why = str(_de)
+            if "expected str instance" in _why:
+                _why += (" -- the .out header carries two channels with the SAME "
+                         "identifier, which this dyntools cannot decode. The engine "
+                         "now writes unique identifiers: re-simulate this fault "
+                         "(delete its .out and .done, or RUN_ONLY_FAULTS)")
+            raise RuntimeError("dyntools could not read %s: %s" % (os.path.basename(p), _why))
         t = cd["time"]
         out = (t, {k: (str(cid[k]).strip(), cd[k]) for k in cid if k != "time"})
         print("  [fast] %s read with dyntools in %.0f s"
@@ -26051,13 +26142,26 @@ def _stale_aside(out_dir, sid, why):
 _FAULT_SIG = {}      # fault id -> _fault_row_sig of the row this run loaded
 
 
-def _mark_done(scen_id, tclear):
+def _mark_done(scen_id, tclear, tend=None):
     """Mark a scenario fully complete. Store tclear so a resumed run can still plot /
        score it without re-running (None -> empty) -- and the fault's fingerprint,
-       so a later run with a renumbered list does not resume it as the same fault."""
+       so a later run with a renumbered list does not resume it as the same fault.
+
+       tend= IS THE RUN'S OWN LAST SIMULATED SECOND. The panel used to judge a
+       finished run by its .out SIZE against the folder's median, and a folder
+       holding two channel sets (14-area and 20-area monitoring) had every
+       complete 90 MB run retired as a truncated 111 MB one. With the end time
+       written here, completeness is read from the marker, not guessed."""
     txt = "" if tclear is None else repr(tclear)
     if scen_id in _FAULT_SIG:
         txt += "\nsig=%s" % _FAULT_SIG[scen_id]
+    if tend is None:
+        try:
+            tend = float(_SIM_T)
+        except Exception:
+            tend = None
+    if tend is not None and tend > 0:
+        txt += "\ntend=%.3f" % float(tend)
     _write_text(_state_path(scen_id, "done"), txt)
 
 def _is_done(scen_id, out_path):
@@ -33469,7 +33573,7 @@ def plot_missing_outs():
                 continue
             complete = is_flat or (t_end >= float(SIM_END_S) - 0.11)
             if not had_done and complete:
-                _mark_done(sid, None)
+                _mark_done(sid, None, tend=t_end)
                 print("               complete to t=%.2f s -- .done written, NO re-run needed" % t_end)
             elif not had_done:
                 # A RUN THAT DID NOT FINISH IS NOT A RESULT.
