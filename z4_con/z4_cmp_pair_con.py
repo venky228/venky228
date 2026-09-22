@@ -654,7 +654,9 @@ def _sbs_elements(z4, ref, group, tags, rk):
             got[t] = cells
             rk2 = _order.get(cls, 1 if ("over the limit" in cls or "under the limit" in cls
                                         or cls not in (z4.CLS_EL_OK, "", "within limit here (measured)",
-                                                       "not measured in this run")) else 0)
+                                                       "not measured in this run",
+                                                       getattr(z4, "CLS_EL_UNKNOWN_T", "\0"),
+                                                       z4.CLS_EL_UNKNOWN)) else 0)
             if rk2 > rank:
                 rank, worst = rk2, ("%s: %s" % (t, cls) if rk2 > 0 else cls)
         row.append(bval)

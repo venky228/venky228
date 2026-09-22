@@ -6621,6 +6621,7 @@ _REPORT_WIDTHS = [26, 22, 14, 9, 8, 8, 12, 8, 9, 15, 18, 22, 15, 18, 10,
                   40]
 
 CLS_EL_UNKNOWN = "UNKNOWN -- base value not available"
+CLS_EL_UNKNOWN_T = "UNKNOWN -- project value not available"
 CLS_EL_OK = "within limit on both sides"
 
 
@@ -6641,7 +6642,8 @@ def _project_only_bus(bus):
     return bool(b0 and b0 <= b <= b0 + 299)
 
 
-def _element_class(fam, kind, bv, tv, lim, base_scored=False, new_bus=False):
+def _element_class(fam, kind, bv, tv, lim, base_scored=False, new_bus=False,
+                   test_scored=False):
     """The classification of ONE element from its two values.
 
        Judged against the limit on each side, not against presence in the
@@ -6653,7 +6655,15 @@ def _element_class(fam, kind, bv, tv, lim, base_scored=False, new_bus=False):
        A machine absent from the base trip list of a fault the base SCORED did
        not trip -- that is a known base result, and the element is NEW, not
        UNKNOWN (768484 in F02 read UNKNOWN with the base cell saying "not
-       tripped" beside it)."""
+       tripped" beside it).
+
+       AND THE SAME RULE ON THE PROJECT SIDE. A base violation with NO project
+       value used to be called RESOLVED -- "the projects fixed this bus" -- on
+       no evidence whatever, which is the mirror of the claim this function
+       refuses to make about the base. It says UNKNOWN now unless the project
+       side SCORED the fault: a machine absent from the trip list of a fault
+       the project scored genuinely did not trip there, and that is a real
+       resolution."""
     def _viol(v):
         if v is None:
             return None
@@ -6666,6 +6676,8 @@ def _element_class(fam, kind, bv, tv, lim, base_scored=False, new_bus=False):
     t_v, b_v = _viol(tv), _viol(bv)
     if fam == "trip" and bv is None and base_scored:
         b_v = False
+    if fam == "trip" and tv is None and test_scored:
+        t_v = False                     # the project scored it and did not trip it
     if bv is None and base_scored and new_bus:
         b_v = False                     # the bus does not exist without the project
     if t_v and b_v:
@@ -6677,7 +6689,9 @@ def _element_class(fam, kind, bv, tv, lim, base_scored=False, new_bus=False):
     if t_v is False and b_v:
         return CLS_RESOLVED
     if t_v is None and b_v:
-        return CLS_RESOLVED
+        # Over the limit in the base, nothing measured with the projects.
+        # Not a resolution -- an absence.
+        return CLS_EL_UNKNOWN_T
     return CLS_EL_OK
 
 # Column positions are looked up BY NAME everywhere they are needed. The list
@@ -6910,8 +6924,9 @@ def _report_rows(results):
                     # overvoltage, not "TEST ONLY". Only an element with no
                     # base evidence at all takes the fault's one-sided class.
                     ecls = _element_class(fam, kind, bv, tv, lim, base_scored,
-                                          _project_only_bus(_bus_of_element(el)))
-                    if r.get("one_sided") and ecls == CLS_EL_UNKNOWN:
+                                          _project_only_bus(_bus_of_element(el)),
+                                          bool(norm_verdict(r["vt"])))
+                    if r.get("one_sided") and ecls in (CLS_EL_UNKNOWN, CLS_EL_UNKNOWN_T):
                         ecls = r["class"]
                     # NO MEASUREMENTS FILE ON THE BASE SIDE (a study written
                     # before it existed), but the base violations list covers
@@ -7236,8 +7251,8 @@ def _xl_style_of(row):
         return 2
     if _ec in _XL_STYLE_OF_CLASS:
         return _XL_STYLE_OF_CLASS[_ec]
-    if _ec == CLS_EL_UNKNOWN:
-        return 6
+    if _ec in (CLS_EL_UNKNOWN, CLS_EL_UNKNOWN_T):
+        return 6                        # grey: not compared, on one side or the other
     return _XL_STYLE_OF_CLASS.get(row[_COL["fault_classification"]], 0)
 
 
@@ -10067,7 +10082,7 @@ def write_dyr_sweep_workbook(found):
         cls = [row[i] for i in range(10, len(row), 2)]
         if any(c == CLS_NEW for c in cls):
             return 2
-        if cls and all(c in (CLS_RESOLVED, "within limit at this value", CLS_EL_OK) for c in cls):
+        if cls and all(c in (CLS_RESOLVED, "within limit at this value", CLS_EL_OK) for c in cls):  # UNKNOWN is not clear
             return 4
         return 3
 
