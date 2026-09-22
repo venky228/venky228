@@ -24,8 +24,14 @@ HOW TO USE
          python z4_cmp_pair_con.py
          python z4_cmp_pair_con.py <reference folder> <test folder> [label]
   3. The reports go to OUT_DIR\<label>\  (OUT_DIR defaults to
-     C:\KV\comparison_pairs). One folder per pair, each file named with the
-     label, so any number of them open side by side in Excel.
+     C:\KV\comparison_pairs, i.e. <panel folder>\comparison_pairs). One
+     folder per pair, e.g.
+         comparison_pairs\SantaFe_studied_vs_base\00_COMPARISON_REPORT_SantaFe_studied_vs_base.xlsx
+         comparison_pairs\SantaFe_Sep21_full_gia_studied_vs_base\00_COMPARISON_REPORT_SantaFe_Sep21_full_gia_studied_vs_base.xlsx
+     The label is <project>_<test tag>_vs_<reference tag>; a test folder that
+     sits in a folder of its own (Sep21_full gia) carries that folder's name,
+     and a label that repeats gets _2, _3. Set OUT_DIR to put them elsewhere,
+     or give a label of your own as the third item of a PAIRS entry.
 
   Nothing is simulated and nothing in the results folders is changed, except
   that a folder whose reports are older than its parts\ is re-merged first
@@ -44,8 +50,9 @@ import subprocess
 # ============================================================================
 #  SETTINGS
 # ============================================================================
-REFERENCE = r""          # the folder every scenario is compared AGAINST, e.g. r"C:\KV\Base\results_base\SantaFe_spp"
-SCENARIOS = [            # the folders to compare against it, one report each, e.g.
+REFERENCE = r"C:\KV\Base\results_base\SantaFe_spp"          # the folder every scenario is compared AGAINST, e.g. r"C:\KV\Base\results_base\SantaFe_spp"
+SCENARIOS = [    r"C:\KV\Projects\results_proj\SantaFe_spp" ,
+                 r"C:\KV\Projects\results_proj\Sep21_full gia\SantaFe_spp",       # the folders to compare against it, one report each, e.g.
     # r"C:\KV\Projects\results_proj\SantaFe_spp",
     # r"C:\KV\Projects\results_proj\SantaFe_spp_poi502",
 ]
@@ -224,12 +231,28 @@ def _prepare(z4, case, folder, suffix):
                 pass
 
 
+_STD_PARENTS = ("results_base", "results_proj", "results", "base", "projects", "kv")
+
+
+def _folder_tag(folder):
+    """What tells this folder apart: its own suffix ('poi502', 'cap50'), and
+       the folder it sits in when that is not one of the usual results roots
+       -- so ...\Sep21_full gia\SantaFe_spp is 'Sep21_full_gia' and not
+       'studied', which is what ...\results_proj\SantaFe_spp is called."""
+    _p, _m, sfx = _split_name(folder, None)
+    bits = []
+    parts = [x for x in re.split(r"[\\/]+", str(folder).strip().strip('"')) if x]
+    parent = parts[-2] if len(parts) >= 2 else ""
+    if parent and parent.lower() not in _STD_PARENTS and not re.match(r"^[A-Za-z]:$", parent):
+        bits.append(parent)
+    bits.append(sfx.strip("_") if sfx else "studied")
+    return "_".join(bits)
+
+
 def _label_for(ref, test):
-    proj, _m, s_t = _split_name(test, None)
-    _p, _m2, s_r = _split_name(ref, None)
-    rk = "base" if "results_base" in _parts(ref) else \
-        ("studied" if not s_r else s_r.strip("_"))
-    tk = "studied" if not s_t else s_t.strip("_")
+    proj, _m, _s = _split_name(test, None)
+    rk = "base" if "results_base" in _parts(ref) else _folder_tag(ref)
+    tk = _folder_tag(test)
     lab = "%s_%s_vs_%s" % (proj, tk, rk)
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", lab)
 
@@ -354,6 +377,19 @@ def main(argv):
               "two folders on the command line.")
         return 1
     z4 = _load_panel()
+    # ONE FOLDER PER PAIR, ALWAYS. Two test folders with the same name (the
+    # as-studied run and yesterday's copy of it) used to get the same label,
+    # and the second report overwrote the first.
+    used, uniq = {}, []
+    for ref, test, label in pairs:
+        lab = re.sub(r"[^A-Za-z0-9_.-]+", "_", label or _label_for(ref, test))
+        if lab in used:
+            used[lab] += 1
+            lab = "%s_%d" % (lab, used[lab])
+        else:
+            used[lab] = 1
+        uniq.append((ref, test, lab))
+    pairs = uniq
     done = []
     for ref, test, label in pairs:
         try:
