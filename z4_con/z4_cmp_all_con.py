@@ -15133,9 +15133,16 @@ def _start_plotter(case, proj, mode, slot, rdir=None):
         env["SPP_FAULT_MODE"] = mode
     # NOTHING THAT COULD SIMULATE OR CLEAR STATE. These decide what a real study
     # run does to the folder; a plotter must carry none of them.
-    for k in ("SPP_FRESH_START", "SPP_ONLY", "SPP_ONLY_PRESLICED", "SPP_REGEN_FAULTS",
+    for k in ("SPP_ONLY", "SPP_ONLY_PRESLICED", "SPP_REGEN_FAULTS",
               "SPP_SKIP_DONE", "SPP_NEW_FAULT_LIST", "SPP_RUN_PROJECTS", "SPP_RUN_MODES"):
         env.pop(k, None)
+    # SAID, NOT LEFT UNSAID. Removing SPP_FRESH_START does not turn it off -- it
+    # leaves the launcher on its OWN default, which is True, and a child with no
+    # selection then takes the branch that deletes every .done and .attempts in
+    # the folder. That is what emptied all four base folders: 271 markers in
+    # base SantaFe, 210 in IronStar, gone in seconds, while the project side --
+    # which had work selected -- kept every one of its own.
+    env["SPP_FRESH_START"] = "0"
     ld = _res_root(case)
     try:
         os.makedirs(ld)

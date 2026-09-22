@@ -317,7 +317,14 @@ PHASE_TIMEOUT_S     = 3600   # kill a build/report that has printed NOTHING for 
                              # continuously, so an hour of silence is a freeze, not slow
                              # progress. Raise it if a single legitimate step really can be
                              # silent longer than this.
-FRESH_START      = True      # clear .done/.attempts + every ALL_DONE*.flag once, up front
+FRESH_START      = False     # clear .done/.attempts + every ALL_DONE*.flag once, up front
+                             # DEFAULT IS "RESUME". This is the most destructive setting in
+                             # the toolchain -- it deletes every marker in the folder -- and a
+                             # default of True meant any child started WITHOUT SPP_FRESH_START
+                             # in its environment did exactly that. The panel states the real
+                             # value on every run it starts, so nothing that should start over
+                             # loses the ability to; what changes is that silence now means
+                             # "keep what is on disk" instead of "throw it away".
 
 # >>> OVERRIDABLE FROM THE ENVIRONMENT, so z4_cmp_all_con.py can start both
 # cases the same way without either launcher being edited. One case starting
