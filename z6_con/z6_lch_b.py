@@ -72,7 +72,7 @@ import os, sys, re, subprocess, time, glob, csv, threading
 # --- EDIT THESE ------------------------------------------------------------
 def _script_dir():
     """The folder THIS FILE is in. Used when the study is run on its own; when
-       z6_cmp_all_con.py drives it, SPP_STUDY_DIR wins and points at the same place."""
+       z6_main.py drives it, SPP_STUDY_DIR wins and points at the same place."""
     try:
         return os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
     except NameError:
@@ -80,7 +80,7 @@ def _script_dir():
 
 
 # NO ABSOLUTE PATH. The case folder is wherever THIS FILE sits, unless
-# z6_cmp_all_con.py says otherwise -- so the whole study moves between machines
+# z6_main.py says otherwise -- so the whole study moves between machines
 # by copying the folder, with nothing to edit.
 STUDY_DIR        = os.environ.get("SPP_STUDY_DIR") or _script_dir()
 # >>> POINT THIS AT THE STUDY SCRIPT YOU ARE ACTUALLY EDITING.
@@ -89,10 +89,10 @@ STUDY_DIR        = os.environ.get("SPP_STUDY_DIR") or _script_dir()
 # have run the OLD file without a word. That is the version mismatch that made
 # REPORT_FAULTS look broken and the progress line stick on "starting".
 # check_study_version() below now also checks whatever this points at.
-STUDY_SCRIPT     = os.path.join(STUDY_DIR, "z6_spp_p_con.py")
+STUDY_SCRIPT     = os.path.join(STUDY_DIR, "z6_spp_b.py")
 N_WORKERS        = 4         # <<< number of PARALLEL PSS/E worker processes (mind license + RAM)
 
-# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_cmp_all_con.py can size BOTH
+# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_main.py can size BOTH
 # cases from one place. It has to be one place: with RUN_IN_PARALLEL the two
 # launchers run at the same time, so the machine sees 2 x this many PSS/E
 # sessions, and a number chosen for one case alone is twice what was intended.
@@ -101,7 +101,7 @@ _envw = (os.environ.get("SPP_LAUNCH_WORKERS") or "").strip()
 if _envw.isdigit() and int(_envw) > 0:
     N_WORKERS = int(_envw)
     print("[parallel] N_WORKERS from the environment: %d" % N_WORKERS)
-                             # 3 because z6_cmp_all_con.py runs BOTH studies at
+                             # 3 because z6_main.py runs BOTH studies at
                              # once (RUN_IN_PARALLEL): 3 here x 2 studies = 6
                              # concurrent PSS/E sessions, which is what 6 in a
                              # single-study run used to cost. Raising this
@@ -191,7 +191,7 @@ elif _envr in ("0", "false", "no", "off"):
 # foreground: a relaunch that had nothing left to simulate for SantaFe still
 # spent its first twenty minutes re-reading SantaFe's scores before IronStar's
 # first fault started. With this on, the launcher stops after the WORK phase
-# of each project and z6_cmp_all_con.py scores every project of both cases at
+# of each project and z6_main.py scores every project of both cases at
 # the end, in one pass, from the parts the workers wrote as they ran.
 #     set SPP_DEFER_REPORTS=1       (the panel sends it: REPORTS_AFTER_ALL_PROJECTS)
 DEFER_REPORTS = False
@@ -279,7 +279,7 @@ if _envrw.isdigit() and int(_envrw) > 0:
     print("[parallel] REPORT_WORKERS from the environment: %d" % REPORT_WORKERS)
 
 REPORT_IN_BACKGROUND = True
-# z6_cmp_all_con.py turns this OFF when CORES_MAX_INCLUDES_REPORTS is set: a report
+# z6_main.py turns this OFF when CORES_MAX_INCLUDES_REPORTS is set: a report
 # left running while the next project's workers start is exactly how a ceiling
 # of 8 sessions became 10 on the machine. Local setting when nothing is driving
 # this launcher.
@@ -341,7 +341,7 @@ FRESH_START      = False     # clear .done/.attempts + every ALL_DONE*.flag once
                              # loses the ability to; what changes is that silence now means
                              # "keep what is on disk" instead of "throw it away".
 
-# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_cmp_all_con.py can start both
+# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_main.py can start both
 # cases the same way without either launcher being edited. One case starting
 # fresh while the other resumes is not a comparison of two cases -- it is a
 # comparison of two different amounts of work.
@@ -354,7 +354,7 @@ if _envfs in ("1", "true", "yes", "on"):
 elif _envfs in ("0", "false", "no", "off"):
     FRESH_START = False
     print("[parallel] FRESH_START forced OFF from the environment -- resuming")
-# A LAUNCH DRIVEN BY z6_cmp_all_con.py STARTS OVER ONLY WHEN THE PANEL SAYS SO.
+# A LAUNCH DRIVEN BY z6_main.py STARTS OVER ONLY WHEN THE PANEL SAYS SO.
 # The panel sends SPP_STUDY_DIR with every launch, and SPP_FRESH_START=1 only
 # when its own FRESH_START is on. A True in THIS file cannot override that: the
 # base case once started over because of it while the project case resumed, and
@@ -363,7 +363,7 @@ if (FRESH_START and (os.environ.get("SPP_STUDY_DIR") or "").strip()
         and _envfs not in ("1", "true", "yes", "on")):
     FRESH_START = False
     print("[parallel] FRESH_START is on in this file, but the launch is driven by")
-    print("[parallel] z6_cmp_all_con.py and it did not ask for a fresh start -- resuming;")
+    print("[parallel] z6_main.py and it did not ask for a fresh start -- resuming;")
     print("[parallel] the .done/.attempts markers are kept")
 # ---- NEVER KILL A WORKER THAT IS STILL RUNNING -----------------------------------
 # A 30 s simulation with ~7,800 channels can take 30-45 minutes of wall clock, and
@@ -881,7 +881,7 @@ elif _envs in ("0", "false", "no", "off"):
     print("[parallel] SKIP_DONE forced OFF from the environment")
 
 
-# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_cmp_all_con.py can restrict BOTH
+# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_main.py can restrict BOTH
 # cases to the same handful of faults without either launcher being edited.
 # Editing one launcher to run three faults and forgetting to edit the other is
 # how the two cases end up having run different sets -- and the comparison would
@@ -919,7 +919,7 @@ LIVE_STATUS_QUIET_ROWS = True
 REGEN_FAULTS     = "if-missing"  # <<< "if-missing" | "always" | "never"
 # AND THE PANEL CAN SAY OTHERWISE.
 #
-# z6_cmp_all_con.py has a REGEN_FAULTS setting and pushes it as SPP_REGEN_FAULTS,
+# z6_main.py has a REGEN_FAULTS setting and pushes it as SPP_REGEN_FAULTS,
 # and this file then wrote its OWN constant into the environment of every build,
 # work and report process it spawned -- so the panel's value could never reach
 # the study. RUN_PROJECTS and FAULT_MODES, declared a few lines from here, both
@@ -1103,7 +1103,7 @@ def _study_results_subdir_base():
 # Base\results -> Base\results_base, Projects\results -> Projects\results_proj
 # -- and everything picks it up with no other change.
 RESULTS_FOLDER_BY_CASE = True
-_RES_KIND = "proj"
+_RES_KIND = "base"
 
 
 def _results_root():
@@ -1215,7 +1215,7 @@ REPORTS_SUBDIR = "reports"
 # a project result in two folders under identical names are two files whose
 # provenance you have to remember, and remembering it wrongly once is a
 # comparison that says the project fixed something the base never had.
-RUN_KIND = "PROJ"
+RUN_KIND = "BASE"
 
 
 def _root_report(head, ext="txt"):
@@ -1336,7 +1336,7 @@ def _rfile(rdir, stem, ext="txt", proj=None):
 
 
 # ---- DYNAMIC WORK SHARING --------------------------------------------------
-# Set by z6_cmp_all_con.py. When on, the workers share ONE queue instead of being
+# Set by z6_main.py. When on, the workers share ONE queue instead of being
 # dealt fixed slices, so this launcher hands every worker the FULL list and lets
 # them claim from it. Handing them pre-cut slices here would put the static deal
 # back underneath the shared queue and defeat it.
@@ -1359,7 +1359,7 @@ def _env(role, widx=0, n=1, only=None, start_delay=0.0, max_attempts=None):
         e["SPP_FAULT_MODE"] = _CUR_MODE
         # The study script has its own STUDY_DIR literal for standalone
         # use; this makes it follow the launcher, which follows
-        # z6_cmp_all_con.py. One setting moves the whole study.
+        # z6_main.py. One setting moves the whole study.
         e["SPP_STUDY_DIR"] = STUDY_DIR
     e["SPP_ROLE"]      = role
     e["SPP_N_WORKERS"] = str(n)
@@ -2301,7 +2301,7 @@ def _shared_fault_list_path():
     """This project's shared fault list, beside the case folders. "" if unknown.
 
        {root}\SPP_FAULTS_CON_{project}.csv -- the DISIS list z4_disis_con.py wrote,
-       same one z6_cmp_all_con.py builds in phase 0."""
+       same one z6_main.py builds in phase 0."""
     try:
         root = os.path.dirname(os.path.normpath(STUDY_DIR))
         if not (root and _CUR_PROJECT):
@@ -2477,7 +2477,7 @@ def _announce_work(selected, n_work):
        a person would find it.
 
        Printed AND written next to the results, because the console of a run
-       launched by z6_cmp_all_con.py belongs to that script, not to this one."""
+       launched by z6_main.py belongs to that script, not to this one."""
     L = []
     L.append("=" * 96)
     L.append(" WHAT THIS RUN WILL DO   %s   project %s   mode %s"
@@ -2567,7 +2567,7 @@ LIVE_STATUS_KEY = (os.environ.get("SPP_LIVE_STATUS_KEY") or "").strip() or "STUD
 # -- and every one of them prints the same project name and the same fault ids.
 # Watching the console or the live table, there was nothing to say which.
 #
-# The tags are already in the environment (z6_cmp_all_con.py sends them, and the
+# The tags are already in the environment (z6_main.py sends them, and the
 # results folder is named from them); this only turns them into the phrase a
 # reader wants. Folder-safe is not readable: "dyr_Kqv0p5" is a path, "Kqv=0.5"
 # is a heading.
@@ -3980,7 +3980,7 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
     t_start = time.time()
     _phase("simulate (%d worker(s))%s" % (n, (" retry round %d" % _round) if _round else ""))
     t_next_status = t_start + LIVE_STATUS_EVERY
-    # TAKE OVER THE OTHER CASE'S SESSIONS WHEN IT FINISHES. z6_cmp_all_con.py
+    # TAKE OVER THE OTHER CASE'S SESSIONS WHEN IT FINISHES. z6_main.py
     # splits the machine between the base and the project launcher; the base
     # side finishes hours earlier and its sessions used to die with it, so
     # the project ran the tail of the sweep on half the cores. When a case
@@ -4856,8 +4856,8 @@ def _write_all_projects_report(passes, done_so_far):
 def confirm_case():
     """State WHICH CASE this launcher is about to write into, before it does.
 
-       Two launchers now sit side by side -- z6_lch_b_con.py for the base
-       case and z6_lch_p_con.py for the projects -- and they are nearly
+       Two launchers now sit side by side -- z6_lch_b.py for the base
+       case and z6_lch_p.py for the projects -- and they are nearly
        identical files pointed at different folders. The failure that costs a
        day is running one thinking it is the other: the results it overwrites
        are the ones you were about to compare against, and nothing in the output
@@ -4874,7 +4874,7 @@ def confirm_case():
     # WHAT IS ACTUALLY BEING READ, not what the study script says by default.
     #
     # These two lines were parsed out of the study script's SOURCE TEXT, so
-    # when z6_cmp_all_con.py points the run at a different deck through
+    # when z6_main.py points the run at a different deck through
     # SPP_SOURCE_CASE / SPP_DYR_FILE the banner went on naming the file in the
     # script -- and the banner is the thing anyone reads to check which case
     # they are running. It said DIS2201-25SP-G03-CQ while the study loaded
@@ -4895,11 +4895,11 @@ def confirm_case():
     _env_sav = (os.environ.get("SPP_SOURCE_CASE") or "").strip()
     _env_dyr = (os.environ.get("SPP_DYR_FILE") or "").strip()
     if _env_sav:
-        _base, _how = _env_sav, "  <- from z6_cmp_all_con.py"
+        _base, _how = _env_sav, "  <- from z6_main.py"
     if _env_dyr:
         _dyr = _env_dyr
     if _dyr:
-        print("#  dynamics    : %s%s" % (_dyr, "  <- from z6_cmp_all_con.py" if _env_dyr else ""))
+        print("#  dynamics    : %s%s" % (_dyr, "  <- from z6_main.py" if _env_dyr else ""))
     if _base:
         print("#  power flow  : %s%s" % (_base, _how))
     # How much finished work is here already -- the thing FRESH_START discards.
@@ -5365,7 +5365,7 @@ def _run_one_study():
     # collection happens in main() once every project has run.
     if DEFER_REPORTS and not REPORT_ONLY:
         el = time.time() - t0
-        _banner("RUNS COMPLETE for %s -- %s (report DEFERRED: z6_cmp_all_con.py scores "
+        _banner("RUNS COMPLETE for %s -- %s (report DEFERRED: z6_main.py scores "
                 "every project once all of them have simulated)"
                 % (_CUR_PROJECT or "this project", _fmt_hms(el)))
         _write_run_summary(t0, launches=None,

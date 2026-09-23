@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """z6_spike_find.py -- WHERE DO THE >1.2 PU OVERVOLTAGES COME FROM?
 
-Python 3.4, stdlib only. Put it in the study root (beside z6_cmp_all_con.py)
+Python 3.4, stdlib only. Put it in the study root (beside z6_main.py)
 and run:
 
     C:\\Python34\\python.exe z6_spike_find.py
@@ -82,7 +82,7 @@ NEAR_Q_REVIEW = True          # read each bad bus's WORST fault .out and review 
                               # generators' Q (before / during / after the fault) -> likely cause
 GEN_TOP       = 25            # generators listed per bus, closest (|Z|) first; the CSV has all
 LINE_CHG_MVAR = 20.0          # lines with at least this much charging are listed
-CASE_SAV      = {}            # {} = read BASE_SAV / PROJ_SAV from z6_cmp_all_con.py, e.g.
+CASE_SAV      = {}            # {} = read BASE_SAV / PROJ_SAV from z6_main.py, e.g.
                               # {"base": r"C:\KV\Base\DIS2201-25SP-G03-CQ_Mitigated.sav"}
 CASE_DYR      = {}            # same, for the .dyr (machine model names: IBR / SYNC / SVC)
 # ===========================================================================
@@ -1034,7 +1034,7 @@ def _psspy():
 
 
 def _panel_setting(name):
-    p = os.path.join(_root(), "z6_cmp_all_con.py")
+    p = os.path.join(_root(), "z6_main.py")
     if not os.path.isfile(p):
         return None
     rx = re.compile(r'^%s\s*=\s*r?["\']([^"\']*)["\']' % name)

@@ -47,7 +47,7 @@ import os, sys, re, csv, glob, time, traceback, contextlib
 # ============================================================================
 # >>>>>>>>>>>>>>>>>>>>>>  EDIT THESE  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 # ============================================================================
-# THE CASE FOLDER. z6_cmp_all_con.py sends it (SPP_STUDY_DIR) so one setting there
+# THE CASE FOLDER. z6_main.py sends it (SPP_STUDY_DIR) so one setting there
 # moves both cases; the literal below is what a standalone run of this file uses,
 # and is the only thing to edit if you run it on its own.
 #
@@ -57,7 +57,7 @@ import os, sys, re, csv, glob, time, traceback, contextlib
 # empty" and then, truthfully, that it built 0 faults.
 def _script_dir():
     """The folder THIS FILE is in. Used when the study is run on its own; when
-       z6_cmp_all_con.py drives it, SPP_STUDY_DIR wins and points at the same place."""
+       z6_main.py drives it, SPP_STUDY_DIR wins and points at the same place."""
     try:
         return os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
     except NameError:
@@ -65,7 +65,7 @@ def _script_dir():
 
 
 # NO ABSOLUTE PATH. The case folder is wherever THIS FILE sits, unless
-# z6_cmp_all_con.py says otherwise -- so the whole study moves between machines
+# z6_main.py says otherwise -- so the whole study moves between machines
 # by copying the folder, with nothing to edit.
 STUDY_DIR   = os.environ.get("SPP_STUDY_DIR") or _script_dir()
 COMMON_BASE = "DIS2201-25SP-G03-CQ_Mitigated"          # base name of your case (NO extension)
@@ -92,7 +92,7 @@ _CAP_TAG_DIR = (os.environ.get("SPP_CAP_TAG") or "").strip()
 # SPP_CAP_TAG names a capacity level and is spelled "_cap75". A .dyr sweep needs
 # the same thing -- one folder per variant, so the runs do not overwrite each
 # other -- but "cap" would be a lie about what varied. SPP_RUN_TAG is the
-# general form: whatever z6_cmp_all_con.py sends becomes the suffix, and the folder
+# general form: whatever z6_main.py sends becomes the suffix, and the folder
 # says which run it is.
 _RUN_TAG_DIR = (os.environ.get("SPP_RUN_TAG") or "").strip()
 
@@ -111,7 +111,7 @@ _RUN_TAG_DIR = (os.environ.get("SPP_RUN_TAG") or "").strip()
 # Base\results -> Base\results_base, Projects\results -> Projects\results_proj
 # -- and everything picks it up with no other change.
 RESULTS_FOLDER_BY_CASE = True
-_RES_KIND = "proj"
+_RES_KIND = "base"
 
 
 def _results_root():
@@ -200,47 +200,19 @@ RESULTS_DIR = os.path.join(
 #
 # ENABLE_BESS = False leaves this whole feature dormant: the script builds and
 # runs exactly as it does today.
-ENABLE_BESS    = True
+ENABLE_BESS    = False
 # >>> Pick the project by NAME. MW, POI, feeders and existing-gen handling all
 #     come from its entry in BESS_PROJECTS -- this is the only line to edit.
-ACTIVE_PROJECT = ""   # <<< SET ME: one of the BESS_PROJECTS names below
+ACTIVE_PROJECT = "EmpirePrairie"   # <<< SET ME: one of the BESS_PROJECTS names below
 # FOLLOW THE PROJECT BEING RUN. When the launcher drives several projects it sets
 # SPP_PROJECT per run, and RUN_PROJECT already follows it. This did not, so with
-# ENABLE_BESS on, a run of IronStar would have built SANTA FE's battery while
-# monitoring IronStar's buses. Editing the line above still works for a single
-# hand-run, where SPP_PROJECT is not set at all.
+# ENABLE_BESS on, a run of IronStar would have built a DIFFERENT project's battery
+# while monitoring IronStar's buses. Editing the line above still works for a
+# single hand-run, where SPP_PROJECT is not set at all.
 ACTIVE_PROJECT = (os.environ.get("SPP_PROJECT") or ACTIVE_PROJECT).strip()
 # ACTIVE_MW: None = the project's rated MW. Only projects with MORE THAN ONE rated
 # size read this; it is ignored for single-size projects.
 ACTIVE_MW      = None
-# >>> AND FROM THE ENVIRONMENT, so z6_cmp_all_con.py can set it per project.
-#
-# WHY THIS HAD TO EXIST. EmpirePrairie is listed as {"mw": [604, 804]} -- two
-# rated sizes -- and with nothing set _project_mw() takes the FIRST, 604. That
-# is a silent choice of what the study is about, made by list order, and it goes
-# into the case tag, the results folder name and every number in the report. A
-# study whose capacity nobody chose is a study nobody can explain.
-#
-# A bare number applies to whichever project is running; a JSON object is looked
-# up by name, and a project it does not name keeps the rating rule above.
-_amw = (os.environ.get("SPP_ACTIVE_MW") or "").strip()
-if _amw:
-    try:
-        if _amw.startswith("{"):
-            import json as _json_mw
-            _tbl = _json_mw.loads(_amw)
-            for _k, _v in (_tbl or {}).items():
-                if str(_k).strip().lower() == (ACTIVE_PROJECT or "").strip().lower():
-                    ACTIVE_MW = float(_v)
-                    break
-        else:
-            ACTIVE_MW = float(_amw)
-        if ACTIVE_MW is not None:
-            print("[bess] ACTIVE_MW from z6_cmp_all_con.py: %s -> %g MW"
-                  % (ACTIVE_PROJECT, ACTIVE_MW))
-    except Exception as _e:
-        print("[bess] SPP_ACTIVE_MW could not be read (%s) -- using the project's "
-              "own rating" % _e)
 
 # >>> MACHINE MVA BASE HEADROOM ABOVE THE DISPATCH ---------------------------
 # MBASE = per-feeder MW x this. It must be > 1.0: with MBASE equal to PGEN every
@@ -266,49 +238,6 @@ import math as _math
 _Q_PER_P       = (_math.tan(_math.acos(POI_PF)) )* 1.32   # 0.95 -> 0.3287 x 1.32 = 0.434 at the terminals (covers the collector/GSU vars)
 # A BESS charges as well as discharges: Pmin = -Pmax. False = Pmin 0 (solar/wind).
 BESS_PMIN_SYMMETRIC = True
-# >>> MBASE AS A WHOLE NUMBER OF INVERTERS. The power triangle gives a machine
-# MBASE like 123.15 MVA; a real plant is N inverters of INVERTER_MVA each, so
-# the MBASE written to the case is the nearest multiple: 28 x 4.4 = 123.2 MVA.
-# PG, Pmax/Pmin and Qmax/Qmin are not changed by this -- only the base. Where
-# MBASE has to be RAISED to cover a gross-up (see _set_machine_p) the next
-# multiple up is used. 0 = the raw power-triangle value, as before.
-INVERTER_MVA = 4.4
-
-
-def _inverter_record(p_ref, pg=None):
-    """(Pmax, Pmin, Qmax, MBASE, inverters) for one machine as a WHOLE NUMBER of
-       INVERTER_MVA inverters. The count is the nearest to the power triangle of
-       p_ref (Q = BESS_Q_CAP_FRACTION x P), stepped up until Pmax covers pg when
-       a dispatch is given. Pmax, Qmax and MBASE keep the triangle's shape:
-       MBASE = n x INVERTER_MVA, Pmax = MBASE / sqrt(1 + k^2), Qmax = k x Pmax."""
-    k = float(BESS_Q_CAP_FRACTION)
-    tri = _math.sqrt(float(p_ref) ** 2 + (k * float(p_ref)) ** 2)
-    # ROUNDED UP, never down: one inverter more is no issue, one less would put
-    # Pmax under the rating and the POI could not be met from the plant.
-    mb, n = _mbase_inverters(tri, up=True)
-    if n <= 0:                                   # INVERTER_MVA = 0: raw triangle, as before
-        pmax = float(p_ref)
-        return pmax, (-pmax if BESS_PMIN_SYMMETRIC else 0.0), k * pmax, tri, 0
-    unit = float(INVERTER_MVA)
-    shape = _math.sqrt(1.0 + k * k)
-    while pg is not None and (n * unit) / shape < abs(float(pg)) - 1e-6:
-        n += 1
-    mb = n * unit
-    pmax = mb / shape
-    return pmax, (-pmax if BESS_PMIN_SYMMETRIC else 0.0), k * pmax, mb, n
-
-
-def _mbase_inverters(mb, up=False):
-    """(MBASE as a whole number of inverters, that number). up = round up."""
-    try:
-        unit = float(INVERTER_MVA)
-    except (TypeError, ValueError):
-        unit = 0.0
-    if unit <= 0 or mb is None or float(mb) <= 0:
-        return float(mb or 0.0), 0
-    n = int(_math.ceil(float(mb) / unit - 1e-9)) if up else int(round(float(mb) / unit))
-    n = max(1, n)
-    return n * unit, n
 # WHAT THE MACHINE IS RATED AT when a project lists several study sizes
 # (EmpirePrairie: "mw": [604, 769]):
 #   "level"  the size being BUILT -- 604 MW is a 604 MW facility: Pmax 151 MW per
@@ -339,159 +268,10 @@ BESS_PROJECTS = [
 ]
 
 
-# ============================================================================
-# TOTAL POWER AT THE POI, WITH THE AREA HELD WHERE IT WAS
-# ============================================================================
-# WHAT THIS IS FOR. Adding a project raises the area's generation by the size of
-# the project, so the base case and the project case no longer carry the same
-# power in the area -- and every difference the study reports then mixes "the
-# project is there" with "the area is generating more". Holding the area total
-# where it was makes the project the ONLY difference between the two runs, which
-# is what a comparison is for.
-#
-# WHAT YOU SET. POI_P_TARGET_MW is the TOTAL real power leaving the plant at the
-# POI, existing machines and new ones together:
-#
-#     POI_P_TARGET_MW = 1000        # SantaFe: 502 MW of BESS + ~498 from the
-#                                   # existing machines on the same feeder buses
-#
-# The project machines keep whatever dispatch they already have (their rating,
-# or the reduced value a capacity sweep asked for), and the EXISTING machines at
-# the plant are moved to make up the difference. So at 1000 MW with the BESS at
-# 100 %, the four existing units carry the remainder between them.
-#
-# THEN THE AREA IS PUT BACK. The area total is read BEFORE the project is added
-# -- that number is the base case's area total, because at that moment the case
-# IS the base case -- and after the plant is dispatched every OTHER machine in
-# the area is scaled so the area sums to it again. Area 534 at 3500 MW before
-# stays 3500 MW after, with 1000 of it now coming from the POI.
-#
-# WHICH AREA. The project's own "area" key: 534 for SantaFe, IronStar and
-# EastFork, 541 for EmpirePrairie. POI_P_AREA overrides it.
-POI_P_TARGET_MW  = None      # None = leave the dispatch alone (the old behaviour)
-POI_P_AREA       = None      # None = the project's "area" key
-POI_HOLD_AREA_MW = True      # False = raise the POI and let the area total rise with it
-# How the remainder is split between the EXISTING machines at the plant:
-#   "capacity"  in proportion to each machine's PMAX      <- default
-#   "present"   in proportion to what each is generating now
-#   "equal"     the same MW each
-POI_P_SHARE      = "capacity"
-# WHERE THE PROJECT MACHINES SIT WHILE THE REST IS MADE UP.
-#
-#   "rated"  put them ON their rating first, then let the existing machines make
-#            up the difference. This is the usual intent -- "the BESS runs at its
-#            capacity and the other units add the rest" -- and it does not depend
-#            on the dispatch the power flow happened to arrive at, on
-#            POI_TUNE_DELIVERY having moved them, or on a previous run.  <- default
-#   "as-is"  leave them wherever they are and make up the difference to whatever
-#            that is. Use this when something else has deliberately set them.
-#
-# A CAPACITY SWEEP STILL WINS. With SPP_CAP_SCALE in force "rated" means the
-# rating TIMES that scale -- otherwise setting a POI total would quietly undo the
-# capacity level and every level of the sweep would report the same answer.
-POI_P_PROJECT_AT = "rated"
-# THE PROJECT'S OWN RATING, when the project row is not the number you want.
-#
-#   None  work it out: ACTIVE_MW, else the project row's "mw", else -- for a
-#         plant already built into the .sav -- the combined PMAX of its machines,
-#         which is the plant that is actually there.   <- default
-#   212   this number, exactly. Use it when the row rounds (IronStar's row says
-#         214 for a plant built as 2 x 106) or when a study wants the BESS held
-#         somewhere other than its rating.
-#
-# It is the BESS half of POI_P_TARGET_MW: at 290 with this at 212, the existing
-# machines at the plant carry the remaining 78.
-POI_P_PROJECT_MW = None
-# EXTRA BUSES THAT BELONG TO THIS PLANT.
-#
-# The existing machines are looked for on the project's feeder buses. Where they
-# sit somewhere else -- a generator bus behind a GSU, a unit the project row
-# never listed -- name those buses here and they are counted as part of the
-# plant: they take their share of the remainder, and they are excluded from the
-# area rescale so they are not moved twice.
-#
-#   POI_P_EXISTING_BUSES = [765910, 765920, 765930]
-POI_P_EXISTING_BUSES = []
-# ---- SPP BP-7250 7.6: THE EGF TURNED OFF ------------------------------------
-#
-# A surplus interconnection request is studied in TWO stability scenarios:
-#
-#   1. the SGF (the surplus facility) dispatched at 100 % and the EGF (the
-#      existing facility) TURNED OFF
-#   2. the SGF at 100 % and the EGF dispatched to set the POI injection to the
-#      Interconnection Service amount of the EGF
-#
-# Scenario 2 is POI_P_TARGET_MW: the project machines go to their rating and
-# the existing ones make up the difference to that number. Scenario 1 is THIS:
-# the plant's existing machines go OUT OF SERVICE and the POI carries whatever
-# the surplus machines alone deliver.
-#
-# THEY ARE NOT THE SAME AS DISPATCHING THE EXISTING UNITS TO ZERO. A machine at
-# 0 MW is still in service -- still a voltage source, still holding its reactive
-# capability, still running its dynamic models through the disturbance -- and
-# SPP's first scenario has it off. Two studies that differ by that are two
-# different systems, and the difference shows up exactly where a surplus study
-# looks: the voltage recovery and the damping at the POI.
-#
-# Set from z6_cmp_all_con.py per scenario; SPP_EGF_OFF=1 turns it on for one run.
-POI_P_EXISTING_OFF = False
-# HOW CLOSE THE AREA HAS TO COME BACK, and how many solve/correct passes it may
-# take. The solve moves the system slack to cover the change in losses, so one
-# pass before the solve does not land it -- see _poi_hold_area_after_solve().
-# WHERE THE 1000 MW IS MEASURED.
-#
-#   "machines"  the sum of the plant's machine P. Simple, exact, and what makes
-#               the area arithmetic exact -- but the POI METER reads less,
-#               because the collector, the GSUs and the MPT consume some of it on
-#               the way. 1000 at the terminals metered 973 at the POI.
-#   "metered"   the number the one-line shows: P leaving the POI toward the
-#               system. The machines are grossed up until the meter reads the
-#               target, and the BESS is grossed up until ITS share at the POI is
-#               its rating -- so "502 at the POI" is literally true.  <- default
-#
-# The losses depend on the flows, which depend on the dispatch, so "metered" is
-# an iteration and not arithmetic: solve, measure, move, solve again.
-POI_P_MEASURE       = "metered"
-POI_P_METER_ITERS   = 8
-POI_P_METER_TOL_MW  = 0.5
-
-POI_HOLD_AREA_TOL_MW = 0.5
-POI_HOLD_AREA_PASSES = 4
-# A machine is never pushed past its PMAX or below its PMIN. If the remainder
-# cannot be placed inside those limits the shortfall is reported rather than
-# quietly absorbed -- a plant that cannot reach the target is a finding about
-# the target, not something to round away.
-# >>> THE LOWEST P A PROJECT (SGF) MACHINE MAY BE DISPATCHED TO.
-#
-# 0.0 means the POI dispatch may take the battery down to zero and no further.
-# A negative P on a BESS is CHARGING -- a different study with a different
-# fault response -- and it must never arrive as the by-product of an iteration
-# overshooting its target. It did: a BESS on a shared feeder bus was driven to
-# -124 MW because the loop could not tell its output from the existing unit's.
-# None allows negative values deliberately, for a charging scenario.
-POI_P_PROJECT_MIN_MW = 0.0
-
-# >>> THE SAME FLOOR, FOR THE MACHINES THAT WERE ALREADY THERE.
-#
-# The existing units take whatever is left of the POI total after the project
-# has taken its rating, and "whatever is left" goes negative the moment the
-# plant is larger than its interconnection. Their own Pmin does not stop it:
-# Pmin on a battery or on pumped storage IS negative, so clamping to the
-# machine's limits permits an existing unit to be driven from generating into
-# charging to make an arithmetic sum come out right.
-#
-# 0.0 refuses that. A unit ALREADY below zero in the case keeps its freedom --
-# the floor is its own starting point where that is lower -- so what is refused
-# is pushing a machine THROUGH zero, not a case that legitimately starts there.
-# None allows it deliberately.
-POI_P_EXISTING_MIN_MW = 0.0
-
-POI_P_RESPECT_LIMITS = True
-
-# ---- PROJECTS ADDED OR REDEFINED FROM z6_cmp_all_con.py -------------------------
+# ---- PROJECTS ADDED OR REDEFINED FROM z6_main.py -------------------------
 # A project lived only in the list above, so adding one -- or pointing an
 # existing one at different feeders -- meant editing BOTH study scripts and
-# keeping them in step. z6_cmp_all_con.py can send the definitions instead, which
+# keeping them in step. z6_main.py can send the definitions instead, which
 # is the same reason every other setting moved there: the two cases cannot
 # disagree about something they are both handed.
 #
@@ -539,7 +319,7 @@ if _bp_env:
               "this file is used as written" % _e)
 
 # ============================================================================
-# EVERY PROJECT AT ONCE   (z6_cmp_all_con.py: PROJECTS_RUN = "together" / "both")
+# EVERY PROJECT AT ONCE   (z6_main.py: PROJECTS_RUN = "together" / "both")
 # ============================================================================
 # SPP_TOGETHER = {"name": "AllProjects", "members": {"SantaFe": 502, ...}} makes
 # ONE project row out of several: every member's POI, feeders and machines
@@ -656,144 +436,6 @@ if _tg_env:
     except Exception as _e:
         print("[together] SPP_TOGETHER could not be read (%s) -- ignored" % _e)
 
-# ============================================================================
-# BUILD A BRAND-NEW PLANT AT THE POI  (instead of re-using the wind feeders)
-# ============================================================================
-# Everything above adds the BESS onto buses THAT ALREADY EXIST -- the wind
-# plant's collector feeders -- and switches the existing machines off. That is
-# the surplus-interconnection question: reuse the service already granted.
-#
-# This is the other question: a NEW facility at the same POI, with its own
-# equipment, in ADDITION to whatever is there. Nothing is switched off, and the
-# network the study runs is the network the plant would actually be built with:
-#
-#   unit bus (LV)  --GSU--  unit MV bus  --collector--  collector bus
-#                                                            |
-#                                                           MPT
-#                                                            |
-#                                                        HV bus --tie-- POI
-#
-# WHY THE IMPEDANCES ARE NOT A DETAIL. The reason the existing study reports an
-# over-voltage at all is the voltage rise from the machines to the POI, and
-# every element above contributes to it. A plant modelled as machines hung
-# straight on the POI has no rise, passes everything, and describes nothing
-# that will be built.
-#
-# WHAT IS CREATED, per unit i of "units":
-#   bus_start + i          unit terminal, unit_kv     <- the machine goes here
-#   bus_start + 100 + i    GSU high side, collector_kv
-# and once for the plant:
-#   bus_start + 200        collector bus, collector_kv
-#   bus_start + 201        MPT high side, hv_kv
-#
-# The machine and its dynamic models then land on the new unit buses through
-# EXACTLY the path an existing feeder takes -- apply_bess_powerflow() puts the
-# machine there and _bess_dyr_text() clones REGCAU1/REECCU1/REPCAU1 onto the
-# same bus numbers. Nothing about the dynamics is special-cased, which is why
-# the fault behaviour is comparable with the reuse study.
-#
-# BUS NUMBERS MUST BE FREE. The build checks every one before it creates
-# anything and STOPS if a number is taken -- writing a plant on top of somebody
-# else's bus is not a failure that shows up later, it is a study of a different
-# network.
-#
-# IMPEDANCE UNITS, and they differ by element:
-#   GSU / MPT   per unit on the TRANSFORMER's own MVA base ("sbase" in the row)
-#               and its winding kV -- the PSS/E convention for a transformer
-#   collector   per unit on the SYSTEM base and the bus kV, like any line
-#   tie         the same, and normally near zero: it is the connection to the
-#               POI, not a line
-NEW_PLANT = {
-    "enabled":        True,       # <<< True = build it. False = this whole block is dormant
-                                  # ON, because the deck is now the BASE case and holds no
-                                  # plant: with this off nothing is built and the BESS lands
-                                  # on the existing feeder buses instead. z6_cmp_all_con.py sends
-                                  # SPP_NEW_PLANT and overrides this either way; it matches
-                                  # here so a standalone run of this file does the same thing.
-    "name":          "NEWGEN",   # goes in the bus names and the record file
-    # HOW MANY FEEDERS: None = worked out from the project's rating and the
-    # FEEDER_MAX_MW cap, capacity divided EQUALLY --
-    #     IronStar  214 MW -> 2 feeder(s) x 107.0 MW
-    #     SantaFe   502 MW -> 3 feeder(s) x 167.3 MW
-    # A number here is honoured and still checked against the cap.
-    "units":         None,
-    # None = the project's rating divided by the feeders above. A value is used
-    # ONLY to size the GSU when the project MW is unknown; the dispatch itself
-    # always comes from the project row, so a number that disagrees is ignored
-    # and said so.
-    "mw_per_unit":   None,
-    "unit_kv":       0.69,       # inverter terminal
-    "collector_kv":  34.5,
-    "hv_kv":         None,       # None = whatever the POI's base kV is
-    "bus_start":     999001,     # first NEW bus number; must be free, and so must the block
-    "area":          None,       # None = copy the POI's area / zone / owner
-    "zone":          None,
-    "owner":         None,
-    # GSU, one per unit: unit terminal -> collector kV
-    # Z = 7.7 % at X/R = 10  ->  R = Z/sqrt(1+(X/R)^2)*1, X = R*(X/R)
-    "gsu":       {"r": 0.007662, "x": 0.076618, "sbase": None},
-    # collector equivalent, one per unit: GSU high side -> the common collector bus
-    "collector": {"r": 0.0200, "x": 0.0400, "b": 0.0000},
-    # main power transformer: collector bus -> HV
-    # Z = 10.0 % at X/R = 40
-    "mpt":       {"r": 0.002499, "x": 0.099969, "sbase": None},
-    # HV bus -> POI. Near zero unless there is a real line in between.
-    "tie":       {"r": 0.0000, "x": 0.0005, "b": 0.0000},
-}
-
-# ---- WHICH psspy CALL CREATES A TRANSFORMER AND A BRANCH --------------------
-# THE SHAPE IS PINNED, NOT SEARCHED FOR. It used to be discovered by trying
-# every plausible combination of function, array length and argument count
-# until one worked. That found the right answer on PSS/E 34.8.0 and printed
-#
-#     transformer call shape ... CZ at intgar[7] -- found after 220 rejected form(s)
-#
-# and then the process died at the NEXT transformer with no traceback and no
-# error -- an access violation, not a Python exception.
-#
-# Those 220 rejected calls are calls INTO A FORTRAN API WITH ARRAYS OF THE
-# WRONG LENGTH. PSS/E does not reliably raise on that: it can read past the end
-# of the array, and the damage need not appear in the call that caused it.
-# Probing an API by calling it wrongly two hundred times is not a safe way to
-# discover it, however carefully each result is checked.
-#
-# So the shape that was found is written down and used directly -- one call per
-# element, no probing.
-#
-#   (function, intgar length, realari length, tail, index of CZ within intgar)
-#   tail: "f" one extra float array | "ff+cc" two floats + two strings
-#         "cc" two strings | "c" one string | "" nothing
-# two_winding_data_5, EXACTLY as the API manual specifies it:
-#
-#   ierr, realaro = two_winding_data_5(ibus, jbus, ckt, intgar, realari,
-#                                      ratings, namear, vgrpar)
-#
-#   INTGAR   15 elements   1 STAT  2 METBUS  3 O1  4 O2  5 O3  6 O4  7 NTP1
-#                          8 TAB1  9 WN1BUS 10 CONT1 11 SICOD1 12 COD1
-#                         13 CW   14 CZ    15 CM
-#   REALARI  21 elements   1 R1-2  2 X1-2   3 SBS1-2  4 WINDV1  5 NOMV1
-#                          6 ANG1  7 WINDV2 8 NOMV2   9..12 F1..F4
-#                         13 MAG1 14 MAG2  15 RMA1   16 RMI1  17 VMA1
-#                         18 VMI1 19 CR1   20 CX1    21 CNXA1
-#   RATINGS  12 elements   RATE1..RATE12
-#   NAMEAR   transformer name        VGRPAR  vector group name
-#
-# So CZ is INTGAR(14) -- index 13 counting from zero -- and the array is
-# FIFTEEN long. The version this replaced was called with thirteen, which is
-# why PSS/E read two elements past the end of it and why the process died at
-# the next transformer rather than at the call that did the damage.
-#
-#   (function, intgar length, realari length, ratings length, CZ index 0-based)
-NEW_PLANT_XFMR_CALL   = ("two_winding_data_5", 15, 21, 12, 13)
-NEW_PLANT_BRANCH_CALL = ("branch_data_3", 6, 12, "f+c")
-
-# True = go back to trying combinations when the pinned shape does not work.
-# OFF by default and it should stay off unless a build fails on a DIFFERENT
-# PSS/E, because it is what crashed 34.8.0. When a pinned shape fails, the
-# build prints psspy's own docstring for that call instead: the signature
-# outright, rather than inferred from what happens not to crash.
-NEW_PLANT_FIND_API = False
-
 # ---- COLLECTOR-SYSTEM IMPEDANCE ---------------------------------------------
 # CHANGE THE COLLECTOR IMPEDANCE AND RE-RUN, to see whether the over-voltage
 # improves. The existing interconnections were built for WIND; a BESS at the
@@ -842,10 +484,10 @@ COLLECTOR_BRANCHES = {
 COLLECTOR_DEFAULT_CKT = "1"
 
 # ONE IMPEDANCE FOR EVERY COLLECTOR, every project: (R, X, B), or None per
-# quantity to leave that one alone. z6_cmp_all_con.py sets it for both cases.
+# quantity to leave that one alone. z6_main.py sets it for both cases.
 COLLECTOR_ALL = None
 
-# ONE IMPEDANCE PER PROJECT: {project: (R, X, B)}. z6_cmp_all_con.py sets it.
+# ONE IMPEDANCE PER PROJECT: {project: (R, X, B)}. z6_main.py sets it.
 COLLECTOR_BY_PROJECT = {}
 
 
@@ -866,7 +508,7 @@ COLLECTOR_ON = True
 
 # A collector branch named here but absent from the case is a mistake in the
 # table when the projects ARE modelled, and simply not there when they are not.
-COLLECTOR_STRICT = True   # the project case: the branches must exist
+COLLECTOR_STRICT = False  # the base case does not model the projects
 
 
 def _project_mw(project, requested=None):
@@ -896,22 +538,6 @@ POI_TUNE_ITERS    = 30       # max solve/measure/adjust passes
 POI_TUNE_TOL_MW   = 0.5      # POI P within this (MW)   -> converged
 POI_TUNE_TOL_MVAR = 0.5      # POI Q within this (MVAr) -> converged
 POI_TUNE_RELAX    = 1.0      # step damping (1.0 = full correction)
-
-# >>> ZERO REACTIVE EXCHANGE AT THE POI ON THE METERED PATH TOO ----------------
-# With POI_P_TARGET_MW set the tuner above is SKIPPED, and the BESS machines were
-# left regulating whatever scheduled voltage their plant records carried -- so
-# they DREW the collector system's reactive losses from the grid. This step runs
-# after the P metering and the area hold, on every member: it moves the
-# machines' QG (equal share per machine, inside each machine's OWN QMAX/QMIN,
-# which are not changed) until the plant exchanges ~0 MVAr at the POI, then sets
-# each plant's scheduled voltage to the voltage the machine sits at, so the
-# regulating solves that follow reproduce the same Q. PMAX/PMIN, QMAX/QMIN and
-# MBASE are not touched; the QT/QB pinned during the iteration are put back to
-# what they were before it.
-POI_Q_ZERO      = True
-POI_Q_TOL_MVAR  = 0.5        # POI Q within this (MVAr) -> converged
-POI_Q_ITERS     = 12         # max solve/measure/adjust passes
-POI_Q_RELAX     = 1.0        # step damping (1.0 = full correction)
 
 # >>> REACTIVE CAPABILITY THE MACHINES KEEP IN THE SAVED CASE ------------------
 # The tuning loop must pin QT = QB = QG while it solves, or the machines regulate
@@ -969,9 +595,9 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 @!/ Lvplsw
     0
 @!/ Tg           Rrpwr        Brkpt        Zerox     Lvpl1
-    0.0200      5.0000       0.9000       0.5000    1.0000
+    0.0200       1.0000       0.9000       0.5000    1.0000
 @!/ Volim        Lvpnt1       Lvpnt0       Iolim     Tfltr
-    1.2000       0.0100       0.0000      -1.0000    0.0200
+    1.2000       0.0100       0.0000      -1.0000    0.0000
 @!/ Khv          Iqrmax       Iqrmin       Accel
     0.0000       20.000      -20.000       0.7000/
 /
@@ -984,15 +610,15 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 @!/ Bus#            PFflag          Vflag           Qflag         PQflag
     0           0               0               0             0
 @!/ Vdip            Vup             Trv             dbd1          dbd2
-    0.900          1.1000          0.0100         -0.1000        0.1000
+    0.8900          1.3000          0.0100         -0.1000        0.1000
 @!/ Kqv             Iqh1            Iql1            Vref0         Tp
-    0.5000          1.0000         -1.0000          0.0000        0.0500
+    1.0000          2.0000         -2.0000          0.0000        0.0500
 @!/ QMax            QMin
     0.4840         -0.4840
 @!/ Vmax            Vmin            Kqp             Kqi           Kvp
     1.2000          0.8000          0.0000          1.0000        0.0000
 @!/ Kvi             Tiq             dPmax           dPmin
-    1.0000          0.0100          1.000          -1.000
+    1.0000          0.0100          0.2000         -0.2000
 @!/ Pmax            Pmin            Imax            Tpord         Vq1
     1.0000         -1.0000          1.0000          0.0100        0.0000
 @!/ Iq1             Vq2             Iq2             Vq3           Iq3
@@ -1011,135 +637,19 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 @!/ Bus#            LDC_FromBus     LDC_ToBus       LDC_ID         VCFlag     Refflag     Fflag
     999000           0           0           '0'            0          1           1
 @!/ Tfltr           Kp              Ki              Tft            Tfv
-    0.0200          0.1000          1.000          0.02            0.100
+    0.0400          0.1000          1.000          0.0000         0.0400
 @!/ Vfrz            Rc              Xc              Kc             emax
-    0.8800          0.0000          0.0000          0.0400         0.1
+    0.8800          0.0000          0.0000          0.0400         999.00
 @!/ emin            dbd1            dbd2            QMax           QMin
-   -0.1            0.0000          0.0000          0.4840         -0.4840
+   -999.00          0.0000          0.0000          0.4840        -0.4840
 @!/ Kpg             Kig             Tp              fdbd1          fdbd2
-    0.1000          1.0000          0.0400          -0.0006         0.0006
+    0.0000          0.5000          0.0400          -0.0006         0.0006
 @!/ femax           femin           Pmax            Pmin           Tg
-    999.00         -999.00          1.0000         -1.0000         0.100
+    999.00         -999.00          1.0000         -1.0000         0.0400
 @!/ Ddn             Dup             
-    20          20/
+    0.0200          0.0200/
 /
-
-	
- /High Voltage Protections PRC-24	
-  99900001   'VTGTPAT'     999000    999000  '1'
-         -1.0000       1.2000        0.5       0.1000      /
-  99900002   'VTGTPAT'     999000    999000  '1'
-          -1.0000       1.15000       2       0.1000      /
-  
-  /Low Voltage Protections PRC-24		 
-  99900003   'VTGTPAT'     999000    999000  '1'
-         0.3000       5.000       1.100       0.1000      /
-  99900004   'VTGTPAT'     999000    999000  '1'
-          0.8       5.000       5       0.1000      /
-
-	  
-  /High Frequency Protections PRC-24		  
-  99900005   'FRQDCAT'     999000    999000  '1'
-       -100.0000      62.000       0.200       0.1000      /
- 99900006   'FRQDCAT'     999000    999000  '1'
-       -100.0000      61.2000      299.000       0.1000      /
-
-  /Low Frequency Protections PRC-24	  
-  99900007   'FRQDCAT'     999000    999000  '1'
-         56.000     100.0000       0.200       0.1000      /
-  99900008   'FRQDCAT'     999000    999000  '1'
-         58.0000     100.0000       299.0000       0.1000      / 
-
-
-
 """
-
-# >>> PROJECT PROTECTION: PRC-029-1 RIDE-THROUGH, MEASURED AT THE POI ---------
-# The block above (the "PRC-24" records as supplied) is replaced when
-# BESS_PRC029_CURVE is True. This is an inverter-based plant: from 1 Oct 2026
-# (FERC Order 909) it falls under PRC-029-1, not PRC-024 (which then covers
-# synchronous units and Type 1/2 wind only). SPP's frequency profile follows
-# PRC-029-1: continuous 58.8-61.2 Hz, 299 s out to 57.0 / 61.8 Hz. Voltage is
-# the PRC-029-1 must-ride-through table for "all other IBR" (BESS/solar):
-#   high  1.10-1.15 pu 1.0 s / 1.15-1.175 pu 0.5 s / 1.175-1.20 pu 0.2 s /
-#         above 1.20 pu no ride-through required
-#   low   0.70-0.90 pu 6.0 s / 0.50-0.70 pu 2.5 s / 0.25-0.50 pu 1.2 s /
-#         below 0.25 pu 0.16 s
-# Each record trips at the END of the required ride-through window (pickup =
-# the table time, plus TB 0.10 s breaker time), so the model rides through
-# exactly what the standard demands and no longer. The "no ride-through
-# required" stages (1.20 pu, 61.8 Hz, 57.0 Hz) carry a 0.10 s pickup so a
-# one-to-two cycle switching step at clearing (the 1.4 pu POI spike in
-# SantaFe F01) does not trip the plant on a numerical artefact. PRC-029-1
-# measures at the high side of the main transformer, so the monitored bus is
-# POIBUS, substituted per project in _bess_clone_models(); the machine bus
-# stays the feeder. Set False to run the supplied block instead.
-BESS_PRC029_CURVE = False   # False = run the supplied PRC-24 block above exactly as edited; True = the PRC-029-1 table below, measured at the POI
-BESS_RELAY_BLOCK_PRC029 = r"""/High Voltage Protections PRC-029-1 (all other IBR) -- measured at the POI
-  99900001   'VTGTPAT'     POIBUS    999000  '1'
-         -1.0000       1.2000       0.100       0.1000      /
-  99900002   'VTGTPAT'     POIBUS    999000  '1'
-         -1.0000       1.1750       0.200       0.1000      /
-  99900003   'VTGTPAT'     POIBUS    999000  '1'
-         -1.0000       1.1500       0.500       0.1000      /
-  99900004   'VTGTPAT'     POIBUS    999000  '1'
-         -1.0000       1.1000       1.000       0.1000      /
-/Low Voltage Protections PRC-029-1 (all other IBR) -- measured at the POI
-  99900011   'VTGTPAT'     POIBUS    999000  '1'
-          0.2500       5.0000       0.160       0.1000      /
-  99900012   'VTGTPAT'     POIBUS    999000  '1'
-          0.5000       5.0000       1.200       0.1000      /
-  99900013   'VTGTPAT'     POIBUS    999000  '1'
-          0.7000       5.0000       2.500       0.1000      /
-  99900014   'VTGTPAT'     POIBUS    999000  '1'
-          0.9000       5.0000       6.000       0.1000      /
-/High Frequency Protections PRC-029-1 (SPP / Eastern Interconnection)
-  99900021   'FRQDCAT'     POIBUS    999000  '1'
-       -100.0000      61.8000       0.100       0.1000      /
-  99900022   'FRQDCAT'     POIBUS    999000  '1'
-       -100.0000      61.2000     299.000       0.1000      /
-/Low Frequency Protections PRC-029-1 (SPP / Eastern Interconnection)
-  99900031   'FRQDCAT'     POIBUS    999000  '1'
-         57.0000     100.0000       0.100       0.1000      /
-  99900032   'FRQDCAT'     POIBUS    999000  '1'
-         58.8000     100.0000     299.000       0.1000      /
-"""
-_RELAY_SPLIT = "/High Voltage Protections PRC-24"
-if BESS_PRC029_CURVE and _RELAY_SPLIT in BESS_MODEL_TEMPLATE:
-    BESS_MODEL_TEMPLATE = (BESS_MODEL_TEMPLATE.split(_RELAY_SPLIT)[0]
-                           + BESS_RELAY_BLOCK_PRC029)
-
-# ---- NEW_PLANT NEEDS ENABLE_BESS -----------------------------------------
-#
-# NEW_PLANT builds the NETWORK: the unit buses, the GSUs, the collector, the MPT
-# and the tie to the POI. It does NOT put machines on those buses. Three steps do
-# the rest, and every one of them is gated on ENABLE_BESS:
-#
-#     apply_bess_powerflow()   the machines themselves
-#     bess_combined_dyr()      their REGCAU1 / REECCU1 / REPCAU1 records -> the .dyr
-#     psspy.save(MOD_SAV)      the modified .sav
-#
-# So NEW_PLANT with ENABLE_BESS off builds a substation with nothing in it, and
-# writes neither a .dyr nor a .sav -- which is exactly what an empty plant looks
-# like from the outside: no error, no files, no generation at the POI.
-#
-# The two settings are one decision, so they are made to agree here rather than
-# leaving the combination that cannot work available.
-_NP_PANEL_ON = bool((NEW_PLANT or {}).get("enabled"))
-try:
-    _npe0 = (os.environ.get("SPP_NEW_PLANT") or "").strip()
-    if _npe0:
-        import json as _json_np0
-        _NP_PANEL_ON = bool((_json_np0.loads(_npe0) or {}).get("enabled", _NP_PANEL_ON))
-except Exception:
-    pass
-if _NP_PANEL_ON and not ENABLE_BESS:
-    print("[newplant] NEW_PLANT is ON, so ENABLE_BESS is switched ON with it.")
-    print("[newplant]   NEW_PLANT builds the buses, GSUs, collector, MPT and tie;")
-    print("[newplant]   ENABLE_BESS is what puts the MACHINES on the new buses,")
-    print("[newplant]   writes their dynamic records into the .dyr and saves the")
-    print("[newplant]   modified .sav. Without it the plant is an empty substation.")
-    ENABLE_BESS = True
 
 _ACTIVE_BESS = None
 if ENABLE_BESS:
@@ -1178,7 +688,7 @@ if ENABLE_BESS:
 # wins over the feeders -- for the case where a machine is not on the feeder
 # bus, or a plant has more machines than feeders.
 # ===========================================================================
-RUN_PROJECT    = "SantaFe"     # <<< SET ME: one of the BESS_PROJECTS names
+RUN_PROJECT    = "IronStar"     # <<< SET ME: one of the BESS_PROJECTS names
 # The launcher overrides this per project when RUN_PROJECTS names more than one.
 # Editing the line above still works for a single run.
 RUN_PROJECT    = (os.environ.get("SPP_PROJECT") or RUN_PROJECT).strip()
@@ -1209,30 +719,8 @@ if ENABLE_BESS:
     # without clobbering each other's outs/logs/plots/resume markers.
     POI_BUS      = _ACTIVE_BESS["poi"]
     PROJECT_GENS = [(b, BESS_ID) for b in _ACTIVE_BESS["feeders"]]
-    # ONLY WHEN NOBODY ELSE HAS NAMED THE FOLDER.
-    #
-    # This renamed the results folder to BESS_<proj>_<MW>MW unconditionally --
-    # which is right for a standalone run of this script, and wrong under the
-    # launcher. The launcher decides the folder from the project and fault mode
-    # it is running (SantaFe_custom), sends them as SPP_PROJECT / SPP_FAULT_MODE,
-    # and then WATCHES that folder for the workers' ALL_DONE sentinels.
-    #
-    # With the two disagreeing the study ran perfectly, wrote everything into
-    # results\BESS_SantaFe_502MW, and the launcher -- watching
-    # results\SantaFe_custom -- saw an empty folder, declared "build phase did
-    # not finish after 3 launch(es)" and aborted. The roll-up then read the
-    # stray folder's name back as a project called "BESS_SantaFe" with a fault
-    # mode of "502MW".
-    #
-    # It surfaced now because NEW_PLANT switches ENABLE_BESS on, and this branch
-    # had never run under the launcher before.
-    if not _PROJ_TAG:
-        RESULTS_DIR = os.path.join(_results_root(),
-                                   "BESS_%s_%dMW" % (ACTIVE_PROJECT, ACTIVE_MW))
-    else:
-        print("[init] results folder stays %s (named by the launcher), not "
-              "BESS_%s_%dMW" % (os.path.basename(RESULTS_DIR), ACTIVE_PROJECT,
-                                ACTIVE_MW))
+    RESULTS_DIR  = os.path.join(_results_root(),
+                                "BESS_%s_%dMW" % (ACTIVE_PROJECT, ACTIVE_MW))
 PROJECT_GEN_BUSES = [b for b, _ in PROJECT_GENS]   # auto-derived; do NOT edit
 
 # ============================================================================
@@ -1394,77 +882,6 @@ def _np_member_cfg(cfg, row):
     c["bus_start"] = int(cfg.get("bus_start") or 900001) + 10 * _np_member_index(row)
     c["name"] = str(row.get("name") or cfg.get("name") or "NEWGEN")
     return c
-
-
-def _shared_build_ok():
-    """True when this member study of a cluster can take the case an earlier
-       member study built: the same .sav/.cnv/.snp (the tag is the cluster's),
-       with a matching stamp. The flat run still runs in this study's own
-       folder; only the build is skipped."""
-    if not _together_row():
-        return False
-    try:
-        ok = (os.path.isfile(SNP_FILE) and os.path.isfile(CNV_CASE)
-              and _collector_stamp_matches())
-    except Exception:
-        ok = False
-    if ok:
-        print("[together] the cluster case is already built (%s) -- reusing it for %s; "
-              "only the flat run and the faults run here"
-              % (os.path.basename(SNP_FILE), RUN_PROJECT))
-    return ok
-
-
-def _bess_members_first():
-    """The member(s) put in the case BEFORE the first solve: all of them for a
-       single project, only the first for a together run -- the rest are added
-       one at a time onto the SOLVED case (see _bess_members_later), because a
-       power flow asked to absorb four plants and ~1600 MW of redispatch in one
-       step is the solve that did not converge."""
-    _m = _bess_members()
-    return _m[:1] if _together_row() else _m
-
-
-def _bess_members_later():
-    _m = _bess_members()
-    return _m[1:] if _together_row() else []
-
-
-def _solve_staged(row):
-    """Solve after one more plant went in. If the solve does not converge, the
-       plant is brought in at half its dispatch, solved, then returned to full
-       and solved again -- a ramp the power flow can follow."""
-    _nm = (row or {}).get("name", "project")
-    ok = solve_powerflow("FDNS after adding %s" % _nm)
-    if ok:
-        _solve_to_mismatch(tol=TOGETHER_STEP_MISMATCH_MVA, tag="after adding %s" % _nm,
-                           abort=False)
-        return True
-    print("  [together] the power flow did not converge with %s at full output -- "
-          "bringing it in at half, then full" % _nm)
-    _p0 = []
-    for _b, _m in (PROJECT_GENS or []):
-        try:
-            ie, p = psspy.macdat(int(_b), str(_m), "P")
-            if ie in (0, None):
-                _p0.append((int(_b), str(_m), float(p)))
-        except Exception:
-            pass
-    for _b, _m, p in _p0:
-        _set_machine_p(_b, _m, 0.5 * p)
-    ok_half = solve_powerflow("FDNS with %s at half output" % _nm)
-    for _b, _m, p in _p0:
-        _set_machine_p(_b, _m, p)
-    ok = solve_powerflow("FDNS with %s back at full output" % _nm)
-    if ok:
-        _solve_to_mismatch(tol=TOGETHER_STEP_MISMATCH_MVA, tag="after adding %s" % _nm,
-                           abort=False)
-    if not ok:
-        print("  [together] *** %s: the case does not converge with this plant at full "
-              "output (half: %s). Check its POI target and the area hold; the build "
-              "continues to the mismatch iteration, which will say where it stands ***"
-              % (_nm, "converged" if ok_half else "did not converge either"))
-    return ok
 
 
 def _hold_rows():
@@ -1755,6 +1172,11 @@ RESUME_ON_RESTART     = True    # skip scenarios already completed on a prior (c
 #     past the flat run under the supervisor). Leave it False so the flat/fault logic controls it.
 FORCE_REBUILD         = False   # True -> always rebuild the snapshot even when the flat run is already done
 MAX_SCENARIO_ATTEMPTS = 4       # give up on a scenario after this many crashes (poison guard)
+# MATCHED TO THE PROJECT CASE ON PURPOSE. The two cases giving up after a
+# different number of tries means a fault can be scored in one and abandoned in
+# the other for no reason but the setting, and the comparison then reports it as
+# "scored on one side only" -- a statement about this file, not the system.
+# z6_main.py can set it for both at once (MAX_SCENARIO_ATTEMPTS in the panel).
 # >>> DOES THE CAP ABOVE APPLY WHEN SPP_ONLY / RUN_ONLY_FAULTS IS SET? -----------
 # It used to NOT apply: the guard read "att > MAX_SCENARIO_ATTEMPTS and not
 # _only_mode()", so naming any scenario switched the cap off. With a selection as
@@ -1767,7 +1189,7 @@ MAX_SCENARIO_ATTEMPTS = 4       # give up on a scenario after this many crashes 
 # True = the old behaviour, unbounded retries whenever a selection is in force.
 ONLY_MODE_IGNORES_ATTEMPT_CAP = False
 ONLY_MODE_RERUNS_DONE         = False
-# ---- THE CASE FILES, WHEN z6_cmp_all_con.py NAMES THEM --------------------------
+# ---- THE CASE FILES, WHEN z6_main.py NAMES THEM --------------------------
 # SOURCE_CASE and DYR_FILE were editable only here, so studying a different
 # deck meant editing this file -- and, for a comparison, editing the other
 # study script to match. BASE_SAV/BASE_DYR and PROJ_SAV/PROJ_DYR in the driver
@@ -1800,7 +1222,7 @@ DYR_FILE    = _case_file("SPP_DYR_FILE", DYR_FILE)
 
 def _case_file_by_project(env_name, current):
     """A deck named for THIS project in a {project: file} table from
-       z6_cmp_all_con.py (BASE_SAV_BY_PROJECT and friends), else `current`."""
+       z6_main.py (BASE_SAV_BY_PROJECT and friends), else `current`."""
     raw = (os.environ.get(env_name) or "").strip()
     if not raw:
         return current
@@ -1826,20 +1248,15 @@ def _case_file_by_project(env_name, current):
 
 SOURCE_CASE = _case_file_by_project("SPP_SOURCE_CASE_BY_PROJECT", SOURCE_CASE)
 DYR_FILE    = _case_file_by_project("SPP_DYR_FILE_BY_PROJECT", DYR_FILE)
-# SAY IT, EVERY PROCESS, EVERY TIME.
-#
-# "PROJ_SAV is set but it is still running the old case" is not a question the
-# logs could answer: the deck was named only where it was DEFAULT, and the
-# override printed one line only when it changed something. Two lines, always,
-# and they name where the value came from -- so the log settles it.
+# SAY IT, EVERY PROCESS, EVERY TIME -- see the same block in z6_spp_p.py.
 print("[case] power flow : %s   (%s)"
       % (SOURCE_CASE,
-         "PROJ_SAV/BASE_SAV in z6_cmp_all_con.py" if os.environ.get("SPP_SOURCE_CASE")
-         else "this file -- z6_cmp_all_con.py did not name one"))
+         "PROJ_SAV/BASE_SAV in z6_main.py" if os.environ.get("SPP_SOURCE_CASE")
+         else "this file -- z6_main.py did not name one"))
 print("[case] dynamics   : %s   (%s)"
       % (DYR_FILE,
-         "PROJ_DYR/BASE_DYR in z6_cmp_all_con.py" if os.environ.get("SPP_DYR_FILE")
-         else "this file -- z6_cmp_all_con.py did not name one"))
+         "PROJ_DYR/BASE_DYR in z6_main.py" if os.environ.get("SPP_DYR_FILE")
+         else "this file -- z6_main.py did not name one"))
 
 
 
@@ -2137,15 +1554,15 @@ ABORT_ON_PF_NONCONV = True
 FREQ_HZ     = 60.0
 FLAT_RUN_S  = 5         # >>> the PQ Run3 idv ends with "RUN,cm  20.1" -- match it
 
-# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_cmp_all_con.py sets the simulation
+# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_main.py sets the simulation
 # lengths for BOTH cases from one place. They have to match: a fault run to 10 s
 # in one case and 20 s in the other is not a comparison -- the longer run has
 # more time to recover, or to fall over, and nothing in the report would say the
 # two were judged over different windows.
 #     set SPP_FLAT_RUN_S=5
 #     set SPP_SIM_END_S=10
-# ---- SETTINGS THIS FILE ACCEPTS FROM z6_cmp_all_con.py ---------------------------
-# z6_cmp_all_con.py owns the settings that must be the SAME IN BOTH CASES, and sends
+# ---- SETTINGS THIS FILE ACCEPTS FROM z6_main.py ---------------------------
+# z6_main.py owns the settings that must be the SAME IN BOTH CASES, and sends
 # them in the environment. A variable that is not set leaves the value in this
 # file alone, so running a study directly still behaves exactly as written here.
 def _env_str(name, default):
@@ -2225,7 +1642,7 @@ RUN_NPLT = 2               # write channels every N steps. 1=every step (huge .o
 # writes 113 MB per scenario -- which then has to be read back and scored.
 # NPLT = 8 samples every 0.033 s (2 cycles), which is ample for voltage
 # recovery over 2.5 s and for rotor-angle swings, and makes it 28 MB.
-# Settable from z6_cmp_all_con.py so both cases get the same resolution.
+# Settable from z6_main.py so both cases get the same resolution.
                            # 2 halves the file with no visible loss for a 30 s plot.
 
 # >>> DIAGNOSTIC LOG FOR PSS/E SUPPORT ---------------------------------------
@@ -2273,7 +1690,7 @@ SOLV_ACCEL_INIT = 0.60      # INIT  network-solution acceleration (PQ Run3 idv: 
 SOLV_TOL        = 0.0001    # BUILD network-solution tolerance
 SOLV_TOL_INIT   = 0.0000095 # INIT  network-solution tolerance (Run3)
 SOLV_DELT       = 1.0 / (FREQ_HZ * 4.0)   # DELT = 1/4 cycle = 0.0041667 s
-# FROM THE PANEL: DELT_CYCLES in z6_cmp_all_con.py (4 = quarter cycle, the PQ idv
+# FROM THE PANEL: DELT_CYCLES in z6_main.py (4 = quarter cycle, the PQ idv
 # value; 8 = eighth cycle). A case whose network solution loses itself in the
 # fault -- NaN in the fault runs while the flat run is clean -- often holds at
 # the smaller step, at twice the run time. Applied at the build and at every
@@ -2282,7 +1699,7 @@ try:
     _dc = float(os.environ.get("SPP_DELT_CYCLES") or 0)
     if _dc > 0:
         SOLV_DELT = 1.0 / (FREQ_HZ * _dc)
-        print("[solver] DELT = 1/%g cycle = %.6f s (DELT_CYCLES from z6_cmp_all_con.py)" % (_dc, SOLV_DELT))
+        print("[solver] DELT = 1/%g cycle = %.6f s (DELT_CYCLES from z6_main.py)" % (_dc, SOLV_DELT))
 except (TypeError, ValueError):
     pass
 SOLV_FREQFILTER = 0.033333
@@ -2291,7 +1708,7 @@ SOLV_FREQFILTER = 0.033333
 _dtol = _env_num("SPP_DYN_TOL", 0)
 if _dtol and _dtol > 0:
     SOLV_TOL_INIT = float(_dtol)
-    print("[solver] TOL = %g (SPP_DYN_TOL from z6_cmp_all_con.py)" % SOLV_TOL_INIT)
+    print("[solver] TOL = %g (SPP_DYN_TOL from z6_main.py)" % SOLV_TOL_INIT)
 
 # >>> AUTO-RETRY A NON-CONVERGED SCENARIO WITH DIFFERENT SOLVER SETTINGS ---------
 # PSS/E prints, per non-converged step:
@@ -2320,7 +1737,7 @@ SOLVER_RETRY_RECIPES = [
 # SPP's fourth system adjustment is "acceleration factors of multiple faults
 # were adjusted", and this is the mechanism for it -- but adjusting the solver
 # under a scenario that will not converge is a decision about the study, not a
-# convenience, so it is OFF unless z6_cmp_all_con.py turns it on. A run that quietly
+# convenience, so it is OFF unless z6_main.py turns it on. A run that quietly
 # re-solved its hard events on different settings and reported them beside the
 # ones that converged first time would be presenting two different studies as
 # one.
@@ -2455,7 +1872,7 @@ FAULTS = [
 # both cases read them, and a file inside one case folder would be moved or
 # retired with that case's results.
 #
-# Written as a placeholder rather than computed so z6_cmp_all_con.py can still READ
+# Written as a placeholder rather than computed so z6_main.py can still READ
 # this setting out of the file with a regex -- it checks that both studies point
 # at the same list before anything is simulated, and a path it cannot see is a
 # check that cannot run.
@@ -2480,7 +1897,7 @@ def _with_root(path):
 
 
 FAULTS_CSV = r"{root}\SPP_FAULTS_CON_{project}.csv"
-# Kept on ONE line above, literal and quoted, because z6_cmp_all_con.py reads this
+# Kept on ONE line above, literal and quoted, because z6_main.py reads this
 # setting out of the file with a regex to check that both studies point at the
 # same list. A path it cannot see is a check that cannot run.
 FAULTS_CSV = _with_root(
@@ -2609,7 +2026,7 @@ CUSTOM_INCLUDE_POI = True         # fault the POI bus itself as well
 AUTO_SPP_FAULTS    = False     # True -> generate SPP fault set from topology and run+plot it
 
 
-# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_cmp_all_con.py can generate the
+# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_main.py can generate the
 # shared fault list once by running this script's BUILD role with the generator
 # turned on -- without editing this file and forgetting to put it back.
 #     set SPP_AUTO_FAULTS=1
@@ -2819,8 +2236,8 @@ SPP_P4_MODE         = "spp-proxy"
 SPP_P4_TAP_SEGMENTS = True
 
 P6_MAX_PER_BUS      = 6                      # cap on (pre-outage, fault) pairs per bus
-NORMAL_CLEAR_CYCLES = None                 # None -> use SPP_CLEAR_BY_KV; a number -> uniform
-# ---- what z6_cmp_all_con.py sends (see _env_str/_env_num above) --------------------
+NORMAL_CLEAR_CYCLES = None                # None -> use SPP_CLEAR_BY_KV; a number -> uniform
+# ---- what z6_main.py sends (see _env_str/_env_num above) --------------------
 # Applied HERE, after every one of these settings has been given its value in
 # this file, so the override is the last word and there is one place to look
 # when a run does not do what the file says.
@@ -2832,7 +2249,7 @@ CON_EVENTS          = _env_list("SPP_CON_EVENTS", CON_EVENTS)
 TABLE_GROUPS        = _env_list("SPP_TABLE_GROUPS", TABLE_GROUPS)
 CON_MAX_ELEMENTS    = int(_env_num("SPP_CON_MAX_ELEMENTS", CON_MAX_ELEMENTS))
 SPP_FAULT_HOPS      = int(_env_num("SPP_FAULT_HOPS", SPP_FAULT_HOPS))
-# ---- the rest of what z6_cmp_all_con.py owns -----------------------------------
+# ---- the rest of what z6_main.py owns -----------------------------------
 AUTO_SPP_FAULTS     = _env_bool("SPP_AUTO_FAULTS", AUTO_SPP_FAULTS)
 CUSTOM_HOPS         = int(_env_num("SPP_CUSTOM_HOPS", CUSTOM_HOPS))
 RUN_NPLT            = max(1, int(_env_num("SPP_RUN_NPLT", RUN_NPLT)))
@@ -2840,7 +2257,7 @@ CUSTOM_KV_MIN       = float(_env_num("SPP_CUSTOM_KV_MIN", CUSTOM_KV_MIN))
 CUSTOM_MAX_BUSES    = int(_env_num("SPP_CUSTOM_MAX_BUSES", CUSTOM_MAX_BUSES))
 CUSTOM_INCLUDE_POI  = _env_bool("SPP_CUSTOM_INCLUDE_POI", CUSTOM_INCLUDE_POI)
 CUSTOM_TYPES        = [str(x).upper() for x in _env_list("SPP_CUSTOM_TYPES", CUSTOM_TYPES)]
-# A TABLE BY TYPE, OR A LIST. z6_cmp_all_con.py sends {"3PH": null, "SLG": 16} as
+# A TABLE BY TYPE, OR A LIST. z6_main.py sends {"3PH": null, "SLG": 16} as
 # JSON when CUSTOM_CYCLES is a dict there, so the clearing time can follow the
 # fault type -- SPP's kV rule for a three-phase fault, 16 cycles for the SLG
 # stuck-breaker case. A bare list is the older form and still means "these
@@ -2885,7 +2302,7 @@ if _sa:
     try:
         _sal = [int(x) for x in re.split(r"[,\s]+", _sa) if x.strip()]
         if _sal:
-            print("[mon] STUDY_AREAS from z6_cmp_all_con.py: %d area(s) -> %s"
+            print("[mon] STUDY_AREAS from z6_main.py: %d area(s) -> %s"
                   % (len(_sal), ", ".join(str(x) for x in _sal)))
             STUDY_AREAS = _sal
     except Exception:
@@ -2900,7 +2317,7 @@ if _evh:
         import json as _json
         for _k, _v in _json.loads(_evh).items():
             SPP_EVENT_HOPS[str(_k)] = int(_v)
-        print("[faults] event hops from z6_cmp_all_con.py: %s"
+        print("[faults] event hops from z6_main.py: %s"
               % ", ".join("%s=%d" % (k, SPP_EVENT_HOPS[k]) for k in sorted(SPP_EVENT_HOPS)))
     except Exception as _e:
         print("[faults] SPP_EVENT_HOPS could not be read (%s) -- using this file's table"
@@ -2909,154 +2326,7 @@ SPP_FAULT_KV_MIN    = float(_env_num("SPP_FAULT_KV_MIN", SPP_FAULT_KV_MIN))
 SPP_MAX_FAULTS      = int(_env_num("SPP_MAX_FAULTS", SPP_MAX_FAULTS))
 SPP_P4_TAP_SEGMENTS = _env_bool("SPP_P4_TAP_SEGMENTS", SPP_P4_TAP_SEGMENTS)
 SPP_P4_MODE         = (os.environ.get("SPP_P4_MODE") or SPP_P4_MODE).strip()
-# THE POI TOTAL, from z6_cmp_all_con.py. _env_num returns the panel value when the
-# variable is absent, so leaving it unset really does leave this file's own.
-_ptg = (os.environ.get("SPP_POI_P_TARGET") or "").strip()
-if _ptg:
-    # A NUMBER, OR A TABLE KEYED BY PROJECT.
-    #
-    # One number cannot serve four projects: SantaFe is 502 MW and EastFork is
-    # 112, so a single 1000 MW target is a different study on each of them and
-    # nonsense on some. z6_cmp_all_con.py may therefore send either
-    #
-    #     POI_P_TARGET_MW = 1000
-    #     POI_P_TARGET_MW = {"SantaFe": 1000, "IronStar": 500, "EastFork": 300}
-    #
-    # and a table sends every project's value to every run, each of which picks
-    # its own by name. A project not named in the table has NO target and its
-    # dispatch is left alone -- which is the honest reading of "not listed", and
-    # is said out loud below.
-    try:
-        POI_P_TARGET_MW = float(_ptg)
-    except ValueError:
-        try:
-            import json as _json_pt
-            _tbl = _json_pt.loads(_ptg)
-            if isinstance(_tbl, dict):
-                POI_P_TARGET_MW = _tbl
-            else:
-                print("[poi-p] SPP_POI_P_TARGET is %r -- ignored" % _ptg)
-        except Exception:
-            print("[poi-p] SPP_POI_P_TARGET is %r, which is neither a number nor a "
-                  "table -- ignored" % _ptg)
-_pta = (os.environ.get("SPP_POI_P_AREA") or "").strip()
-if _pta:
-    try:
-        POI_P_AREA = int(float(_pta))
-    except ValueError:
-        pass
-POI_HOLD_AREA_MW = _env_bool("SPP_POI_HOLD_AREA", POI_HOLD_AREA_MW)
-POI_P_SHARE      = (os.environ.get("SPP_POI_P_SHARE") or POI_P_SHARE).strip()
-_egfoff = (os.environ.get("SPP_EGF_OFF") or "").strip().lower()
-if _egfoff in ("1", "true", "yes", "on"):
-    POI_P_EXISTING_OFF = True
-elif _egfoff in ("0", "false", "no", "off"):
-    POI_P_EXISTING_OFF = False
-POI_P_PROJECT_AT = (os.environ.get("SPP_POI_P_PROJECT_AT") or POI_P_PROJECT_AT).strip()
-_ppm = (os.environ.get("SPP_POI_P_PROJECT_MW") or "").strip()
-if _ppm:
-    try:
-        POI_P_PROJECT_MW = float(_ppm)
-    except ValueError:
-        print("[poi-p] SPP_POI_P_PROJECT_MW is %r, which is not a number -- ignored" % _ppm)
-POI_P_MEASURE      = (os.environ.get("SPP_POI_P_MEASURE") or POI_P_MEASURE).strip()
-# WHAT THE METER READS when POI_P_MEASURE is "metered":
-#   "delivered"  MW arriving INTO the POI over the plant-side branches -- the
-#                interconnection amount SPP means by "MW at the POI"  <- default
-#   "export"     MW leaving the POI toward the system, net of anything served
-#                at the POI bus itself (the older reading)
-# The two differ by whatever the POI bus feeds directly; both are printed.
-POI_P_METER = (os.environ.get("SPP_POI_P_METER") or "delivered").strip().lower()
-
-
-def _poi_area_of(name):
-    """The area this project's row names, without needing _ACTIVE_BESS.
-
-       This banner prints at import, and _ACTIVE_BESS is filled in only under
-       ENABLE_BESS -- so with a pre-built case it said "area ? held at its
-       pre-project total", which reads as though the area were unknown. It is
-       not: it is in the project's own row, and the row is right there."""
-    for p in (BESS_PROJECTS or []):
-        if str(p.get("name", "")).strip().lower() == str(name or "").strip().lower():
-            return p.get("area", "?")
-    return "?"
-
-
-def _poi_pick(val, what):
-    """One project's value out of a setting that may be a table.
-
-       POI_P_TARGET_MW and POI_P_EXISTING_BUSES may be written per project --
-       {"SantaFe": 1000, "IronStar": 500} -- because the four projects are
-       different sizes at different points of interconnection and one number
-       cannot describe them. A plain value applies to whichever project is
-       running; a table is looked up by name, and a project the table does not
-       name is left alone rather than given somebody else's number."""
-    if not isinstance(val, dict):
-        return val
-    for _k in (ACTIVE_PROJECT, RUN_PROJECT):
-        if _k and str(_k) in val:
-            return val[str(_k)]
-    # case-insensitively, so "santafe" in the panel still finds SantaFe
-    for _k in (ACTIVE_PROJECT, RUN_PROJECT):
-        if not _k:
-            continue
-        for _n, _v in val.items():
-            if str(_n).strip().lower() == str(_k).strip().lower():
-                return _v
-    print("[poi-p] %s names %s and not %r -- this project is left alone"
-          % (what, ", ".join(sorted(str(x) for x in val)) or "(nothing)",
-             ACTIVE_PROJECT or RUN_PROJECT))
-    return None
-
-
-_POI_P_TARGET_RAW = POI_P_TARGET_MW          # the whole table, for the members of a together run
-_POI_P_EXIST_RAW  = POI_P_EXISTING_BUSES
-if _together_row() and isinstance(POI_P_TARGET_MW, dict):
-    # Per member, inside _member_scope. At the top level there is no single
-    # target; the existing-bus list is the union of the members'.
-    POI_P_TARGET_MW = None
-    _eb = []
-    for _mr, _mmw in _bess_members():
-        for _b in (_table_pick(_POI_P_EXIST_RAW, _mr.get("name")) or []):
-            if int(_b) not in _eb:
-                _eb.append(int(_b))
-    POI_P_EXISTING_BUSES = _eb
-    print("[together] POI totals per member: %s"
-          % ", ".join("%s=%s" % (_mr.get("name"), _member_target(_mr))
-                      for _mr, _mmw in _bess_members()))
-else:
-    POI_P_TARGET_MW      = _poi_pick(POI_P_TARGET_MW, "POI_P_TARGET_MW")
-    POI_P_EXISTING_BUSES = _poi_pick(POI_P_EXISTING_BUSES, "POI_P_EXISTING_BUSES") or []
-if POI_P_TARGET_MW is not None:
-    try:
-        POI_P_TARGET_MW = float(POI_P_TARGET_MW)
-        print("[poi-p] %s: total P at the POI -> %.1f MW, area %s held at its "
-              "pre-project total"
-              % (ACTIVE_PROJECT or RUN_PROJECT, POI_P_TARGET_MW,
-                 POI_P_AREA if POI_P_AREA is not None
-                 else _poi_area_of(ACTIVE_PROJECT or RUN_PROJECT)))
-    except (TypeError, ValueError):
-        print("[poi-p] the target for %r is %r, which is not a number -- ignored"
-              % (ACTIVE_PROJECT or RUN_PROJECT, POI_P_TARGET_MW))
-        POI_P_TARGET_MW = None
-POI_P_METER_ITERS  = int(_env_num("SPP_POI_METER_ITERS", POI_P_METER_ITERS))
-POI_P_METER_TOL_MW = _env_num("SPP_POI_METER_TOL", POI_P_METER_TOL_MW)
-POI_HOLD_AREA_TOL_MW = _env_num("SPP_POI_HOLD_TOL", POI_HOLD_AREA_TOL_MW)
-POI_HOLD_AREA_PASSES = int(_env_num("SPP_POI_HOLD_PASSES", POI_HOLD_AREA_PASSES))
-_peb = (os.environ.get("SPP_POI_P_EXIST_BUSES") or "").strip()
-if _peb:
-    # "765910,765920" for every project, or {"SantaFe": [765910, 765920]} per
-    # project -- the same two forms as the target above.
-    try:
-        if _peb.lstrip().startswith("{"):
-            import json as _json_pb
-            POI_P_EXISTING_BUSES = _json_pb.loads(_peb)
-        else:
-            POI_P_EXISTING_BUSES = [int(float(x)) for x in _peb.split(",") if x.strip()]
-    except Exception:
-        print("[poi-p] SPP_POI_P_EXIST_BUSES is %r -- ignored" % _peb)
-POI_P_TAG        = (os.environ.get("SPP_POI_P_TAG") or "").strip()
-# THE THREE RECLOSE SWITCHES, from z6_cmp_all_con.py. ENABLE_RECLOSE decides whether
+# THE THREE RECLOSE SWITCHES, from z6_main.py. ENABLE_RECLOSE decides whether
 # the step is described at all, SIMULATE_RECLOSE whether it is actually performed,
 # and RECLOSE_SKIP_IF_ISLANDS applies SPP's "removed if it would island a
 # generator" rule. Read here beside the other fault settings so one panel governs
@@ -3080,7 +2350,7 @@ if _ncc:
 # is turned OFF, so the setting says what the study runs rather than adding to
 # whatever was already on.
 
-# ---- COLLECTOR IMPEDANCE FROM z6_cmp_all_con.py ----------------------------------
+# ---- COLLECTOR IMPEDANCE FROM z6_main.py ----------------------------------
 # Sent as JSON so a table survives the trip through the environment intact. Not
 # set -> the table written in this file stands, and a standalone run behaves
 # exactly as it reads.
@@ -3112,7 +2382,7 @@ if _collb:
 _evon = _env_list("SPP_EVENTS_ON", None)
 if _evon:
     SPP_EVENTS = dict((k, (k in _evon)) for k in SPP_EVENTS)
-    print("[faults] planning events from z6_cmp_all_con.py: %s"
+    print("[faults] planning events from z6_main.py: %s"
           % ", ".join(sorted(k for k, v in SPP_EVENTS.items() if v)))
 
                                            # None because SPP_CLEAR_BY_KV IS the table SPP's
@@ -3161,7 +2431,7 @@ V_OVERSHOOT_EXEMPT = {}
 V_SS_LOW, V_SS_HIGH = 0.90, 1.10
 SS_WINDOW_S    = 1.0
 ANGLE_DEV_DEG  = 16.0
-# ---- the limits, when z6_cmp_all_con.py sets them ------------------------------
+# ---- the limits, when z6_main.py sets them ------------------------------
 # Applied here, below the definitions. These decide PASS and FAIL, so they must
 # be identical in both cases -- two studies scored against different thresholds
 # produce a comparison whose differences ARE the thresholds, and nothing in the
@@ -3723,6 +2993,8 @@ ALWAYS_KEEP_KEYWORDS = ["PROJ", "NPGEN", "POI", "SYNC", "FLT"]  # always plotted
                                                      #  angle and speed for each unit)
                                                      # ("FLT" = the faulted bus of the
                                                      #  scenario -- never filtered out)
+                                                     # ("FLT" = the faulted bus of the
+                                                     #  scenario -- never filtered out)
 WANT = ["VOLT", "ANGLE", "SPEED", "PELEC", "QELEC", "ETERM"]   # which quantities to plot
 PER_PAGE, MAKE_PNG, YSPAN_FRAC = 3, False, 0.01      # INDIVIDUAL panels per PDF page; MAKE_PNG=False (no PNG -> faster); min y-span fraction
 
@@ -3843,7 +3115,7 @@ NEW_PLANT_MACHINE_KIND = "ASYNC"
 #
 # "" turns it off and leaves only the recorded plant buses. A different
 # numbering block is just a different prefix here.
-NEW_GEN_BUS_PREFIX = "9990"
+NEW_GEN_BUS_PREFIX = "999"
 
 # >>> LAYOUT: how signals are laid out in the pure-Python PDF/SVG plots.
 #   PLOT_INDIVIDUAL = True  -> ONE panel per SIGNAL (each channel gets its own plot)
@@ -3906,7 +3178,7 @@ INDIVIDUAL_KEYWORDS = []   # [] = give EVERY monitored signal its own individual
 # FROM THE PANEL. This is the knob that decides whether a scenario's PDF is 650
 # pages or twenty, and with no matplotlib that is the difference between fifty
 # minutes and two. It had to be edited in BOTH study scripts by hand; it comes
-# from z6_cmp_all_con.py now, like everything else. "ALL" or an empty value means
+# from z6_main.py now, like everything else. "ALL" or an empty value means
 # every monitored signal, which is what [] means here.
 _ik = (os.environ.get("SPP_INDIVIDUAL_KEYWORDS") or "").strip()
 if _ik:
@@ -3934,7 +3206,7 @@ EXPORT_SVG = _env_bool("SPP_EXPORT_SVG", EXPORT_SVG)
 #     automatically-saved PDF on Python 3.4. Leave True.
 EXPORT_PDF_PUREPY = True
 # ---- THE PLOTTING THROTTLES, FROM THE PANEL -------------------------------
-# All of these already existed and none of them could be set from z6_cmp_all_con.py,
+# All of these already existed and none of them could be set from z6_main.py,
 # so throttling the plots meant editing two study scripts by hand and keeping
 # them in step. Without matplotlib they are the only thing standing between a
 # scenario and an hour of pure-Python drawing.
@@ -4238,7 +3510,6 @@ PLOT_ONLY_DONE = _env_bool("SPP_PLOT_ONLY_DONE", PLOT_ONLY_DONE)
 
 PLOT_NONFINITE = True
 PLOT_NONFINITE = _env_bool("SPP_PLOT_NONFINITE", PLOT_NONFINITE)
-
 # ---- REBUILD THE REPORTS FROM parts\, WITHOUT RE-SCORING ANYTHING ---------
 # True = this process does NOTHING but the merge: read the per-scenario parts
 # already on disk and write every report from them. No PSS/E session, no case
@@ -4373,36 +3644,17 @@ DISABLE_STDIN_REDIRECT = False
 # ============================================================================
 
 CYC = 1.0 / FREQ_HZ
-# THE CASE ON DISK, FOLLOWING SOURCE_CASE -- not COMMON_BASE.
-#
-# SAV_CASE was written straight from COMMON_BASE, so it named the ORIGINAL deck
-# whatever SOURCE_CASE had been pointed at. The dynamics were unaffected (they
-# load SOURCE_CASE, then the .cnv/.snp built from it), but three places load
-# SAV_CASE directly to read topology -- the two fault enumerators and the report
-# process -- and every one of them opened DIS2201-25SP-G03-CQ.sav while the
-# study itself was running DIS2201-25SP-G03-CQ_BESS_SantaFe_502MW.sav. Faults
-# were then enumerated on a network that does not contain the project.
-#
-# So SAV_CASE is the resolved SOURCE_CASE when that is a .sav, and only falls
-# back to COMMON_BASE for a .raw source, where there is no .sav to point at.
+# THE CASE ON DISK, FOLLOWING SOURCE_CASE -- not COMMON_BASE. See the same block
+# in z6_spp_p.py: SAV_CASE is loaded directly by the fault enumerators and by the
+# report process, and taken from COMMON_BASE it named the original deck however
+# BASE_SAV had pointed the run.
 if SOURCE_CASE.lower().endswith(".sav"):
     SAV_CASE = SOURCE_CASE
 else:
     SAV_CASE = os.path.join(STUDY_DIR, COMMON_BASE + ".sav")
-# _SAV_CASE_HAS_PLANT is decided further down, once CASE_TAG is known: with
-# NEW_PLANT the facility exists ONLY in the case the build saved, so enumerating
-# faults from SOURCE_CASE would walk a network without the project in it.
-# THE NAME THE BUILD WRITES UNDER, likewise: taken from the SOURCE FILE, so two
-# runs on two different decks cannot overwrite each other's .cnv/.snp -- and so
-# the name in a log ("as saved in ....cnv") names the deck it came from.
-#
-# THE TAG IS NEVER STRIPPED. A first attempt cut a trailing _BESS_<proj>_<MW>
-# off the source name to avoid tagging a pre-built case twice, and that turned
-# DIS2201-25SP-G03-CQ_BESS_SantaFe_502MW.sav back into DIS2201-25SP-G03-CQ --
-# which is not just a misleading log line. With ENABLE_BESS off, MOD_SAV is
-# CASE_TAG + ".sav", so the build would have written over the ORIGINAL deck.
-# The double-tag is avoided by checking for the exact suffix this run would add
-# and not adding it again, which leaves every other name alone.
+# THE TAG IS NEVER STRIPPED -- see the same block in z6_spp_p.py. Cutting a
+# trailing _BESS_<proj>_<MW> off the source name would, with ENABLE_BESS off,
+# make MOD_SAV the ORIGINAL deck and the build would write over it.
 _TAG_ROOT = os.path.splitext(os.path.basename(SAV_CASE))[0]
 # With ENABLE_BESS every file the build WRITES gets a per-project tag, so each project
 # keeps its own modified case + snapshot beside the untouched originals.
@@ -4413,41 +3665,6 @@ if ENABLE_BESS:
     CASE_TAG = _TAG_ROOT if _TAG_ROOT.endswith(_BESS_SUF) else (_TAG_ROOT + _BESS_SUF)
 else:
     CASE_TAG = _TAG_ROOT
-# AND A TAG WHEN THE NEW PLANT IS BUILT, even with ENABLE_BESS off.
-#
-# NEW_PLANT adds a whole facility, so the case this build produces is not the
-# case the deck describes -- but with ENABLE_BESS off nothing changed the name,
-# and the .cnv/.snp came out as <deck>.cnv / <deck>.snp: the same names a run
-# WITHOUT the plant writes. Two runs then share one snapshot, and the second one
-# reuses the first one's network without a word. Worse, MOD_SAV would be the
-# original .sav itself.
-#
-# Read from the panel and from SPP_NEW_PLANT, because z6_cmp_all_con.py switches it
-# on through the environment and this runs long before _np_cfg() exists.
-# A VARIANT RUN BUILDS ITS OWN CASE. SPP_RUN_TAG / SPP_CAP_TAG put the results
-# in their own folder, but the .sav/.snp/.cnv were named without the tag --
-# so a POI-level or capacity run REBUILT the as-studied case files in place
-# with its own dispatch, and the next as-studied launch (the flat run being
-# done, so no rebuild) ran on them. The tag goes into the case name too.
-try:
-    if _CAP_TAG_DIR:
-        CASE_TAG += "_cap%s" % _CAP_TAG_DIR
-    if _RUN_TAG_DIR:
-        CASE_TAG += "_%s" % _RUN_TAG_DIR
-except NameError:
-    pass
-_NP_ON = bool((NEW_PLANT or {}).get("enabled"))
-try:
-    _npe = (os.environ.get("SPP_NEW_PLANT") or "").strip()
-    if _npe:
-        import json as _json_np
-        _NP_ON = bool((_json_np.loads(_npe) or {}).get("enabled", _NP_ON))
-except Exception:
-    pass
-if _NP_ON and not CASE_TAG.endswith("_NEWPLANT"):
-    CASE_TAG += "_NEWPLANT"
-    print("[case] NEW_PLANT is on -- the build writes %s.* so it cannot be "
-          "confused with a run without the plant" % CASE_TAG)
 # ---- ONE SET OF BUILD FILES PER LEVEL --------------------------------------
 # RESULTS_DIR already carries the level ("..._cap60", "..._poi393"), so the
 # .out files of each level are kept apart. The BUILD files were not: MOD_SAV,
@@ -4474,31 +3691,7 @@ if _LEVEL_SUF and not CASE_TAG.endswith(_LEVEL_SUF):
 print("[case] build files: %s.cnv / .snp / .cnl   (from %s)"
       % (CASE_TAG, os.path.basename(SAV_CASE)))
 MOD_SAV  = os.path.join(STUDY_DIR, CASE_TAG + ".sav")   # MODIFIED case (BESS added)
-# ---- THE CASE THE FAULT ENUMERATORS READ ----------------------------------
-#
-# They load SAV_CASE to walk the topology. With ENABLE_BESS or NEW_PLANT the
-# project is NOT in SOURCE_CASE -- it is added during the build and saved as
-# MOD_SAV -- so enumerating from SOURCE_CASE walks a network without the plant:
-# no POI tie, no project buses, and hop distances measured on the wrong graph.
-# The log said "loaded DIS2201-25SP-G03-CQ.sav for topology enumeration" while
-# the study was running the case with the new facility in it.
-#
-# So when the build has already produced MOD_SAV, that is the case to read.
-# Before the first build it does not exist and SOURCE_CASE is all there is,
-# which is correct: there is nothing else to enumerate from yet.
-if ENABLE_BESS:
-    try:
-        if os.path.isfile(MOD_SAV) and os.path.abspath(MOD_SAV) != os.path.abspath(SAV_CASE):
-            print("[case] topology  : %s   (it has the project in it; %s does not)"
-                  % (os.path.basename(MOD_SAV), os.path.basename(SAV_CASE)))
-            SAV_CASE = MOD_SAV
-    except Exception:
-        pass
-# WHEN THE SOURCE IS ALSO THE DESTINATION. Point PROJ_SAV at a case the build
-# produced earlier and MOD_SAV lands on that same file, so the build saves over
-# what it read. That is harmless where the plant is already in the case (the
-# adopt path re-saves the same network), but it is not something to discover
-# from a modification time, so it is said out loud.
+# WHEN THE SOURCE IS ALSO THE DESTINATION -- see z6_spp_p.py.
 try:
     if os.path.abspath(MOD_SAV) == os.path.abspath(SOURCE_CASE):
         print("[case] NOTE: the build writes back to the case it read (%s)."
@@ -4509,180 +3702,6 @@ except Exception:
 CNL_CASE = os.path.join(STUDY_DIR, CASE_TAG + ".cnl")
 CNV_CASE = os.path.join(STUDY_DIR, CASE_TAG + ".cnv")
 SNP_FILE = os.path.join(STUDY_DIR, CASE_TAG + ".snp")
-
-# ---- WHICH BUSES THE NEW PLANT'S MACHINES ARE ON ---------------------------
-#
-# WHY THIS FILE EXISTS. build_new_plant() creates the unit buses and then sets
-# PROJECT_GENS to them -- but it runs inside build_case(), and build_case() runs
-# in ONE process, the one that builds the snapshot. Every WORKER restores that
-# snapshot and never calls it, so in a worker PROJECT_GENS was still the
-# project's ORIGINAL feeder list.
-#
-# add_channels() reads PROJECT_GENS. So the workers channelled PROJ1..PROJn on
-# the old machines, the new units were never recorded, and the plots had no
-# panel for them -- while the build process's own log showed the new buses being
-# created, which is why this looked like a plotting problem rather than a
-# channel one. The .out files simply did not contain them.
-#
-# The bus list is therefore written beside the snapshot it belongs to, and read
-# back by every process at import. Named from CASE_TAG so two cases in one
-# folder cannot read each other's.
-NEW_PLANT_BUSES_FILE = os.path.join(STUDY_DIR, CASE_TAG + "_newplant_buses.txt")
-
-
-def _np_buses_write(buses):
-    """Record the new plant's machine buses beside the snapshot."""
-    try:
-        with open(NEW_PLANT_BUSES_FILE, "w") as fh:
-            fh.write("# buses of the plant built by build_new_plant()\n")
-            fh.write("# written %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
-            fh.write("# <role> <bus>; a bare number is a MACH bus (older format)\n")
-            for role, b in buses:
-                fh.write("%-6s %d\n" % (role, int(b)))
-        print("  [newplant] %d plant bus(es) recorded in %s"
-              % (len(buses), os.path.basename(NEW_PLANT_BUSES_FILE)))
-    except Exception as e:
-        print("  [newplant] *** could not record the plant buses (%s) -- the "
-              "workers will channel the ORIGINAL project machines and the new "
-              "units will not appear in any plot ***" % e)
-
-
-def _np_read_file(_path):
-    """[(role, bus)] for the recorded plant, or [].
-
-       ROLES: MACH (a unit terminal, which carries a machine), GSUHV (a GSU high
-       side), COLL (the collector bus), HV (the plant's high-voltage bus). A bare
-       number is read as MACH, so a file written by the first version of this --
-       machine buses only -- still works."""
-    out = []
-    try:
-        if not os.path.isfile(_path):
-            return out
-        for ln in open(_path):
-            ln = ln.strip()
-            if not ln or ln.startswith("#"):
-                continue
-            bits = ln.split()
-            if len(bits) == 1:
-                out.append(("MACH", int(bits[0])))
-            else:
-                out.append((bits[0].upper(), int(bits[1])))
-    except Exception as e:
-        print("  [newplant] could not read %s (%s)"
-              % (os.path.basename(_path), e))
-    return out
-
-
-def _np_plant_buses_read():
-    """[(role, bus)] for the recorded plant(s): the member's own file inside a
-       _member_scope, every member's file (in member order) for a together run
-       read outside one, the single record file otherwise."""
-    _t = _together_row()
-    if _t and _MEMBER_ACTIVE[0] is None:
-        out = []
-        for _r in _t["member_rows"]:
-            out += _np_read_file(_np_member_file(_r["name"]))
-        return out
-    return _np_read_file(NEW_PLANT_BUSES_FILE)
-
-
-def _np_buses_read():
-    """The recorded MACHINE buses, or [] when there is no new plant."""
-    return [b for role, b in _np_plant_buses_read() if role == "MACH"]
-
-
-def _np_buses_adopt():
-    """Point PROJECT_GENS at the recorded new-plant machines, in ANY process.
-
-       Called at import, so a worker that only ever restores a snapshot still
-       monitors, plots and scores the machines that snapshot actually contains.
-
-       NO TIMESTAMP TEST. The first version ignored the file when it was more
-       than five seconds older than the .snp, meaning to catch a snapshot built
-       by something else. But build_case() writes this file when it creates the
-       plant and saves the snapshot MINUTES later, at the end of the same build
-       -- so the file is always older, and the guard would have rejected it on
-       every run after the first, quietly restoring the exact bug it sits inside
-       the fix for.
-
-       WHAT KEEPS IT HONEST INSTEAD. The name carries CASE_TAG, so a different
-       deck reads a different file; build_case() rewrites it whenever it builds
-       a plant; and a bus that is named here but is not in the case is reported
-       by add_channels() as a machine that would not channel, per bus, rather
-       than passing silently."""
-    buses = _np_buses_read()
-    if not buses:
-        # THE FILE IS NAMED FROM CASE_TAG, AND CASE_TAG MOVES.
-        #
-        # Switching NEW_PLANT off drops the _NEWPLANT suffix, and switching
-        # ENABLE_BESS off drops the _BESS_<proj>_<MW>MW one -- so a run that
-        # reuses a case built earlier looks for a file name that build never
-        # wrote. PROJECT_GENS then stayed on the project's DECLARED feeder
-        # buses while the machines were on 999001.., and nothing was monitored,
-        # plotted or scored on the plant that was actually being studied.
-        #
-        # So if the exact name is not there, look for any plant record in this
-        # folder. One is unambiguous; several are not, and it says so and takes
-        # none rather than guessing which build the case came from.
-        try:
-            _cands = sorted(glob.glob(os.path.join(STUDY_DIR, "*_newplant_buses.txt")))
-        except Exception:
-            _cands = []
-        # ONE RECORD IS NOT THE SAME AS THE RIGHT RECORD.
-        #
-        # A SantaFe run found the single record in this folder and took it --
-        # and it was EastFork's:
-        #
-        #   [newplant] ..._BESS_SantaFe_502MW_NEWPLANT_newplant_buses.txt is not
-        #              there; using the one plant record in this folder:
-        #              ..._BESS_EastFork_112MW_NEWPLANT_newplant_buses.txt
-        #
-        # It happened to do no harm, because NEW_PLANT numbers every plant from
-        # 999001 and the two lists coincided. That is luck, not correctness: had
-        # EastFork's plant carried different buses, SantaFe would have monitored,
-        # plotted and scored the wrong machines with nothing saying so.
-        #
-        # The record's name carries the project it was built for, so a record
-        # belonging to a DIFFERENT project is refused by name.
-        _other = None
-        if len(_cands) == 1:
-            _m = re.search(r"_BESS_([A-Za-z0-9]+)_", os.path.basename(_cands[0]))
-            _mine = (globals().get("ACTIVE_PROJECT")
-                     or globals().get("RUN_PROJECT") or "")
-            if _m and _mine and _m.group(1).lower() != str(_mine).lower():
-                _other = _m.group(1)
-        if len(_cands) == 1 and _other:
-            print("  [newplant] the only plant record in this folder was built for "
-                  "%s, and this run is %s: %s"
-                  % (_other, _mine, os.path.basename(_cands[0])))
-            print("  [newplant]   REFUSED. Monitoring another project's machines "
-                  "would score this study against the wrong plant. PROJECT_GENS "
-                  "stays on %s's declared feeder buses; build this project's "
-                  "plant, or name its machines with the project's \"gens\" key."
-                  % _mine)
-        elif len(_cands) == 1:
-            print("  [newplant] %s is not there; using the one plant record in this "
-                  "folder: %s" % (os.path.basename(NEW_PLANT_BUSES_FILE),
-                                  os.path.basename(_cands[0])))
-            globals()["NEW_PLANT_BUSES_FILE"] = _cands[0]
-            buses = _np_buses_read()
-        elif len(_cands) > 1:
-            print("  [newplant] %s is not there and this folder holds %d plant "
-                  "record(s): %s" % (os.path.basename(NEW_PLANT_BUSES_FILE),
-                                     len(_cands),
-                                     ", ".join(os.path.basename(x) for x in _cands)))
-            print("  [newplant]   Taking none of them -- PROJECT_GENS stays on the "
-                  "project's declared feeder buses. Name the machines with the "
-                  "project's \"gens\" key if that is wrong.")
-    if not buses:
-        return
-    globals()["PROJECT_GENS"] = [(int(b), BESS_ID) for b in buses]
-    globals()["PROJECT_GEN_BUSES"] = [int(b) for b in buses]
-    print("  [newplant] project machines for this run: %s  (from %s)"
-          % (", ".join(str(b) for b in buses), os.path.basename(NEW_PLANT_BUSES_FILE)))
-
-
-_np_buses_adopt()
 
 OUT_DIR  = os.path.join(RESULTS_DIR, "outs")
 LOG_DIR  = os.path.join(RESULTS_DIR, "logs")
@@ -5589,7 +4608,7 @@ def _assert_init_ok(tag, rc):
         print("        and the worker dies on it -- which is what a scenario that")
         print("        GAVE-UP with no output looks like. If these are loads or")
         print("        machines nowhere near this project, take them out of the deck")
-        print("        in z6_cmp_all_con.py -- in BOTH cases, because the deck is shared:")
+        print("        in z6_main.py -- in BOTH cases, because the deck is shared:")
         _sug = ", ".join('("%s", %s)' % (m, b) for (m, b, _n, _w, _c) in nan[:6]
                          if m != "?" and str(b).isdigit())
         if _sug:
@@ -6624,7 +5643,7 @@ def fault_preflight(faults):
     if len(bad) > 20:
         print("        ... and %d more" % (len(bad) - 20))
     print("        The fault list is built from ONE case's topology (FAULT_LIST_FROM")
-    print("        in z6_cmp_all_con.py) and read by both, which is what makes the two")
+    print("        in z6_main.py) and read by both, which is what makes the two")
     print("        studies comparable -- but an event this case cannot place is not")
     print("        a result, it is a fault applied to a bus that is not there.")
     try:
@@ -7633,17 +6652,14 @@ def add_channels():
         print("  monitor [%-9s] codes=%s -> %s%s"
               % (spec["name"], spec["codes"], desc, _nm_txt))
     if MONITOR_PROJECT:
-        # THE STUDY MACHINES, IN FULL.
+        # THE STUDY MACHINES, IN FULL -- and the SAME set as z6_spp_p.py records.
         #
-        # These are the machines the study is ABOUT -- the project's own units,
-        # and with NEW_PLANT the new ones, because build_new_plant() points
-        # PROJECT_GENS at them. P, Q and Eterm were the whole of it; angle and
-        # speed were recorded for every OTHER machine in the study area and not
-        # for these, so the one plant whose behaviour is under examination was
-        # the one plant whose rotor angle could not be plotted.
+        # Angle and speed were recorded for every other machine in the study area
+        # and not for these. They are also what makes the two cases comparable:
+        # a channel present on one side and absent on the other is a row the
+        # comparison can only report as scored on one side.
         #
-        # ARRAY CODES (machine_array_channel): 1 = ANGLE, 2 = PELEC, 3 = QELEC,
-        # 4 = ETERM, 6 = SPEED (pu deviation).
+        # ARRAY CODES: 1 = ANGLE, 2 = PELEC, 3 = QELEC, 4 = ETERM, 6 = SPEED.
         for n, (bus, mid) in enumerate(PROJECT_GENS, start=1):
             tag = "PROJ%d" % n
             # P, Q AND ETERM ONLY. The project units are IBR/BESS: their
@@ -7697,10 +6713,6 @@ def add_channels():
                 for _ix, _mx in enumerate(_idsx.get(_bx) or []):
                     if (_bx, _mx) in _own:
                         continue           # already channelled as PROJ*
-                    # SEPARATED. "XGEN%d%s" glued a numeric machine id onto
-                    # the bus ("XGEN5873132"), and _chan_bus reads the first
-                    # run of >= 3 digits -- so the panel label, the area tag
-                    # and the workbook all named a bus that does not exist.
                     _tagx = "XGEN%d%s" % (_bx, "" if _ix == 0 else ("_" + str(_mx)))
                     for _code, _sfx in _PROJ_CODES:
                         rc = psspy.machine_array_channel(
@@ -7732,30 +6744,6 @@ def add_channels():
                     chk(psspy.machine_array_channel([-1, _code, _b], _m,
                                                     "NPGEN%d_%s" % (_b, _sfx)),
                         "NPGEN%d %s" % (_b, _sfx))
-        # AND THE PLANT'S OWN BUSES, when NEW_PLANT built them.
-        #
-        # The unit terminals, the GSU high sides, the collector and the plant HV
-        # bus are all NEW: no area-based voltage subsystem knows to include them,
-        # and they are the buses the plant's own voltage behaviour actually lives
-        # on. Named PBUS<bus> so they sort with the project machines rather than
-        # among the several hundred network voltages -- see _panel_tier().
-        _plant = []
-        try:
-            _plant = _np_plant_buses_read()
-        except Exception:
-            _plant = []
-        if _plant:
-            print("  monitor [newplant] %d plant bus(es): unit terminals, GSU high "
-                  "sides, collector, HV" % len(_plant))
-            for _role, _b in _plant:
-                if not _bus_exists(int(_b)):
-                    print("  monitor [newplant] *** bus %s (%s) is not in this case "
-                          "-- not channelled ***" % (_b, _role))
-                    continue
-                chk(psspy.voltage_and_angle_channel(
-                        [-1, -1, -1, int(_b)],
-                        ["PBUS%d V" % int(_b), "PBUS%d ANG" % int(_b)]),
-                    "PBUS %s V/ANG (%s)" % (_b, _role))
     else:
         print("  PROJECT machine channels SKIPPED (MONITOR_PROJECT=False)")
     if MONITOR_SYNC_IN_RADIUS:
@@ -8062,10 +7050,10 @@ def _bess_machine_limits(project, mw_level):
        at their limits add up to, Pmin = -Pmax for a BESS (BESS_PMIN_SYMMETRIC)."""
     n = max(1, len(project["feeders"]))
     p_rated = _bess_feeder_mw(_bess_rating_mw(project, mw_level), n)
-    # THE RECORD IS A WHOLE NUMBER OF INVERTERS: Pmax, Qmax and MBASE from the
-    # rounded MBASE (see _inverter_record); the dispatch itself is not changed.
-    pmax, pmin, qmax, mbase, _n_inv = _inverter_record(p_rated)
-    return pmax, pmin, qmax, mbase
+    qmax = BESS_Q_CAP_FRACTION * p_rated
+    mbase = _math.sqrt(p_rated * p_rated + qmax * qmax)
+    pmin = -p_rated if BESS_PMIN_SYMMETRIC else 0.0
+    return p_rated, pmin, qmax, mbase
 
 
 def apply_bess_powerflow(project, mw_level):
@@ -8104,10 +7092,8 @@ def apply_bess_powerflow(project, mw_level):
           % (project["name"], mw_level, len(feeders), per, FEEDER_MAX_MW, p, q, mb,
              project["disable_existing"], POI_TUNE_DELIVERY))
     print("  [bess]   machine record (power triangle of the %.1f MW rating per machine): "
-          "Pmax %.2f  Pmin %.2f  Qmax +/-%.2f  MBASE %.2f MVA  (pf at Pmax %.3f)%s"
-          % (per, pmax, pmin, qcap, mb, pmax / mb if mb else 0.0,
-             ("  = %d inverter(s) x %g MVA" % (_mbase_inverters(mb)[1], INVERTER_MVA))
-             if (INVERTER_MVA or 0) > 0 else ""))
+          "Pmax %.1f  Pmin %.1f  Qmax +/-%.1f  MBASE %.1f MVA  (pf at Pmax %.3f)"
+          % (pmax, pmax, pmin, qcap, mb, pmax / mb if mb else 0.0))
     # a) optionally take the EXISTING gens at those buses off (surplus study)
     if project["disable_existing"]:
         mode = str(DISABLE_EXISTING_MODE).lower()
@@ -8366,7 +7352,9 @@ def _bess_restore_q_limits(project, mw_level):
             _pg = abs(float(_pg)) if _ie in (0, None) and _pg is not None else 0.0
         except Exception:
             _pg = 0.0
-        pmax_i, _pmin_i, qcap, mb_i, _n_inv = _inverter_record(max(p_rated, _pg), pg=_pg)
+        pmax_i = max(p_rated, _pg)
+        qcap = BESS_Q_CAP_FRACTION * pmax_i
+        mb_i = _math.sqrt(pmax_i * pmax_i + qcap * qcap)
         realar = [_f] * 17                     # _f = "leave unchanged" for every field
         realar[2] = qcap                       # QT
         realar[3] = -qcap                      # QB   (QG at index 1 is NOT touched)
@@ -8386,196 +7374,14 @@ def _bess_restore_q_limits(project, mw_level):
         except Exception as e:
             print("  [bess]   restore Q limits FAILED at %s: %s" % (b, e))
     print("  [bess] reactive capability restored on %d/%d machine(s): "
-          "QT/QB = +/-%.1f MVAr per feeder (%.2f pf); QG left at the solved value%s"
-          % (n_ok, len(feeders), qcap, POI_PF,
-             ("; MBASE %.2f MVA = %d inverter(s) x %g MVA per machine"
-              % (mb_i, _n_inv, INVERTER_MVA)) if (INVERTER_MVA or 0) > 0 else ""))
+          "QT/QB = +/-%.1f MVAr per feeder (%.2f pf); QG left at the solved value"
+          % (n_ok, len(feeders), qcap, POI_PF))
     for b in feeders:
         try:
             _, qg = psspy.macdat(int(b), BESS_ID, "Q")
             print("  [bess]   feeder %s initial Q = %s MVAr" % (b, qg))
         except Exception:
             pass
-
-
-def zero_bess_poi_q(project, mw_level):
-    """Set the project's machines so the plant exchanges ~0 MVAr at the POI --
-       the collector losses are supplied by the machines themselves.
-
-       solve -> measure Q delivered into the POI across the interconnection cut
-       -> move every machine's QG by an equal share of the error, clamped to
-       its own QMAX/QMIN -> solve again, up to POI_Q_ITERS times. QT/QB are
-       pinned to QG while iterating (or the solve regulates voltage and moves
-       Q), then put back to what they were. Finally each plant's scheduled
-       voltage is set to the voltage its machine sits at, so a regulating solve
-       lands on the same Q, and that is checked with one more solve."""
-    # THE SAME MACHINES AND THE SAME CUT THE P METERING USES. _member_gens()
-    # can answer the DECLARED feeder buses (EastFork: 531620 / 531607, where the
-    # disabled existing units sit) while the plant the build made is on the
-    # new unit buses; _poi_project_pairs() knows the built plant.
-    try:
-        gens, _rate, _from_new = _poi_project_pairs(project)
-    except Exception:
-        gens = []
-    if not gens:
-        gens = _member_gens(project)
-    gens = [(int(b), str(m)) for b, m in gens]
-    poi = int(project.get("poi") or POI_BUS)
-    if not gens:
-        print("  [poi-q] %s: no project machines -- nothing to do" % project.get("name"))
-        return
-    try:
-        _hv = [int(b) for r, b in _np_plant_buses_read() if r == "HV"]
-    except Exception:
-        _hv = []
-    cut = _hv or [b for b, _m in gens]
-    n = len(gens)
-    # what the machines have now: Q, and the limits they must stay inside
-    cur, lim, pinned = {}, {}, {}
-    for b, m in gens:
-        try:
-            _e, q = psspy.macdat(int(b), str(m), "Q")
-            cur[(b, m)] = float(q) if _e in (0, None) and q is not None else 0.0
-        except Exception:
-            cur[(b, m)] = 0.0
-        qmx = qmn = None
-        try:
-            _e1, qmx = psspy.macdat(int(b), str(m), "QMAX")
-            _e2, qmn = psspy.macdat(int(b), str(m), "QMIN")
-            qmx = float(qmx) if _e1 in (0, None) else None
-            qmn = float(qmn) if _e2 in (0, None) else None
-        except Exception:
-            qmx = qmn = None
-        # PINNED LIMITS ARE NOT THE CAPABILITY. The build creates and meters the
-        # units with QT = QB = QG (0 MVAr) so the solves hold that Q; read as
-        # limits, every move clamped to 0 and the machines were reported "at a
-        # reactive limit" with nothing changed. A machine whose QT and QB
-        # coincide gets the range the limit restore writes afterwards:
-        # +/- BESS_Q_CAP_FRACTION x Pmax (0.95 pf), and that range is what is
-        # left on it before the check solve below.
-        if qmx is None or qmn is None or (qmx - qmn) < 1e-6:
-            try:
-                _e3, _pmx = psspy.macdat(int(b), str(m), "PMAX")
-                _e4, _pg = psspy.macdat(int(b), str(m), "P")
-                _pmx = abs(float(_pmx)) if _e3 in (0, None) and _pmx is not None else 0.0
-                _pg = abs(float(_pg)) if _e4 in (0, None) and _pg is not None else 0.0
-                _cap = float(BESS_Q_CAP_FRACTION) * max(_pmx, _pg)
-            except Exception:
-                _cap = 0.0
-            if _cap > 0:
-                print("  [poi-q]   %s '%s': QT/QB pinned at %s -- using the 0.95-pf capability +/-%.1f MVAr"
-                      % (b, m, qmx, _cap))
-                qmx, qmn = _cap, -_cap
-        lim[(b, m)] = (qmn, qmx)
-        pinned[(b, m)] = (qmn, qmx)          # the range left on the machine afterwards
-    P0, Q0, nb = _delivered_to_poi(cut, poi)
-    if nb == 0:
-        print("  [poi-q] %s: no tie branch between the plant and POI %d could be read -- "
-              "the reactive exchange cannot be measured, machines left as they are"
-              % (project.get("name"), poi))
-        return
-    print("  [poi-q] === %s: driving the reactive exchange at POI %d to 0 MVAr (now P=%.1f MW, Q=%+.1f MVAr "
-          "delivered into the POI; machines Q %s) ==="
-          % (project.get("name"), poi, P0, Q0,
-             ", ".join("%s '%s' %+.1f" % (b, m, cur[(b, m)]) for b, m in gens)))
-    if abs(Q0) <= float(POI_Q_TOL_MVAR):
-        print("  [poi-q]   already within %.1f MVAr -- nothing moved" % float(POI_Q_TOL_MVAR))
-        return
-    Q, P = Q0, P0
-    limited = False
-    for it in range(1, int(POI_Q_ITERS) + 1):
-        dq = -float(Q) * float(POI_Q_RELAX) / n
-        at_limit = []
-        for b, m in gens:
-            qn = cur[(b, m)] + dq
-            qmn, qmx = lim[(b, m)]
-            if qmx is not None and qn > qmx:
-                qn = qmx; at_limit.append("%s '%s' at QMAX %.1f" % (b, m, qmx))
-            if qmn is not None and qn < qmn:
-                qn = qmn; at_limit.append("%s '%s' at QMIN %.1f" % (b, m, qmn))
-            realar = [_f] * 17
-            realar[1] = qn; realar[2] = qn; realar[3] = qn          # QG, and QT=QB pinned to it
-            try:
-                ie = psspy.machine_chng_2(int(b), str(m), [_i] * 6, realar)
-                ie = ie[0] if isinstance(ie, (list, tuple)) else ie
-                if ie not in (0, None):
-                    print("  [poi-q]   machine_chng_2 %s '%s' ierr=%s" % (b, m, ie))
-            except Exception as e:
-                print("  [poi-q]   could not set Q at %s '%s': %s" % (b, m, e))
-            cur[(b, m)] = qn
-        try:
-            solve_powerflow("FDNS POI-Q %d" % it)
-        except Exception as e:
-            print("  [poi-q]   the re-solve failed (%s) -- stopping" % e)
-            break
-        P, Q, nb = _delivered_to_poi(cut, poi)
-        print("  [poi-q]   iter %d: machines Q %+.1f MVAr total -> POI P=%.1f MW, Q=%+.1f MVAr%s"
-              % (it, sum(cur.values()), P, Q, ("   [%s]" % "; ".join(at_limit)) if at_limit else ""))
-        if abs(Q) <= float(POI_Q_TOL_MVAR):
-            print("  [poi-q]   converged: %+.2f MVAr at the POI after %d pass(es)" % (Q, it))
-            break
-        limited = bool(at_limit)
-        if at_limit and len(at_limit) >= n:
-            print("  [poi-q]   *** every machine is at a reactive limit -- %+.1f MVAr at the POI "
-                  "cannot be removed within QMAX/QMIN (limits NOT changed) ***" % Q)
-            break
-    # THE SCHEDULED VOLTAGE = THE VOLTAGE REACHED, so the regulating solve that
-    # follows (limits restored) reproduces this Q instead of pulling back to the
-    # old schedule. A plant regulating a remote bus takes that bus's voltage.
-    ireg_of = {}
-    try:
-        _e, _a = psspy.agenbusint(-1, 1, ["NUMBER", "IREG"])
-        if _e in (0, None) and _a and len(_a) >= 2:
-            for _nb, _ir in zip(_a[0], _a[1]):
-                ireg_of[int(_nb)] = int(_ir or 0)
-    except Exception:
-        pass
-    n_vs = 0
-    for b, m in gens:
-        rb = ireg_of.get(int(b), 0) or int(b)
-        try:
-            _e, v = psspy.busdat(int(rb), "PU")
-            if _e not in (0, None) or v is None:
-                continue
-            ie = psspy.plant_data(int(b), _i, [float(v), _f])
-            ie = ie[0] if isinstance(ie, (list, tuple)) else ie
-            if ie in (0, None):
-                n_vs += 1
-                print("  [poi-q]   %s '%s': scheduled voltage -> %.4f pu%s"
-                      % (b, m, float(v), (" (regulated bus %d)" % rb) if rb != int(b) else ""))
-            else:
-                print("  [poi-q]   plant_data %s ierr=%s -- scheduled voltage not set" % (b, ie))
-        except Exception as e:
-            print("  [poi-q]   scheduled voltage at %s not set: %s" % (b, e))
-    # QT/QB back to what they were -- QG stays where the iteration put it
-    for b, m in gens:
-        qmn, qmx = pinned[(b, m)]
-        realar = [_f] * 17
-        if qmx is not None: realar[2] = qmx
-        if qmn is not None: realar[3] = qmn
-        try:
-            psspy.machine_chng_2(int(b), str(m), [_i] * 6, realar)
-        except Exception as e:
-            print("  [poi-q]   could not restore QT/QB at %s '%s': %s" % (b, m, e))
-    # CHECKED, not assumed: one regulating solve with the limits back
-    try:
-        solve_powerflow("FDNS POI-Q check")
-        P2, Q2, _n2 = _delivered_to_poi(cut, poi)
-        qs = []
-        for b, m in gens:
-            try:
-                _e, q = psspy.macdat(int(b), str(m), "Q")
-                qs.append("%s '%s' %+.1f" % (b, m, float(q)))
-            except Exception:
-                pass
-        print("  [poi-q] RESULT %s: POI %d  P=%.1f MW  Q=%+.2f MVAr with the machines regulating their "
-              "scheduled voltage (%d plant(s) set); machines Q %s%s"
-              % (project.get("name"), poi, P2, Q2, n_vs, ", ".join(qs),
-                 "" if abs(Q2) <= 2.0 * float(POI_Q_TOL_MVAR) else
-                 ("   *** held back by the machines' QMAX/QMIN (not changed) ***" if limited else
-                  "   *** drifted past the tolerance on the regulating solve -- read the iterations above ***")))
-    except Exception as e:
-        print("  [poi-q]   check solve failed (%s)" % e)
 
 
 def tune_bess_poi_delivery(project, mw_level):
@@ -8636,13 +7442,6 @@ def tune_bess_poi_delivery(project, mw_level):
     return Pg, Qg
 
 
-# The machine-relay models in the template. Their records carry the machine id
-# just as the USRMDL records do, and it has to be substituted with them -- see
-# _bess_clone_models(). Add a model here if the template gains one.
-BESS_RELAY_MODELS = ("VTGTPAT", "VTGDCAT", "FRQTPAT", "FRQDCAT",
-                     "VTGTPA1", "FRQTPA1")
-
-
 def _bess_filter_models(txt):
     """Drop the REPCAU1 and/or relay records per the isolation toggles (records are
        '/'-terminated). Lets you rule a group out of an strt_2 crash without editing
@@ -8665,37 +7464,10 @@ def _bess_clone_models(feeder, poi):
        preserving every ICON/CON verbatim, then apply the isolation toggles."""
     txt = BESS_MODEL_TEMPLATE
     txt = txt.replace(BESS_REF_BUS, str(feeder))       # machine bus -> feeder bus
-    txt = txt.replace("POIBUS", str(poi))              # relay monitored bus -> the POI (PRC-024 point)
     if BESS_ID != BESS_REF_ID:
         nid = BESS_ID
         # the USRMDL header id: the token between 'USRMDL' and the 'RE...' model name
         txt = re.sub(r"('USRMDL'\s+)\S+(\s+'RE)", r"\g<1>" + nid + r"\g<2>", txt)
-        # AND THE PROTECTION RECORDS.
-        #
-        # They are not USRMDL and their model names do not begin with RE, so the
-        # rule above never reached them: every VTGTPAT and FRQDCAT kept the
-        # template's machine id ('1') while the machine itself was created with
-        # BESS_ID. A relay aimed at a machine id that does not exist at that bus
-        # protects nothing, so the plant would run the whole study with no
-        # PRC-024 voltage or frequency protection and nothing would say so.
-        _models = "|".join(BESS_RELAY_MODELS)
-
-        def _rid(m):
-            return "%s%s%s" % (m.group(1), nid, m.group(3))
-        # '<MODEL>' <bus> <bus> '<id>'   and   '<MODEL>' <bus> '<id>'
-        txt, _n1 = re.subn(r"('(?:%s)'\s+\d+\s+\d+\s+')([^']*)(')" % _models,
-                           _rid, txt, flags=re.I)
-        txt, _n2 = re.subn(r"('(?:%s)'\s+\d+\s+')([^']*)(')" % _models,
-                           _rid, txt, flags=re.I)
-        if _n1 + _n2:
-            print("  [bess]   %d protection record(s) retargeted to machine '%s'"
-                  % (_n1 + _n2, nid))
-        else:
-            _has = [m for m in BESS_RELAY_MODELS if m.upper() in txt.upper()]
-            if _has:
-                print("  [bess]   *** %s record(s) present but their machine id could "
-                      "not be rewritten -- check the record layout in "
-                      "BESS_MODEL_TEMPLATE ***" % ", ".join(_has))
     if BESS_REPCA_REGULATE_POI:
         # Rewrite ONLY the first ICON of the REPCAU1 record (the remote regulated bus)
         # from 0 to the POI bus. Every other ICON and CON is left exactly as supplied.
@@ -8748,7 +7520,7 @@ def _strip_dyr_plant(text, feeders, valid_buses=None, min_bus=10000):
 # .DYR PARAMETER STUDY -- change a model constant and see what it does
 # ============================================================================
 # The question "how much does this parameter matter" is answered by running the
-# study twice and diffing, which the run-against-run comparison in z6_cmp_all_con.py
+# study twice and diffing, which the run-against-run comparison in z6_main.py
 # already does. What was missing is a way to CHANGE the parameter without
 # hand-editing a deck of thousands of records and losing track of which run had
 # which value.
@@ -8817,7 +7589,7 @@ DYR_EDITS = []
 # case too. Disabling a model in the project case only would remove its
 # oscillation from one side of the comparison and leave it in the other, and
 # the difference would be reported as something the project did. That is why
-# z6_cmp_all_con.py's DYR_DISABLE_APPLY_TO defaults to "both".
+# z6_main.py's DYR_DISABLE_APPLY_TO defaults to "both".
 DYR_DISABLE = []
 
 # Shorthand for the families that get disabled as a group. A relay model name
@@ -10326,19 +9098,13 @@ def dyr_verify_in_case(edits):
 # "on-edit"  run them only when this build changed the .dyr
 # "never"    do not run them
 #
-# THE DEFAULT IS "always" NOW. "on-edit" was the default and it kept finding
-# reasons not to run: the edit list was empty, or the .flx signature matched, or
-# the build phase was skipped entirely because a snapshot was already there. Each
-# skip is defensible on its own and the result was the same every time -- a run
-# on the PREVIOUS dsusr.dll, reported as a normal run. A link is a minute or two,
-# once per build; a set of results from the wrong model code is worth a great
-# deal more than that.
+# THE DEFAULT IS "always" NOW -- see the same block in z6_spp_p.py. "on-edit"
+# kept finding defensible reasons not to run and the result was always the same:
+# a run on the PREVIOUS dsusr.dll, reported as a normal run.
 DYR_COMPILE_WHEN = "always"
 # THE LINK STEP IS NAMED DIFFERENTLY IN DIFFERENT FOLDERS -- MyCload41.bat here,
-# MyCload4.bat there. Named wrongly it is not a quiet miss (the compile raises
-# and says the file is not there), but it stops the run for a filename, so the
-# alternatives are listed and the first one PRESENT is used. Put an explicit
-# name here to override the search.
+# MyCload4.bat there. The first name PRESENT is used; an explicit
+# DYR_COMPILE_BATS overrides the search.
 DYR_COMPILE_BATS  = None            # None = resolve from DYR_COMPILE_BAT_NAMES
 DYR_COMPILE_BAT_NAMES = [("MyCompile34.bat",),                      # compile step
                          ("MyCload41.bat", "MyCload4.bat")]         # link step
@@ -10390,7 +9156,7 @@ def _dyr_stage_compile_bats():
        the PROJECT's model set, which is the one error this whole step exists to
        prevent."""
     # AN EXPLICIT LIST IS STILL A LIST OF FILES THAT HAVE TO BE IN THIS FOLDER.
-    # z6_cmp_all_con.py names both .bat files outright, and this returned on that --
+    # z6_main.py names both .bat files outright, and this returned on that --
     # so the one case that had neither of them stayed the case that had neither
     # of them, which is the whole failure this function exists to end.
     steps = ([(b,) for b in DYR_COMPILE_BATS] if DYR_COMPILE_BATS
@@ -10789,8 +9555,7 @@ def _dll_stamp(note=""):
 
        "the .dll is not updated" was not answerable from a log: every path
        through the compile said what it decided and none of them said what the
-       file ended up being. This is called on every path, so the log carries the
-       timestamp the question is really about."""
+       file ended up being."""
     dll = os.path.join(STUDY_DIR, "dsusr.dll")
     try:
         if os.path.isfile(dll):
@@ -10903,9 +9668,6 @@ def _dyr_compile_user_models(changed):
         _dll_stamp("(NOT rebuilt)")
         return
     if when == "on-edit" and not changed:
-        # SAY IT. This returned silently, and a silent skip is how a run comes
-        # to use the previous model set's dsusr.dll without anything, anywhere,
-        # recording that it did.
         print("  [dyr] the deck fed to dyre_new is the original, unedited .dyr "
               "-- the user models are left as they are (DYR_COMPILE_WHEN = "
               "\"on-edit\"). Set it to \"always\" to rebuild regardless.")
@@ -11174,37 +9936,28 @@ def _dyr_stamp():
 def bess_combined_dyr(project, base_dyr):
     """Write <base>_with_BESS_<proj>.dyr = the ORIGINAL base .dyr (read only), optionally
        with the disabled gens' records stripped, plus this project's REGCAU1/REECAU1/REPCAU1
-       records -- for EVERY member when the project is a together run. The original
-       base_dyr is NEVER modified."""
+       records. The original base_dyr is NEVER modified."""
     dst = os.path.join(STUDY_DIR, "%s_with_BESS_%s.dyr"
-                       % (os.path.splitext(os.path.basename(base_dyr))[0],
-                          project.get("cluster") or project["name"]))
+                       % (os.path.splitext(os.path.basename(base_dyr))[0], project["name"]))
     with open(base_dyr, "r", errors="ignore") as fh:
         base = fh.read()
-    members = project.get("member_rows") or [project]
-    for _m in members:
-        if STRIP_DISABLED_GEN_DYR and _m.get("disable_existing"):
-            seed = list(_m.get("feeders_original") or _m["feeders"]) + list(STRIP_EXTRA_DYR_BUSES)
-            base, nrem, _ = _strip_dyr_plant(base, seed)
-            print("  [bess] %s: stripped %d .dyr record(s) mentioning disabled feeders %s"
-                  % (_m.get("name"), nrem, seed[:8]))
-            if nrem > 40:
-                print("  [bess]   *** WARNING: stripped %d records -- a lot for %d feeder(s); "
-                      "check the combined .dyr or set STRIP_DISABLED_GEN_DYR=False ***"
-                      % (nrem, len(_m["feeders"])))
+    if STRIP_DISABLED_GEN_DYR and project["disable_existing"]:
+        seed = list(project["feeders"]) + list(STRIP_EXTRA_DYR_BUSES)
+        base, nrem, _ = _strip_dyr_plant(base, seed)
+        print("  [bess] stripped %d .dyr record(s) mentioning disabled feeders %s"
+              % (nrem, project["feeders"]))
+        if nrem > 40:
+            print("  [bess]   *** WARNING: stripped %d records -- a lot for %d feeder(s); "
+                  "check the combined .dyr or set STRIP_DISABLED_GEN_DYR=False ***"
+                  % (nrem, len(project["feeders"])))
     if not base.endswith("\n"):
         base += "\n"
-    add = ""
-    n_feed = 0
-    for _m in members:
-        add += _bess_dyr_text(_m)
-        n_feed += len(_m["feeders"])
+    add = _bess_dyr_text(project)
     with open(dst, "w") as fh:
         fh.write(base + add)
     n_per = add.count("'USRMDL'") + add.count("'REPCAU1'")
-    print("  [bess] combined dyr -> %s (base + %d BESS record(s) for %d feeder(s)%s)"
-          % (dst, n_per, n_feed,
-             (", %d projects" % len(members)) if len(members) > 1 else ""))
+    print("  [bess] combined dyr -> %s (base + %d BESS record(s) for %d feeder(s))"
+          % (dst, n_per, len(project["feeders"])))
     return dst
 
 
@@ -11311,17 +10064,12 @@ SAVE_MISMATCH_PASSES = 20    # max solve passes spent trying to reach it
 # silently carried forward.
 ABORT_ON_MISMATCH = True
 
-# ---- what z6_cmp_all_con.py sends for these three -------------------------------
+# ---- what z6_main.py sends for these three -------------------------------
 # APPLIED HERE, immediately below the settings themselves -- not up in the main
 # environment block, which runs three thousand lines EARLIER than these are
 # defined and therefore cannot override them. An override that reads a name
 # before it exists is a NameError in every worker, which is what happened.
 SAVE_MISMATCH_MVA    = _env_num("SPP_MISMATCH_MVA", SAVE_MISMATCH_MVA)
-# BETWEEN PLANTS OF A CLUSTER BUILD: after each plant goes in, the case is
-# iterated to this total system mismatch before the next plant is added, so
-# every plant starts from a balanced case rather than from the previous
-# plant's residual. The final save still iterates to SAVE_MISMATCH_MVA.
-TOGETHER_STEP_MISMATCH_MVA = _env_num("SPP_TOGETHER_MISMATCH", 0.1)
 SAVE_MISMATCH_PASSES = int(_env_num("SPP_MISMATCH_PASSES", SAVE_MISMATCH_PASSES))
 ABORT_ON_MISMATCH    = _env_bool("SPP_MISMATCH_ABORT", ABORT_ON_MISMATCH)
 
@@ -11380,7 +10128,7 @@ def _record_mismatch(tag, tol, ok, m):
         pass
 
 
-def _solve_to_mismatch_inner(tol=None, passes=None, tag="pre-save", abort=None):
+def _solve_to_mismatch_inner(tol=None, passes=None, tag="pre-save"):
     """Keep solving until the total system mismatch is under `tol` MVA.
 
        A case that merely 'converged' can still carry a mismatch of several MVA:
@@ -11478,7 +10226,7 @@ def _solve_to_mismatch_inner(tol=None, passes=None, tag="pre-save", abort=None):
                     "reached but inside the deck's Newton tolerance (%.3g MW) -- "
                     "case saved" % (tag, m, tol, _floor))
         return False, m
-    if (ABORT_ON_MISMATCH if abort is None else abort):
+    if ABORT_ON_MISMATCH:
         raise RuntimeError(
             "system mismatch %.4f MVA exceeds SAVE_MISMATCH_MVA=%.3f after %d pass(es) "
             "-- the case is not in balance and everything built from it would inherit "
@@ -11576,7 +10324,7 @@ CAP_TAG = (os.environ.get("SPP_CAP_TAG") or "").strip()
 # nothing else about the network moved between the two runs.
 PROJECT_OFF = _env_bool("SPP_PROJECT_OFF", False)
 
-# ---- ANY LISTED MACHINES OUT OF SERVICE (GEN_TEST in z6_cmp_all_con.py) -----
+# ---- ANY LISTED MACHINES OUT OF SERVICE (GEN_TEST in z6_main.py) -----
 # SPP_MACHINES_OFF = "765912:1;539670:1" -- each machine is set STATUS 0 before
 # the power flow, so the snapshot and every fault run are built without it.
 MACHINES_OFF = []
@@ -11642,1283 +10390,6 @@ def _switch_project_off():
         raise RuntimeError("SPP_PROJECT_OFF was set but no project machine could "
                            "be taken out of service -- check PROJECT_GENS %s "
                            "against the case" % (PROJECT_GEN_BUSES or "(none)"))
-
-
-_AREA_MW_BEFORE = {}          # {area: total machine P before the project was added}
-
-
-def _area_gen_mw(area):
-    """Total real power of every in-service machine in one area."""
-    tot = 0.0
-    try:
-        ie, ai = psspy.amachint(-1, 1, ["NUMBER"])
-        je, ac = psspy.amachchar(-1, 1, ["ID"])
-        if ie not in (0, None) or je not in (0, None):
-            return None
-        for b, mid in zip(ai[0], ac[0]):
-            b = int(b)
-            try:
-                e2, ar = psspy.busint(b, "AREA")
-                if e2 not in (0, None) or int(ar) != int(area):
-                    continue
-                e3, p = psspy.macdat(b, str(mid).strip(), "P")
-                if e3 in (0, None):
-                    tot += float(p)
-            except Exception:
-                continue
-    except Exception as e:
-        print("  [poi-p] could not total area %s (%s)" % (area, e))
-        return None
-    return tot
-
-
-def _area_machines(area, exclude_buses, skip_slack=True):
-    """[(bus, id, P, PMAX, PMIN)] for the machines this rebalance may move.
-
-       THE SLACK IS NOT ONE OF THEM. Its output is whatever balances the system,
-       so scaling it does nothing: the next solve puts it back and the pass
-       reports the same error it started with. Left in, the correction loop
-       spends every one of its passes discovering that.
-
-       It also changes what the loop can achieve. If the system slack is INSIDE
-       this area, the area's total is pinned by its load, its interchange and its
-       losses -- redispatching machines within it moves generation between them
-       and not the total. Holding the area then needs the interchange to change,
-       which is not something this can do, and the loop says so rather than
-       grinding."""
-    out = []
-    skip = set(int(b) for b in (exclude_buses or []))
-    if skip_slack:
-        try:
-            skip |= set(int(b) for b in (SLACK_GENS or []))
-        except Exception:
-            pass
-        try:
-            if SWING_BUS:
-                skip.add(int(SWING_BUS))
-        except Exception:
-            pass
-    try:
-        ie, ai = psspy.amachint(-1, 1, ["NUMBER"])
-        je, ac = psspy.amachchar(-1, 1, ["ID"])
-        if ie not in (0, None) or je not in (0, None):
-            return out
-        for b, mid in zip(ai[0], ac[0]):
-            b, mid = int(b), str(mid).strip()
-            if b in skip:
-                continue
-            try:
-                e2, ar = psspy.busint(b, "AREA")
-                if e2 not in (0, None) or int(ar) != int(area):
-                    continue
-                e3, p = psspy.macdat(b, mid, "P")
-                e4, pmax = psspy.macdat(b, mid, "PMAX")
-                e5, pmin = psspy.macdat(b, mid, "PMIN")
-                if e3 in (0, None):
-                    out.append((b, mid, float(p),
-                                float(pmax) if e4 in (0, None) else float(p),
-                                float(pmin) if e5 in (0, None) else 0.0))
-            except Exception:
-                continue
-    except Exception as e:
-        print("  [poi-p] could not list area %s machines (%s)" % (area, e))
-    return out
-
-
-def _set_machine_status(bus, mid, status):
-    """In service (1) or out (0), whichever psspy form this build accepts.
-
-       The status sits in INTGAR(1) and the array's length has moved between
-       PSS/E versions, so the forms are tried rather than assumed -- and the
-       caller is told which machines did not take, because a scenario that
-       silently left the existing plant running is not the scenario it is
-       labelled as."""
-    for nm, ni, nr in (("machine_chng_4", 7, 21), ("machine_chng_4", 7, 24),
-                       ("machine_chng_2", 7, 17), ("machine_data_2", 6, 17)):
-        f = getattr(psspy, nm, None)
-        if f is None:
-            continue
-        ints = [psspy._i] * ni
-        ints[0] = int(status)
-        try:
-            rc = f(int(bus), str(mid), ints, [psspy._f] * nr)
-        except Exception:
-            continue
-        if (rc[0] if isinstance(rc, (list, tuple)) else rc) in (0, None):
-            return True
-    return False
-
-
-def _set_machine_p(bus, mid, p):
-    """PGEN to p, and PMAX up with it so the solution cannot undo the change.
-
-       PMAX IS RAISED, NEVER LOWERED HERE. _scale_project_output() brings PMAX
-       down with PGEN because a capacity study means "this plant can only make
-       this much". This is a dispatch change, not a capability change: a machine
-       held down to balance the area must still be ABLE to return, or the next
-       solve reports a limit that the case does not really have."""
-    realar = [_f] * 17
-    realar[0] = float(p)
-    try:
-        ie, pmax = psspy.macdat(int(bus), str(mid), "PMAX")
-        if ie in (0, None) and float(pmax) < float(p):
-            realar[4] = float(p)          # PT -- index 4; index 2 is QT, which this once overwrote
-            # THE MVA FOLLOWS, BY THE POWER TRIANGLE. A record whose Pmax was
-            # just raised above its MBASE would put the machine above 1.0 pu
-            # on its own base; MBASE is raised to sqrt(Pmax^2 + Qmax^2) when
-            # it is smaller than that, and never lowered.
-            try:
-                _e1, _qt = psspy.macdat(int(bus), str(mid), "QMAX")
-                _e2, _mb = psspy.macdat(int(bus), str(mid), "MBASE")
-                _qt = abs(float(_qt)) if _e1 in (0, None) else 0.0
-                _need, _n_inv = _mbase_inverters(_math.sqrt(float(p) ** 2 + _qt ** 2), up=True)
-                if _e2 in (0, None) and float(_mb) < _need - 1e-6:
-                    realar[6] = _need     # MBASE
-                    print("  [poi-p]   %s '%s': Pmax raised to %.1f MW -> MBASE %.1f -> %.1f MVA "
-                          "(sqrt(P^2+Q^2), Qmax %.1f)" % (bus, mid, float(p), float(_mb), _need, _qt))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    try:
-        ie = psspy.machine_chng_2(int(bus), str(mid), [_i] * 6, realar)
-        ie = ie[0] if isinstance(ie, (list, tuple)) else ie
-        return ie in (0, None)
-    except Exception as e:
-        print("  [poi-p] could not set %s '%s' to %.1f MW (%s)" % (bus, mid, p, e))
-        return False
-
-
-def _poi_area_snapshot(project):
-    """Record the area total BEFORE the project is added.
-
-       Called from build_case() straight after the case is loaded, which is the
-       one moment the case in memory IS the base case -- so this number needs no
-       second run and no file passed between the two studies to agree with."""
-    if not project:
-        return
-    area = POI_P_AREA if POI_P_AREA is not None else project.get("area")
-    if area is None:
-        return
-    tot = _area_gen_mw(area)
-    if tot is None:
-        return
-    _AREA_MW_BEFORE[int(area)] = tot
-    print("  [poi-p] area %s generation before the project: %.1f MW" % (area, tot))
-
-
-def _poi_export_mw(poi, plant_buses):
-    """P (MW) leaving the POI toward the SYSTEM -- the number the one-line shows.
-
-       ONLY THE OUTGOING BRANCHES. The first version summed every branch at the
-       POI whose far end was not in a list of known plant buses -- and the list
-       could not be complete. On SantaFe the existing units reach the POI through
-       765910/765920/765930, which are on no feeder list and in no NEW_PLANT
-       record, so their INCOMING flows were added as though they were exports.
-       The measured POI power came out far too low, the loop kept finding a
-       shortfall, and it drove the existing machines up to their limits chasing
-       a number that could not be reached.
-
-       Direction is the honest test and needs no list: brnflo(poi, nb) is
-       positive when power LEAVES the POI on that branch. Summing the positive
-       ones gives what the plant delivers to the system --
-
-           SPERVIL7 222.9 + SPERVIL7 240.0 + BUCKNER7 437.4 = 900.3
-
-       -- which is exactly what the one-line adds up. The incoming branches are
-       the plant's own sources and are not part of it.
-
-       plant_buses is still honoured, as a second guard: a plant bus is never
-       counted even if power happens to flow toward it."""
-    tot, n, seen = 0.0, 0, []
-    skip = set(int(b) for b in (plant_buses or []))
-    try:
-        adj = _sf_adjacency().get(int(poi), set())
-    except Exception:
-        adj = set()
-    # WHICH NEIGHBOURS ARE THE SYSTEM, decided by connectivity.
-    sysside = _poi_system_side(poi, plant_buses)
-    for nb in sorted(adj):
-        if int(nb) in skip:
-            continue
-        if sysside is not None and int(nb) not in sysside:
-            continue                        # reachable from the plant: a source
-        for ck in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
-            try:
-                ierr, cx = _flow_leaving(int(poi), int(nb), str(ck))
-            except Exception:
-                continue
-            if ierr not in (0, None) or cx is None:
-                continue
-            try:
-                p = float(cx.real)
-            except Exception:
-                p = float(cx[0])
-            n += 1
-            # NET, NOT ONLY THE POSITIVE ONES -- once the system side is known.
-            #
-            # THIS IS WHAT LEFT IronStar 35 MW SHORT. The rule used to be "sum
-            # the branches on which power LEAVES the POI", because a bus list
-            # could not be trusted to name every plant source (see above). But
-            # direction is not the same question as ownership. IronStar's POI
-            # 560080 carries THREE branches: 214.0 MW in from the new plant's HV
-            # bus 999202, 44.0 MW in from the existing unit at 587310, 34.8 MW
-            # in FROM THE SYSTEM, and 292.8 MW out. Dropping the incoming
-            # system branch reported 292.8 as the plant's delivery, the meter
-            # called 290 met, and the machines stopped at 214 + 44 = 258 MW --
-            # the 293 MW on the one-line, of which 35 MW is the system's.
-            #
-            # With the plant and system sides separated by connectivity, the
-            # honest measure is the NET flow across the cut: 292.8 - 34.8 = 258.
-            # A system branch flowing inward is an import and reduces what the
-            # plant is exporting, exactly as the one-line's own totals do.
-            if sysside is not None or p > 0.0:
-                tot += p
-                seen.append((int(nb), ck, p))
-    return tot, len(seen)
-
-
-_POI_SIDE_CACHE = {}
-
-# A POI total that is NOT met is a different study. True = stop the build when
-# the delivered MW at the POI ends more than POI_P_STRICT_TOL_MW (or 1 %) away
-# from POI_P_TARGET_MW after the metering; False = print it and go on.
-POI_P_STRICT = (os.environ.get("SPP_POI_P_STRICT") or "1").strip() not in ("0", "False", "false", "")
-POI_P_STRICT_TOL_MW = 2.0
-try:
-    POI_P_STRICT_TOL_MW = float((os.environ.get("SPP_POI_P_STRICT_TOL") or "").strip()
-                                or POI_P_STRICT_TOL_MW)
-except Exception:
-    pass
-
-
-def _pocket_buses_behind_poi(poi, cap=300):
-    """Every bus of every plant POCKET behind the POI: a neighbour of the POI
-       whose walk (never crossing the POI) stays within `cap` buses and holds a
-       machine. This is the plant as the NETWORK has it -- the new plant and the
-       existing units alike -- and needs no list to be complete. EmpirePrairie's
-       existing units sit behind 761376; a list that did not name them left the
-       remainder unplaced and the POI at 1372 MW against 769 asked for."""
-    poi = int(poi)
-    out = set()
-    try:
-        adj = _sf_adjacency()
-    except Exception:
-        return out
-    for nb in adj.get(poi, set()):
-        nb = int(nb)
-        if nb in out:
-            continue
-        seen, q, ok = set([nb]), [nb], True
-        while q and ok:
-            u = q.pop()
-            for w in adj.get(u, ()):
-                w = int(w)
-                if w == poi or w in seen:
-                    continue
-                seen.add(w)
-                q.append(w)
-                if len(seen) > cap:
-                    ok = False
-                    break
-        if ok and _plant_machines(seen):
-            out |= seen
-    return out
-
-
-def _poi_plant_tie_mw(poi):
-    """(total MW into the POI across every plant tie, tie count, [(bus, ckt, MW)]).
-
-       The ties are found exactly as the POI power channels are -- the project's
-       own island, every named plant behind the POI, and any other generation
-       pocket -- so the number here, the TOTAL panel in the plots and the sum on
-       the one-line are the same quantity computed the same way."""
-    poi = int(poi)
-    ties, seen = [], set()
-
-    def _add(t):
-        try:
-            a, b, ck = int(t[0]), int(t[1]), str(t[2]).strip()
-        except Exception:
-            return
-        other = b if a == poi else (a if b == poi else None)
-        if other is None or (other, ck) in seen:
-            return
-        seen.add((other, ck))
-        ties.append((other, ck))
-    try:
-        for t in _poi_ties_all(_project_feeder_buses()):
-            _add(t)
-    except Exception:
-        pass
-    _named = []
-    for b in (list((globals().get("_RUN_PROJ") or {}).get("feeders") or [])
-              + list((globals().get("_RUN_PROJ") or {}).get("feeders_original") or [])
-              + list(globals().get("POI_P_EXISTING_BUSES") or [])
-              + [x for (x, _m) in (PROJECT_GENS or [])]):
-        try:
-            _named.append((int(b), "plant"))
-        except Exception:
-            pass
-    try:
-        for t, _why in _poi_named_plant_ties(poi, _named):
-            _add(t)
-    except Exception:
-        pass
-    try:
-        for t in _poi_plant_ties(poi):
-            _add(t)
-    except Exception:
-        pass
-    tot, rows = 0.0, []
-    for other, ck in ties:
-        try:
-            ierr, cx = _flow_leaving(int(other), poi, str(ck))
-        except Exception:
-            continue
-        if ierr not in (0, None) or cx is None:
-            continue
-        p = float(cx.real)          # MW leaving `other` toward the POI
-        tot += p
-        rows.append((other, ck, p))
-    rows.sort(key=lambda r: -abs(r[2]))
-    return tot, len(rows), rows
-
-
-def _poi_target_verify(project, target_mw):
-    """The last word on the POI total: what the plant DELIVERS into the POI on
-       the solved case, against what was asked for. Prints it always; stops the
-       build under POI_P_STRICT when it is not met."""
-    if not project:
-        return True
-    if target_mw is None:
-        # NOTHING WAS ASKED FOR, SO NOTHING WAS HELD. Under POI_P_STRICT that is
-        # not a study of this project at its interconnection: the plant is left
-        # at whatever dispatch the input deck happened to carry.
-        if POI_P_STRICT:
-            raise RuntimeError("POI_P_TARGET_MW has no entry for %s, so its POI total was "
-                               "never held to anything. Add it to POI_P_TARGET_MW, or set "
-                               "POI_P_STRICT = False to run without a target."
-                               % project.get("name"))
-        print("  [poi-p] VERIFY %s: no POI target given -- the dispatch is left as the "
-              "deck had it" % project.get("name"))
-        return True
-    poi = int(project.get("poi") or POI_BUS)
-    plant = sorted(_pocket_buses_behind_poi(poi)
-                   | set(int(b) for b in (project.get("feeders") or []))
-                   | set(int(b) for b in (project.get("feeders_original") or []))
-                   | set(int(b) for b, _m in (PROJECT_GENS or [])))
-    dmw, nd = _poi_delivered_mw(poi, plant)
-    xmw, nx = _poi_export_mw(poi, plant)
-    # AND THE SAME SUM THE PLOTS AND THE ONE-LINE SHOW: every tie into the POI
-    # that carries plant, found the way the POI power channels are found, not by
-    # the plant/system walk. The walk answers "which side is this neighbour on";
-    # a stale answer to that made 502 MW of BESS invisible to a check that then
-    # passed. This adds them up independently, so the two have to agree.
-    tmw, nt, _tie_rows = _poi_plant_tie_mw(poi)
-    if not nd and not nx and not nt:
-        print("  [poi-p] VERIFY: the POI %d flows could not be read" % poi)
-        return True
-    got = dmw if nd else xmw
-    if nt:
-        # The tie sum is the authority when the two disagree by more than the
-        # tolerance: it counts every plant tie by name and prints each one.
-        if abs(tmw - got) > max(float(POI_P_STRICT_TOL_MW), 0.01 * abs(float(target_mw))):
-            print("  [poi-p] VERIFY: the plant/system split at POI %d and the tie sum "
-                  "disagree (%.1f vs %.1f MW) -- taking the TIE SUM, which is what the "
-                  "one-line shows" % (poi, got, tmw))
-        got = tmw
-        for _b, _ck, _p in _tie_rows:
-            print("  [poi-p]   tie %8d -> POI %d ck %-2s %9.1f MW" % (_b, poi, _ck, _p))
-    tol = max(float(POI_P_STRICT_TOL_MW), 0.01 * abs(float(target_mw)))
-    ok = abs(got - float(target_mw)) <= tol
-    print("  [poi-p] VERIFY %s: %.1f MW delivered into POI %d against %.1f MW asked for "
-          "(%+.1f MW; net export %.1f MW) -- %s"
-          % (project.get("name"), got, poi, float(target_mw), got - float(target_mw), xmw,
-             "OK" if ok else "*** NOT MET ***"))
-    if not ok:
-        # SAY WHAT WAS FOUND, machine by machine, so the reason is on the screen.
-        for b, m in _plant_machines(plant):
-            try:
-                _ie, _p = psspy.macdat(int(b), str(m), "P")
-                _ie2, _px = psspy.macdat(int(b), str(m), "PMAX")
-                print("  [poi-p]   %-8d '%s'  PG %8.1f  PMAX %8.1f" % (int(b), m, float(_p), float(_px)))
-            except Exception:
-                pass
-        if POI_P_STRICT:
-            raise RuntimeError("POI_P_TARGET_MW not met for %s: %.1f MW delivered into POI %d against "
-                               "%.1f asked for. The machines behind the POI are listed above; set "
-                               "POI_P_STRICT = False to build it anyway" % (project.get("name"), got, poi, float(target_mw)))
-    return ok
-
-
-def _poi_delivered_mw(poi, plant_buses):
-    """P (MW) arriving INTO the POI over the PLANT-side branches -- the plant's
-       delivery at the interconnection, whatever the POI bus itself then serves.
-       Returns (MW, number of plant-side branches read); (0, 0) when the plant
-       side cannot be told from the system side."""
-    sysside = _poi_system_side(poi, plant_buses)
-    if sysside is None:
-        return 0.0, 0
-    try:
-        adj = _sf_adjacency().get(int(poi), set())
-    except Exception:
-        adj = set()
-    tot, n = 0.0, 0
-    for nb in sorted(adj):
-        if int(nb) in sysside:
-            continue
-        for ck in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
-            try:
-                ierr, cx = _flow_leaving(int(poi), int(nb), str(ck))
-            except Exception:
-                continue
-            if ierr not in (0, None) or cx is None:
-                continue
-            try:
-                p = float(cx.real)
-            except Exception:
-                p = float(cx[0])
-            tot += -p                          # leaving the POI toward the plant is negative: delivery is its negative
-            n += 1
-    return tot, n
-
-
-def _poi_system_side(poi, plant_buses):
-    """The POI's neighbours that belong to the SYSTEM, not to the plant.
-
-       A neighbour is on the PLANT side when it can be reached from a plant bus
-       without passing through the POI -- that is what "behind the
-       interconnection" means, and it needs no list to be complete: a GSU, a
-       collector bus, an intertie or an unlisted tap all come back as plant side
-       because the walk reaches them from the machines. Everything else is the
-       system.
-
-       Returns a set of bus numbers, or None when the answer cannot be trusted
-       (no plant buses, no adjacency, or the walk reaching EVERY neighbour --
-       which means the plant and the system are connected around the POI and the
-       cut is not a cut). None makes the caller fall back to the direction rule,
-       which is what this replaced and is still better than a wrong partition."""
-    poi = int(poi)
-    seeds = set(int(b) for b in (plant_buses or []) if int(b) != poi)
-    key = (poi, tuple(sorted(seeds)))
-    if key in _POI_SIDE_CACHE:
-        return _POI_SIDE_CACHE[key]
-    ans = None
-    try:
-        adj = _sf_adjacency()
-        nbrs = set(int(b) for b in adj.get(poi, set()))
-        if seeds and nbrs:
-            # Walk out from the plant with the POI REMOVED from the graph.
-            seen_b = set(seeds)
-            stack = [b for b in seeds]
-            while stack:
-                b = stack.pop()
-                for nb in adj.get(b, ()):    # noqa: the POI is never enqueued
-                    nb = int(nb)
-                    if nb == poi or nb in seen_b:
-                        continue
-                    seen_b.add(nb)
-                    stack.append(nb)
-            plant_side = nbrs & seen_b
-            sysside = nbrs - seen_b
-            if sysside and plant_side:
-                ans = sysside
-            else:
-                # Everything on one side: either no plant source was found at
-                # all, or the walk got right round the POI and back. Neither is
-                # a cut, so say so instead of guessing.
-                print("  [poi-p] the plant and the system could not be separated "
-                      "at POI %d (%d of %d neighbour(s) reachable from the plant) "
-                      "-- measuring exports by flow direction instead"
-                      % (poi, len(plant_side), len(nbrs)))
-    except Exception as e:
-        print("  [poi-p] could not work out the system side of POI %s (%s) -- "
-              "measuring exports by flow direction instead" % (poi, e))
-        ans = None
-    _POI_SIDE_CACHE[key] = ans
-    return ans
-
-
-def _poi_project_pairs(project=None):
-    """(machines, rating_mw, from_new) -- which machines the POI dispatch must
-       treat as THE PROJECT, and what rating to put on them.
-
-       THE BUG THIS EXISTS FOR. Both dispatchers took PROJECT_GENS as "the
-       BESS". That is true only while build_new_plant() is running in this
-       process, because the builder points PROJECT_GENS at the units it just
-       made. Build the plant once, save the .sav, then turn the builder off --
-       which is the normal way to work, since the machines are in the case now
-       -- and PROJECT_GENS falls back to the project row's feeder buses, which
-       are the EXISTING machines.
-
-       Every conclusion downstream then inverts:
-
-         * the EXISTING machines are put on the project's full rating, because
-           the code believes they are the BESS.  214 MW on 587313/587317.
-         * the BESS is either invisible (its buses are in no list the dispatch
-           searches) or is treated as an existing machine to be trimmed.
-
-       IronStar came out at 213 MW from the BESS and 213 MW from the existing
-       units -- 426 MW for a 290 MW target -- and neither number was asked for.
-
-       So: if there are machines in the new-generator block that are not already
-       in PROJECT_GENS, THEY are the project. PROJECT_GENS then describes the
-       existing units, which is exactly what the remainder is meant to be spread
-       over. When there are none -- an ordinary project, or a build running in
-       this process -- nothing changes.
-
-       THE RATING. POI_P_PROJECT_MW if it is set. Otherwise ACTIVE_MW or the
-       project row, as before. Otherwise, for new-block machines only, the sum
-       of their own PMAX -- the plant that is actually in the case, which is a
-       better answer than a row that may round it. Said out loud either way."""
-    new = []
-    try:
-        new = _new_plant_gens()
-    except Exception as e:
-        print("  [poi-p] could not look for new-block machines (%s)" % e)
-        new = []
-    pairs = [(int(b), str(m).strip()) for b, m in (PROJECT_GENS or [])]
-    from_new = False
-    if new:
-        pairs = [(int(b), str(m).strip()) for b, m in new]
-        from_new = True
-        print("  [poi-p] the project machines are the %d machine(s) in the new-generator "
-              "block: %s" % (len(pairs), ", ".join("%d '%s'" % p for p in pairs)))
-        print("  [poi-p] PROJECT_GENS (%s) is therefore the EXISTING plant, and takes "
-              "the remainder."
-              % (", ".join("%d" % b for b, _m in (PROJECT_GENS or [])) or "empty"))
-    rate = None
-    asked = False            # did someone NAME the number, or is it the project row?
-    try:
-        if POI_P_PROJECT_MW is not None:
-            rate = float(POI_P_PROJECT_MW)
-            asked = True
-            print("  [poi-p] project rating %.1f MW (POI_P_PROJECT_MW)" % rate)
-    except (TypeError, ValueError):
-        rate = None
-    if rate is None:
-        try:
-            if ACTIVE_MW:
-                rate = float(ACTIVE_MW)
-                asked = True
-        except (TypeError, ValueError):
-            rate = None
-    if rate is None and project:
-        try:
-            rate = float(project.get("mw"))
-        except (TypeError, ValueError):
-            rate = None
-    # THE MACHINES' OWN PMAX ONLY WHEN NOBODY NAMED A NUMBER. POI_P_PROJECT_MW
-    # and ACTIVE_MW are deliberate -- a capacity level, a study at reduced
-    # output -- and reading PMAX over the top of one would quietly undo it. Only
-    # the project ROW is a guess worth improving on.
-    if from_new and not asked:
-        # WHAT IS ACTUALLY IN THE CASE. The row said 214 for a plant built as
-        # 2 x 106; the machines are the truth about the machines.
-        _pm = 0.0
-        _ok = True
-        for _b, _m in pairs:
-            try:
-                _e, _v = psspy.macdat(_b, _m, "PMAX")
-            except Exception:
-                _ok = False
-                break
-            if _e not in (0, None) or _v is None or float(_v) <= 0 or float(_v) > 1e5:
-                _ok = False
-                break
-            _pm += float(_v)
-        # SANITY, AGAINST THE ROW. A machine whose PMAX was never set carries
-        # the 9999 default, and two of those sum to 19998 MW -- which would be
-        # taken as the plant's rating and dispatched. So the machines' own PMAX
-        # is used only when it AGREES with the project row to within a factor of
-        # three. 212 against a row of 214 is the case this exists for; 19998
-        # against 214 is the case it has to refuse.
-        if _ok and _pm > 0 and rate is not None and not (rate / 3.0 <= _pm <= rate * 3.0):
-            print("  [poi-p] their combined PMAX is %.1f MW against %.1f in the project "
-                  "row -- too far apart to believe (PMAX is probably unset), so the "
-                  "row is used" % (_pm, rate))
-            _ok = False
-        if _ok and _pm > 0:
-            if rate is None or abs(_pm - rate) > 0.05:
-                print("  [poi-p] their combined PMAX is %.1f MW%s -- using that as the "
-                      "rating" % (_pm, ("" if rate is None
-                                        else ", against %.1f in the project row" % rate)))
-            rate = _pm
-    return pairs, rate, from_new
-
-
-def apply_poi_p_metered(project, target_mw):
-    """Iterate the dispatch until the POI METER reads target_mw.
-
-       WHY AN ITERATION AND NOT ARITHMETIC. The losses between the machines and
-       the POI depend on the flows, which depend on the dispatch -- so the
-       gross-up needed to deliver 1000 MW cannot be computed in advance, only
-       converged to. Each pass: solve, measure the POI, move the machines by the
-       error, solve again.
-
-       WHAT MOVES. The BESS is grossed up until ITS OWN delivery at the POI is
-       its rating (so "the BESS is at 502 at the POI" is literally true), and the
-       existing machines take whatever is left to reach the total. With
-       POI_P_MEASURE = "machines" none of this runs and the target is the sum of
-       the machines' P, which is the older and simpler convention.
-
-       Called AFTER the solve, and it solves again itself, so the case that is
-       saved and snapshotted is the converged one."""
-    if target_mw is None or not project:
-        return
-    poi = int(project.get("poi") or POI_BUS)
-    plant = [b for _r, b in _np_plant_buses_read()]
-    proj_pairs, _poi_rate, _from_new = _poi_project_pairs(project)
-    plant += [b for b, _m in proj_pairs]
-    plant += [int(b) for b, _m in (PROJECT_GENS or [])]
-    plant += [int(b) for b in (project.get("feeders") or [])]
-    plant += [int(b) for b in (project.get("feeders_original") or [])]
-    plant += [int(b) for b in (POI_P_EXISTING_BUSES or [])]
-    plant += sorted(_pocket_buses_behind_poi(poi))       # the plant as the network has it
-    # The plant's HV bus, where NEW_PLANT ties in: the BESS's own contribution is
-    # what crosses it. Without a new plant the BESS sits on the feeders and the
-    # feeders are the cut.
-    _hv = [b for r, b in _np_plant_buses_read() if r == "HV"]
-    _bess_cut = _hv or [b for b, _m in proj_pairs]
-    if _from_new and not _hv:
-        # No recorded HV bus, so the cut is the new machines' own buses. Without
-        # this the BESS share would be measured across the EXISTING feeders.
-        _bess_cut = [b for b, _m in proj_pairs]
-    exist = [(b, m) for (b, m) in _plant_machines(plant)
-             if (b, m) not in proj_pairs]
-    print("")
-    print("  [poi-p] === METERED: driving the POI %s to %.1f MW ===" % (poi, target_mw))
-    if not exist:
-        print("  [poi-p] no existing machines to trim with -- the BESS alone is moved")
-    last = None
-    for it in range(1, int(POI_P_METER_ITERS) + 1):
-        exp_mw, nbr = _poi_export_mw(poi, plant)
-        net_mw = exp_mw
-        if (POI_P_METER or "delivered") == "delivered":
-            _dmw, _nd = _poi_delivered_mw(poi, plant)
-            if _nd:
-                exp_mw = _dmw                  # the meter is what the plant DELIVERS into the POI
-            elif it == 1:
-                print("  [poi-p]   plant side of the POI could not be separated -- metering the "
-                      "net export instead")
-        if nbr == 0:
-            print("  [poi-p] *** no branch out of the POI could be read -- the metered "
-                  "target cannot be measured, leaving the dispatch as it is ***")
-            return
-        bess_mw, _q, _n = _delivered_to_poi(_bess_cut, poi)
-        err = float(target_mw) - exp_mw
-        # THE MACHINES' OWN TOTAL, printed beside the meter.
-        #
-        # These two numbers differ by the losses, and ONLY by the losses. When
-        # they differed by 35 MW at IronStar that was the system's import being
-        # counted as the plant's output, and nothing in the log said so -- the
-        # meter read 293, the one-line read 293, and the machines quietly sat at
-        # 258. Printing both makes that kind of gap impossible to miss again.
-        gen_mw = 0.0
-        for _b, _m in proj_pairs + exist:
-            try:
-                _ie, _pg = psspy.macdat(int(_b), str(_m), "P")
-                if _ie in (0, None) and _pg is not None:
-                    gen_mw += float(_pg)
-            except Exception:
-                pass
-        print("  [poi-p]   iter %d: POI meter %.1f MW %s (net export to system %.1f, machines %.1f, "
-              "BESS share %.1f) -- %+.1f MW to find"
-              % (it, exp_mw, "delivered into the POI" if exp_mw != net_mw or POI_P_METER == "delivered" else "net export",
-                 net_mw, gen_mw, bess_mw, err))
-        if abs(err) <= float(POI_P_METER_TOL_MW):
-            print("  [poi-p]   converged: %.1f MW delivered into POI %d, %.1f MW net export to the "
-                  "system, machines %.1f MW gross, BESS delivering %.1f MW  (meter - machines = %+.1f "
-                  "MW of losses%s)"
-                  % (exp_mw, poi, net_mw, gen_mw, bess_mw, exp_mw - gen_mw,
-                     ("; delivered - export = %.1f MW served at the POI bus" % (exp_mw - net_mw))
-                     if abs(exp_mw - net_mw) > 0.5 else ""))
-            last = exp_mw
-            break
-        # 1. the BESS first, to its rating AT THE POI
-        _rate = _poi_rate
-        if _rate is not None and CAP_SCALE is not None:
-            _rate *= float(CAP_SCALE)
-        # THE POI TOTAL IS A CEILING, NOT A SUGGESTION.
-        #
-        # THIS IS WHAT STOPPED EmpirePrairie DEAD. Its plant is rated 804 MW and
-        # its interconnection is 769 MW. The gross-up below drives the BESS until
-        # ITS OWN delivery at the POI is the rating -- 804 -- and then hands the
-        # remainder to the existing machines. The remainder is -35 MW. The
-        # existing units are pushed down, into their Pmin, which for a battery is
-        # a NEGATIVE number, so they start charging; the POI meter never reaches
-        # 769 because the plant is being told to deliver more than the POI is
-        # allowed to carry; and the loop runs out of iterations printing "the POI
-        # meter is still ... against ... asked for".
-        #
-        # A plant larger than its interconnection is not a mistake to refuse. It
-        # is the ordinary shape of a queue project -- 804 MW of equipment behind
-        # 769 MW of service -- and the study of it is the CURTAILED plant. So the
-        # rating is capped at the POI total, and the curtailment is stated: a
-        # curtailed plant is a different study from a full one, and the
-        # difference must not be something the reader has to infer from a number
-        # in a log.
-        if _rate is not None and float(_rate) > float(target_mw) + float(POI_P_METER_TOL_MW):
-            if it == 1:
-                print("  [poi-p]     CURTAILED: the plant is rated %.1f MW and the POI "
-                      "total asked for is %.1f MW. The project is dispatched to %.1f "
-                      "-- the interconnection limit -- and the existing machines to "
-                      "what is left of it."
-                      % (float(_rate), float(target_mw), float(target_mw)))
-                print("  [poi-p]     This study is of the CURTAILED plant. Raise "
-                      "POI_P_TARGET_MW to study it at full output.")
-            _rate = float(target_mw)
-        # CAN THE BESS's OWN SHARE ACTUALLY BE MEASURED?
-        #
-        # THIS IS WHAT PUT A BESS AT -124 MW. bess_mw is what crosses _bess_cut
-        # on its way to the POI. With NEW_PLANT the cut is the plant's own HV
-        # bus and nothing else crosses it, so the number IS the BESS. Without
-        # it the BESS machines sit on the EXISTING feeder buses, beside the
-        # existing units -- 765935 carries 'B' and '1' -- and the cut then
-        # measures BOTH. The loop reads "the BESS is delivering 627 MW against a
-        # 502 rating", takes 125 MW off it, and repeats: straight through zero
-        # and into negative generation. A discharging battery quietly became a
-        # charging one, and the case still solved.
-        #
-        # So the cut is checked for machines that are not the project's. If any
-        # are there, the BESS share is not separable and the gross-up is REFUSED
-        # -- the existing machines still take the whole error below, which is
-        # the right answer for a co-located battery and is what the arithmetic
-        # in apply_poi_p_target() already assumes.
-        _cut_foreign = [(b, m) for (b, m) in _plant_machines([int(x) for x in _bess_cut])
-                        if (int(b), str(m).strip()) not in
-                        set((int(x), str(y).strip()) for x, y in proj_pairs)]
-        if _rate is not None and proj_pairs and _cut_foreign and not _hv:
-            print("  [poi-p]     BESS gross-up REFUSED: the cut it would be measured "
-                  "across (%s) also carries %s, so \"the BESS share\" cannot be told "
-                  "from the plant's total. The existing machines take the whole "
-                  "error instead."
-                  % (", ".join(str(x) for x in _bess_cut),
-                     ", ".join("%d '%s'" % (b, m) for b, m in _cut_foreign[:6])))
-            _rate = None
-        if _rate is not None and proj_pairs:
-            dB = _rate - bess_mw
-            if abs(dB) > float(POI_P_METER_TOL_MW):
-                _moved = 0
-                for b, m in proj_pairs:
-                    # NOT A SILENT except. A machine that will not move is the
-                    # difference between an iteration that converges and one that
-                    # repeats the same line eight times, and swallowing the reason
-                    # is how that becomes a mystery instead of a message.
-                    try:
-                        e, p = psspy.macdat(b, m, "P")
-                    except Exception as _e:
-                        print("  [poi-p]     cannot read %s '%s' (%s)" % (b, m, _e))
-                        continue
-                    if e not in (0, None):
-                        print("  [poi-p]     cannot read %s '%s' (ierr=%s)" % (b, m, e))
-                        continue
-                    _pnew = float(p) + dB / len(proj_pairs)
-                    # A FLOOR ON THE PROJECT MACHINES. "Dispatch the plant to a
-                    # POI total" never means "run the battery backwards": a
-                    # negative P on an SGF machine is CHARGING, a different
-                    # study, and it must not arrive as the by-product of an
-                    # iteration overshooting. Set POI_P_PROJECT_MIN_MW to None
-                    # to allow it deliberately.
-                    if POI_P_PROJECT_MIN_MW is not None and _pnew < float(POI_P_PROJECT_MIN_MW):
-                        print("  [poi-p]     %s '%s' would go to %.1f MW -- held at "
-                              "%.1f (POI_P_PROJECT_MIN_MW)"
-                              % (b, m, _pnew, float(POI_P_PROJECT_MIN_MW)))
-                        _pnew = float(POI_P_PROJECT_MIN_MW)
-                    if _set_machine_p(b, m, _pnew):
-                        _moved += 1
-                if _moved:
-                    print("  [poi-p]     BESS grossed by %+.1f MW over %d machine(s) so it "
-                          "delivers %.1f at the POI" % (dB, _moved, _rate))
-                else:
-                    print("  [poi-p]     *** none of the %d project machine(s) would move -- "
-                          "the BESS cannot be grossed up ***" % len(proj_pairs))
-                    break
-                err -= dB          # the BESS has just taken part of the shortfall
-        # 2. the existing machines take the rest
-        if exist and abs(err) > 1e-6:
-            share = err / len(exist)
-            _moved = 0
-            for b, m in exist:
-                try:
-                    e, p = psspy.macdat(b, m, "P")
-                    e2, pmax = psspy.macdat(b, m, "PMAX")
-                    e3, pmin = psspy.macdat(b, m, "PMIN")
-                except Exception as _e:
-                    print("  [poi-p]     cannot read %s '%s' (%s)" % (b, m, _e))
-                    continue
-                if e not in (0, None):
-                    continue
-                p1 = float(p) + share
-                if POI_P_RESPECT_LIMITS and e2 in (0, None) and e3 in (0, None):
-                    lo, hi = min(float(pmin), float(pmax)), max(float(pmin), float(pmax))
-                    p1 = max(lo, min(hi, p1))
-                # AND A FLOOR THE MACHINE'S OWN LIMITS DO NOT GIVE.
-                #
-                # Pmin is a NEGATIVE number on a battery and on pumped storage,
-                # so "clamp to the machine's limits" permits an existing unit to
-                # be driven from generating into CHARGING to make a POI total
-                # come out right. That is a different plant, and it arrives as
-                # arithmetic rather than as a decision -- exactly the way a
-                # project machine reached -124 MW before POI_P_PROJECT_MIN_MW
-                # existed.
-                #
-                # THE FLOOR IS THE MACHINE'S OWN STARTING POINT WHERE THAT IS
-                # LOWER. A unit already charging in the case stays free to move;
-                # what is refused is pushing one THROUGH zero to get there. Set
-                # POI_P_EXISTING_MIN_MW to None to allow it deliberately.
-                if POI_P_EXISTING_MIN_MW is not None:
-                    _floor = min(float(POI_P_EXISTING_MIN_MW), float(p))
-                    if p1 < _floor:
-                        print("  [poi-p]     %s '%s' would go to %.1f MW -- held at "
-                              "%.1f (POI_P_EXISTING_MIN_MW)" % (b, m, p1, _floor))
-                        p1 = _floor
-                if _set_machine_p(b, m, p1):
-                    _moved += 1
-            if not _moved:
-                print("  [poi-p]     *** none of the %d existing machine(s) would move -- "
-                      "stopping ***" % len(exist))
-                break
-            print("  [poi-p]     existing machines moved by %+.1f MW between %d of them"
-                  % (err, _moved))
-        try:
-            solve_powerflow("FDNS POI-meter %d" % it)
-        except Exception as e:
-            print("  [poi-p]   the re-solve failed (%s) -- stopping" % e)
-            break
-        last = exp_mw
-    else:
-        print("  [poi-p]   *** %d iteration(s) and the POI meter is still %.1f MW "
-              "against %.1f asked for. Raise POI_P_METER_ITERS, or the machines "
-              "are at their limits. ***"
-              % (POI_P_METER_ITERS, last if last is not None else float("nan"),
-                 target_mw))
-
-
-def _plant_machines(buses):
-    """[(bus, id)] for every in-service machine on the given buses."""
-    out = []
-    want = set(int(b) for b in (buses or []))
-    try:
-        ie, ai = psspy.amachint(-1, 1, ["NUMBER"])
-        je, ac = psspy.amachchar(-1, 1, ["ID"])
-        if ie in (0, None) and je in (0, None):
-            for b, mid in zip(ai[0], ac[0]):
-                if int(b) in want:
-                    out.append((int(b), str(mid).strip()))
-    except Exception:
-        pass
-    return out
-
-
-def _poi_hold_area_after_solve(project, tries=None):
-    """Bring the area back to its pre-project total on the SOLVED case.
-
-       WHY A SECOND PASS IS NEEDED. apply_poi_p_target() sets the dispatch before
-       the solve, which is right -- the converted case and the snapshot have to
-       carry it. But the solve then moves the SYSTEM SLACK to cover the change in
-       losses, and 502 MW injected at a new point changes the losses. If the slack
-       is in this area, the area total afterwards is near the one that was asked
-       for and not on it, which is exactly what "the area power is not maintained"
-       looks like.
-
-       So: measure the solved case, correct the other machines, solve again, and
-       repeat until it is inside POI_HOLD_AREA_TOL_MW. It converges in two or
-       three passes because the loss sensitivity to a small redispatch is small;
-       the loop is bounded either way and says where it got to."""
-    if not project:
-        return
-    area = POI_P_AREA if POI_P_AREA is not None else project.get("area")
-    if area is None:
-        return
-    before = _AREA_MW_BEFORE.get(int(area))
-    if before is None:
-        return
-    poi_buses = sorted(set(int(b) for b in (project.get("feeders") or []))
-                       | set(int(b) for b in (project.get("feeders_original") or []))
-                       | set(int(b) for b, _m in (PROJECT_GENS or []))
-                       | set(int(b) for b in (POI_P_EXISTING_BUSES or []))
-                       | set(int(b) for b in _HOLD_EXCLUDE_BUSES)
-                       | _pocket_buses_behind_poi(int(project.get("poi") or POI_BUS)))
-    n = int(POI_HOLD_AREA_PASSES if tries is None else tries)
-    tol = float(POI_HOLD_AREA_TOL_MW)
-    _prev_diff = float("inf")
-    for k in range(1, n + 1):
-        now = _area_gen_mw(area)
-        if now is None:
-            print("  [poi-p] the area total could not be read after the solve")
-            return
-        diff = now - before
-        if abs(diff) <= tol:
-            print("  [poi-p] area %s after the solve: %.1f MW (target %.1f, "
-                  "difference %+.2f) -- within %.2f MW, pass %d"
-                  % (area, now, before, diff, tol, k))
-            return
-        others = _area_machines(area, poi_buses)
-        now_others = sum(r[2] for r in others)
-        want_others = now_others - diff
-        if now_others <= 0 or want_others <= 0:
-            print("  [poi-p] area %s is %+.1f MW out after the solve and there is "
-                  "nothing left to scale" % (area, diff))
-            return
-        kf = want_others / now_others
-        if k > 1 and abs(diff) >= abs(_prev_diff) - 0.01:
-            # NO PROGRESS. The correction was applied and the error did not move,
-            # which means something outside this loop is putting it back -- the
-            # system slack sitting in this area is the usual reason.
-            print("  [poi-p] pass %d: the area is still %+.1f MW out and the last "
-                  "correction changed nothing." % (k, diff))
-            _sl = ", ".join(str(x) for x in (SLACK_GENS or [])) or "(unset)"
-            print("  [poi-p]   The system slack (%s) holds this area's total to its "
-                  "load + interchange + losses, so moving generation between "
-                  "machines inside it cannot change the total." % _sl)
-            print("  [poi-p]   Either the slack is inside area %s, or an area "
-                  "interchange control is holding it. Set POI_HOLD_AREA_MW = False "
-                  "and compare on the interchange instead." % area)
-            break
-        _prev_diff = diff
-        print("  [poi-p] pass %d: area %s is %+.1f MW out -- scaling %d machine(s) "
-              "by %.5f and solving again" % (k, area, diff, len(others), kf))
-        for b, mid, p0, pmax, pmin in others:
-            p1 = p0 * kf
-            if POI_P_RESPECT_LIMITS:
-                lo, hi = min(pmin, pmax), max(pmin, pmax)
-                p1 = max(lo, min(hi, p1))
-            _set_machine_p(b, mid, p1)
-        try:
-            solve_powerflow("FDNS")
-        except Exception as e:
-            print("  [poi-p] the re-solve failed (%s) -- stopping here" % e)
-            break
-    now = _area_gen_mw(area)
-    if now is not None:
-        print("  [poi-p] *** area %s finished at %.1f MW against %.1f asked for "
-              "(%+.1f). The base case and this case do NOT carry the same area "
-              "power, so a difference between them is not the project alone. ***"
-              % (area, now, before, now - before))
-
-
-def apply_poi_p_target(project, target_mw):
-    """Dispatch the plant to target_mw at the POI and put the area back.
-
-       Runs on the case in memory BEFORE the solve, for the same reason
-       _scale_project_output() does: a dispatch applied after the solution would
-       not be in the converted case, the snapshot, or anything built from them.
-    """
-    if target_mw is None or not project:
-        return
-    area = POI_P_AREA if POI_P_AREA is not None else project.get("area")
-    # WHERE THE PLANT'S MACHINES ARE.
-    #
-    #   * the project's CURRENT feeder list -- with NEW_PLANT these are the new
-    #     unit buses
-    #   * the ORIGINAL feeder list, kept before NEW_PLANT overwrote it: this is
-    #     where the existing machines are, and without it they are invisible
-    #   * PROJECT_GENS, whatever it now points at
-    #   * anything named in POI_P_EXISTING_BUSES, for a plant whose existing
-    #     machines are not on the declared feeder buses at all
-    _pm_pairs, _pm_rate, _pm_new = _poi_project_pairs(project)
-    poi_buses = sorted(set(int(b) for b in (project.get("feeders") or []))
-                       | set(int(b) for b in (project.get("feeders_original") or []))
-                       | set(int(b) for b, _m in (PROJECT_GENS or []))
-                       | set(int(b) for b, _m in _pm_pairs)
-                       | set(int(b) for b in (POI_P_EXISTING_BUSES or []))
-                       | set(int(b) for b in _HOLD_EXCLUDE_BUSES)
-                       | _pocket_buses_behind_poi(int(project.get("poi") or POI_BUS)))
-    print("")
-    print("  [poi-p] === TOTAL P AT THE POI -> %.1f MW (area %s) ===" % (target_mw, area))
-
-    # ---- 0. the project machines go to their rating FIRST ----
-    #
-    # Without this the remainder is computed against whatever dispatch the case
-    # happened to carry: apply_bess_powerflow() sets the rating, but
-    # POI_TUNE_DELIVERY then moves the machines to land the POI on a target, and
-    # a case read back from disk carries whatever the run that wrote it left.
-    # "the BESS at its capacity, the other units adding the rest" has to mean the
-    # capacity, not a number near it.
-    if (POI_P_PROJECT_AT or "rated").strip().lower() == "rated" and _pm_pairs:
-        _rate = _pm_rate
-        if _rate is None:
-            print("  [poi-p] the project's rating is not a number -- the project "
-                  "machines are left where they are")
-        else:
-            # THE CAPACITY LEVEL STILL APPLIES. At SPP_CAP_SCALE = 0.5 the plant
-            # is being studied at half output; putting it back on its full rating
-            # here would undo exactly what that sweep varies.
-            if CAP_SCALE is not None:
-                _rate = _rate * float(CAP_SCALE)
-                print("  [poi-p] rating %.1f MW x capacity level %.0f %% = %.1f MW"
-                      % (_rate / float(CAP_SCALE), 100.0 * float(CAP_SCALE), _rate))
-            # THE POI TOTAL IS A CEILING. A plant rated above its
-            # interconnection -- 804 MW of equipment behind 769 MW of service --
-            # is the ordinary shape of a queue project, and the study of it is
-            # the CURTAILED plant. Without this the project machines are set to
-            # 804, the remainder for the existing units is -35 MW, and they are
-            # driven down into a Pmin that on a battery is negative: the POI
-            # never reaches the target and an existing unit quietly starts
-            # charging. Capped here, and said out loud, because a curtailed
-            # plant is a different study from a full one.
-            if float(_rate) > float(target_mw) + 1e-6:
-                print("  [poi-p] CURTAILED: rated %.1f MW, POI total asked for "
-                      "%.1f MW -- the project is dispatched to %.1f, the "
-                      "interconnection limit."
-                      % (float(_rate), float(target_mw), float(target_mw)))
-                print("  [poi-p]   This study is of the CURTAILED plant. Raise "
-                      "POI_P_TARGET_MW to study it at full output.")
-                _rate = float(target_mw)
-            _per = _rate / max(1, len(_pm_pairs))
-            print("  [poi-p] project machines set to their rating: %d x %.1f MW = %.1f MW"
-                  % (len(_pm_pairs), _per, _rate))
-            for _b, _m in _pm_pairs:
-                _set_machine_p(_b, _m, _per)
-
-    # ---- 1. what the plant is generating now, project machines and existing ----
-    proj_pairs = set((int(b), str(m).strip()) for b, m in _pm_pairs)
-    plant, proj_mw, exist = [], 0.0, []
-    for b in poi_buses:
-        try:
-            ie, ai = psspy.amachint(-1, 1, ["NUMBER"])
-            je, ac = psspy.amachchar(-1, 1, ["ID"])
-            ids = [str(m).strip() for n, m in zip(ai[0], ac[0]) if int(n) == b]
-        except Exception:
-            ids = []
-        for mid in ids:
-            try:
-                e, p = psspy.macdat(b, mid, "P")
-                e2, pmax = psspy.macdat(b, mid, "PMAX")
-                e3, pmin = psspy.macdat(b, mid, "PMIN")
-            except Exception:
-                continue
-            if e not in (0, None):
-                continue
-            rec = (b, mid, float(p),
-                   float(pmax) if e2 in (0, None) else float(p),
-                   float(pmin) if e3 in (0, None) else 0.0)
-            plant.append(rec)
-            if (b, mid) in proj_pairs:
-                proj_mw += float(p)
-            else:
-                exist.append(rec)
-    print("  [poi-p] buses searched for this plant's machines: %s"
-          % ", ".join(str(x) for x in poi_buses) or "(none)")
-    if not plant:
-        print("  [poi-p] *** no machines found on any of them -- nothing to "
-              "dispatch. Name the generator buses in POI_P_EXISTING_BUSES. ***")
-        return
-    print("  [poi-p] project machines : %.1f MW over %d machine(s)"
-          % (proj_mw, len(plant) - len(exist)))
-    # THE PROJECT MUST BE AMONG THE MACHINES THAT WERE FOUND.
-    #
-    # If it is not, proj_mw is 0, the remainder becomes the WHOLE target, and the
-    # existing units are dispatched to the full POI value with the plant's output
-    # on top of it -- 1485 MW into a 984 MW interconnection, with every number in
-    # the log looking reasonable. That is not a study of this project.
-    if _pm_pairs and (len(plant) - len(exist)) == 0:
-        print("  [poi-p] *** the project's machines (%s) were NOT found among the "
-              "machines behind the POI ***"
-              % ", ".join("%s '%s'" % (b, m) for b, m in _pm_pairs))
-        print("  [poi-p]     Buses searched: %s"
-              % ", ".join(str(x) for x in poi_buses))
-        if globals().get("POI_P_STRICT"):
-            raise RuntimeError("the project's machines were not found behind POI %s, so "
-                               "the remainder would give the existing units the whole "
-                               "%.1f MW and the plant would sit on top of it. Set "
-                               "POI_P_STRICT = False to build it anyway."
-                               % (poi_buses and project.get("poi"), float(target_mw)))
-    print("  [poi-p] existing machines: %.1f MW over %d machine(s)"
-          % (sum(r[2] for r in exist), len(exist)))
-
-    # ---- 2. the existing machines make up the difference ----
-    #
-    # UNLESS THIS IS SPP'S FIRST SURPLUS SCENARIO, in which case they do not
-    # exist for the purposes of this run.
-    #
-    # BP-7250 section 7.6 asks for two stability scenarios on a surplus
-    # interconnection request:
-    #
-    #     the SGF dispatched at 100 % and the EGF TURNED OFF
-    #     the SGF dispatched at 100 % and the EGF dispatched to set the POI
-    #     injection to the Interconnection Service amount of the EGF
-    #
-    # The second is what the remainder arithmetic below already does: the
-    # project machines go to their rating and the existing ones make up the
-    # difference to POI_P_TARGET_MW. The first is not a target at all -- it is
-    # the existing plant OUT OF SERVICE, with the POI carrying whatever the
-    # surplus machines alone deliver -- and dispatching the existing units to
-    # zero is not the same thing: a machine at 0 MW is still a voltage source
-    # with its reactive capability and its dynamic models in service, and SPP's
-    # scenario has it off.
-    if POI_P_EXISTING_OFF:
-        # ---- WHICH MACHINES ARE THE SGF, AND WHICH ARE THE EGF -----------
-        #
-        # SGF = the SURPLUS facility = the new machines in the NEW_GEN_BUS_PREFIX
-        # block ("999"). EGF = the EXISTING facility = this plant's other
-        # machines, which for these projects are the PROJECT_GENS on their
-        # feeder buses -- SantaFe's 765912, 765922, 765932, 765935 and the
-        # equivalent for the rest.
-        #
-        # _poi_project_pairs() already makes exactly that split: new-block
-        # machines are "the project" and PROJECT_GENS become the existing ones.
-        # It falls back to PROJECT_GENS when it finds NO new-block machine --
-        # and THAT fallback inverts this scenario. Switching "the existing
-        # machines" off would then switch off whatever else sits on the feeders
-        # while the real EGF, the project gens, ran on at their rating: the
-        # opposite of what the run is labelled.
-        #
-        # So it is checked, printed, and refused rather than guessed at. The
-        # same inversion has cost this study before -- see _poi_project_pairs --
-        # and it produced numbers nobody asked for with nothing to say so.
-        print("  [poi-p] SGF (surplus, bus block %s*): %s"
-              % (NEW_GEN_BUS_PREFIX,
-                 ", ".join("%d '%s'" % (b, m) for b, m in proj_pairs) or "(none)"))
-        print("  [poi-p] EGF (existing)              : %s"
-              % (", ".join("%d '%s'" % (r[0], r[1]) for r in exist) or "(none)"))
-        if not _pm_new:
-            print("  [poi-p] *** EGF OFF REFUSED: no machine was found in the %s* "
-                  "block, so the" % NEW_GEN_BUS_PREFIX)
-            print("  [poi-p]     surplus facility could not be identified and "
-                  "the machines above")
-            print("  [poi-p]     called EGF are whatever else sits on the "
-                  "feeders. Switching those")
-            print("  [poi-p]     off would leave the real existing units "
-                  "running -- the opposite of")
-            print("  [poi-p]     BP-7250 7.6's first scenario.")
-            print("  [poi-p]     Build the BESS into the %s* block, or run this "
-                  "scenario with" % NEW_GEN_BUS_PREFIX)
-            print("  [poi-p]     ENABLE_BESS on. ***")
-        elif not exist:
-            print("  [poi-p] *** EGF OFF: there are no existing machines at this "
-                  "plant to switch off. The POI already carries the surplus "
-                  "facility alone. ***")
-    if POI_P_EXISTING_OFF and exist and _pm_new:
-        print("  [poi-p] EGF OFF (BP-7250 7.6, first scenario): taking the "
-              "plant's %d existing machine(s) OUT OF SERVICE" % len(exist))
-        _off = 0
-        for (b, mid, p0, _pmax, _pmin) in exist:
-            if _set_machine_status(b, mid, 0):
-                _off += 1
-                print("  [poi-p]   %-8d '%s'  %8.1f MW -> OUT OF SERVICE"
-                      % (b, mid, p0))
-            else:
-                print("  [poi-p]   *** %-8d '%s' could NOT be switched off -- "
-                      "this run is not the EGF-off scenario ***" % (b, mid))
-        print("  [poi-p] POI now carries the surplus machines alone: %.1f MW"
-              % proj_mw)
-        exist = []
-
-    want = float(target_mw) - proj_mw
-    if not exist:
-        # NOT A RETURN. The project machines have just been put on their rating,
-        # so the area total has risen by the project whether or not the
-        # remainder could be placed -- and leaving before step 3 would leave the
-        # area high as well as the POI short. Say it and carry on to hold the
-        # area.
-        print("  [poi-p] *** no EXISTING machines were found at this plant, so the "
-              "remaining %.1f MW cannot be placed and the POI will be short of "
-              "the target by that much." % want)
-        print("  [poi-p]     Buses searched: %s"
-              % ", ".join(str(x) for x in poi_buses))
-        print("  [poi-p]     Name the generator buses in POI_P_EXISTING_BUSES "
-              "(z6_cmp_all_con.py) and run again. ***")
-        placed = 0.0
-    else:
-        if want < 0:
-            print("  [poi-p] *** the project alone generates %.1f MW, more than the "
-                  "%.1f MW asked for -- the existing machines go to their minimum "
-                  "and the POI will exceed the target ***" % (proj_mw, target_mw))
-        share = (POI_P_SHARE or "capacity").strip().lower()
-        if share == "equal":
-            w = [1.0] * len(exist)
-        elif share == "present":
-            w = [max(0.0, r[2]) for r in exist]
-        else:
-            w = [max(0.0, r[3]) for r in exist]
-        if sum(w) <= 0:
-            w = [1.0] * len(exist)
-        tot_w = sum(w)
-        placed, short = 0.0, 0.0
-        print("  [poi-p] existing machines take %.1f MW, split by %s:" % (want, share))
-        for (b, mid, p0, pmax, pmin), wi in zip(exist, w):
-            p1 = want * (wi / tot_w)
-            if POI_P_RESPECT_LIMITS:
-                lo, hi = min(pmin, pmax), max(pmin, pmax)
-                p1c = max(lo, min(hi, p1))
-                if abs(p1c - p1) > 1e-6:
-                    short += (p1 - p1c)
-                p1 = p1c
-            # A FLOOR THE MACHINE'S OWN PMIN DOES NOT GIVE -- see
-            # POI_P_EXISTING_MIN_MW. Pmin is negative on a battery, so clamping
-            # to the limits alone lets an existing unit be driven from
-            # generating into CHARGING to make the remainder come out. A unit
-            # already below zero keeps its freedom; pushing one THROUGH zero is
-            # what is refused.
-            if POI_P_EXISTING_MIN_MW is not None:
-                _floor = min(float(POI_P_EXISTING_MIN_MW), float(p0))
-                if p1 < _floor:
-                    short += (p1 - _floor)
-                    print("  [poi-p]   %-8d '%s' would go to %.1f MW -- held at "
-                          "%.1f (POI_P_EXISTING_MIN_MW)" % (b, mid, p1, _floor))
-                    p1 = _floor
-            if _set_machine_p(b, mid, p1):
-                placed += p1
-                print("  [poi-p]   %-8d '%s'  %8.1f -> %8.1f MW   (Pmax %.1f)"
-                      % (b, mid, p0, p1, pmax))
-        print("  [poi-p] POI total now %.1f MW (target %.1f)"
-              % (proj_mw + placed, target_mw))
-        if abs(short) > 0.05:
-            print("  [poi-p] *** %.1f MW could not be placed inside the machines' "
-                  "Pmin/Pmax -- the POI is short of the target by that much ***" % short)
-
-    # ---- 3. put the area back where it was ----
-    if not POI_HOLD_AREA_MW or area is None:
-        return
-    before = _AREA_MW_BEFORE.get(int(area))
-    if before is None:
-        print("  [poi-p] no 'before' total was recorded for area %s -- the area is "
-              "left as it is" % area)
-        return
-    others = _area_machines(area, poi_buses)
-    now_others = sum(r[2] for r in others)
-    plant_now = proj_mw + placed
-    want_others = before - plant_now
-    print("  [poi-p] area %s: was %.1f MW, plant is now %.1f MW -> the rest of the "
-          "area must come to %.1f MW (it is %.1f)"
-          % (area, before, plant_now, want_others, now_others))
-    if want_others < 0:
-        print("  [poi-p] *** the plant alone exceeds the area's original total. The "
-              "area cannot be held at %.1f MW; it is left unscaled. ***" % before)
-        return
-    if now_others <= 0:
-        print("  [poi-p] *** the rest of the area generates nothing -- there is "
-              "nothing to scale ***")
-        return
-    k = want_others / now_others
-    print("  [poi-p] scaling %d other machine(s) in area %s by %.4f"
-          % (len(others), area, k))
-    moved = 0
-    for b, mid, p0, pmax, pmin in others:
-        p1 = p0 * k
-        if POI_P_RESPECT_LIMITS:
-            lo, hi = min(pmin, pmax), max(pmin, pmax)
-            p1 = max(lo, min(hi, p1))
-        if _set_machine_p(b, mid, p1):
-            moved += 1
-    after = _area_gen_mw(area)
-    # READ BACK, ALWAYS. A scale factor that was computed correctly and applied
-    # to machines that clipped at their limits gives an area total that is not
-    # the one asked for, and nothing downstream would notice.
-    if after is None:
-        print("  [poi-p] %d machine(s) scaled; the area total could not be read back"
-              % moved)
-        return
-    print("  [poi-p] area %s after: %.1f MW  (before %.1f, difference %+.1f)"
-          % (area, after, before, after - before))
-    if abs(after - before) > max(1.0, 0.001 * abs(before)):
-        print("  [poi-p] *** the area did NOT come back to its original total. The "
-              "usual cause is machines clipping at Pmin/Pmax. The base case and "
-              "this case do NOT carry the same area power, so a difference "
-              "between them is not the project alone. ***")
 
 
 def _scale_project_output(scale):
@@ -12996,7 +10467,7 @@ def _scale_project_output(scale):
 # ---------------------------------------------------------------------------
 # A .xlsx WRITER, SO THE STUDY CAN PRODUCE ONE WITHOUT A LIBRARY.
 #
-# Ported verbatim from z6_cmp_all_con.py. The measurement workbook is written where
+# Ported verbatim from z6_main.py. The measurement workbook is written where
 # the measurements are taken -- in the report phase of the study itself -- and
 # PSS/E 34's Python 3.4 has no openpyxl and no way to install one. A .xlsx is a
 # zip of XML parts, so writing it directly costs nothing but this block, and it
@@ -13315,7 +10786,7 @@ def _collector_rows():
     except Exception:
         print("  [coll] COLLECTOR_SCALE[%r] is not (r, x, b) -- ignored" % RUN_PROJECT)
         rmul = xmul = bmul = 1.0
-    # ONE VALUE FOR EVERY COLLECTOR, when z6_cmp_all_con.py asks for it. Applied to
+    # ONE VALUE FOR EVERY COLLECTOR, when z6_main.py asks for it. Applied to
     # every row of every project, over whatever the row says: "the same
     # impedance everywhere" and "this row is different" cannot both hold, and
     # silently honouring the row would make the setting a lie.
@@ -13646,7 +11117,7 @@ def fault_line_impedance_check(fault):
     return n_changed
 
 
-# ---- .dyr edits from z6_cmp_all_con.py -----------------------------------------
+# ---- .dyr edits from z6_main.py -----------------------------------------
 _dyrs = (os.environ.get("SPP_DYR_SHOW") or "").strip()
 if _dyrs:
     try:
@@ -13691,50 +11162,11 @@ if _dyrp:
         _mine = _json.loads(_dyrp).get(RUN_PROJECT) or []
         if _mine:
             DYR_EDITS = list(DYR_EDITS) + [tuple(e) for e in _mine]
-            print("[dyr] %d edit(s) for %s from z6_cmp_all_con.py" % (len(_mine), RUN_PROJECT))
+            print("[dyr] %d edit(s) for %s from z6_main.py" % (len(_mine), RUN_PROJECT))
     except Exception as _e:
         print("[dyr] SPP_DYR_EDITS_BY_PROJECT could not be read (%s) -- ignored" % _e)
 if DYR_EDITS:
     print("[dyr] %d .dyr edit(s) in force" % len(DYR_EDITS))
-
-
-def _poi_stamp():
-    """One line describing the DISPATCH this run asks for, for the same guard.
-
-       WHY THIS BELONGS IN THE STAMP. The POI dispatch is applied DURING the
-       build -- apply_poi_p_target() runs on the case in memory before the solve,
-       so that the .cnv, the snapshot and everything made from them carry it.
-       Which means a build that is REUSED never sees a change to it.
-
-       That is exactly the trap the collector stamp already exists to close, and
-       the POI settings were not in it. Change POI_P_TARGET_MW, or the block that
-       decides which machines are the project, run again with the .cnv and .snp
-       still on disk, and the run reports:
-
-           [resume] reusing existing snapshot
-
-       No conversion, no compile, no .snp, no dispatch -- and a .cnv still
-       holding the previous run's numbers, under the new heading. It looks like
-       the change did nothing, because nothing ran.
-
-       Including them here means changing any of them invalidates the snapshot
-       by itself, and the next launch rebuilds without anyone having to remember
-       FORCE_REBUILD."""
-    try:
-        _eb = ",".join(str(int(b)) for b in (POI_P_EXISTING_BUSES or []))
-    except Exception:
-        _eb = "?"
-    _tg = ""
-    _t = _together_row()
-    if _t:
-        _tg = " together=" + ",".join("%s:%g@%s" % (_r.get("name"), float(_r.get("mw_together") or 0),
-                                                    _member_target(_r))
-                                      for _r in _t["member_rows"])
-    return ("poi: target=%s measure=%s share=%s at=%s projmw=%s area=%s hold=%s "
-            "newblock=%s existing=[%s] off=%s%s"
-            % (POI_P_TARGET_MW, POI_P_MEASURE, POI_P_SHARE, POI_P_PROJECT_AT,
-               POI_P_PROJECT_MW, POI_P_AREA, POI_HOLD_AREA_MW,
-               NEW_GEN_BUS_PREFIX, _eb, PROJECT_OFF, _tg))
 
 
 def _collector_stamp():
@@ -13764,15 +11196,7 @@ def _collector_stamp():
     # THE .dyr EDITS BELONG IN THE SAME STAMP. A snapshot built with a different
     # REECAU1 constant is as wrong to reuse as one built with a different
     # collector, and for the same reason: the change happens during the build.
-    return (coll + " | " + _dyr_stamp() + " | " + _poi_stamp()
-            + " | " + _monitor_stamp() + " | " + _poi_q_stamp())
-
-
-def _poi_q_stamp():
-    """The reactive-zeroing step is applied DURING THE BUILD, so a snapshot
-       built before it existed, or with it off, must not be reused under the new
-       setting: with it in the stamp the change rebuilds by itself."""
-    return "poi-q: %s tol=%s | inverter=%s MVA" % ("zero" if POI_Q_ZERO else "off", POI_Q_TOL_MVAR, INVERTER_MVA)
+    return coll + " | " + _dyr_stamp() + " | " + _monitor_stamp()
 
 
 def _monitor_stamp():
@@ -13828,13 +11252,6 @@ def _collector_stamp_matches():
         # No stamp: a snapshot from before this setting existed. Treat it as a
         # match only when nothing is being asked for, so an untouched study does
         # not rebuild for no reason.
-        #
-        # A POI TARGET COUNTS AS SOMETHING BEING ASKED FOR. Without this, a
-        # snapshot built before the dispatch settings joined the stamp has no
-        # stamp file to compare against, falls through here, and is reused --
-        # which is the very case this change exists to catch.
-        if POI_P_TARGET_MW is not None:
-            return False
         return not (COLLECTOR_ON and _collector_rows())
 
 
@@ -13888,11 +11305,23 @@ def _new_facility_buses():
        stops at the POI because the POI is not in that block -- and the tie to
        it is still reported, as the branch that crosses the boundary."""
     roles = {}
-    try:
-        for role, b in (_np_plant_buses_read() or []):
-            roles[int(b)] = str(role).upper()
-    except Exception:
-        pass
+    # THE BASE CASE HAS NO NEW PLANT, AND SO NO _np_plant_buses_read.
+    #
+    # That function is the project script's -- it reads the roles of the buses
+    # NEW_PLANT created -- and it does not exist in this file at all. The call
+    # was raising NameError on every invocation and the bare `except Exception`
+    # was swallowing it, so `roles` stayed empty. The RESULT was right (a case
+    # with no new plant has no roles to report) but only by accident, and an
+    # exception handler that exists to catch a missing bus was silently
+    # absorbing a missing function. Asked for by name instead, so the answer is
+    # the same and it is deliberate.
+    _npb = globals().get("_np_plant_buses_read")
+    if _npb is not None:
+        try:
+            for role, b in (_npb() or []):
+                roles[int(b)] = str(role).upper()
+        except Exception:
+            pass
     try:
         for b, _m in (_new_plant_gens() or []):
             roles.setdefault(int(b), "MACH")
@@ -14331,614 +11760,6 @@ def _apply_collector_impedance():
     _collector_record(rows, changed, skipped)
 
 
-# ============================================================================
-# THE NEW PLANT -- creating buses, transformers and a collector, not switching
-# ============================================================================
-# See NEW_PLANT in the panel for what is built and why. This is the code that
-# builds it, and everything here follows one rule: CREATE, THEN READ BACK. A
-# psspy call that returns ierr=0 having changed nothing is the failure mode this
-# whole script is written around, and it is far worse here than elsewhere -- a
-# transformer that silently was not created leaves the plant connected by the
-# collector alone, the study runs, and the voltage rise it reports is not the
-# one the plant would have.
-
-
-def _np_cfg():
-    """The NEW_PLANT settings, panel merged with SPP_NEW_PLANT from the
-       environment. None when the feature is off."""
-    cfg = dict(NEW_PLANT or {})
-    raw = (os.environ.get("SPP_NEW_PLANT") or "").strip()
-    if raw:
-        try:
-            import json as _json
-            over = _json.loads(raw)
-            if isinstance(over, dict):
-                for k, v in over.items():
-                    # A nested block (gsu / collector / mpt / tie) is MERGED, not
-                    # replaced: sending {"gsu": {"x": 0.08}} from z6_cmp_all_con.py
-                    # must not silently drop r and sbase.
-                    if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                        d = dict(cfg[k]); d.update(v); cfg[k] = d
-                    else:
-                        cfg[k] = v
-        except Exception as e:
-            print("  [newplant] could not read SPP_NEW_PLANT (%s) -- using the "
-                  "panel as written" % e)
-    if not cfg.get("enabled"):
-        return None
-    return cfg
-
-
-def _np_units_for(cfg, warn=True):
-    """(units, MW per unit) -- HOW MANY FEEDERS THIS PLANT NEEDS.
-
-       Not a number you set. The plant's rating comes from its row in
-       BESS_PROJECTS, one feeder may carry at most FEEDER_MAX_MW, and the
-       capacity is divided EQUALLY -- so the count follows:
-
-           units = ceil(project MW / FEEDER_MAX_MW)
-
-       IronStar  214 MW / 200 -> 2 feeder(s) x 107.0 MW
-       SantaFe   502 MW / 200 -> 3 feeder(s) x 167.3 MW
-
-       That is the same rule the reuse study is held to: _bess_feeder_mw()
-       raises when a split exceeds the cap. Deriving the count here means the
-       new plant cannot be built with a feeder count that the machine placement
-       would then reject -- the two would disagree, and the build would get
-       most of the way through a facility before failing.
-
-       units set to a NUMBER in the panel is honoured, and still checked
-       against the cap: asking for one feeder on a 502 MW plant is a 502 MW
-       feeder, and that is worth stopping for rather than quietly adding
-       feeders nobody asked for."""
-    total = float(ACTIVE_MW or 0.0)
-    n = cfg.get("units")
-    if n in (None, 0, "", "auto"):
-        if total <= 0.0:
-            raise RuntimeError("NEW_PLANT: units is 'auto' but the project MW is "
-                               "%r -- nothing to divide" % ACTIVE_MW)
-        n = int(_math.ceil(total / float(FEEDER_MAX_MW) - 1e-9))
-        n = max(1, n)
-        why = "derived: %.1f MW / %.0f MW cap" % (total, FEEDER_MAX_MW)
-    else:
-        n = max(1, int(n))
-        why = "set in the panel"
-    per = (total / n) if total > 0 else float(cfg.get("mw_per_unit") or 0.0)
-    if total > 0 and per > FEEDER_MAX_MW + 1e-6:
-        raise RuntimeError(
-            "NEW_PLANT: %d feeder(s) for %.1f MW is %.1f MW each, over the %.0f MW "
-            "cap. Leave NEW_PLANT['units'] as None and it is worked out (%d "
-            "feeder(s)), or raise FEEDER_MAX_MW if the equipment really is that big."
-            % (n, total, per, FEEDER_MAX_MW,
-               int(_math.ceil(total / float(FEEDER_MAX_MW) - 1e-9))))
-    # mw_per_unit in the panel is only a fallback for the MVA-base defaults; the
-    # dispatch itself is split by _bess_feeder_mw() from the project's rating,
-    # so a panel value that disagreed with it would size the GSU for a load the
-    # machine never carries.
-    if warn and total > 0 and cfg.get("mw_per_unit"):
-        want = float(cfg["mw_per_unit"])
-        if abs(want - per) > 0.05:
-            print("  [newplant] NEW_PLANT['mw_per_unit'] = %.1f is IGNORED: the "
-                  "project is rated %.1f MW over %d feeder(s) = %.1f MW each"
-                  % (want, total, n, per))
-    return n, per, why
-
-
-def _np_layout(cfg, poi):
-    """Every bus this plant needs, with its kV and name. Numbers only -- nothing
-       is created here, so the whole layout can be checked before anything is."""
-    n, _per, _why = _np_units_for(cfg, warn=False)
-    b0 = int(cfg.get("bus_start") or 900001)
-    nm = str(cfg.get("name") or "NEWGEN")[:8].upper()
-    ukv = float(cfg.get("unit_kv") or 0.69)
-    ckv = float(cfg.get("collector_kv") or 34.5)
-    hkv = cfg.get("hv_kv")
-    if hkv is None:
-        try:
-            ie, v = psspy.busdat(int(poi), "BASE")
-            hkv = float(v) if ie in (0, None) else 345.0
-        except Exception:
-            hkv = 345.0
-    hkv = float(hkv)
-    units = [(b0 + i, ukv, "%s U%d" % (nm, i + 1)) for i in range(n)]
-    gsuhv = [(b0 + 100 + i, ckv, "%s G%d" % (nm, i + 1)) for i in range(n)]
-    coll = (b0 + 200, ckv, "%s COLL" % nm)
-    hv = (b0 + 201, hkv, "%s HV" % nm)
-    return {"units": units, "gsuhv": gsuhv, "coll": coll, "hv": hv,
-            "n": n, "unit_kv": ukv, "coll_kv": ckv, "hv_kv": hkv, "name": nm}
-
-
-def _np_add_bus(num, kv, name, area, zone, owner, ide=1):
-    """Create one bus. Tries the v34 forms in turn and verifies it exists.
-
-       ide is the BUS TYPE: 1 for an ordinary PQ bus, 2 for a GENERATOR bus.
-       Every bus here was being created as type 1, including the unit terminals
-       -- so the machines were added to load buses. A type 1 bus does not hold
-       its scheduled voltage: the solution treats the machine's reactive output
-       as fixed injection rather than as regulation, the plant does not control
-       voltage, and the POI voltage the study reports is not the one the plant
-       would produce. plant_data() converts the bus when the machine is added,
-       but only sometimes, and a bus created as what it is does not depend on
-       that."""
-    num = int(num)
-    intgar = [int(ide), int(area or 1), int(zone or 1), int(owner or 1)]
-    realar = [float(kv), 1.0, 0.0, 1.1, 0.9, 1.1, 0.9]              # BASKV,VM,VA,N/E hi/lo
-    tries = []
-    if hasattr(psspy, "bus_data_4"):
-        tries.append(("bus_data_4",
-                      lambda: psspy.bus_data_4(num, 0, intgar, realar, name[:12])))
-    if hasattr(psspy, "bus_data_3"):
-        tries.append(("bus_data_3",
-                      lambda: psspy.bus_data_3(num, intgar, realar, name[:12])))
-    if hasattr(psspy, "bus_data_2"):
-        # v2 takes IDE/AREA/ZONE/OWNER + BASKV,VM,VA and no limits
-        tries.append(("bus_data_2",
-                      lambda: psspy.bus_data_2(num, intgar, realar[:3], name[:12])))
-    for what, call in tries:
-        try:
-            call()
-        except Exception as e:
-            print("  [newplant] %s raised on bus %d: %s" % (what, num, e))
-            continue
-        if _bus_exists(num):
-            return what
-    return ""
-
-
-def _np_api_doc(fn):
-    """psspy's own docstring for a call, printed when the pinned shape fails.
-
-       This is the honest way to learn a signature: psspy carries it. Inferring
-       it from which wrong call does not crash is how the previous version
-       destabilised PSS/E."""
-    try:
-        d = getattr(psspy, fn).__doc__ or ""
-    except Exception:
-        return
-    if not d.strip():
-        print("  [newplant]   psspy.%s has no docstring on this install" % fn)
-        return
-    print("  [newplant]   ---- psspy.%s signature, as psspy states it ----" % fn)
-    for ln in d.splitlines()[:40]:
-        print("  [newplant]   | %s" % ln.rstrip()[:150])
-    print("  [newplant]   ---- end ----")
-
-
-def _np_add_line(i, j, ck, r, x, b, what):
-    """Create one line (collector or tie) using the PINNED branch call.
-
-       R, X and B are per unit on the system base and the bus kV, as for any
-       line, so the value read back should equal the value sent -- which makes
-       the check exact."""
-    i, j, ck = int(i), int(j), str(ck)
-    r, x, b = float(r), float(x), float(b)
-    shapes = [tuple(NEW_PLANT_BRANCH_CALL)]
-    if NEW_PLANT_FIND_API:
-        for fn in ("branch_data_3", "branch_data", "branch_chng_3", "branch_chng"):
-            if hasattr(psspy, fn):
-                for ni in (6, 7, 12):
-                    for nr in (12, 18, 24, 3):
-                        for tail in ("f+c", "c", ""):
-                            if (fn, ni, nr, tail) not in shapes:
-                                shapes.append((fn, ni, nr, tail))
-    last = ""
-    for fn, ni, nr, tail in shapes:
-        if not hasattr(psspy, fn):
-            last = "psspy has no %s" % fn
-            continue
-        ig = [1] + [_i] * (ni - 1)          # intgar[0] = STAT, in service
-        ra = [_f] * nr
-        ra[0], ra[1], ra[2] = r, x, b       # R, X, B
-        args = [i, j, ck, ig, ra]
-        if tail == "f+c":
-            args += [[_f] * 12, ""]
-        elif tail == "c":
-            args += [""]
-        try:
-            getattr(psspy, fn)(*args)
-        except Exception as e:
-            last = "%s: %s" % (fn, e)
-            continue
-        got = _brn_rxb(i, j, ck)
-        if got is None:
-            last = "%s returned without creating the branch" % fn
-            continue
-        bad = (abs(got[0] - r) > max(1e-6, 0.02 * abs(r))
-               or abs(got[1] - x) > max(1e-6, 0.02 * abs(x)))
-        print("  [newplant]   %-10s %6d - %-6d ck%s  R=%.6f X=%.6f B=%.6f%s"
-              % (what, i, j, ck, got[0], got[1], got[2],
-                 ("   *** sent R=%.6f X=%.6f -- the value did NOT land where "
-                  "intended ***" % (r, x)) if bad else ""))
-        return fn
-    print("  [newplant] *** could not create %s %d-%d: %s ***" % (what, i, j, last))
-    print("  [newplant]     the pinned call is NEW_PLANT_BRANCH_CALL = %r"
-          % (tuple(NEW_PLANT_BRANCH_CALL),))
-    _np_api_doc(NEW_PLANT_BRANCH_CALL[0])
-    return ""
-
-
-def _np_sysbase():
-    """The system MVA base, or None if this PSS/E will not say."""
-    for fn in ("sysmva", "base_mva"):
-        if not hasattr(psspy, fn):
-            continue
-        try:
-            v = getattr(psspy, fn)()
-            if isinstance(v, (list, tuple)):
-                v = v[-1]
-            v = float(v)
-            if v > 0:
-                return v
-        except Exception:
-            continue
-    return None
-
-
-# THE SHAPE OF two_winding_data_*, ONCE FOUND, IS REMEMBERED.
-# The search below is cheap but noisy, and a plant has one MPT and a GSU per
-# feeder -- rediscovering the same answer five times fills the log with failures
-# that are not failures.
-def _np_xfmr_ratio(i, j, ck):
-    """The transformer's turns ratio as the case holds it, or None."""
-    for fn in ("xfrdat", "xfrint"):
-        if not hasattr(psspy, fn):
-            continue
-        try:
-            ie, v = getattr(psspy, fn)(int(i), int(j), str(ck), "RATIO")
-            if ie in (0, None):
-                return float(v)
-        except Exception:
-            continue
-    return None
-
-
-def _np_add_xfmr(i, j, ck, r, x, sbase, kv_i, kv_j, what):
-    """Create one two-winding transformer with CZ = 2, per the API manual.
-
-       ONE CALL, with the arrays the length the manual states. The previous
-       version searched for the layout by trying combinations, which found a
-       shape that appeared to work -- it set INTGAR(8), the impedance
-       correction table number, and passed a 13-element INTGAR where 15 are
-       required. PSS/E read past the end of the array, the impedance came back
-       looking plausible because the garbage beyond it happened to act like
-       CZ = 2, and the process died at the NEXT transformer. Probing a Fortran
-       API by calling it wrongly is not a way to discover it.
-
-       CZ = INTGAR(14) is the impedance I/O code:
-           1  R and X per unit on the SYSTEM MVA base   <- the default
-           2  R and X per unit on the WINDING base, SBS1-2, which is the
-              nameplate convention and what 7.7 % and 10 % are quoted on
-       At the default, 7.7 % on a 201 MVA GSU is read as 7.7 % on 100 MVA and
-       the transformer is about twice the impedance intended.
-
-       Only R1-2, X1-2 and SBS1-2 are set. WINDV1/WINDV2 default to 1.0 and
-       NOMV1/NOMV2 to 0.0, which means "the bus base kV" -- a fixed-ratio
-       transformer at nominal taps, which is what this is."""
-    i, j, ck = int(i), int(j), str(ck)
-    r, x, sbase = float(r), float(x), float(sbase)
-    fn, n_int, n_real, n_rate, cz = tuple(NEW_PLANT_XFMR_CALL)
-    if not hasattr(psspy, fn):
-        print("  [newplant] *** this PSS/E has no psspy.%s ***" % fn)
-        return ""
-    intgar = [_i] * n_int
-    intgar[0] = 1                       # STAT, in service
-    intgar[cz] = 2                      # CZ, impedance on the winding base
-    realari = [_f] * n_real
-    realari[0], realari[1], realari[2] = r, x, sbase     # R1-2, X1-2, SBS1-2
-    try:
-        getattr(psspy, fn)(i, j, ck, intgar, realari, [_f] * n_rate, "", "")
-    except Exception as e:
-        print("  [newplant] *** %s %d-%d: psspy.%s raised: %s ***" % (what, i, j, fn, e))
-        _np_api_doc(fn)
-        return ""
-    got = _brn_rxb(i, j, ck)
-    if got is None:
-        print("  [newplant] *** %s %d-%d: %s returned without creating it ***"
-              % (what, i, j, fn))
-        _np_api_doc(fn)
-        return ""
-    # ---- DID CZ = 2 TAKE? -------------------------------------------------
-    # The value is stored on the winding base and read back on the system base,
-    # so CZ = 2 is confirmed by arithmetic rather than assumed. Read back equal
-    # to what was sent means CZ stayed at 1 and the impedance is wrong by the
-    # ratio of the bases.
-    note = ""
-    sys_mva = _np_sysbase()
-    if sys_mva:
-        want_x = x * sys_mva / sbase
-        if abs(got[1] - want_x) > max(1e-6, 0.01 * abs(want_x)):
-            note = ("   *** X reads %.6f on the %.0f MVA system base, expected "
-                    "%.6f -- CZ = 2 did NOT take ***" % (got[1], sys_mva, want_x))
-        else:
-            note = "   (= %.6f on the %.0f MVA system base, as expected)" % (
-                got[1], sys_mva)
-    ratio = _np_xfmr_ratio(i, j, ck)
-    if ratio is not None and abs(ratio - 1.0) > 0.02:
-        note += "   *** turns ratio came back %.4f, not 1.0 ***" % ratio
-    print("  [newplant]   %-10s %6d - %-6d ck%s  R=%.6f X=%.6f on %.0f MVA "
-          "(%.3f/%.3f kV, CZ=2)%s"
-          % (what, i, j, ck, r, x, sbase, kv_i, kv_j, note))
-    return fn
-
-
-def _np_roles(lay):
-    """[(role, bus)] for the whole facility, in electrical order.
-
-       EVERY BUS, not only the ones that carry a machine. The units are what is
-       scored, but a plant is judged on the voltage it holds at its own terminals
-       and along the way out to the POI -- unit, GSU high side, collector, HV --
-       and those buses are new, so nothing else in the study knows they exist."""
-    out = [("MACH", int(b)) for b, _kv, _nm in lay["units"]]
-    out += [("GSUHV", int(b)) for b, _kv, _nm in lay["gsuhv"]]
-    out.append(("COLL", int(lay["coll"][0])))
-    out.append(("HV", int(lay["hv"][0])))
-    return out
-
-
-def _topology_cache_reset(why=""):
-    """Forget every cached view of the network.
-
-       THE CACHES ARE BUILT ONCE AND THE CASE CHANGES UNDER THEM. build_new_plant()
-       adds buses 999001.., the collector, the HV bus and the POI tie AFTER the
-       branch list, the adjacency map and the POI plant/system partition have
-       been read. Every walk that ran afterwards therefore could not see the new
-       plant: it was classed as SYSTEM side at the POI, so
-
-         * apply_poi_p_target() found no project machines, made the remainder
-           the WHOLE target, and gave the existing units 984 MW of their own,
-         * and _poi_target_verify() measured only those existing units, saw
-           984 against 984 and reported OK,
-
-       while the one-line showed 1485 MW into the POI: 502 from the BESS on top
-       of the 983 the existing plant had been given. Both numbers were computed
-       correctly from a picture of the network that was one step out of date."""
-    global _SF_NAMES, _SF_ALL_BRANCHES, _SF_ALL_XFMR, _SF_HOPS, _POI_TIES
-    global _SF_MACH_AT, _SF_ADJ, _SF_NB_CACHE, _SF_LINE_AT, _SF_LOAD_BUSES, _BR_SCAN
-    _SF_NAMES = None; _SF_ALL_BRANCHES = None; _SF_ALL_XFMR = None; _SF_HOPS = None
-    _SF_MACH_AT = None; _SF_ADJ = None; _SF_NB_CACHE = None
-    _SF_LINE_AT = None; _SF_LOAD_BUSES = None; _BR_SCAN = None; _POI_TIES = None
-    try:
-        _POI_SIDE_CACHE.clear()
-    except Exception:
-        pass
-    try:
-        _3W_CACHE["map"] = None
-    except Exception:
-        pass
-    try:
-        globals()["_POI_TIE_CACHE"] = {}
-    except Exception:
-        pass
-    print("  [topology] cached bus/branch/adjacency views cleared%s"
-          % (" -- %s" % why if why else ""))
-
-
-def build_new_plant(cfg, poi):
-    """Create the whole facility and return the list of NEW machine buses.
-
-       Raises rather than returning a half-built plant. A study of a facility
-       missing its main transformer is not a conservative study, it is a study
-       of something else."""
-    lay = _np_layout(cfg, poi)
-    n, mw_u, why = _np_units_for(cfg)
-    print("")
-    print("  [newplant] === BUILDING A NEW FACILITY AT POI %s ===" % poi)
-    print("  [newplant] %s: %d feeder(s) x %.1f MW = %.1f MW   (%s)"
-          % (lay["name"], n, mw_u, n * mw_u, why))
-    print("  [newplant] %.3f kV -> %.1f kV -> %.1f kV"
-          % (lay["unit_kv"], lay["coll_kv"], lay["hv_kv"]))
-    if not _bus_exists(int(poi)):
-        raise RuntimeError("NEW_PLANT: POI bus %s is not in the case -- nothing to "
-                           "connect to" % poi)
-    # ---- EVERY NUMBER FREE, CHECKED BEFORE ANYTHING IS CREATED -------------
-    want = [b for b, _kv, _nm in lay["units"]] + [b for b, _kv, _nm in lay["gsuhv"]] \
-        + [lay["coll"][0], lay["hv"][0]]
-    # THE TRANSFORMER MVA BASES, worked out before the bus check so BOTH paths
-    # can record them -- the adopt path below writes NEW_PLANT.txt too.
-    gsu_mva = float((cfg.get("gsu") or {}).get("sbase") or (mw_u * 1.2))
-    mpt_mva = float((cfg.get("mpt") or {}).get("sbase") or (n * mw_u * 1.2))
-    taken = [b for b in want if _bus_exists(b)]
-    if taken and len(taken) == len(want):
-        # THE PLANT IS ALREADY IN THIS CASE.
-        #
-        # Which happens for a reason that is not a mistake: the build SAVES its
-        # work as <case>_BESS_<project>_<MW>.sav, and pointing PROJ_SAV at that
-        # saved case -- rather than at the original deck -- feeds a case that
-        # already contains the facility back into the builder.
-        #
-        # Refusing there is wrong. Every bus is present, so nothing of anyone
-        # else's is being built on; the question is only whether it is OUR
-        # plant, intact. That is checked below, the same walk the fresh build
-        # ends with, and if the chain holds the plant is adopted and the
-        # machines go on the same unit buses as before.
-        print("  [newplant] every bus this plant needs is ALREADY in the case "
-              "(%d..%d)." % (min(want), max(want)))
-        print("  [newplant] that is what a case saved by a previous build looks "
-              "like -- checking it is intact rather than rebuilding it.")
-        _chain = []
-        for _idx in range(n):
-            _ub = lay["units"][_idx][0]; _gb = lay["gsuhv"][_idx][0]
-            _chain.append((_ub, _gb, "GSU %d" % (_idx + 1)))
-            _chain.append((_gb, lay["coll"][0], "collector %d" % (_idx + 1)))
-        _chain.append((lay["coll"][0], lay["hv"][0], "MPT"))
-        _chain.append((lay["hv"][0], int(poi), "POI tie"))
-        _gone = [nm for i2, j2, nm in _chain if _brn_rxb(i2, j2, "1") is None]
-        if _gone:
-            raise RuntimeError(
-                "NEW_PLANT: the buses %d..%d are in the case but the plant is NOT "
-                "continuous to the POI -- missing: %s. That is not a facility this "
-                "builder left behind, so it will not be adopted and it will not be "
-                "built over. Point PROJ_SAV at the ORIGINAL deck to build it fresh, "
-                "or move NEW_PLANT['bus_start'] to a free block."
-                % (min(want), max(want), ", ".join(_gone)))
-        print("  [newplant] chain verified: unit -> GSU -> collector -> MPT -> POI "
-              "%s  (ADOPTED, not rebuilt)" % poi)
-        print("  [newplant] the impedances are whatever that case holds -- NOT the "
-              "NEW_PLANT settings in this run. To build it from the panel's values,")
-        print("  [newplant] point PROJ_SAV at the original deck instead of a case a "
-              "previous build saved.")
-        _np_record(cfg, lay, poi, mw_u, gsu_mva, mpt_mva)
-        return _np_roles(lay)
-    if taken:
-        raise RuntimeError(
-            "NEW_PLANT: %d of the %d bus numbers it would create are ALREADY IN "
-            "THE CASE: %s. Not all of them, so this is not a plant a previous "
-            "build left behind -- it is a collision with something else. Move "
-            "NEW_PLANT['bus_start'] to a free block; building on top of an "
-            "existing bus would study a different network and nothing downstream "
-            "would show it."
-            % (len(taken), len(want), ", ".join(str(b) for b in taken[:12])))
-    # area / zone / owner: the POI's, unless the panel names them. A new plant
-    # in area 1 when its POI is in area 534 lands outside the study area and is
-    # then not monitored by anything.
-    a = cfg.get("area"); z = cfg.get("zone"); o = cfg.get("owner")
-    for attr, val in (("AREA", a), ("ZONE", z), ("OWNER", o)):
-        if val is not None:
-            continue
-        try:
-            ie, v = psspy.busint(int(poi), attr)
-            if ie in (0, None):
-                if attr == "AREA":
-                    a = int(v)
-                elif attr == "ZONE":
-                    z = int(v)
-                else:
-                    o = int(v)
-        except Exception:
-            pass
-    print("  [newplant] area=%s zone=%s owner=%s (from the POI unless set)" % (a, z, o))
-
-    made = []
-    # TYPE 2 FOR THE UNIT TERMINALS, type 1 for everything else. The machine
-    # goes on the unit bus and nowhere else, so that is the only bus that is a
-    # generator bus; the GSU high sides, the collector and the HV bus carry no
-    # generation and are ordinary buses.
-    for b, kv, nm in lay["units"]:
-        if not _np_add_bus(b, kv, nm, a, z, o, ide=2):
-            raise RuntimeError("NEW_PLANT: could not create GENERATOR bus %d (%s, "
-                               "%.3f kV). No bus_data_* form this PSS/E exposes "
-                               "accepted it." % (b, nm, kv))
-        made.append(b)
-    for b, kv, nm in lay["gsuhv"] + [lay["coll"], lay["hv"]]:
-        if not _np_add_bus(b, kv, nm, a, z, o, ide=1):
-            raise RuntimeError("NEW_PLANT: could not create bus %d (%s, %.3f kV). "
-                               "No bus_data_* form this PSS/E exposes accepted it."
-                               % (b, nm, kv))
-        made.append(b)
-    print("  [newplant] %d bus(es) created: %d..%d   (%d of them TYPE 2, the unit "
-          "terminals)" % (len(made), min(made), max(made), len(lay["units"])))
-    # READ THE TYPE BACK. A bus created as type 1 when it should be 2 is not an
-    # error anywhere -- it is a plant that quietly does not regulate voltage.
-    for b, _kv, nm in lay["units"]:
-        try:
-            ie, t = psspy.busint(int(b), "TYPE")
-            if ie in (0, None) and int(t) != 2:
-                print("  [newplant]   *** bus %d (%s) came back as TYPE %s, not 2 -- "
-                      "the machine there will not regulate voltage ***" % (b, nm, t))
-        except Exception:
-            pass
-
-    gsu = dict(cfg.get("gsu") or {})
-    col = dict(cfg.get("collector") or {})
-    mpt = dict(cfg.get("mpt") or {})
-    tie = dict(cfg.get("tie") or {})
-
-    for idx in range(n):
-        ub, _ukv, _un = lay["units"][idx]
-        gb, _gkv, _gn = lay["gsuhv"][idx]
-        if not _np_add_xfmr(ub, gb, "1", gsu.get("r", 0.007662), gsu.get("x", 0.076618),
-                            gsu_mva, lay["unit_kv"], lay["coll_kv"], "GSU"):
-            raise RuntimeError("NEW_PLANT: GSU %d-%d could not be created" % (ub, gb))
-        if not _np_add_line(gb, lay["coll"][0], "1", col.get("r", 0.02),
-                            col.get("x", 0.04), col.get("b", 0.0), "collector"):
-            raise RuntimeError("NEW_PLANT: collector %d-%d could not be created"
-                               % (gb, lay["coll"][0]))
-    if not _np_add_xfmr(lay["coll"][0], lay["hv"][0], "1", mpt.get("r", 0.002499),
-                        mpt.get("x", 0.099969), mpt_mva, lay["coll_kv"], lay["hv_kv"],
-                        "MPT"):
-        raise RuntimeError("NEW_PLANT: the main power transformer could not be created")
-    if not _np_add_line(lay["hv"][0], int(poi), "1", tie.get("r", 0.0),
-                        tie.get("x", 0.0005), tie.get("b", 0.0), "POI tie"):
-        raise RuntimeError("NEW_PLANT: the tie from %d to the POI %s could not be "
-                           "created" % (lay["hv"][0], poi))
-
-    # ---- IS IT ACTUALLY CONNECTED TO THE POI? ------------------------------
-    # Every element above was read back individually, which proves each exists
-    # and proves nothing about the chain. This walks it.
-    chain = []
-    for idx in range(n):
-        ub = lay["units"][idx][0]; gb = lay["gsuhv"][idx][0]
-        chain.append((ub, gb, "GSU %d" % (idx + 1)))
-        chain.append((gb, lay["coll"][0], "collector %d" % (idx + 1)))
-    chain.append((lay["coll"][0], lay["hv"][0], "MPT"))
-    chain.append((lay["hv"][0], int(poi), "POI tie"))
-    broken = [nm for i2, j2, nm in chain if _brn_rxb(i2, j2, "1") is None]
-    if broken:
-        raise RuntimeError("NEW_PLANT: the plant is not continuous to the POI -- "
-                           "missing: %s" % ", ".join(broken))
-    print("  [newplant] chain verified: unit -> GSU -> collector -> MPT -> POI %s" % poi)
-    _np_record(cfg, lay, poi, mw_u, gsu_mva, mpt_mva)
-    # THE CASE HAS JUST CHANGED. Everything cached from it is now wrong -- see
-    # _topology_cache_reset(); without this the POI dispatch and its check both
-    # run against a network that has no new plant in it.
-    _topology_cache_reset("the new plant was added to the case")
-    return _np_roles(lay)
-
-
-def _np_z_xr(r, x):
-    """"Z = 7.70 %, X/R = 10.0" from the R and X that were actually used."""
-    try:
-        r, x = float(r), float(x)
-    except (TypeError, ValueError):
-        return ""
-    z = (r * r + x * x) ** 0.5
-    return "Z = %.2f %%, X/R = %.1f" % (100.0 * z, (x / r) if r else float("inf"))
-
-
-def _np_record(cfg, lay, poi, mw_u, gsu_mva, mpt_mva):
-    """NEW_PLANT.txt beside the results, so a run can be told apart from
-       another one built with different equipment. Same reason
-       COLLECTOR_IMPEDANCE.txt exists: the folder name records the RUN, not
-       what was in it."""
-    try:
-        d = RESULTS_DIR
-        if not os.path.isdir(d):
-            os.makedirs(d)
-        gsu = dict(cfg.get("gsu") or {}); col = dict(cfg.get("collector") or {})
-        mpt = dict(cfg.get("mpt") or {}); tie = dict(cfg.get("tie") or {})
-        with open(os.path.join(d, "NEW_PLANT.txt"), "w") as fh:
-            fh.write("NEW PLANT BUILT AT POI %s\n" % poi)
-            fh.write("written %s\n\n" % _ts())
-            fh.write("%s: %d unit(s) x %.1f MW = %.1f MW\n"
-                     % (lay["name"], lay["n"], mw_u, lay["n"] * mw_u))
-            fh.write("%.3f kV -> %.1f kV -> %.1f kV\n\n"
-                     % (lay["unit_kv"], lay["coll_kv"], lay["hv_kv"]))
-            # Z AND X/R AS WELL AS R AND X. A transformer is specified as an
-            # impedance and a ratio and stored as R and X, and reading the
-            # stored pair back to check it against a nameplate is arithmetic
-            # nobody should have to do twice. DERIVED here rather than carried,
-            # so it cannot disagree with what was actually built.
-            fh.write("GSU        R=%s X=%s on %.0f MVA (one per unit)   %s\n"
-                     % (gsu.get("r"), gsu.get("x"), gsu_mva,
-                        _np_z_xr(gsu.get("r"), gsu.get("x"))))
-            fh.write("collector  R=%s X=%s B=%s (one per unit, to the collector bus)\n"
-                     % (col.get("r"), col.get("x"), col.get("b")))
-            fh.write("MPT        R=%s X=%s on %.0f MVA   %s\n"
-                     % (mpt.get("r"), mpt.get("x"), mpt_mva,
-                        _np_z_xr(mpt.get("r"), mpt.get("x"))))
-            fh.write("POI tie    R=%s X=%s B=%s\n\n"
-                     % (tie.get("r"), tie.get("x"), tie.get("b")))
-            fh.write("buses created\n")
-            for b, kv, nm in lay["units"]:
-                fh.write("  %-8d %-14s %8.3f kV   MACHINE\n" % (b, nm, kv))
-            for b, kv, nm in lay["gsuhv"]:
-                fh.write("  %-8d %-14s %8.3f kV   GSU high side\n" % (b, nm, kv))
-            for b, kv, nm in (lay["coll"], lay["hv"]):
-                fh.write("  %-8d %-14s %8.3f kV\n" % (b, nm, kv))
-    except Exception as e:
-        print("  [newplant] could not write NEW_PLANT.txt (%s)" % e)
-
-
 def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
     global _SF_ALL_BRANCHES, _SF_ALL_XFMR, _POI_TIES
     """Build .cnv + .snp following RUN1C1.IDV (Run1-create-snap) EXACTLY:
@@ -14967,12 +11788,6 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # a new case is in memory: drop the cached topology so the POI tie branches and
         # the branch/transformer lists are re-read from THIS case
         _SF_ALL_BRANCHES = None; _SF_ALL_XFMR = None; _POI_TIES = None
-        # THE AREA TOTAL BEFORE ANYTHING IS ADDED -- see POI_P_TARGET_MW. Taken
-        # here because at this instant the case in memory is the UNMODIFIED one,
-        # which is the base case: the number the project case has to come back to.
-        if _any_poi_target():
-            for _mr, _mmw in _bess_members():
-                _poi_area_snapshot(_mr)
         # ---- WHAT THE PROJECT'S MACHINES REALLY ARE, BEFORE ANYTHING USES THEM
         #
         # _resolve_project_gens() reads the case and corrects PROJECT_GENS -- an
@@ -14999,10 +11814,6 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # correctly absent -- and the resolver drops buses it cannot find, which
         # would empty PROJECT_GENS just before the code that fills it.
         _adding_machines = bool(ENABLE_BESS)
-        try:
-            _adding_machines = _adding_machines or bool(_np_cfg())
-        except Exception:
-            pass
         if _adding_machines:
             print("  [proj] this build ADDS the project machines -- PROJECT_GENS is "
                   "checked against the case afterwards, not now")
@@ -15012,129 +11823,16 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # less project injection, so the reduced dispatch has to be what the
         # power flow converges to -- scaled afterwards, the snapshot would still
         # hold full output and the sweep would measure nothing.
+        if CAP_SCALE is not None:
+            _scale_project_output(CAP_SCALE)
         # BEFORE THE SOLVE, for the same reason: the collector impedance sets
         # the voltage rise between the machines and the POI, and a network
         # changed after the solution would appear in no result.
-        for _mr, _mmw in _bess_members() or [(None, None)]:
-            with _member_scope(_mr, _mmw):
-                if CAP_SCALE is not None:
-                    _scale_project_output(CAP_SCALE)
-                _apply_collector_impedance()
-        # 1a-) A BRAND-NEW FACILITY, when NEW_PLANT is on: buses, GSUs, collector,
-        #      MPT and the tie to the POI, created BEFORE the machines so the
-        #      machines have somewhere to go.
-        #
-        #      The unit buses it returns then REPLACE the project's feeder list,
-        #      which is what makes everything downstream work unchanged:
-        #      apply_bess_powerflow() puts a machine on each, _bess_dyr_text()
-        #      clones the dynamic models onto the same numbers, and PROJECT_GENS
-        #      -- what the monitoring, the tripping check and the scoring all
-        #      read -- follows the feeders. Special-casing any of those would be
-        #      a second code path whose results could not be compared with the
-        #      reuse study's.
-        _np = _np_cfg()
-        # THE PROJECT ROW, WHETHER OR NOT ENABLE_BESS IS ON.
-        #
-        # _ACTIVE_BESS is filled in only under `if ENABLE_BESS:` at the top of
-        # this file. NEW_PLANT is the OTHER way of adding the facility -- new
-        # buses and new machines rather than machines on the existing feeders --
-        # and it is normally used with ENABLE_BESS OFF. In that combination
-        # _ACTIVE_BESS was still None, and the very first thing this block does
-        # is read _ACTIVE_BESS["poi"]:
-        #
-        #     TypeError: 'NoneType' object is not subscriptable
-        #
-        # So the row is resolved here from BESS_PROJECTS by name, and if the
-        # project is not in that table a minimal one is built from POI_BUS --
-        # which is the only field build_new_plant() actually needs.
-        # ALSO WHEN THE PLANT IS ALREADY IN THE CASE.
-        #
-        # Once the .sav and .dyr have been built, the natural next step is to
-        # point PROJ_SAV/PROJ_DYR at them and switch ENABLE_BESS and NEW_PLANT
-        # off, so nothing is rebuilt. But _ACTIVE_BESS is filled in only under
-        # ENABLE_BESS, so it was None -- and apply_poi_p_target() begins
-        # "if not project: return". The POI dispatch would have been skipped
-        # WITHOUT A WORD, and the run would report a POI wherever the saved case
-        # happened to leave it.
-        if _ACTIVE_BESS is None and (_np or POI_P_TARGET_MW is not None):
-            _row = next((dict(p) for p in BESS_PROJECTS
-                         if str(p.get("name")) == str(ACTIVE_PROJECT)), None)
-            if _row is None:
-                _row = {"name": ACTIVE_PROJECT or "project", "area": None,
-                        "poi": POI_BUS, "mw": 0, "feeders": [],
-                        "disable_existing": False}
-                print("  [proj] %r is not in BESS_PROJECTS -- using POI_BUS %s "
-                      "and no existing feeders" % (ACTIVE_PROJECT, POI_BUS))
-            else:
-                print("  [proj] ENABLE_BESS is off; the project row for %s is taken "
-                      "from BESS_PROJECTS (POI %s, %s MW, feeders %s)"
-                      % (_row.get("name"), _row.get("poi"), _row.get("mw"),
-                         _row.get("feeders")))
-            globals()["_ACTIVE_BESS"] = _row
-            # AND THE RATING, for the same reason: _np_units_for() divides it
-            # into feeders and POI_P_PROJECT_AT = "rated" dispatches to it.
-            if not ACTIVE_MW:
-                try:
-                    globals()["ACTIVE_MW"] = _project_mw(_row, None)
-                    print("  [newplant] project rating: %s MW" % globals()["ACTIVE_MW"])
-                except Exception as _e:
-                    print("  [newplant] could not read the project's rating (%s)" % _e)
-        def _np_build_member(_mr):
-            """The new facility of ONE member: buses, GSUs, collector, MPT, tie.
-               Must run inside that member's _member_scope."""
-            _npc = _np_member_cfg(_np, _mr)
-            _np_plant = build_new_plant(_npc, _mr["poi"])
-            _np_buses = [b for role, b in _np_plant if role == "MACH"]
-            _mr.setdefault("feeders_original",
-                           [int(x) for x in (_mr.get("feeders") or [])])
-            _mr["feeders"] = _np_buses
-            if _mr.get("disable_existing") and not _npc.get("disable_existing"):
-                print("  [newplant] disable_existing was True for %s and is being "
-                      "IGNORED: a new facility is added to the system, not swapped "
-                      "for what is there." % _mr.get("name"))
-            _mr["disable_existing"] = bool(_npc.get("disable_existing"))
-            globals()["PROJECT_GENS"] = [(int(b), BESS_ID) for b in _np_buses]
-            globals()["PROJECT_GEN_BUSES"] = [int(b) for b in _np_buses]
-            print("  [newplant] %s machines are now %s"
-                  % (_mr.get("name"),
-                     ", ".join("%s '%s'" % (b, BESS_ID) for b in _np_buses)))
-            _np_buses_write(_np_plant)
-        if _np:
-            # ONE PLANT NOW -- the first member (or the only project). The other
-            # members' facilities are built one at a time onto the SOLVED case,
-            # each with its machines and dispatch, each solved before the next.
-            for _mr, _mmw in _bess_members_first():
-                with _member_scope(_mr, _mmw):
-                    _np_build_member(_mr)
+        _apply_collector_impedance()
         # 1a0) SURPLUS BESS: add the BESS machines (and optionally disable the existing
         #      gens) BEFORE the power-flow solve, so the dispatch includes the BESS.
-        # A POI TOTAL NEEDS THE EXISTING MACHINES IN SERVICE.
-        #
-        # disable_existing = True switches the machines on the feeder buses OUT
-        # OF SERVICE -- that is the "surplus" study, where the BESS REPLACES what
-        # is there. POI_P_TARGET_MW is the opposite question: the BESS runs at its
-        # rating and the EXISTING machines make up the difference to the target.
-        # With both in force there would be nothing left to make up the
-        # difference and the POI would come out at the BESS rating alone.
-        #
-        # The target wins, and the override is announced -- a setting quietly
-        # reversed is worse than one ignored.
-        for _mr, _mmw in _bess_members():
-            with _member_scope(_mr, _mmw):
-                if POI_P_TARGET_MW is not None and _mr.get("disable_existing"):
-                    print("  [poi-p] disable_existing was True for %s and is being IGNORED: "
-                          "POI_P_TARGET_MW = %.1f MW needs those machines in service to "
-                          "make up the difference."
-                          % (_mr.get("name"), POI_P_TARGET_MW))
-                    _mr["disable_existing"] = False
         if ENABLE_BESS:
-            for _mr, _mmw in _bess_members_first():
-                with _member_scope(_mr, _mmw):
-                    apply_bess_powerflow(_mr, _mmw)
-            if _bess_members_later():
-                print("  [together] %d more plant(s) are added one at a time AFTER the "
-                      "first solve, each solved before the next"
-                      % len(_bess_members_later()))
+            apply_bess_powerflow(_ACTIVE_BESS, ACTIVE_MW)
         # AFTER THE MACHINES EXIST, BEFORE THE SOLVE. They are added just above,
         # so switching off any earlier would find nothing to switch off; and the
         # power flow has to converge on the case with them out, or the snapshot
@@ -15143,14 +11841,6 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
             _switch_project_off()
         if MACHINES_OFF:
             _switch_machines_off()
-        # THE POI TOTAL, AND THE AREA PUT BACK. After the project machines exist
-        # (they are what the existing ones make up the difference to) and before
-        # the solve, so the converted case and the snapshot carry this dispatch.
-        if not PROJECT_OFF:
-            for _mr, _mmw in _bess_members_first():
-                with _member_scope(_mr, _mmw):
-                    if POI_P_TARGET_MW is not None:
-                        apply_poi_p_target(_mr, POI_P_TARGET_MW)
         # 1a) remove broken machines (garbage dynamic states crash the swing-capture
         #     writer at the first disturbance -- see REMOVE_MACHINES comment)
         _rm_list = REMOVE_MACHINES if APPLY_REMOVE_MACHINES else []
@@ -15186,99 +11876,20 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
                  _f, _f, _f, _f, _f, _f, _f, _f, _f, _f, _f])
         # 3) Robust power-flow solve (FDNS, then full-Newton polish if it hunts)
         solve_powerflow("FDNS")
-        if _bess_members_later():
-            _solve_to_mismatch(tol=TOGETHER_STEP_MISMATCH_MVA,
-                               tag="after adding %s" % _bess_members_first()[0][0].get("name"),
-                               abort=False)
-        # THE REST OF THE CLUSTER, ONE PLANT AT A TIME ONTO THE SOLVED CASE.
-        for _k, (_mr, _mmw) in enumerate(_bess_members_later(), 2):
-            with _member_scope(_mr, _mmw):
-                print("")
-                print("  [together] ===== plant %d of %d: %s -> the solved case ====="
-                      % (_k, len(_bess_members()), _mr.get("name")))
-                if _np:
-                    _np_build_member(_mr)
-                if POI_P_TARGET_MW is not None and _mr.get("disable_existing"):
-                    _mr["disable_existing"] = False
-                if ENABLE_BESS:
-                    apply_bess_powerflow(_mr, _mmw)
-                if PROJECT_OFF:
-                    _switch_project_off()
-                elif POI_P_TARGET_MW is not None:
-                    apply_poi_p_target(_mr, POI_P_TARGET_MW)
-                _solve_staged(_mr)
         # 3a) SURPLUS BESS: gross up the gen dispatch so the POI meter delivers the target
         #     P/Q despite intertie losses (solve/measure/adjust loop).
-        # NOT WHEN A POI TOTAL IS IN FORCE. tune_bess_poi_delivery() grosses the
-        # BESS machines UP until the POI meter reads ACTIVE_MW -- which moves them
-        # off the rating this run pinned them to, and moves the area off the total
-        # it was just held at. Two mechanisms aiming at the same machines from
-        # different directions, and the later one wins silently.
-        for _mr, _mmw in _bess_members():
-            with _member_scope(_mr, _mmw):
-                if ENABLE_BESS and POI_TUNE_DELIVERY and POI_P_TARGET_MW is None:
-                    tune_bess_poi_delivery(_mr, _mmw)
-                elif ENABLE_BESS and POI_TUNE_DELIVERY:
-                    print("  [poi-p] POI_TUNE_DELIVERY is ON but POI_P_TARGET_MW is set -- the "
-                          "tuner is SKIPPED, or it would move the machines off the dispatch "
-                          "this run just fixed.")
-        # THE AREA, AFTER THE SOLVE. Holding it before the solve is not enough:
-        # the solve moves the system slack to cover the change in losses, and if
-        # the slack is in this area the total comes out somewhere near the one
-        # asked for rather than on it. Re-measured and re-held here, on the
-        # SOLVED case, which is the number that goes into the snapshot.
-        # THE METERED TARGET FIRST, then the area. In that order because the
-        # gross-up changes the machines, and the area hold has to be the last
-        # word on what the area totals.
-        _mm = _bess_members()
-        # Two rounds when several plants are metered: the second plant's
-        # redispatch moves the flows at the first plant's POI a little.
-        for _round in range(2 if len(_mm) > 1 else 1):
-            for _mr, _mmw in _mm:
-                with _member_scope(_mr, _mmw):
-                    if (POI_P_TARGET_MW is not None
-                            and (POI_P_MEASURE or "metered").strip().lower() == "metered"):
-                        apply_poi_p_metered(_mr, POI_P_TARGET_MW)
-        if _any_poi_target() and POI_HOLD_AREA_MW:
-            for _hr in _hold_rows():
-                _poi_hold_area_after_solve(_hr)
-        # ---- 0 MVAr AT THE POI (POI_Q_ZERO): the machines carry their own
-        # collector losses. After the P metering and the area hold, before the
-        # P verification, so what is verified and saved is the final state.
-        if ENABLE_BESS and POI_Q_ZERO:
-            for _mr, _mmw in _mm:
-                with _member_scope(_mr, _mmw):
-                    try:
-                        zero_bess_poi_q(_mr, _mmw)
-                    except Exception as _qe:
-                        print("  [poi-q] *** %s: reactive zeroing failed (%s) -- machines left as metered ***"
-                              % (_mr.get("name"), _qe))
-        # THE LAST WORD ON THE POI TOTAL, per plant, on the solved case.
-        for _mr, _mmw in _mm:
-            with _member_scope(_mr, _mmw):
-                if POI_P_TARGET_MW is not None:
-                    _poi_target_verify(_mr, POI_P_TARGET_MW)
+        if ENABLE_BESS and POI_TUNE_DELIVERY:
+            tune_bess_poi_delivery(_ACTIVE_BESS, ACTIVE_MW)
         # 3a2) SURPLUS BESS: hand the machines their full 0.95-pf reactive RANGE back.
         #      The tuning loop pinned QT=QB=QG so the POI Q landed on target; saving the
         #      case that way would leave every inverter with no reactive capability.
         #      QG (the initial condition) is not touched.
         if ENABLE_BESS:
-            for _mr, _mmw in _bess_members():
-                with _member_scope(_mr, _mmw):
-                    _bess_restore_q_limits(_mr, _mmw)
+            _bess_restore_q_limits(_ACTIVE_BESS, ACTIVE_MW)
         # 3b) SURPLUS BESS: save the MODIFIED power-flow case BEFORE the GNET/CONL
         #     conversions, so it re-loads as a normal solved case. The ORIGINAL is untouched.
         if ENABLE_BESS:
             chk(psspy.save(MOD_SAV), "save modified .sav (%s)" % os.path.basename(MOD_SAV))
-            if _together_row():
-                print("")
-                print("  [together] ===== CLUSTER CASE SAVED: %s =====" % MOD_SAV)
-                print("  [together] every plant is in it, dispatched, each area held; the "
-                      "member studies reuse this file, its .cnv/.snp and the combined .dyr")
-                for _mr, _mmw in _bess_members():
-                    print("  [together]   %-16s %g MW  POI %s  machines %s"
-                          % (_mr.get("name"), float(_mmw or 0), _mr.get("poi"),
-                             ", ".join("%s '%s'" % (b, m) for b, m in _member_gens(_mr)) or "-"))
         # THE SOLVED POWER FLOW, TO TOLERANCE, BEFORE ANY CONVERSION.
         # The existing check runs after CONL, just before the .cnl is saved --
         # by then the loads are converted and a mismatch is harder to read and
@@ -15322,24 +11933,13 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         #     and conet.flx for this model set; they are Fortran until these run.
         #     Before the snapshot, because everything after inherits it.
         #
-        # WHAT "CHANGED" HAS TO MEAN, and what it used to mean.
-        #
-        # This was bool(DYR_EDITS) -- the panel's edit list. That is NOT what
-        # changes the model set. The deck handed to dyre_new is _dyr_used, and
-        # it is the original .dyr ONLY when the BESS is off and nothing was
-        # edited. With ENABLE_BESS on it is the combined deck, carrying a
-        # REGCAU1 / REECCU1 / REPCAU1 block per feeder that the original does
-        # not contain -- and with NEW_PLANT on, those blocks are on buses that
-        # did not exist a moment ago.
-        #
-        # So with DYR_EDITS empty and DYR_COMPILE_WHEN = "on-edit", the compile
-        # returned on its first line, SILENTLY. dyre_new had rewritten
-        # conec.flx and conet.flx for the new model set, dsusr.dll was still
-        # the previous set's, and PSS/E ran the old routines against the new
-        # deck -- which is precisely the "plausible garbage" this whole
-        # mechanism exists to prevent.
-        #
-        # The deck being different from the original is the honest test.
+        # THE DECK, NOT THE EDIT LIST. This was bool(DYR_EDITS), which is empty
+        # for a normal run, so with DYR_COMPILE_WHEN at its default of
+        # "on-edit" the compile returned on its first line and did so silently.
+        # The base case is edited less often than the project case, but
+        # DYR_APPLY_TO = "both" reaches it, and a base case running the
+        # previous model set's dsusr.dll is the half of the comparison nobody
+        # would think to check.
         _deck_changed = bool(DYR_EDITS)
         try:
             _deck_changed = _deck_changed or (
@@ -15706,7 +12306,7 @@ def _run_to(t_end, total_end, label):
 # four workers appending to one file interleave their lines, and the timings
 # would be unreadable exactly when a run is slow enough to want them.
 #
-# The report phase gathers them into RUN_TIMES, and z6_cmp_all_con.py puts the
+# The report phase gathers them into RUN_TIMES, and z6_main.py puts the
 # two cases side by side -- which is the question worth asking, because "the
 # project case is slower" is a statement about the model and "both cases are
 # slower" is a statement about the machine.
@@ -15977,8 +12577,79 @@ def _project_feeder_buses():
         return []
 
 
+# THIS IS THE BASE CASE. The project is NOT in it -- that is what "base" means
+# and what every comparison rests on. _project_online_check() below is the
+# project engine's routine: it forces the project machines in service and
+# closes the POI ties before strt_2. In a base .sav that simply does not hold
+# the plant it is a no-op, which is why it never showed. The EastFork base
+# .sav DOES hold the plant, saved out of service with its tie open -- and the
+# routine switched it on before every fault, with no power-flow solve behind
+# it. strt_2 then initialised a network that was never solved in that state:
+# the flat run (which does not call this) came up clean, every fault run came
+# up with NaN in models three areas away. So in the base engine the project
+# is left exactly as the case was saved, and only REPORTED.
+BASE_PROJECT_STAYS_AS_SAVED = True
+
+
+def _project_state_report(tag="pre-fault"):
+    """Say what the saved case holds for the project machines and POI ties.
+       Touches nothing."""
+    try:
+        gens = list(PROJECT_GENS)
+    except Exception:
+        gens = []
+    # THE NEW PLANT'S MACHINES TOO: a base .sav that was derived from a project
+    # case can hold the 9999xx plant, and a plant in service there is a base
+    # that includes the project just as much as the feeder machines are.
+    try:
+        for g in _new_plant_gens() or []:
+            if tuple(g) not in [tuple(x) for x in gens]:
+                gens.append(tuple(g))
+    except Exception:
+        pass
+    if not gens:
+        return None, None
+    on, off, unknown = [], [], []
+    for (b, mid) in gens:
+        try:
+            ie, st = psspy.macint(int(b), str(mid), "STATUS")
+            if ie == 0:
+                (on if int(st) == 1 else off).append("%s '%s'" % (b, mid))
+            else:
+                unknown.append("%s '%s'" % (b, mid))
+        except Exception:
+            unknown.append("%s '%s'" % (b, mid))
+    closed = opened = 0
+    try:
+        for (a, b, ck) in _poi_ties_all([g[0] for g in gens]):
+            try:
+                ie, st = psspy.brnint(int(a), int(b), str(ck), "STATUS")
+                if ie == 0 and int(st) == 1:
+                    closed += 1
+                elif ie == 0:
+                    opened += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    print("  [%s] [%s] BASE CASE: project left as the case was saved -- %d machine(s) "
+          "out of service%s, %d in service%s; POI ties: %d open, %d closed"
+          % (_ts(), tag, len(off), (" (%s)" % ", ".join(off)) if off else "",
+             len(on), (" (%s)" % ", ".join(on)) if on else "", opened, closed))
+    if unknown:
+        print("  [%s] [%s]   not in this case: %s" % (_ts(), tag, ", ".join(unknown)))
+    if on:
+        print("  [%s] [%s]   *** project machine(s) are IN SERVICE in the BASE case: "
+              "this base includes the project. If that is not intended, save the "
+              "base .sav with them out of service ***" % (_ts(), tag))
+    return None, None
+
+
 def _project_online_check(tag="pre-fault"):
     """Make sure the PROJECT is generating before the fault is applied, and say so.
+
+       BASE ENGINE: with BASE_PROJECT_STAYS_AS_SAVED (the default) this only
+       reports -- see the note above _project_state_report.
 
        Two things can leave it dark at t=0: a project machine saved out of service in
        the built case, or a POI tie branch left open. Both are forced back here, right
@@ -15986,6 +12657,8 @@ def _project_online_check(tag="pre-fault"):
        plant online at its full dispatch. Nothing else in the case is touched.
 
        Returns the (P, Q) delivered across the interconnection cut, or (None, None)."""
+    if BASE_PROJECT_STAYS_AS_SAVED:
+        return _project_state_report(tag)
     try:
         gens = list(PROJECT_GENS)
     except Exception:
@@ -18897,7 +15570,6 @@ def export_channels_csv(path, kb):
           % (name, csv_path, len(cols), (len(t) + st - 1) // st))
     return csv_path
 
-
 def _g(name, default=None):
     """A global if this script has one, else the default.
 
@@ -19165,7 +15837,7 @@ def make_plots(path, is_flat, kb, tclear=None):
     # killed mid-draw (the stall timeout, an access violation, a reboot) leaves
     # a TRUNCATED .pdf on disk, and every "does this .out have a PDF?" test in
     # the toolchain -- _count_unplotted(), the had_pdf check above,
-    # z6_cmp_all_con.py's plot-missing scan -- is a file-exists test. The scenario
+    # z6_main.py's plot-missing scan -- is a file-exists test. The scenario
     # would count as drawn for good, and the pass would report success over a
     # PDF that cannot be opened.
     #
@@ -22732,7 +19404,7 @@ def evaluate_case(path, kind, tclear, kb):
                     # and well damped about its settling value, and is here only
                     # because SPPR is measured from the run minimum. Untagged,
                     # every downstream reader (and the comparison's roll-up at
-                    # z6_cmp_all_con.py:3369, which labels the whole bucket
+                    # z6_main.py:3369, which labels the whole bucket
                     # "machines below 16 deg needing individual review")
                     # described a healthy machine as an unresolved one -- and
                     # this one is not even below 16 deg.
@@ -22951,7 +19623,7 @@ def evaluate_case(path, kind, tclear, kb):
 # with identical filenames are two files you have to remember the provenance of
 # -- and remembering it wrongly once is a comparison that says the project fixed
 # something the base never had.
-RUN_KIND = "PROJ"
+RUN_KIND = "BASE"
 
 # THE ROOT OF A RESULTS FOLDER HOLDS THREE FILES, NOT FIFTEEN.
 #
@@ -23009,8 +19681,8 @@ def report_path(stem, ext, tag=""):
        project suffix, the case kind and the folder cannot drift apart across
        the writers.
 
-           reports\SPP_CRITERIA_REPORT_PROJ_EastFork.txt
-           02_VIOLATIONS_PROJ_EastFork.txt        <- root: read while running
+           reports\SPP_CRITERIA_REPORT_BASE_EastFork.txt
+           02_VIOLATIONS_BASE_EastFork.txt        <- root: read while running
     """
     proj = ("_%s" % RUN_PROJECT) if (NAME_FILES_BY_PROJECT and RUN_PROJECT) else ""
     head = ROOT_REPORTS.get(stem)
@@ -26538,7 +23210,7 @@ def _reset_resume_state():
     # were finished was gone, and the next launch set out to simulate them all
     # again.
     #
-    # z6_cmp_all_con.py says what it wants in SPP_FRESH_START -- "1" when its
+    # z6_main.py says what it wants in SPP_FRESH_START -- "1" when its
     # FRESH_START is on, "0" otherwise -- and only that explicit "1" clears the
     # .done markers and .attempts counters here. The claims and .returns
     # counters are this process's bookkeeping and are cleared regardless.
@@ -29181,7 +25853,7 @@ QUEUE_MAX_RETURNS = 3
 # anything still free when it trips is picked up by the next launch.
 MAX_QUEUE_PASSES = 50
 
-# what z6_cmp_all_con.py sends, applied below the settings themselves
+# what z6_main.py sends, applied below the settings themselves
 DYNAMIC_WORK        = _env_bool("SPP_DYNAMIC_WORK", DYNAMIC_WORK)
 CLAIM_STALE_S       = float(_env_num("SPP_CLAIM_STALE_S", CLAIM_STALE_S))
 
@@ -29697,9 +26369,6 @@ def sf_make_custom_fault_list():
     print("[faults] CUSTOM set: %s at %d bus(es) within %d hop(s) of POI %d, "
           "kV >= %.1f" % ("/".join(CUSTOM_TYPES), len(buses), CUSTOM_HOPS, poi,
                           CUSTOM_KV_MIN))
-    # WHAT CLEARING TIME EACH TYPE ACTUALLY GOT, and where it came from. With a
-    # per-kV rule the answer is no longer one number, and "10cy" in a scenario
-    # id is the only place it was ever visible.
     print("[faults]   %d type(s) -> %d scenario(s); clearing time per type:"
           % (len(CUSTOM_TYPES), len(out)))
     for _t in CUSTOM_TYPES:
@@ -30567,7 +27236,7 @@ def _imported_or_shared(make_list):
     # and no temp-and-rename, so a study process could also read a half-written
     # list and run a short fault set without complaint.
     #
-    # z6_cmp_all_con.py names the publisher with SPP_PUBLISH_SHARED, from its
+    # z6_main.py names the publisher with SPP_PUBLISH_SHARED, from its
     # FAULT_LIST_FROM setting. With nothing said -- a study run on its own,
     # outside the comparison -- the old rule applies and this case publishes.
     _may_publish = _env_bool("SPP_PUBLISH_SHARED",
@@ -31240,7 +27909,7 @@ def finalize_report(produced, part=None, claim=False):
                                     continue
                         _rows = []
                         # THE EXACT WORDING evaluate_case USES, character for
-                        # character. The comparison in z6_cmp_all_con.py pairs BASE
+                        # character. The comparison in z6_main.py pairs BASE
                         # against PROJ by matching the criterion STRING, so a
                         # divergence row phrased differently ("... of clearing",
                         # "... after clearing", "Rotor-angle damping (SPPR1 <=
@@ -31457,7 +28126,7 @@ def finalize_report(produced, part=None, claim=False):
             # you N reports each covering a sixth of the study.
             #
             # UNLESS THIS IS THE ONLY SHARD. The launcher refuses to merge for
-            # one (z6_lch_b_con.py: `if n <= 1: return True`), so returning here is
+            # one (z6_lch_b.py: `if n <= 1: return True`), so returning here is
             # how a pass that scored every scenario ends with no report on disk.
             # With one shard there is no "a sixth of the study" -- what it holds
             # IS the study -- so it falls through and writes the report itself.
@@ -32522,7 +29191,7 @@ def main():
             # SPP_CRITERIA_REPORT is ever written" this study has been seeing,
             # and it is a bug, not the cost of reading .out files.
             #
-            # The launcher refuses to merge for a single shard (z6_lch_b_con.py:
+            # The launcher refuses to merge for a single shard (z6_lch_b.py:
             # `if n <= 1: return True`), so this shard also writes the merged
             # report itself -- see the tail of finalize_report().
             finalize_report(produced, part=WORKER_INDEX)
@@ -32530,7 +29199,7 @@ def main():
         return
 
     # ---- GENERATE THE FAULT LIST AND STOP ----------------------------------
-    # z6_cmp_all_con.py's phase 0 needs one thing from this script: the fault
+    # z6_main.py's phase 0 needs one thing from this script: the fault
     # set for this case's topology. It used to get it by running the BUILD role,
     # which rebuilds the whole snapshot first -- loads the case, adds the plants,
     # solves, writes .cnv/.snp -- and only then reaches the generator. That is
@@ -32590,7 +29259,7 @@ def main():
     # So the decision is made twice: once here, to find out whether a build is
     # needed at all, and again under the lock, where a worker that waited can
     # see what the worker that built has left behind and reuse it.
-    _need_build = (FORCE_REBUILD or (eff_run_flat and not _flat_done and not _shared_build_ok())
+    _need_build = (FORCE_REBUILD or (eff_run_flat and not _flat_done)
                    or not (os.path.isfile(SNP_FILE) and os.path.isfile(CNV_CASE))
                    or not _collector_stamp_matches()
                    or not _snapshot_dll_matches())
@@ -32636,15 +29305,9 @@ def main():
             print("[resume] reusing existing snapshot (flat already built it this session): %s" % SNP_FILE)
     finally:
         _lock_release(_blk)
-    # NO BUILD MEANS NO dyre_new, AND SO NO COMPILE.
-    #
-    # This is the third way the .bat files come not to run, and the quietest:
-    # nothing in the compile is skipping anything, because the compile is never
-    # reached. The snapshot on disk is reused and dsusr.dll is whatever the run
-    # that made it left behind -- which is right when that run is this study,
-    # and wrong the moment the folder has been touched since.
-    #
-    # So it is checked and said out loud rather than assumed.
+    # NO BUILD MEANS NO dyre_new, AND SO NO COMPILE -- see z6_spp_p.py. The
+    # quietest of the ways the .bat files come not to run: nothing is skipping
+    # anything, the compile is simply never reached.
     if not _did_build:
         # NOT ONLY A WARNING ANY MORE.
         #
@@ -32681,7 +29344,7 @@ def main():
         #
         # custom called the generator directly and never looked at FAULTS_CSV,
         # so every worker of BOTH cases built the list from its OWN deck's
-        # topology -- while z6_cmp_all_con.py printed "both studies read <shared>
+        # topology -- while z6_main.py printed "both studies read <shared>
         # ... same file, same events, so the comparison is like for like" about
         # the mode the panel actually selects. The two cases do not have the
         # same topology: the project buses exist on one side and not the other,
@@ -33140,7 +29803,7 @@ def main():
 # the simulation ran; the marker is bookkeeping, and a marker that is missing is
 # not a reason to withhold a plot from data that exists.
 #
-# Driven by SPP_PLOT_MISSING=1 (z6_cmp_all_con.py sets it for PIPELINE = "missing").
+# Driven by SPP_PLOT_MISSING=1 (z6_main.py sets it for PIPELINE = "missing").
 # It runs before anything else and then exits, so it never starts PSS/E, never
 # touches the queue and cannot disturb a study running in parallel with it.
 def _plotter_lock_path():
@@ -33330,7 +29993,7 @@ def _pdf_current(sid):
        A PDF drawn before its scenario was re-simulated shows the previous
        run. Existence alone kept such pages for ever; comparing the two
        timestamps replaces the label-guessing heuristic that used to move
-       whole groups of PDFs aside (RETIRE_STALE_PDFS in z6_cmp_all_con.py)."""
+       whole groups of PDFs aside (RETIRE_STALE_PDFS in z6_main.py)."""
     pdf = os.path.join(PLOT_DIR, "%s_plots.pdf" % sid)
     if not os.path.isfile(pdf):
         return False
@@ -33340,7 +30003,7 @@ def _pdf_current(sid):
             return False
     except Exception:
         pass
-    # FORCE_REPLOT (z6_cmp_all): a PDF drawn before this launch started is
+    # FORCE_REPLOT (z6_main): a PDF drawn before this launch started is
     # redrawn from its .out -- the plot layout changed, the .out did not.
     try:
         _rb = float(os.environ.get("SPP_REPLOT_BEFORE") or 0)
@@ -33824,7 +30487,7 @@ def plot_missing_outs():
     #
     # A plotter that finds its files condemned refuses them in a second or two
     # and exits 0, having done exactly what it should. The supervisor in
-    # z6_cmp_all_con.py saw only "exited after 5s" and announced "it is failing at
+    # z6_main.py saw only "exited after 5s" and announced "it is failing at
     # startup" -- which sent the reader to a log about a startup that was fine,
     # while the actual reason (a .badout marker, or three recorded read deaths)
     # sat in this process's own output and nowhere else.
@@ -33883,7 +30546,7 @@ def plot_missing_outs():
         # takes the file over.
         # ---- IS A PER-FILE CLAIM NEEDED AT ALL? ---------------------------
         #
-        # Only in FLEET mode. There, z6_cmp_all_con.py runs several plotters over
+        # Only in FLEET mode. There, z6_main.py runs several plotters over
         # one folder and the folder-level lock is deliberately off, so this
         # claim is the only thing keeping two of them off the same file.
         #
@@ -34347,7 +31010,7 @@ def plot_missing_outs():
         # is what the rounds do -- never addressed it.
         #
         # A fresh process has a fresh address space. So this draws ONE scenario
-        # and returns; _plot_missing_pass() in z6_cmp_all_con.py already refills a
+        # and returns; _plot_missing_pass() in z6_main.py already refills a
         # slot as soon as its plotter exits, so the next file starts clean and
         # the fleet size stays exactly what was asked for.
         #
@@ -34498,7 +31161,7 @@ def plot_missing_outs():
     # goes. Same script, same environment, fresh 2 GB. The chain continues
     # until the folder is finished, whether or not a run is going on.
     if _relaunch_for_next and MAKE_PLOTS and _env_bool("SPP_PLOT_FLEET", False):
-        # UNDER THE PANEL'S FLEET the slot is refilled by z6_cmp_all_con.py the
+        # UNDER THE PANEL'S FLEET the slot is refilled by z6_main.py the
         # moment this process exits. Starting a successor here as well put a
         # second, unsupervised chain of plotters beside the fleet -- outside
         # PLOT_TOTAL_MAX, invisible to the progress line, and holding claims
@@ -34556,7 +31219,7 @@ if __name__ == "__main__":
     #
     #     MERGE_ONLY = True   in the settings above, or
     #     set SPP_MERGE_ONLY=1  in the environment
-    #     <python> z6_spp_p_con.py
+    #     <python> z6_spp_p.py
     #
     # Safe beside a live run: it only reads parts\ and writes reports\.
     if MERGE_ONLY:

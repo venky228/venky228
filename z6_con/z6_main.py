@@ -337,7 +337,7 @@ DYR_SWEEP_COMPARE    = True                 # also write a full comparison folde
 # wasted day of compute. Such variants are skipped; the comparison already
 # carries as-studied as its "project" column, so nothing is lost.
 #
-# THE DECK VALUES ARE READ AUTOMATICALLY from BESS_MODEL_TEMPLATE in z6_spp_p_con.py
+# THE DECK VALUES ARE READ AUTOMATICALLY from BESS_MODEL_TEMPLATE in z6_spp_p.py
 # (they are already there: Kqv 2.0, Khv 0.0, Volim 1.2, ...), overlaid by the
 # panel .dyr edits the as-studied run applies. You need declare nothing.
 #
@@ -794,7 +794,7 @@ NEW_PLANT = {
     # So this is a question about the PROJECT, not about the script: is the BESS
     # its own facility with its own collector and transformer, or is it behind
     # the existing one? Set it accordingly. See NEW_GEN_BUS_PREFIX and
-    # POI_P_PROJECT_MW in z6_spp_p_con.py.
+    # POI_P_PROJECT_MW in z6_spp_p.py.
     "units":        None,                   # None = project MW / 200 MW cap, divided EQUALLY
     "mw_per_unit":  None,                   # None = follows from the above
     "unit_kv":      0.69,
@@ -1723,13 +1723,13 @@ SEARCH_ROOT = STUDY_ROOT                   # the folder the cases sit in
 CASE_BASE = {
     "key":    "BASE",
     "dir":    BASE_DIR,
-    "script": "z6_lch_b_con.py",
+    "script": "z6_lch_b.py",
     "label":  "base case -- projects NOT modelled",
 }
 CASE_TEST = {
     "key":    "PROJ",
     "dir":    TEST_DIR,
-    "script": "z6_lch_p_con.py",
+    "script": "z6_lch_p.py",
     "label":  "one BESS project added to the base case, one project at a time",
 }
 
@@ -9485,7 +9485,7 @@ def _dyr_sweep_variants(proj=None):
     variants = [("dyr_" + t, e) for t, e in out]
     # DROP ANY VARIANT THAT IS THE DECK AS IT STANDS. The deck values come from
     # the engine's BESS_MODEL_TEMPLATE automatically (they are already in
-    # z6_spp_p_con.py), overlaid by DYR_DECK_VALUES and the panel edits -- so no
+    # z6_spp_p.py), overlaid by DYR_DECK_VALUES and the panel edits -- so no
     # value need be typed twice. See DYR_DECK_VALUES / DYR_SWEEP_SKIP_DECK.
     if DYR_SWEEP_SKIP_DECK:
         kept, dropped = [], []
@@ -9510,7 +9510,7 @@ _ENGINE_DYR_DEFAULTS = [None]
 
 def _engine_dyr_defaults():
     """{model: {constant name: value}} read from BESS_MODEL_TEMPLATE in the
-       project engine (z6_spp_p_con.py) -- the deck defaults that are ALREADY in the
+       project engine (z6_spp_p.py) -- the deck defaults that are ALREADY in the
        file, so the guard needs no hand-typed DYR_DECK_VALUES.
 
        The template annotates every record: an "@!/ name name ..." line above a
@@ -9524,8 +9524,8 @@ def _engine_dyr_defaults():
     try:
         spp = _study_script_for(CASE_TEST)
         if not spp:
-            for _p in (os.path.join(TEST_DIR, "z6_spp_p_con.py"),
-                       _root_named("z6_spp_p_con.py")):
+            for _p in (os.path.join(TEST_DIR, "z6_spp_p.py"),
+                       _root_named("z6_spp_p.py")):
                 if os.path.isfile(_p):
                     spp = _p
                     break
@@ -13549,7 +13549,7 @@ def _push_settings(env, case):
     # change the very case the comparison measures against -- so every difference
     # afterwards would be "the project, plus a base case we moved".
     #
-    # z6_spp_b_con.py implements none of this, so the variables were ignored there in
+    # z6_spp_b.py implements none of this, so the variables were ignored there in
     # any case. They are removed rather than left to be ignored: an environment
     # that carries a setting the process does not honour is a setting somebody
     # will later believe was applied.
@@ -14512,7 +14512,7 @@ def check_fault_lists():
         print("[compare]     %s  ->  %s + its study script"
               % (CASE_TEST["dir"], CASE_TEST["script"]))
         print("[compare]   This file (%s) sits in the folder ABOVE them."
-              % os.path.basename(__file__ if "__file__" in dir() else "z6_cmp_all_con.py"))
+              % os.path.basename(__file__ if "__file__" in dir() else "z6_main.py"))
         return False
 
     # BOTH GENERATING = two different fault sets, and nothing later can tell.
@@ -14639,7 +14639,7 @@ def check_feeder_ratings():
        equally across its feeders and ABORTS when a feeder would carry more
        than FEEDER_MAX_MW:  804 / 4 = 201.0 against a cap of 200.0.
 
-       That check is module-level code in z6_spp_p_con.py, so it raises on IMPORT,
+       That check is module-level code in z6_spp_p.py, so it raises on IMPORT,
        before main(). Every process of that project's PROJECT-case pass died the
        same way -- build, worker, report, plot -- the launcher retried the build
        three times and gave up, and the pass produced no results folder at all.
@@ -15079,7 +15079,7 @@ def _cases_to_run():
 
 
 def _study_script_for(case):
-    """The STUDY script for this case -- z6_spp_b_con.py / z6_spp_p_con.py.
+    """The STUDY script for this case -- z6_spp_b.py / z6_spp_p.py.
 
        NOT case["script"], which is the LAUNCHER. The launcher runs a whole
        study: build, simulate, report. It does not know SPP_PLOT_MISSING and
@@ -16057,7 +16057,7 @@ def run_merge_only():
     """The merge step alone, for every project and both cases. Returns how many
        folders were rebuilt.
 
-       See MERGE_ONLY. This spawns the STUDY script (z6_spp_p_con.py / z6_spp_b_con.py)
+       See MERGE_ONLY. This spawns the STUDY script (z6_spp_p.py / z6_spp_b.py)
        with SPP_MERGE_ONLY=1, which is handled before main() -- so no PSS/E
        session is started, no case is loaded and no .out is opened. A folder
        with no parts\ is skipped and said so, rather than writing an empty
@@ -16240,7 +16240,7 @@ def _merge_one_folder(case, rdir):
     env = dict(os.environ)
     # THE SAME ENVIRONMENT THE RUN HAD. Without it the merge process fell back
     # to the study script's own deck names -- "DIS2201-25SP-G03-CQ.sav (this
-    # file -- z6_cmp_all_con.py did not name one)" -- could not find the
+    # file -- z6_main.py did not name one)" -- could not find the
     # _CQ_F_..._NEWPLANT_newplant_buses.txt the run had written, and rebuilt
     # the violations report with "PROJECT_GENS stays on the project's declared
     # feeder buses": the wrong machines labelled as the project's. The decks,
@@ -16776,7 +16776,7 @@ def mark_partial_runs(quiet=False):
         for sid, te in found:
             try:
                 with open(os.path.join(od, sid + ".partial"), "w") as fh:
-                    fh.write("tend=%.3f\nby=z6_cmp_all_con (time axis)\n" % te)
+                    fh.write("tend=%.3f\nby=z6_main (time axis)\n" % te)
                 n_new += 1
                 if not quiet:
                     print("[compare]     %-10s reached %.2f s of %.2f s" % (sid, te, _end))
@@ -18963,10 +18963,10 @@ if __name__ == "__main__":
 # HOW THE TWO SIDES STAY APART. They read the same file and write different
 # ones:
 #
-#   base case      ENABLE_BESS = False in z6_spp_b_con.py, so NO .sav is ever
+#   base case      ENABLE_BESS = False in z6_spp_b.py, so NO .sav is ever
 #                  saved -- it reads the deck, converts in memory, and writes
 #                  DIS2201-25SP-G03-CQ.cnv/.snp/.cnl into the Base folder
-#   project case   ENABLE_BESS = True in z6_spp_p_con.py, so the build writes
+#   project case   ENABLE_BESS = True in z6_spp_p.py, so the build writes
 #                  DIS2201-25SP-G03-CQ_BESS_<project>_<MW>MW.sav/.cnv/.snp
 #                  into the Projects folder -- one set per project, beside the
 #                  untouched original
@@ -19666,9 +19666,9 @@ if __name__ == "__main__":
 # ============================  CONTROL PANEL  ===============================
 # ============================================================================
 # EVERYTHING YOU NORMALLY CHANGE IS HERE. The rest of this file, and both
-# launchers, take their instructions from these -- z6_cmp_all_con.py passes
+# launchers, take their instructions from these -- z6_main.py passes
 # them down through the environment, so a run driven from here does not need
-# z6_lch_b_con.py or z6_lch_p_con.py to be edited at all. Anything set in
+# z6_lch_b.py or z6_lch_p.py to be edited at all. Anything set in
 # a launcher is OVERRIDDEN while this script is driving.
 #
 # Each setting keeps its full explanation further down, beside the code that
@@ -19686,9 +19686,9 @@ if __name__ == "__main__":
 # to another machine: put the five scripts and the two case folders on the new
 # PC, run this file from where it sits, and every path below follows it.
 #
-#   <ROOT>\                  z6_cmp_all_con.py    <- this file
-#     Base\                  z6_lch_b_con.py  z6_spp_b_con.py
-#     Projects\              z6_lch_p_con.py  z6_spp_p_con.py  + THE ONE DECK
+#   <ROOT>\                  z6_main.py    <- this file
+#     Base\                  z6_lch_b.py  z6_spp_b.py
+#     Projects\              z6_lch_p.py  z6_spp_p.py  + THE ONE DECK
 #
 # With SHARED_DECK on there is a single deck, in Projects\, and it is the BASE
 # CASE -- the system with none of the new BESS in it. The Base folder holds the
