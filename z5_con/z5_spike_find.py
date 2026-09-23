@@ -47,7 +47,7 @@ report files above).
 from __future__ import print_function
 import os, sys, re, csv, glob, time
 
-VERSION = "2026-09-23f"      # z5_probe_psse.py checks this
+VERSION = "2026-09-23g"      # z5_probe_psse.py checks this
 
 # =========================== SETTINGS ======================================
 ROOT          = ""            # "" = the folder this file is in (the study root)
@@ -565,9 +565,25 @@ def run_folder(kind, proj, res_dir, vcsv):
     tag = KINDS[kind][2]
     rows = read_overshoots(vcsv)
     faults_all = set()
+    other_viol = {}                    # fault -> set of NON-overshoot violation kinds
     with open(vcsv, newline="") as fh:
         for r in csv.DictReader(fh):
-            faults_all.add((r.get("fault_id") or "").strip())
+            fid = (r.get("fault_id") or "").strip()
+            faults_all.add(fid)
+            k = (r.get("violation") or "").strip().lower()
+            if k and k not in ("overshoot", "review"):
+                other_viol.setdefault(fid, set()).add(k)
+    # faults whose ONLY violation is overshoot, and every overshoot is a SPIKE
+    spike_only, swing_faults = [], []
+    for fr in set(r["fault"] for r in rows):
+        fr_rows = [r for r in rows if r["fault"] == fr]
+        if all(r["dur"] is not None and r["dur"] <= SPIKE_S + 1e-9 for r in fr_rows):
+            if not other_viol.get(fr):
+                spike_only.append(fr)
+        else:
+            swing_faults.append(fr)
+    spike_only.sort()
+    swing_faults.sort()
     buses = rank_buses(rows, len(faults_all))
     faults = rank_faults(rows)
     groups = group_buses(buses)
@@ -639,6 +655,16 @@ def run_folder(kind, proj, res_dir, vcsv):
         W("=" * 100 + "\n")
         W(" %d distinct bus(es) over %.2f pu, in %d of %d fault(s).  SPIKE %d  SWING %d  other %d\n"
           % (len(buses), LIMIT_PU, len(faults), len(faults_all), n_sp, n_sw, len(buses) - n_sp - n_sw))
+        W("\n 0. HOW MUCH DEPENDS ON THE CLEARING SPIKE (<= %.1f cycles above the limit)\n"
+          % (SPIKE_S * 60.0))
+        W("    faults failing ONLY on clearing spikes (would PASS if they are excluded): %d\n"
+          % len(spike_only))
+        W("      %s\n" % (" ".join(spike_only) if spike_only else "-"))
+        W("    faults with a real over-voltage SWING (> %.1f cycles) -- these stay a violation: %d\n"
+          % (SPIKE_S * 60.0, len(swing_faults)))
+        W("      %s\n" % (" ".join(swing_faults) if swing_faults else "-"))
+        W("    faults with over-voltage spikes AND another violation (recovery / trip / damping): %d\n"
+          % len([f for f in set(r["fault"] for r in rows) if f not in spike_only and f not in swing_faults]))
         W("\n 1. BUSES, most faults first (all of them in %s)\n" % os.path.basename(bcsv))
         W(" %-22s %-6s %6s %6s %-10s %-6s %8s %5s  %s\n"
           % ("bus", "area", "faults", "worst", "in", "shape", "abv_s", "hops", "likely cause"))
@@ -729,8 +755,9 @@ def run_folder(kind, proj, res_dir, vcsv):
           "  only the faults in section 4 with ONLY_FAULTS and run this again.\n")
     print("[spike] %s -> %s" % (stem, txt))
     top = buses[0] if buses else None
-    return buses, traced, ("%-24s %4d bus(es) in %3d/%3d fault(s); SPIKE %d SWING %d; top %s (%d faults, %.3f pu)"
-            % (stem, len(buses), len(faults), len(faults_all), n_sp, n_sw,
+    return buses, traced, ("%-24s %4d bus(es) in %3d/%3d fault(s); SPIKE %d SWING %d; %d fault(s) fail ONLY on "
+            "clearing spikes; top %s (%d faults, %.3f pu)"
+            % (stem, len(buses), len(faults), len(faults_all), n_sp, n_sw, len(spike_only),
                top["label"] if top else "-", top["n"] if top else 0, top["worst"] if top else 0.0))
 
 
