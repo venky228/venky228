@@ -382,6 +382,7 @@ CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False =
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
 FORCE_RESCORE   = False      # True = re-score every folder every launch (only after a criterion change)
+REPORTS_AFTER_ALL_PROJECTS = True  # True = the launchers simulate every project first; scoring runs once at the end for both cases (a relaunch no longer re-reads a finished project before the next one simulates) | False = each project is scored right after it simulates
 RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
 SCORE_NO_CASE   = True          # True = shards score without loading the case (32-bit memory fix) -- keep
 # -- PLOTS: PDFs --
@@ -13840,6 +13841,7 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False)
     env["SPP_LICENCE_BACKOFF_S"] = str(float(LICENCE_BACKOFF_S))
     env["SPP_STARTUP_SILENT_S"] = str(float(STARTUP_SILENT_MIN) * 60.0)
     env["SPP_RETRY_GAVE_UP_ROUNDS"] = str(int(RETRY_GAVE_UP_ROUNDS))
+    env["SPP_DEFER_REPORTS"] = "1" if REPORTS_AFTER_ALL_PROJECTS else "0"
     # ALWAYS 1. This used to follow NEVER_KILL_WORKERS, but the two are different
     # questions: whether a watchdog may end a frozen process, and whether a worker
     # may take a scenario whose owner is still alive. The second is never yes.

@@ -186,6 +186,21 @@ if _envr in ("1", "true", "yes", "on"):
 elif _envr in ("0", "false", "no", "off"):
     REPORT_ONLY = False
 
+# >>> SIMULATE EVERY PROJECT FIRST, SCORE AFTERWARDS.
+# The report phase ran right after each project's simulation, in the
+# foreground: a relaunch that had nothing left to simulate for SantaFe still
+# spent its first twenty minutes re-reading SantaFe's scores before IronStar's
+# first fault started. With this on, the launcher stops after the WORK phase
+# of each project and z4_cmp_all_con.py scores every project of both cases at
+# the end, in one pass, from the parts the workers wrote as they ran.
+#     set SPP_DEFER_REPORTS=1       (the panel sends it: REPORTS_AFTER_ALL_PROJECTS)
+DEFER_REPORTS = False
+_envd = (os.environ.get("SPP_DEFER_REPORTS") or "").strip().lower()
+if _envd in ("1", "true", "yes", "on"):
+    DEFER_REPORTS = True
+elif _envd in ("0", "false", "no", "off"):
+    DEFER_REPORTS = False
+
 # --- SCORE ONLY SOME SCENARIOS ----------------------------------------------
 # Empty = score every .out in the folder.
 # Non-empty = score ONLY these, and write the result to SPP_CRITERIA_REPORT_
@@ -5348,6 +5363,15 @@ def _run_one_study():
     # than after the .out files have all been read. Everything below that judges
     # the report is skipped in that case -- there is nothing to judge yet, and the
     # collection happens in main() once every project has run.
+    if DEFER_REPORTS and not REPORT_ONLY:
+        el = time.time() - t0
+        _banner("RUNS COMPLETE for %s -- %s (report DEFERRED: z4_cmp_all_con.py scores "
+                "every project once all of them have simulated)"
+                % (_CUR_PROJECT or "this project", _fmt_hms(el)))
+        _write_run_summary(t0, launches=None,
+                           why="written after the WORK phase; the criteria report is "
+                               "deferred to the panel's scoring pass over every project")
+        return 0
     if REPORT_WORKERS > 1:
         # Sharded reports run HERE rather than in the background: they occupy
         # REPORT_WORKERS sessions at once, and letting several projects do that
