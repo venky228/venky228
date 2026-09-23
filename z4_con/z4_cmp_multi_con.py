@@ -51,6 +51,7 @@ import glob
 import time
 import types
 import subprocess
+import json
 
 # ============================================================================
 #  SETTINGS
@@ -85,6 +86,9 @@ SCAN_ROOTS = [           # extra folders to look in for runs of the same project
 REMERGE_STALE = True     # rebuild a folder's reports from parts\ when the parts are newer (same as the panel)
 ASK_IF_EMPTY = True      # nothing above and nothing on the command line -> folder pickers
 PANEL = "z4_cmp_all_con.py"
+FAST_COMPARE = True      # True = quick: no re-merge from parts\, no measurement reads (a value no report
+                         # carries shows '-'), projects compared in parallel. False = the full way, as before
+FAST_PARALLEL = 4        # FAST_COMPARE: projects compared at once, each in its own process (1 = one at a time)
 # ============================================================================
 
 
@@ -270,6 +274,11 @@ def _prepare(z4, case, folder, suffix):
         print("[pair]             run the panel (z4_cmp_all_con.py) once with PIPELINE = \"compare\"")
         print("[pair]             -- it restores retired .done markers and re-scores the")
         print("[pair]             report -- then run this script again. ***")
+    if FAST_COMPARE:
+        if behind > z4.STALE_REPORT_TOL_S:
+            print("[pair]         FAST_COMPARE: not re-merged -- compared on its reports as "
+                  "they stand (FAST_COMPARE = False to re-merge)")
+        return
     _b = _busy(folder) if (REMERGE_STALE and behind > z4.STALE_REPORT_TOL_S) else None
     if _b is not None:
         print("[pair]         the study wrote to this folder %.0f s ago -- it is being scored" % _b)
@@ -1005,6 +1014,11 @@ def _sbs_context(z4, ref, group, tags, rk, lay=None):
                     todo.setdefault(tt, []).append((k, fam, el))
                     break
     fills = {}
+    if todo and FAST_COMPARE:
+        print("[pair]   FAST_COMPARE: %d value(s) no report carries are left '-' -- the "
+              "measurements are not read (FAST_COMPARE = False to fill them)"
+              % sum(len(v) for v in todo.values()))
+        todo = {}
     if todo:
         for t, folder in ([(x, lay["ref_dir"][x]) for x in lay["refs"]] +
                           [(tt, lay["test_dir"][tt]) for tt in lay["tests"]]):
@@ -2094,7 +2108,14 @@ def _expand_parents(z4, pairs):
 
 
 def main(argv):
-    pairs = _pairs_from_settings(argv)
+    child = os.environ.get("CMP_MULTI_PAIRS")
+    if child:
+        # A FAST_COMPARE CHILD: its one project's pairs come from the parent,
+        # never from the settings or the folder pickers again.
+        with open(child) as fh:
+            pairs = [tuple(x) for x in json.load(fh)]
+    else:
+        pairs = _pairs_from_settings(argv)
     z4 = _load_panel()
     if pairs is None:
         pairs = _auto_pairs(z4)
@@ -2134,7 +2155,13 @@ def main(argv):
             groups[k] = []
             gorder.append(k)
         groups[k].append((ref, test, label))
+    if (not child and FAST_COMPARE and int(FAST_PARALLEL or 1) > 1 and len(gorder) > 1):
+        done = _fast_parallel(z4, [groups[k] for k in gorder])
+        _finish(z4, done)
+        print("[pair] %d of %d pair(s) compared" % (len(done), len(pairs)))
+        return 0 if len(done) == len(pairs) else 1
     done = []
+    t_all = time.time()
     for k in gorder:
         grp = []
         for ref, test, label in groups[k]:
@@ -2164,6 +2191,75 @@ def main(argv):
             done.append(dict((kk, g[kk]) for kk in ("label", "faults", "new", "pre", "ref", "test", "folder", "proj")))
         del grp
         _free(z4)
+    if child:
+        with open(os.environ["CMP_MULTI_DONE"], "w") as fh:
+            json.dump(done, fh)
+        print("[pair] %d of %d pair(s) compared -- %.0f s" % (len(done), len(pairs), time.time() - t_all))
+        return 0 if len(done) == len(pairs) else 1
+    _finish(z4, done)
+    print("[pair] %d of %d pair(s) compared" % (len(done), len(pairs)))
+    return 0 if len(done) == len(pairs) else 1
+
+
+def _fast_parallel(z4, glist):
+    """FAST_COMPARE: each project in its OWN process, FAST_PARALLEL at a time --
+       each its own 2 GB of address space, and the projects no longer wait on
+       one another. A child's console goes to <out>\<proj>\FAST_COMPARE_<proj>.log;
+       what it compared comes back as a small JSON file."""
+    import tempfile
+    out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
+    tmp = tempfile.mkdtemp(prefix="cmp_multi_")
+    todo, running, done = list(enumerate(glist)), [], []
+    n = max(1, int(FAST_PARALLEL or 1))
+    t0 = time.time()
+    print("[fast] FAST_COMPARE: %d project(s), %d at a time -- each in its own process"
+          % (len(glist), n))
+    while todo or running:
+        while todo and len(running) < n:
+            i, grp = todo.pop(0)
+            proj = _split_name(_norm(grp[0][1]), z4.MODES)[0] or ("group%d" % i)
+            pd = os.path.join(out_root, proj)
+            if not os.path.isdir(pd):
+                os.makedirs(pd)
+            pj = os.path.join(tmp, "pairs_%d.json" % i)
+            dj = os.path.join(tmp, "done_%d.json" % i)
+            with open(pj, "w") as fh:
+                json.dump([list(x) for x in grp], fh)
+            env = dict(os.environ)
+            env["CMP_MULTI_PAIRS"] = pj
+            env["CMP_MULTI_DONE"] = dj
+            logp = os.path.join(pd, "FAST_COMPARE_%s.log" % proj)
+            lf = open(logp, "w")
+            pr = subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__)],
+                                  env=env, stdout=lf, stderr=subprocess.STDOUT,
+                                  cwd=os.path.dirname(os.path.abspath(__file__)))
+            running.append((pr, lf, proj, dj, logp, time.time()))
+            print("[fast]   started %-16s -> %s" % (proj, logp))
+        time.sleep(2)
+        for item in list(running):
+            pr, lf, proj, dj, logp, ts = item
+            if pr.poll() is None:
+                continue
+            running.remove(item)
+            lf.close()
+            got = []
+            try:
+                with open(dj) as fh:
+                    got = json.load(fh)
+            except Exception:
+                pass
+            done += got
+            print("[fast]   %-16s %s -- %d pair(s), %.0f s%s"
+                  % (proj, "done" if pr.returncode == 0 else "rc=%s" % pr.returncode,
+                     len(got), time.time() - ts,
+                     "" if pr.returncode == 0 else "  (see %s)" % logp))
+    print("[fast] all projects: %.0f s" % (time.time() - t0))
+    return done
+
+
+def _finish(z4, done):
+    """RERUN_ALL.txt, each project's RERUN list and the index, from what was
+       compared."""
     if done:
         out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
         # EVERY FAULT TO RE-RUN, EVERY FOLDER COMPARED, IN ONE FILE: per project,
@@ -2197,8 +2293,6 @@ def main(argv):
             print("[pair] index -> %s" % idx)
         except Exception:
             pass
-    print("[pair] %d of %d pair(s) compared" % (len(done), len(pairs)))
-    return 0 if len(done) == len(pairs) else 1
 
 
 if __name__ == "__main__":
