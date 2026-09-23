@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-z4_cmp_pair_con.py -- compare ANY two results folders and write the full
+z4_cmp_multi_con.py -- compare ANY two results folders and write the full
 comparison report: the same 00_COMPARISON_REPORT_*.xlsx / .txt / .csv,
 COMPARISON_SPP_TABLE and run-time comparison the panel writes, built by the
 panel's own readers and writers, so the layout and the content are identical.
@@ -21,8 +21,8 @@ HOW TO USE
   2. Either fill in REFERENCE + SCENARIOS (or PAIRS) below and run it, or run
      it with nothing filled in and pick the two folders when asked, or give
      them on the command line:
-         python z4_cmp_pair_con.py
-         python z4_cmp_pair_con.py <reference folder> <test folder> [label]
+         python z4_cmp_multi_con.py
+         python z4_cmp_multi_con.py <reference folder> <test folder> [label]
   3. The reports go to OUT_DIR\<label>\  (OUT_DIR defaults to
      C:\KV\comparison_pairs, i.e. <panel folder>\comparison_pairs). One
      folder per PROJECT, and inside it one folder per pair, e.g.
@@ -596,6 +596,53 @@ _SBS_EL = [("value", "project_value"), ("state", "project_state"),
 _MEASURABLE = ("recovery", "overshoot", "steady", "angle", "trip")
 _KEY4 = ("fault", "criterion", "element", "bus_number")
 
+# ONE ROW PER VIOLATION. Runs name the same element differently -- "765911"
+# in one report, "POI 765911" or "PROJ 765912" in another, "763676 [converging,
+# ...]" where the study added a note -- and each spelling made its own row.
+# The key drops the prefix and the note; the row shows the fullest name.
+_EL_PRE = re.compile(r"^(POI|PROJ)\s+", re.I)
+_EL_NOTE = re.compile(r"\s*\[[^\]]*\]\s*$")
+
+
+def _elkey(el):
+    return _EL_PRE.sub("", _EL_NOTE.sub("", str(el).strip())).strip()
+
+
+def _key4(vals):
+    """(fault, criterion, element, bus) with the element's name normalised."""
+    k = [str(v).strip() for v in vals]
+    k[2] = _elkey(k[2])
+    return tuple(k)
+
+
+def _better_label(old, new):
+    """The fuller of two names of one element: a POI/PROJ prefix, then a note."""
+    def sc(s):
+        s = str(s)
+        return (1 if _EL_PRE.match(s) else 0, 1 if _EL_NOTE.search(s) else 0)
+    return new if (old is None or sc(new) > sc(old)) else old
+
+
+# The columns a reader compares, in this order, right after the key; all the
+# others (event, source, area, hops, notes, run settings ...) go to the end.
+# 'project' (the workbook is one project's) and 'unit' (the limit says it)
+# are dropped.
+_ORDER = {"limit": 0, "verdict_projects": 1, "worst_criterion": 2, "project_value": 3,
+          "change": 4, "classification": 5, "element_classification": 5,
+          "fault_classification": 5, "who_caused_it": 5, "action": 6, "past_limit": 7,
+          "project_state": 8, "projects_state": 8}
+_DROP = set(["project", "unit"])
+
+
+def _rank_col(c, element=False):
+    """Where column c goes. On an element sheet the element's own numbers come
+       first; the fault's verdict (the same on every row of a fault) after."""
+    if element and c in ("verdict_projects", "worst_criterion"):
+        return 9
+    if not element and c == "limit":
+        return 2.5                                # a fault's limit: beside its worst value
+    return _ORDER.get(c, 20)
+
 
 def _empty(z4, v):
     """True for a cell that says nothing: blank, '-', or the panel's own n/a.
@@ -901,18 +948,30 @@ def _sbs_context(z4, ref, group, tags, rk, lay=None):
     RC = dict((c, i) for i, c in enumerate(z4._REPORT_COLS))
     SC = dict((c, i) for i, c in enumerate(z4._SUMMARY_COLS))
     proj = group[0]["proj"]
-    det, summ, order, seen, shared = {}, {}, [], set(), {}
+    det, summ, order, seen, shared, label = {}, {}, [], set(), {}, {}
     base = dict((x, {}) for x in lay["refs"])     # base tag -> key -> its own values
     _scols = ("planning_event", "fault_source", "measured", "area", "hops_from_fault",
               "hops_from_poi", "limit", "unit", "description")
     _bcols = ("verdict_base", "base_value", "base_state", "base_value_note", "secs_above_1_20_base")
+
+    def _score(r):
+        return (0 if _empty(z4, r[RC["project_value"]]) else 2) + \
+               (0 if _empty(z4, r[RC["base_value"]]) else 1)
     for g, t in zip(group, tags):
         bt = base[lay["rk_of"][t]]
-        d = {}
+        d, dk = {}, []
+        # ONE ROW PER ELEMENT IN ONE RUN: of two spellings of one element the
+        # row with numbers wins; the other adds nothing but its name.
         for r in (g.get("detail") or []):
-            k = tuple(str(r[RC[c]]).strip() for c in _KEY4)
+            k = _key4(r[RC[c]] for c in _KEY4)
+            label[k] = _better_label(label.get(k), str(r[RC["element"]]).strip())
             if k not in d:
                 d[k] = r
+                dk.append(k)
+            elif _score(r) > _score(d[k]):
+                d[k] = r
+        for k in dk:
+            r = d[k]
             if k not in seen:
                 seen.add(k)
                 order.append(k)
@@ -988,7 +1047,8 @@ def _sbs_context(z4, ref, group, tags, rk, lay=None):
             if "secs_above_1_20_base" not in b and f[2] != "-":
                 _merge_add(b, "secs_above_1_20_base", x, f[2], z4)
     return {"RC": RC, "SC": SC, "det": det, "summ": summ, "order": order,
-            "base": base, "shared": shared, "fills": fills, "rk": rk, "lay": lay}
+            "base": base, "shared": shared, "fills": fills, "rk": rk, "lay": lay,
+            "label": label}
 
 
 def _base_num(z4, ctx, k, t=None):
@@ -1119,15 +1179,19 @@ def _sbs_faults(z4, ref, group, tags, rk, ctx=None, lay=None):
     # gia ... -- the numbers to be compared sit in ADJACENT columns.
     _w = {"verdict": 11, "class": 14, "worst_criterion": 24, "value": 10, "limit": 8,
           "unit": 6, "past_limit": 10, "new_criteria": 18, "violating_buses": 40, "cause": 50}
-    header = ["fault", "planning_event", "fault_source", "project", "reference"]
-    widths = [8, 12, 9, 12, 22]
+    # THE NUMBERS FIRST: verdicts, class, worst criterion, values, limit; the
+    # event, source and description last. project / reference / unit dropped
+    # -- the folder names the project, the Key sheet the references, the
+    # limit its unit.
+    header = ["fault"]
+    widths = [8]
     for x in lay["refs"]:
         header.append("verdict | %s" % x); widths.append(11)
     for tt in lay["tests"]:
         header.append("verdict | %s" % tt); widths.append(11)
     header += ["worst_across_scenarios"]; widths += [22]
     _attrs = [("class", "classification"), ("worst_criterion", "worst_criterion"),
-              ("value", None), ("limit", "limit"), ("unit", "unit"), ("past_limit", "past_limit"),
+              ("value", None), ("limit", "limit"), ("past_limit", "past_limit"),
               ("new_criteria", "new_criteria"), ("violating_buses", "violating_buses"),
               ("cause", "cause")]
     for nm, _c in _attrs:
@@ -1136,12 +1200,11 @@ def _sbs_faults(z4, ref, group, tags, rk, ctx=None, lay=None):
                 header.append("value | %s" % x); widths.append(_w[nm])
         for t in tags:
             header.append("%s | %s" % (nm, t)); widths.append(_w[nm])
-    header += ["description"]; widths += [60]
+    header += ["planning_event", "fault_source", "description"]; widths += [12, 9, 60]
     rows = []
     for fid in sorted(order, key=lambda x: (len(x), x)):
         h = head[fid]
-        row = [fid, _merge_get(h, "planning_event", z4), _merge_get(h, "fault_source", z4),
-               proj, ", ".join(lay["refs"]) if lay["multi"] else _base(ref)]
+        row = [fid]
         for x in lay["refs"]:
             if lay["multi"] and not any(t in per[fid] for t in lay["of_ref"].get(x, [])):
                 row.append("not in this run")
@@ -1183,7 +1246,8 @@ def _sbs_faults(z4, ref, group, tags, rk, ctx=None, lay=None):
                 continue
             for t in tags:
                 row.append(cells[t][SC[c]] if cells[t] is not None else "-")
-        row.append(_merge_get(h, "description", z4))
+        row += [_merge_get(h, "planning_event", z4), _merge_get(h, "fault_source", z4),
+                _merge_get(h, "description", z4)]
         rows.append([("-" if (v is None or str(v).strip() == "") else v) for v in row])
     nw = header.index("worst_across_scenarios")
 
@@ -1235,18 +1299,21 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
     # side, then the states, then each comparison's class, change and
     # past-limit -- one glance per row.
     _w = {"value": 11, "state": 22, "class": 26, "change": 9, "past_limit": 10}
-    header = ["fault", "planning_event", "fault_source", "project", "criterion", "measured",
-              "element", "bus_number", "area", "hops_from_fault", "hops_from_poi",
-              "limit", "unit"]
-    widths = [8, 12, 9, 12, 22, 15, 18, 10, 6, 8, 8, 8, 6]
+    # THE NUMBERS FIRST: key, limit, every value, then change / class /
+    # past-limit per comparison, then states; the element's particulars last.
+    header = ["fault", "criterion", "element", "bus_number", "limit"]
+    widths = [8, 22, 18, 10, 12]
     for x in lay["refs"] + lay["tests"]:
         header.append("value | %s" % x); widths.append(_w["value"])
     header.append("worst_across_scenarios"); widths.append(26)
-    for x in lay["refs"] + lay["tests"]:
-        header.append("state | %s" % x); widths.append(_w["state"])
-    for nm in ("class", "change", "past_limit"):
+    for nm in ("change", "class", "past_limit"):
         for t in tags:
             header.append("%s | %s" % (nm, t)); widths.append(_w[nm])
+    for x in lay["refs"] + lay["tests"]:
+        header.append("state | %s" % x); widths.append(_w["state"])
+    header += ["measured", "planning_event", "fault_source", "area", "hops_from_fault",
+               "hops_from_poi"]
+    widths += [15, 12, 9, 6, 8, 8]
     for x in lay["refs"]:
         header.append("note | %s" % x); widths.append(30)
     header.append("description"); widths.append(40)
@@ -1262,10 +1329,7 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
         bs = [ctx["base"][x].get(k) or {} for x in lay["refs"]]
         fam = z4._criterion_family(crit)
         limit = _merge_one(s, "limit")            # to judge with
-        row = [fid, _merge_get(s, "planning_event", z4), _merge_get(s, "fault_source", z4), proj,
-               crit, _merge_get(s, "measured", z4), el, bus, _merge_get(s, "area", z4),
-               _merge_get(s, "hops_from_fault", z4), _merge_get(s, "hops_from_poi", z4),
-               _merge_get(s, "limit", z4), _merge_get(s, "unit", z4)]
+        row = [fid, crit, ctx["label"].get(k, el), bus, _merge_get(s, "limit", z4)]
         got, own = {}, {}                         # comparison -> [value, state, class, change, past]
         worst, rank = "", -1
         for t in tags:
@@ -1304,13 +1368,16 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
         for tt in lay["tests"]:
             row.append(_per_test(z4, [(t, got[t][0], own[t]) for t in lay["of_test"][tt]]))
         row.append(worst or "-")
+        for ix in (3, 2, 4):                      # change, class, past_limit
+            for t in tags:
+                row.append(got[t][ix])
         for b in bs:
             row.append(_merge_get(b, "base_state", z4, default="-"))
         for tt in lay["tests"]:
             row.append(_per_test(z4, [(t, got[t][1], own[t]) for t in lay["of_test"][tt]]))
-        for ix in (2, 3, 4):
-            for t in tags:
-                row.append(got[t][ix])
+        row += [_merge_get(s, "measured", z4), _merge_get(s, "planning_event", z4),
+                _merge_get(s, "fault_source", z4), _merge_get(s, "area", z4),
+                _merge_get(s, "hops_from_fault", z4), _merge_get(s, "hops_from_poi", z4)]
         for b in bs:
             row.append(_merge_get(b, "base_value_note", z4, default="-"))
         row.append(_merge_get(s, "description", z4))
@@ -1395,13 +1462,37 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
     keys = _KEYS.get(key, ["fault"])
     shared = [c for c in cols if c not in keys and _is_shared(c)]
     perrun = [c for c in cols if c not in keys and not _is_shared(c)]
-    per, order, merged, mref = {}, [], {}, {}
+    per, order, merged, mref, wl = {}, [], {}, {}, {}
+    el4 = (len(keys) == 4 and "element" in ix)
+
+    def _vs(r):
+        return sum(1 for c in ("project_value", "base_value")
+                   if c in ix and not _empty(z4, r[ix[c]]))
     for g, t in zip(group, tags):
         x = lay["rk_of"][t]
-        cnt = {}
+        cnt, spell = {}, {}
         for r in (g.get(key) or []):
             r = list(r) + [z4.EMPTY_CELL] * (len(cols) - len(r))
-            k0 = tuple(str(r[ix[c]]).strip() for c in keys)
+            if el4:
+                # ONE ROW PER VIOLATION: another spelling ("POI 765911") of an
+                # element this run already listed joins that row.
+                k0 = _key4(r[ix[c]] for c in keys)
+                lab = str(r[ix["element"]]).strip()
+                wl[k0] = _better_label(wl.get(k0), lab)
+                sp = spell.setdefault(k0, [])
+                if sp and lab not in sp:
+                    sp.append(lab)
+                    k = k0 + (1,)
+                    if _vs(r) > _vs(per[k][t]):
+                        per[k][t] = r
+                    for c in shared:
+                        st = mref[k][x] if _is_base_col(c) else merged[k]
+                        if c not in st:
+                            _merge_add(st, c, t, r[ix[c]], z4)
+                    continue
+                sp.append(lab)
+            else:
+                k0 = tuple(str(r[ix[c]]).strip() for c in keys)
             # A KEY THAT REPEATS WITHIN ONE RUN keeps every row: the n-th row
             # of a run pairs with the n-th row of the others.
             n = cnt.get(k0, 0) + 1
@@ -1466,34 +1557,35 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
             return c.replace("project ", "base ", 1)
         return None
     paired = set(b for b in (_base_of(c) for c in perrun) if b)
-    front = [c for c in shared if c not in paired]
-    header = list(keys)
-    flay = []                                     # (column, base tag or None) per front cell
+    drop = set(c for c in _DROP if c != "unit" or "limit" in ix)
+    front = [c for c in shared if c not in paired and c not in drop]
+    # (rank, header, kind, column, tag): the compared numbers right after the
+    # key, everything descriptive at the end -- see _ORDER.
+    spec = []
     for c in front:
         if _is_base_col(c):
             for y in lay["refs"]:
-                header.append(("%s | %s" % (c, y)) if (lay["multi"] or c.startswith("base")
-                                                       or c == "verdict_base") else c)
-                flay.append((c, y))
+                spec.append((_rank_col(c, el4), ("%s | %s" % (c, y)) if (lay["multi"] or c.startswith("base")
+                                                                 or c == "verdict_base") else c,
+                             "front", c, y))
         else:
-            header.append(c)
-            flay.append((c, None))
-    layout = []                                   # (column, "ref" / "test" / "pair", tag) per cell
+            spec.append((_rank_col(c, el4), c, "front", c, None))
     for c in perrun:
+        if c in drop:
+            continue
         b = _base_of(c)
         if b:
             for y in lay["refs"]:
-                header.append("%s | %s" % (b, y))
-                layout.append((b, "ref", y))
+                spec.append((_rank_col(c, el4), "%s | %s" % (b, y), "ref", b, y))
         if b or c in _TEST_COLS:
             for tt in lay["tests"]:
-                header.append("%s | %s" % (c, tt))
-                layout.append((c, "test", tt))
+                spec.append((_rank_col(c, el4), "%s | %s" % (c, tt), "test", c, tt))
         else:
             for t in tags:
-                header.append("%s | %s" % (c, t))
-                layout.append((c, "pair", t))
-    widths = [10] * len(keys) + [14] * len(flay) + [14] * len(layout)
+                spec.append((_rank_col(c, el4), "%s | %s" % (c, t), "pair", c, t))
+    spec = [sp[1:] for _i, sp in sorted(enumerate(spec), key=lambda e: (e[1][0], e[0]))]
+    header = list(keys) + [h for h, _kd, _c, _t in spec]
+    widths = [10] * len(keys) + [14] * len(spec)
     cls_cols = [i for i, hh in enumerate(header)
                 if hh.split(" | ")[0] in ("classification", "element_classification",
                                           "fault_classification", "who_caused_it")]
@@ -1534,10 +1626,12 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
                                 z4._criterion_family(k[1]), default=v)
                 return v
             row = list(k[:len(keys)])
-            for c, y in flay:
-                row.append(_merge_get(mk if y is None else mr[y], c, z4))
-            for c, kind, t in layout:
-                if kind == "ref":
+            if el4:
+                row[2] = wl.get(tuple(k[:4]), row[2])
+            for _h, kind, c, t in spec:
+                if kind == "front":
+                    row.append(_merge_get(mk if t is None else mr[t], c, z4))
+                elif kind == "ref":
                     if (lay["multi"] and c not in mr[t]
                             and not any(p in per[k] for p in lay["of_ref"].get(t, []))):
                         row.append("not in this run")
