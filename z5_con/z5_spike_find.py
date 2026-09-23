@@ -47,7 +47,7 @@ report files above).
 from __future__ import print_function
 import os, sys, re, csv, glob, time, json, subprocess
 
-VERSION = "2026-09-23j"      # z5_probe_psse.py checks this
+VERSION = "2026-09-23k"      # z5_probe_psse.py checks this
 
 # =========================== SETTINGS ======================================
 ROOT          = ""            # "" = the folder this file is in (the study root)
@@ -266,7 +266,17 @@ def rank_faults(rows):
 
 
 # ----------------------------- SOLVER CHECK ---------------------------------
-_NC_RX = re.compile(r"Network not converged at TIME\s*=\s*([-\d.E+]+)\s+(\d+)\s+([\d.E+-]+)\s+(\d+)", re.I)
+_NC_RX = re.compile(r"Network not converged at TIME\s*=\s*([-\d.E+]+)"
+                    r"(?:\s+(\d+)\s+([\d.E+-]+)\s+(\d+))?", re.I)
+
+
+def _nc_tuple(m):
+    """(t, iterations|None, mismatch|None, bus|None) from an _NC_RX match."""
+    t = float(m.group(1))
+    try:
+        return (t, int(m.group(2)), float(m.group(3)), int(m.group(4)))
+    except (TypeError, ValueError):
+        return (t, None, None, None)
 
 
 def solver_info(res_dir, fault_ids, kind_tag):
@@ -316,8 +326,7 @@ def solver_info(res_dir, fault_ids, kind_tag):
                         if m and cur in info:
                             n_lines += 1
                             try:
-                                info[cur]["nc"].append((float(m.group(1)), int(m.group(2)),
-                                                        float(m.group(3)), int(m.group(4))))
+                                info[cur]["nc"].append(_nc_tuple(m))
                             except ValueError:
                                 pass
         except Exception:
@@ -342,44 +351,66 @@ def write_solver_log(res_dir, tag, proj):
     if not files:
         return None
     rx_other = re.compile(r"NaN|not converged|SUSPECT|exceed|overflow|IERR|error|diverg", re.I)
-    rows, detail = [], []
+    rows, samples = [], []
     for pth in files:
         fid = os.path.splitext(os.path.basename(pth))[0]
         nc, other = [], {}
         try:
             with open(pth, errors="replace") as fh:
-                for ln in fh:
-                    m = _NC_RX.search(ln)
-                    if m:
-                        try:
-                            nc.append((float(m.group(1)), int(m.group(2)), float(m.group(3)), int(m.group(4))))
-                        except ValueError:
-                            pass
-                        continue
-                    if rx_other.search(ln):
-                        k = re.sub(r"[-\d.E+]{3,}", "#", ln.strip())[:110]
-                        other[k] = other.get(k, 0) + 1
+                lines = fh.readlines()
         except Exception as e:
+            lines = []
             other["could not read: %s" % e] = 1
-        w = max(nc, key=lambda x: x[2]) if nc else None
-        rows.append((fid, nc, w, other))
+        for i, ln in enumerate(lines):
+            m = _NC_RX.search(ln)
+            if m:
+                try:
+                    nc.append(_nc_tuple(m))
+                except ValueError:
+                    pass
+                if len(samples) < 3 and (not samples or samples[-1][0] != fid):
+                    samples.append((fid, [x.rstrip() for x in lines[max(0, i - 1): i + 4]]))
+                continue
+            if rx_other.search(ln):
+                k = re.sub(r"[-\d.E+]{3,}", "#", ln.strip())[:110]
+                other[k] = other.get(k, 0) + 1
+        wm = [x for x in nc if x[2] is not None]
+        w = max(wm, key=lambda x: x[2]) if wm else None
+        # contiguous stretches (steps closer than 2 cycles belong together)
+        st = []
+        for x in sorted(nc):
+            if st and x[0] - st[-1][1] <= 2.0 / 60.0 + 1e-9:
+                st[-1][1] = x[0]
+                st[-1][2] += 1
+            else:
+                st.append([x[0], x[0], 1])
+        rows.append((fid, nc, w, other, st))
     with open(os.path.join(res_dir, "SOLVER_LOG_%s_%s.txt" % (tag, proj)), "w") as f:
         W = f.write
         W("PSS/E SOLVER LOG -- %s %s   (%s)\n" % (tag, proj, time.strftime("%Y-%m-%d %H:%M")))
         W("from logs\\psse\\<fault>.txt, written when PSSE_FAULT_LOG = True in the panel\n")
         W("=" * 100 + "\n")
         bad = [r for r in rows if r[1]]
+        W(" A quarter-cycle step is %.4f s, so 240 non-converged steps = 1 s of simulation whose\n"
+          " network solution PSS/E could not close.\n" % (1.0 / 240.0))
         W(" %d scenario(s) logged; %d with non-converged network solutions\n\n" % (len(rows), len(bad)))
         W(" %-14s %6s %9s %9s %12s %9s  %s\n"
-          % ("scenario", "steps", "first s", "last s", "worst mism.", "at bus", "other messages"))
+          % ("scenario", "steps", "first s", "last s", "worst mism.", "at bus", "stretches (start-end s, steps)"))
         W(" " + "-" * 98 + "\n")
-        for fid, nc, w, other in sorted(rows, key=lambda r: (-len(r[1]), r[0])):
+        for fid, nc, w, other, st in sorted(rows, key=lambda r: (-len(r[1]), r[0])):
             W(" %-14s %6d %9s %9s %12s %9s  %s\n"
-              % (fid, len(nc), "%.4f" % nc[0][0] if nc else "-", "%.4f" % nc[-1][0] if nc else "-",
+              % (fid, len(nc), "%.4f" % min(x[0] for x in nc) if nc else "-",
+                 "%.4f" % max(x[0] for x in nc) if nc else "-",
                  "%.4g" % w[2] if w else "-", w[3] if w else "-",
-                 ("%d kind(s)" % len(other)) if other else "-"))
+                 ", ".join("%.3f-%.3f (%d)" % tuple(x) for x in st[:4]) + (" ..." if len(st) > 4 else "")))
+        if samples:
+            W("\n WHAT PSS/E PRINTED (first lines around a non-converged step)\n")
+            for fid, ls in samples:
+                W(" %s:\n" % fid)
+                for x in ls:
+                    W("    | %s\n" % x[:120])
         W("\n OTHER PSS/E MESSAGES (numbers replaced by #), per scenario\n")
-        for fid, nc, w, other in rows:
+        for fid, nc, w, other, st in rows:
             if not other:
                 continue
             W(" %s\n" % fid)
@@ -775,8 +806,12 @@ def run_folder(kind, proj, res_dir, vcsv):
         if nc:
             ts = t_spk.get(fid)
             near = [x for x in nc if ts is not None and abs(x[0] - ts) <= NC_WINDOW_S]
-            out.append("%d non-converged step(s)%s" % (len(nc), (", %d AT THE SPIKE (worst mismatch %.3g at bus %d)"
-                       % (len(near), max(x[2] for x in near), max(near, key=lambda x: x[2])[3])) if near else ""))
+            span = "%.3f-%.3f s" % (min(x[0] for x in nc), max(x[0] for x in nc))
+            wm = [x for x in near if x[2] is not None]
+            out.append("%d non-converged step(s) %s%s" % (len(nc), span, (", %d AT THE SPIKE%s" % (
+                len(near), (" (worst mismatch %.3g at bus %d)" % (max(x[2] for x in wm),
+                                                                   max(wm, key=lambda x: x[2])[3])) if wm else ""))
+                if near else ""))
         return "; ".join(out)
     groups = group_buses(buses)
     stem = "%s_%s" % (tag, proj)
