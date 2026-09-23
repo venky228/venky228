@@ -25,7 +25,7 @@ HOW TO USE
          python z4_cmp_multi_con.py <reference folder> <test folder> [label]
   3. The reports go to OUT_DIR\<label>\  (OUT_DIR defaults to
      C:\KV\comparison_pairs, i.e. <panel folder>\comparison_pairs). One
-     folder per pair, e.g.
+     folder per PROJECT, and inside it one folder per pair, e.g.
          comparison_pairs\SantaFe_studied_vs_base\00_COMPARISON_REPORT_SantaFe_studied_vs_base.xlsx
          comparison_pairs\SantaFe_Sep21_full_gia_studied_vs_base\00_COMPARISON_REPORT_SantaFe_Sep21_full_gia_studied_vs_base.xlsx
      The label is <project>_<test tag>_vs_<reference tag>; a test folder that
@@ -511,7 +511,7 @@ def compare_pair(z4, ref, test, label=None):
     if hasattr(z4, "ONLY_WORDS"):
         z4.ONLY_WORDS = []
     z4.COMPARE_BY_PROJECT = False
-    z4.COMPARE_DIR = out_root
+    z4.COMPARE_DIR = os.path.join(out_root, proj_t)   # one folder per project
     z4.results_dir = lambda case, p, m: ref if str(case.get("key")) == "BASE" else test
     z4._res_root = lambda case: os.path.dirname(ref if str(case.get("key")) == "BASE" else test)
     z4.discover_projects = lambda m: ([proj_t], [], [])
@@ -1831,7 +1831,7 @@ def write_side_by_side(z4, ref, group):
     ref = lay["ref_dir"][rk]
     out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
     lab = re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_SIDE_BY_SIDE_vs_%s" % (proj, "_and_".join(lay["refs"])))
-    d = os.path.join(out_root, lab)
+    d = os.path.join(out_root, proj, lab)          # beside that project's pair reports
     if not os.path.isdir(d):
         os.makedirs(d)
     xp = os.path.join(d, "00_SIDE_BY_SIDE_%s.xlsx" % lab)

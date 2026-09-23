@@ -17,7 +17,7 @@ exactly as they are:
   4. the POI total is metered and grossed up for losses, the other machines in
      the area are rescaled so the area comes back to its pre-project MW, and
      the case is solved
-  5. that solved case is saved as  OUT_DIR\\<input>_<project>_POI<MW>.sav
+  5. that solved case is saved as  OUT_DIR\\<project>\\<input>_<project>_POI<MW>.sav
      with a .txt beside it saying what was done and the area MW before/after
 
 Nothing is simulated, no .cnv / .snp / .dyr is written, and nothing in the
@@ -116,7 +116,10 @@ def build_one(z4, proj, mw, base_sav, out_dir):
         return None
     patched_engine_source(script)                 # stop now if the study script does not fit
     stem = os.path.splitext(os.path.basename(base_sav))[0]
-    out = os.path.join(out_dir, "%s_%s_POI%sMW%s.sav"
+    pdir = os.path.join(out_dir, proj)            # one folder per project
+    if not os.path.isdir(pdir):
+        os.makedirs(pdir)
+    out = os.path.join(pdir, "%s_%s_POI%sMW%s.sav"
                        % (stem, proj, _mw_txt(mw), "_EGFoff" if EGF_OFF else ""))
     env = dict(os.environ)
     z4._push_settings(env, z4.CASE_TEST)          # every panel setting, as for a study run
