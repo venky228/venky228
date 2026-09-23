@@ -656,6 +656,8 @@ GEN_TEST_SCENARIOS = [
     ("s3_it400_a020",        None, 400,  0.20, None),
     ("s4_tol1em4",           None, None, None, 0.0001),   # looser network tolerance
     ("s5_delt8_it400_a020",  8,    400,  0.20, None),     # all together
+    ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10
+    ("s7_delt8_it400_a010",  8,    400,  0.10, None),     # same, 1/8-cycle time step
 ]
 GEN_TEST_GEN_SCENARIOS = "all"     # "all" | ["s0_asis", "s1_delt8"] -- scenarios each machine-off run uses
 GEN_TEST_CLEAN_BUILD = True        # True = delete each finished run's own .sav/.cnv/.snp/.cnl (disk space);
