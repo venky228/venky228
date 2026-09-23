@@ -215,6 +215,27 @@ def _merge_folder(z4, case, rdir, suffix):
     return rc == 0
 
 
+def _busy(folder, window=300.0):
+    """Seconds since the study last wrote a claim, a part or a status file in
+       this folder -- when that was within `window` -- else None. A folder the
+       panel is scoring right now is not re-merged from here: two merges
+       writing the same report files at once leave either a half-written
+       report or a Windows 'file in use' failure."""
+    newest = 0.0
+    for pat in (os.path.join(folder, "outs", "*.claim"), os.path.join(folder, "outs", "*.rclaim"),
+                os.path.join(folder, "parts", "*.csv"), os.path.join(folder, "logs", "REPORT_STATUS*.txt"),
+                os.path.join(folder, "logs", "PROGRESS*.csv")):
+        for p in glob.glob(pat):
+            try:
+                newest = max(newest, os.path.getmtime(p))
+            except OSError:
+                pass
+    if not newest:
+        return None
+    age = time.time() - newest
+    return age if age < window else None
+
+
 def _prepare(z4, case, folder, suffix):
     """Say what the folder holds; re-merge it first if its parts are newer
        than its reports."""
@@ -239,7 +260,12 @@ def _prepare(z4, case, folder, suffix):
         print("[pair]             run the panel (z4_cmp_all_con.py) once with PIPELINE = \"compare\"")
         print("[pair]             -- it restores retired .done markers and re-scores the")
         print("[pair]             report -- then run this script again. ***")
-    if REMERGE_STALE and behind > z4.STALE_REPORT_TOL_S:
+    _b = _busy(folder) if (REMERGE_STALE and behind > z4.STALE_REPORT_TOL_S) else None
+    if _b is not None:
+        print("[pair]         the study wrote to this folder %.0f s ago -- it is being scored" % _b)
+        print("[pair]         right now, so it is NOT re-merged from here; its reports are")
+        print("[pair]         compared as they stand. Run this again when the panel is done.")
+    elif REMERGE_STALE and behind > z4.STALE_REPORT_TOL_S:
         if _merge_folder(z4, case, folder, suffix):
             try:
                 outs, scored = z4._out_and_scored_sets(folder, proj)
@@ -262,7 +288,12 @@ def _folder_tag(folder):
     parent = parts[-2] if len(parts) >= 2 else ""
     if parent and parent.lower() not in _STD_PARENTS and not re.match(r"^[A-Za-z]:$", parent):
         bits.append(parent)
-    bits.append(sfx.strip("_") if sfx else "studied")
+    # A BASE FOLDER IS A BASE. ...\results_base\BASE_CQ_F\SantaFe_spp is
+    # 'BASE_CQ_F_base' and ...\results_base\SantaFe_spp is 'base', so an old
+    # base and a new one compared side by side never share a column name.
+    _low = [x.lower() for x in parts]
+    _dflt = "base" if any(x == "base" or x.startswith("results_base") for x in _low) else "studied"
+    bits.append(sfx.strip("_") if sfx else _dflt)
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", "_".join(bits))
 
 
@@ -356,17 +387,40 @@ def _unrun(z4, folder, proj):
     listed = _fault_ids_of(z4, proj)
     never = [f for f in listed if f not in outs] if listed else []
     novote = [f for f in outs if f not in scored and not f.upper().startswith("FLAT")]
-    return _idsort(never), _idsort(novote)
+    # AN ID THE FAULT LIST DOES NOT HAVE CANNOT BE RE-RUN BY NAME (F02_previous
+    # is a kept copy, not a fault): listed on its own line, kept out of the
+    # line that is pasted into the panel.
+    extra = []
+    if listed:
+        lset = set(listed)
+        extra = [f for f in novote if f not in lset]
+        novote = [f for f in novote if f in lset]
+    return _idsort(never), _idsort(novote), _idsort(extra), bool(listed)
 
 
 def _rerun_lines(z4, tag, folder, proj):
-    never, novote = _unrun(z4, folder, proj)
-    L = ["%s   %s" % (tag, folder),
-         "   %d fault(s) with NO .out (never run) : %s" % (len(never), ", ".join(never) or "-"),
-         "   %d .out(s) with NO verdict (crashed / non-finite / unscored): %s"
-         % (len(novote), ", ".join(novote) or "-")]
+    never, novote, extra, have_list = _unrun(z4, folder, proj)
+    _root, kind = _case_root(folder)
+    side = "proj" if kind == "p" else ("base" if kind == "b" else "?")
+    parent = _base(os.path.dirname(_norm(folder))).lower()
+    L = ["%s   %s" % (tag, folder)]
+    if not have_list:
+        L.append("   (fault list %s not found -- faults never run cannot be listed)"
+                 % os.path.join(z4.STUDY_ROOT, "SPP_FAULTS_CON_%s.csv" % proj))
+    else:
+        L.append("   %d fault(s) with NO .out (never run) : %s" % (len(never), ", ".join(never) or "-"))
+    L.append("   %d .out(s) with NO verdict (crashed / non-finite / unscored): %s"
+             % (len(novote), ", ".join(novote) or "-"))
+    if extra:
+        L.append("   %d .out(s) not in the fault list -- cannot be re-run by id: %s"
+                 % (len(extra), ", ".join(extra)))
     both = _idsort(never + novote)
-    L.append("   RUN_ONLY_FAULTS = [%s]" % ", ".join('"%s"' % x for x in both))
+    L.append("   RUN_CASES   = \"%s\"" % side)
+    L.append("   ONLY_FAULTS = [%s]" % ", ".join('"%s"' % x for x in both))
+    if parent not in ("results_base", "results_proj"):
+        L.append("   NOTE: the panel writes to %s\\results_%s\\%s, not to this folder -- a "
+                 "re-run lands there." % ("Base" if side == "base" else "Projects",
+                                          "base" if side == "base" else "proj", _base(folder)))
     return L, both
 
 
@@ -376,9 +430,18 @@ def write_rerun_list(z4, path, entries):
        (RUN_CASES = "base" or "proj" for that side)."""
     L = ["FAULTS WITH NO RESULT -- what to re-run in z4_cmp_all_con.py",
          "generated %s" % time.strftime("%Y-%m-%d %H:%M"),
-         "Paste the RUN_ONLY_FAULTS line into the panel with PIPELINE = \"all\" and RUN_CASES",
-         "set to the side named; RUN_ONLY_MISSING_OUT must be False for a fault that has an",
-         "unscorable .out to be simulated again (the file is replaced).", ""]
+         "",
+         "To re-run one folder's list, in z4_cmp_all_con.py set, for that run only:",
+         "    PIPELINE             = \"all\"",
+         "    RUN_CASES            = the value given below for that folder",
+         "    ONLY_FAULTS          = the list given below for that folder",
+         "    RUN_ONLY_MISSING_OUT = False   (a crashed fault HAS an .out; with True it is",
+         "                                    skipped. The selected ids get their .done /",
+         "                                    .attempts cleared and their .out replaced;",
+         "                                    nothing else is touched.)",
+         "Afterwards set ONLY_FAULTS = [] and RUN_ONLY_MISSING_OUT = True again and run",
+         "PIPELINE = \"compare\" once, so the full reports include the new results.",
+         ""]
     for tag, folder, proj in entries:
         lines, _b = _rerun_lines(z4, tag, folder, proj)
         L += lines + [""]
@@ -392,7 +455,7 @@ def write_rerun_list(z4, path, entries):
 
 def _label_for(ref, test):
     proj, _m, _s = _split_name(test, None)
-    rk = "base" if "results_base" in _parts(ref) else _folder_tag(ref)
+    rk = _folder_tag(ref)
     tk = _folder_tag(test)
     lab = "%s_%s_vs_%s" % (proj, tk, rk)
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", lab)
@@ -504,8 +567,8 @@ def compare_pair(z4, ref, test, label=None):
         outs_t, scored_t = z4._out_and_scored_sets(test, proj_t)
     except Exception:
         outs_r = scored_r = outs_t = scored_t = set()
-    return {"label": label, "ref": ref, "test": test, "folder": folder, "proj": proj_t,
-            "faults": len(rows), "new": n_new, "pre": n_pre, "summary": summ,
+    return {"label": label, "ref": ref, "test": test, "folder": folder, "report": xl,
+            "proj": proj_t, "faults": len(rows), "new": n_new, "pre": n_pre, "summary": summ,
             "detail": detail, "notrun": notrun, "poi": poi, "new_el": new_el,
             "pre_el": pre_el, "tag": _folder_tag(test),
             "n_out_ref": len(outs_r), "n_scored_ref": len(scored_r),
@@ -513,14 +576,25 @@ def compare_pair(z4, ref, test, label=None):
             "only_ref": sorted(only_b or []), "only_test": sorted(only_t or [])}
 
 
-_SBS_PER = [("verdict", "verdict_projects"), ("class", "classification"),
-            ("worst_criterion", "worst_criterion"), ("ref_value", "base_value"),
-            ("value", "project_value"), ("limit", "limit"), ("unit", "unit"),
-            ("past_limit", "past_limit"), ("new_criteria", "new_criteria"),
-            ("violating_buses", "violating_buses"), ("cause", "cause")]
 _SBS_EL = [("value", "project_value"), ("state", "project_state"),
            ("class", "element_classification"), ("change", "change"),
            ("past_limit", "past_limit")]
+
+# The criterion families a measurement file holds a NUMBER for. The others
+# (terminal voltage, review, bus angle, yes/no statements) have none, and a
+# cell for them says so instead of "not measured".
+_MEASURABLE = ("recovery", "overshoot", "steady", "angle", "trip")
+_KEY4 = ("fault", "criterion", "element", "bus_number")
+
+
+def _empty(z4, v):
+    """True for a cell that says nothing: blank, '-', or the panel's own n/a.
+       The panel never writes a blank -- every empty cell is EMPTY_CELL -- so a
+       test for "" alone never saw a missing value and never filled one."""
+    if v is None:
+        return True
+    s = str(v).strip()
+    return s in ("", "-", str(getattr(z4, "EMPTY_CELL", "n/a")))
 
 
 def _free(z4, keep_want=False):
@@ -531,7 +605,7 @@ def _free(z4, keep_want=False):
        and the workbook could not be built."""
     import gc
     for name in ("_MEAS_CACHE", "_WANT_BUSES", "_WHERE", "_OUT_SET_CACHE",
-                 "_SCEN_PART_CACHE", "_PART_LAY_CACHE"):
+                 "_SCEN_PART_CACHE", "_PART_LAY_CACHE", "_VIO_EXTRA", "_DIST_CACHE"):
         if keep_want and name == "_WANT_BUSES":
             continue               # the element sheet's bus list must survive the read
         d = getattr(z4, name, None)
@@ -540,165 +614,18 @@ def _free(z4, keep_want=False):
     gc.collect()
 
 
-def _write_xlsx_lowmem(z4, path, sheets, legend=None, title_rows=None):
-    """The panel's write_xlsx_multi, one sheet at a time. The panel builds every
-       sheet's XML and holds them all while it zips; here each sheet is built,
-       streamed to a temporary file and added to the zip from disk, so the
-       peak is ONE sheet, not the workbook."""
-    import zipfile, tempfile, gc
-    names = [z4._xl_sheet_name(sh[0]) for sh in sheets] + ["Key"]
-    ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
-          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
-          '<Default Extension="xml" ContentType="application/xml"/>',
-          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>']
-    wb = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"',
-          ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
-          '<sheets>']
-    rels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
-    for i, name in enumerate(names, start=1):
-        ct.append('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType='
-                  '"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i)
-        wb.append('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (z4._xl_esc(name), i, i))
-        rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
-                    '/officeDocument/2006/relationships/worksheet" Target="worksheets'
-                    '/sheet%d.xml"/>' % (i, i))
-    ct.append('<Override PartName="/xl/styles.xml" ContentType="application/vnd.'
-              'openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
-    wb.append("</sheets></workbook>")
-    rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
-                '/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
-                % (len(names) + 1))
-    rels.append("</Relationships>")
-    z = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED)
-    try:
-        z.writestr("[Content_Types].xml", "".join(ct))
-        z.writestr("_rels/.rels", z4._XL_RELS)
-        z.writestr("xl/workbook.xml", "".join(wb))
-        z.writestr("xl/_rels/workbook.xml.rels", "".join(rels))
-        z.writestr("xl/styles.xml", z4._XL_STYLES)
-        for i, sh in enumerate(sheets, start=1):
-            name, header, rows, widths, style_of = (list(sh) + [None, None])[:5]
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xml")
-            try:
-                tmp.write(z4._xl_sheet_xml(header, rows, widths, style_of,
-                                           first=(i == 1)).encode("utf-8"))
-                tmp.close()
-                z.write(tmp.name, "xl/worksheets/sheet%d.xml" % i)
-            finally:
-                try:
-                    os.remove(tmp.name)
-                except Exception:
-                    pass
-            gc.collect()
-        z.writestr("xl/worksheets/sheet%d.xml" % len(names),
-                   z4._xl_legend_sheet(legend or [], title_rows or []))
-    finally:
-        z.close()
-    return path
-
-
-def _sbs_tags(group):
-    tags = []
+def _sbs_tags(group, rk=None):
+    """One column tag per run, never the same twice -- and never the same as
+       the reference's, or 'value | base' would name two different folders."""
+    tags, used = [], ([rk] if rk else [])
     for g in group:
         t = g["tag"]
         n = 2
-        while t in tags:
+        while t in tags or t in used:
             t = "%s_%d" % (g["tag"], n)
             n += 1
         tags.append(t)
     return tags
-
-
-def _sbs_faults(z4, ref, group, tags, rk):
-    """Sheet 1: one row per fault -- the reference verdict, then each
-       scenario's verdict, class, worst criterion, both values, limit, buses."""
-    SC = dict((c, i) for i, c in enumerate(z4._SUMMARY_COLS))
-    per, order, head = {}, [], {}
-    for g, t in zip(group, tags):
-        for r in g["summary"]:
-            fid = str(r[SC["fault"]]).strip()
-            if fid not in per:
-                per[fid] = {}
-                order.append(fid)
-                head[fid] = r
-            per[fid][t] = r
-    proj = group[0]["proj"]
-    # ATTRIBUTE-MAJOR: verdict | base, studied, gia ... then class | studied,
-    # gia ... -- the numbers to be compared sit in ADJACENT columns.
-    _w = {"verdict": 11, "class": 14, "worst_criterion": 24, "value": 10, "limit": 8,
-          "unit": 6, "past_limit": 10, "new_criteria": 18, "violating_buses": 40, "cause": 50}
-    header = ["fault", "planning_event", "fault_source", "project", "reference"]
-    widths = [8, 12, 9, 12, 22]
-    header.append("verdict | %s" % rk); widths.append(11)
-    for t in tags:
-        header.append("verdict | %s" % t); widths.append(11)
-    header += ["worst_across_scenarios"]; widths += [22]
-    _attrs = [("class", "classification"), ("worst_criterion", "worst_criterion"),
-              ("value", None), ("limit", "limit"), ("unit", "unit"), ("past_limit", "past_limit"),
-              ("new_criteria", "new_criteria"), ("violating_buses", "violating_buses"),
-              ("cause", "cause")]
-    for nm, _c in _attrs:
-        if nm == "value":
-            header.append("value | %s" % rk); widths.append(_w[nm])
-        for t in tags:
-            header.append("%s | %s" % (nm, t)); widths.append(_w[nm])
-    header += ["description"]; widths += [60]
-    rows = []
-    for fid in sorted(order, key=lambda x: (len(x), x)):
-        h = head[fid]
-        row = [fid, h[SC["planning_event"]], h[SC["fault_source"]], proj, _base(ref),
-               h[SC["verdict_base"]]]
-        worst, act, allpass = "", False, True
-        cells = {}
-        for t in tags:
-            r = per[fid].get(t)
-            if r is None:
-                cells[t] = None
-                row.append("not compared")
-                allpass = False
-                continue
-            cells[t] = r
-            row.append(r[SC["verdict_projects"]])
-            cls = str(r[SC["classification"]])
-            if str(r[SC["action"]]).startswith("ACT"):
-                act = True
-                worst = "%s: %s" % (t, cls)
-            elif cls == z4.CLS_PRE and not act:
-                worst = "%s: %s" % (t, cls)
-            if str(r[SC["verdict_projects"]]).upper() != "PASS":
-                allpass = False
-        row.append(worst or ("all PASS" if allpass else "mixed / see element sheet"))
-        # the reference value of the worst criterion: from the first scenario that has it
-        _bv = ""
-        for t in tags:
-            if cells[t] is not None and str(cells[t][SC["base_value"]]).strip() not in ("", "-"):
-                _bv = cells[t][SC["base_value"]]
-                break
-        for nm, c in _attrs:
-            if nm == "value":
-                row.append(_bv)
-                for t in tags:
-                    row.append(cells[t][SC["project_value"]] if cells[t] is not None else "not compared")
-                continue
-            for t in tags:
-                row.append(cells[t][SC[c]] if cells[t] is not None else "-")
-        row.append(h[SC["description"]])
-        rows.append([("-" if (v is None or str(v).strip() == "") else v) for v in row])
-    nw = header.index("worst_across_scenarios")
-
-    def _style(row):
-        w = str(row[nw])
-        if w.endswith(": " + z4.CLS_NEW):
-            return 2
-        if w.endswith(": " + z4.CLS_PRE):
-            return 3
-        if w == "all PASS":
-            return 5
-        return 0
-    return header, rows, widths, _style
 
 
 def _num(v):
@@ -709,6 +636,8 @@ def _num(v):
        every measured-only cell was called "within limit" whatever it read."""
     if v is None:
         return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
     txt = str(v).strip()
     if txt in ("", "-"):
         return None
@@ -725,6 +654,29 @@ def _num(v):
         return float(m[-1] if len(m) > 1 else m[0])
     except ValueError:
         return None
+
+
+def _limits(txt):
+    """(low, high) of a limit as the panel words it: 'min 0.70 pu' -> (0.7,
+       None), 'max 1.20 pu' -> (None, 1.2), '0.90 - 1.10 pu' -> (0.9, 1.1).
+       A steady-state band has TWO sides; judging it on its upper bound alone
+       called 0.85 pu 'within limit'."""
+    if txt is None:
+        return None, None
+    s = str(txt).strip().lower()
+    try:
+        nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", s)]
+    except ValueError:
+        return None, None
+    if not nums:
+        return None, None
+    if s.startswith("min"):
+        return nums[0], None
+    if s.startswith("max"):
+        return None, nums[0]
+    if len(nums) >= 2:
+        return min(nums[0], nums[1]), max(nums[0], nums[1])
+    return None, nums[0]
 
 
 def _fmt(v, fam):
@@ -752,7 +704,7 @@ def _meas_fill(z4, meas, fam, fid, element):
         # machine ended at; putting it in the same column as the report's p0
         # compared two different quantities side by side.
         p0 = rec.get("p0")
-        return _fmt(p0, fam), z4._trip_state_text(rec, None)
+        return _fmt(p0, fam), (z4._trip_state_text(rec, None) or "measured in this run")
     try:
         v = z4.measured_value(meas, fam, fid, element)
     except Exception:
@@ -762,7 +714,370 @@ def _meas_fill(z4, meas, fam, fid, element):
     return _fmt(v, fam), "measured in this run"
 
 
-def _sbs_elements(z4, ref, group, tags, rk):
+def _meas_cell(z4, meas, fam, fid, element):
+    """(value, state, seconds above 1.20) of one element in one folder."""
+    val, state = _meas_fill(z4, meas, fam, fid, element)
+    above = "-"
+    if fam == "overshoot" and val != "-":
+        try:
+            a = z4.measured_above(meas, fid, element)
+            if a is not None:
+                above = "%.4f" % float(a)
+        except Exception:
+            pass
+    return val, state, above
+
+
+def _measured_class(fam, val, state, limit):
+    """How one MEASURED cell reads against its criterion's limit -- for a run
+       whose own report has no row for this element."""
+    if fam not in _MEASURABLE:
+        return "no numeric value for this criterion"
+    if str(val).strip() in ("", "-"):
+        return "not measured in this run"
+    if fam == "trip":
+        return ("TRIPPED in this run (measured)" if str(state).strip().upper().startswith("TRIPPED")
+                else "connected in this run (measured)")
+    v = _num(val)
+    if v is None:
+        return "not measured in this run"
+    lo, hi = _limits(limit)
+    if lo is not None and v < lo and fam in ("recovery", "steady"):
+        return "under the limit in this run (measured)"
+    if hi is not None and v > hi:
+        if fam == "angle":
+            return "swing above %g deg in this run (measured; damping is judged by the study)" % hi
+        if fam in ("overshoot", "steady"):
+            return "over the limit in this run (measured)"
+    return "within limit here (measured)"
+
+
+# ---- merging one value that several pair workbooks each carry ---------------
+# The reference's numbers are the same in every pair -- same folder, same
+# measurements -- so they are shown ONCE, beside the runs' numbers. When two
+# pairs disagree (the summary's base value belongs to each pair's WORST
+# criterion, and those can differ) every distinct value is shown with the run
+# it came from, instead of the first one standing for all.
+def _merge_add(store, col, t, v, z4):
+    if _empty(z4, v):
+        return
+    sv = str(v).strip()
+    lst = store.setdefault(col, [])
+    for ent in lst:
+        if ent[0] == sv:
+            if t not in ent[2]:
+                ent[2].append(t)
+            return
+    lst.append([sv, v, [t]])
+
+
+def _merge_get(store, col, z4, default=None):
+    lst = store.get(col)
+    if not lst:
+        return z4.EMPTY_CELL if default is None else default
+    if len(lst) == 1:
+        return lst[0][1]
+    return " / ".join("%s: %s" % (", ".join(ent[2]), ent[1]) for ent in lst)
+
+
+def _merge_one(store, col):
+    """The single value, or None when the pairs disagree or have none."""
+    lst = store.get(col)
+    return lst[0][1] if lst and len(lst) == 1 else None
+
+
+def _sbs_context(z4, ref, group, tags, rk):
+    """What every side-by-side sheet needs besides the pair rows themselves:
+       each run's detail and summary indexed by key, the reference's values
+       merged across the pairs, and the MEASURED value of every element in
+       every run where that run's own report has no number for it.
+
+       The measurements are read ONE FOLDER AT A TIME, the few cells needed
+       are kept as short strings, and the folder is dropped before the next --
+       holding three folders' measurements together is what ran a 32-bit
+       python out of memory."""
+    RC = dict((c, i) for i, c in enumerate(z4._REPORT_COLS))
+    SC = dict((c, i) for i, c in enumerate(z4._SUMMARY_COLS))
+    proj = group[0]["proj"]
+    det, summ, order, seen, base = {}, {}, [], set(), {}
+    _bcols = ("planning_event", "fault_source", "measured", "area", "hops_from_fault",
+              "hops_from_poi", "limit", "unit", "description", "verdict_base",
+              "base_value", "base_state", "base_value_note", "secs_above_1_20_base")
+    for g, t in zip(group, tags):
+        d = {}
+        for r in (g.get("detail") or []):
+            k = tuple(str(r[RC[c]]).strip() for c in _KEY4)
+            if k not in d:
+                d[k] = r
+            if k not in seen:
+                seen.add(k)
+                order.append(k)
+                base[k] = {}
+            for c in _bcols:
+                _merge_add(base[k], c, t, r[RC[c]], z4)
+        det[t] = d
+        s = {}
+        for r in (g.get("summary") or []):
+            s[str(r[SC["fault"]]).strip()] = r
+        summ[t] = s
+    # WHICH CELLS NEED A MEASUREMENT: the reference where no pair had a base
+    # number, and each run where its report has no row, or a row with no number.
+    todo = {}
+    for k in order:
+        fam = z4._criterion_family(k[1])
+        if not k[1] or fam not in _MEASURABLE:
+            continue
+        el = k[2] if z4._bus_of_element(k[2]) is not None else k[3]
+        if "base_value" not in base[k] or "base_state" not in base[k]:
+            todo.setdefault(rk, []).append((k, fam, el))
+        for t in tags:
+            r = det[t].get(k)
+            if r is None or _empty(z4, r[RC["project_value"]]) or _empty(z4, r[RC["project_state"]]):
+                todo.setdefault(t, []).append((k, fam, el))
+    fills = {}
+    if todo:
+        for t, folder in [(rk, ref)] + [(tg, g["test"]) for g, tg in zip(group, tags)]:
+            if not todo.get(t):
+                continue
+            print("[pair]   reading the measurements of %s for %d element value(s) its report "
+                  "does not carry ..." % (folder, len(todo[t])))
+            try:
+                _free(z4, keep_want=True)
+                # ONLY THE BUSES THIS FOLDER'S CELLS NEED. The panel's reader
+                # keeps every fault's row for a wanted bus; wanting every bus
+                # on the sheet kept hundreds of thousands of rows per folder.
+                want = z4._want_buses(proj)
+                want.clear()
+                for k, fam, el in todo[t]:
+                    b = z4._bus_of_element(el)
+                    if b is not None:
+                        want.add(str(b))
+                m = z4.read_measurements(folder, proj)
+                for k, fam, el in todo[t]:
+                    fills[(t,) + k] = _meas_cell(z4, m, fam, k[0], el)
+                del m
+            except Exception as e:
+                print("[pair]   measurements of %s could not be read (%s) -- those cells "
+                      "show '-'" % (folder, e))
+            _free(z4, keep_want=True)
+    # THE REFERENCE'S OWN NUMBERS, FILLED WHERE NO PAIR HAD ONE.
+    for k in order:
+        f = fills.get((rk,) + k)
+        if not f:
+            continue
+        b = base[k]
+        if "base_value" not in b and f[0] != "-":
+            _merge_add(b, "base_value", rk, f[0], z4)
+            if "base_value_note" not in b:
+                _merge_add(b, "base_value_note", rk, "from the reference measurements", z4)
+        if "base_state" not in b and f[1]:
+            _merge_add(b, "base_state", rk, f[1], z4)
+        if "secs_above_1_20_base" not in b and f[2] != "-":
+            _merge_add(b, "secs_above_1_20_base", rk, f[2], z4)
+    return {"RC": RC, "SC": SC, "det": det, "summ": summ, "order": order,
+            "base": base, "fills": fills, "rk": rk}
+
+
+def _base_num(z4, ctx, k, t=None):
+    """The reference value to subtract from run t's value: t's OWN pair's base
+       value when it has one (it belongs to the same criterion), else the one
+       value every pair agrees on, else None."""
+    RC = ctx["RC"]
+    if t is not None:
+        r = ctx["det"][t].get(k)
+        if r is not None and not _empty(z4, r[RC["base_value"]]):
+            return _num(r[RC["base_value"]])
+    one = _merge_one(ctx["base"].get(k, {}), "base_value")
+    return _num(one) if one is not None else None
+
+
+def _detail_fallback(z4, ctx, t, k4):
+    """A detail row for run t when its own report has none for this element:
+       the fault-level cells from t's summary, the element's cells from t's
+       measurements, judged against the limit."""
+    r0 = ctx["det"][t].get(k4)
+    if r0 is not None:
+        return r0
+    RC, SC = ctx["RC"], ctx["SC"]
+    E = z4.EMPTY_CELL
+    row = [E] * len(z4._REPORT_COLS)
+
+    def put(c, v):
+        if c in RC:
+            row[RC[c]] = E if (v is None or str(v).strip() == "") else v
+    fid, crit, el, bus = k4
+    for c, v in zip(_KEY4, k4):
+        put(c, v)
+    s = ctx["summ"][t].get(fid)
+    if s is not None:
+        for c in ("run_setting", "dyr_edits", "project_output", "project",
+                  "planning_event", "fault_source", "verdict_base", "description"):
+            if c in SC:
+                put(c, s[SC[c]])
+        put("verdict_projects", s[SC["verdict_projects"]])
+        put("fault_classification", s[SC["classification"]])
+        put("fault_introduced_by_projects", "YES" if s[SC["classification"]] == z4.CLS_NEW else "no")
+    else:
+        put("verdict_projects", "fault not in this run")
+    if crit:
+        fam = z4._criterion_family(crit)
+        limit = _merge_one(ctx["base"].get(k4, {}), "limit")
+        f = ctx["fills"].get((t,) + k4)
+        if f:
+            val, state, above = f
+        elif fam in _MEASURABLE:
+            val, state, above = "-", "not measured in this run", "-"
+        else:
+            val, state, above = "-", "no numeric value for this criterion", "-"
+        put("project_value", val)
+        put("project_state", state)
+        put("secs_above_1_20_project", above)
+        put("element_classification", _measured_class(fam, val, state, limit))
+        v, b0, lim = _num(val) if val != "-" else None, _base_num(z4, ctx, k4), _num(limit)
+        put("change", _fmt(v - b0, fam) if (v is not None and b0 is not None) else "-")
+        put("past_limit", _fmt(v - lim, fam) if (v is not None and lim is not None) else "-")
+        put("criterion_is_new", "-")
+        put("limit", limit)
+    return row
+
+
+def _compact_fallback(z4, ctx, t, k4):
+    try:
+        return z4._compact_view([_detail_fallback(z4, ctx, t, k4)])[0]
+    except Exception:
+        return None
+
+
+def _notrun_fallback(z4, ctx, t, fid):
+    """A fault run t DID compare: its not-compared cells say so, with the
+       verdict, instead of 'not in this run'."""
+    s = ctx["summ"][t].get(fid)
+    if s is None:
+        return None
+    NC = dict((c, i) for i, c in enumerate(z4._NOTRUN_COLS))
+    SC = ctx["SC"]
+    row = ["-"] * len(z4._NOTRUN_COLS)
+    for c in ("run_setting", "dyr_edits", "project_output", "project",
+              "planning_event", "fault_source", "description"):
+        if c in NC and c in SC:
+            row[NC[c]] = s[SC[c]]
+    row[NC["fault"]] = fid
+    if "projects_state" in NC:
+        row[NC["projects_state"]] = ("compared in this run: %s (%s)"
+                                     % (s[SC["verdict_projects"]], s[SC["classification"]]))
+    return row
+
+
+def _sbs_faults(z4, ref, group, tags, rk, ctx=None):
+    """Sheet 1: one row per fault -- the reference verdict, then each
+       scenario's verdict, class, worst criterion, both values, limit, buses."""
+    SC = dict((c, i) for i, c in enumerate(z4._SUMMARY_COLS))
+    per, order, head = {}, [], {}
+    for g, t in zip(group, tags):
+        for r in g["summary"]:
+            fid = str(r[SC["fault"]]).strip()
+            if fid not in per:
+                per[fid] = {}
+                order.append(fid)
+                head[fid] = {}
+            per[fid][t] = r
+            for c in ("planning_event", "fault_source", "verdict_base", "description"):
+                _merge_add(head[fid], c, t, r[SC[c]], z4)
+    proj = group[0]["proj"]
+    # ATTRIBUTE-MAJOR: verdict | base, studied, gia ... then class | studied,
+    # gia ... -- the numbers to be compared sit in ADJACENT columns.
+    _w = {"verdict": 11, "class": 14, "worst_criterion": 24, "value": 10, "limit": 8,
+          "unit": 6, "past_limit": 10, "new_criteria": 18, "violating_buses": 40, "cause": 50}
+    header = ["fault", "planning_event", "fault_source", "project", "reference"]
+    widths = [8, 12, 9, 12, 22]
+    header.append("verdict | %s" % rk); widths.append(11)
+    for t in tags:
+        header.append("verdict | %s" % t); widths.append(11)
+    header += ["worst_across_scenarios"]; widths += [22]
+    _attrs = [("class", "classification"), ("worst_criterion", "worst_criterion"),
+              ("value", None), ("limit", "limit"), ("unit", "unit"), ("past_limit", "past_limit"),
+              ("new_criteria", "new_criteria"), ("violating_buses", "violating_buses"),
+              ("cause", "cause")]
+    for nm, _c in _attrs:
+        if nm == "value":
+            header.append("value | %s" % rk); widths.append(_w[nm])
+        for t in tags:
+            header.append("%s | %s" % (nm, t)); widths.append(_w[nm])
+    header += ["description"]; widths += [60]
+    rows = []
+    for fid in sorted(order, key=lambda x: (len(x), x)):
+        h = head[fid]
+        row = [fid, _merge_get(h, "planning_event", z4), _merge_get(h, "fault_source", z4),
+               proj, _base(ref), _merge_get(h, "verdict_base", z4)]
+        worst, act, allpass = "", False, True
+        cells = {}
+        for t in tags:
+            r = per[fid].get(t)
+            if r is None:
+                cells[t] = None
+                row.append("not in this run")
+                allpass = False
+                continue
+            cells[t] = r
+            row.append(r[SC["verdict_projects"]])
+            cls = str(r[SC["classification"]])
+            if str(r[SC["action"]]).startswith("ACT"):
+                act = True
+                worst = "%s: %s" % (t, cls)
+            elif cls == z4.CLS_PRE and not act:
+                worst = "%s: %s" % (t, cls)
+            if str(r[SC["verdict_projects"]]).upper() != "PASS":
+                allpass = False
+        row.append(worst or ("all PASS" if allpass else "mixed / see element sheet"))
+        # THE REFERENCE VALUE OF EACH RUN'S WORST CRITERION. One number when
+        # the runs' worst criteria agree; every distinct one, named by run,
+        # when they do not -- a pu value is not the base of an MW value.
+        _bv = {}
+        for t in tags:
+            if cells[t] is not None:
+                _merge_add(_bv, "v", t, cells[t][SC["base_value"]], z4)
+        for nm, c in _attrs:
+            if nm == "value":
+                row.append(_merge_get(_bv, "v", z4, default="-"))
+                for t in tags:
+                    row.append(cells[t][SC["project_value"]] if cells[t] is not None else "not in this run")
+                continue
+            for t in tags:
+                row.append(cells[t][SC[c]] if cells[t] is not None else "-")
+        row.append(_merge_get(h, "description", z4))
+        rows.append([("-" if (v is None or str(v).strip() == "") else v) for v in row])
+    nw = header.index("worst_across_scenarios")
+
+    def _style(row):
+        w = str(row[nw])
+        if w.endswith(": " + z4.CLS_NEW):
+            return 2
+        if w.endswith(": " + z4.CLS_PRE):
+            return 3
+        if w == "all PASS":
+            return 5
+        return 0
+    return header, rows, widths, _style
+
+
+def _el_rank(z4, cls):
+    """How loud an element class is, for 'worst across scenarios'."""
+    c = str(cls)
+    if c == z4.CLS_NEW:
+        return 3
+    if c == z4.CLS_PRE:
+        return 2
+    if ("over the limit" in c or "under the limit" in c or c.startswith("TRIPPED")
+            or c.startswith("swing above")):
+        return 1
+    if c in (z4.CLS_EL_OK, "", "within limit here (measured)", "not measured in this run",
+             "connected in this run (measured)", "no numeric value for this criterion",
+             getattr(z4, "CLS_EL_UNKNOWN_T", "\0"), z4.CLS_EL_UNKNOWN):
+        return 0
+    return 1
+
+
+def _sbs_elements(z4, ref, group, tags, rk, ctx=None):
     """Sheet 2: one row per fault x criterion x ELEMENT (bus or machine) --
        the reference value and state, then each scenario's value, state and
        element classification. This is where 'what did bus 531605 do in the
@@ -772,63 +1087,10 @@ def _sbs_elements(z4, ref, group, tags, rk):
        no report row in the second; its value there is read from that folder's
        own measurements (the bus is added to the panel's want-list first, so
        the selective read keeps it). What was never measured says so."""
-    RC = dict((c, i) for i, c in enumerate(z4._REPORT_COLS))
-    per, order, head = {}, [], {}
-    for g, t in zip(group, tags):
-        for r in g["detail"]:
-            k = (str(r[RC["fault"]]).strip(), str(r[RC["criterion"]]).strip(),
-                 str(r[RC["element"]]).strip(), str(r[RC["bus_number"]]).strip())
-            if k not in per:
-                per[k] = {}
-                order.append(k)
-                head[k] = r
-            per[k][t] = r
+    if ctx is None:
+        ctx = _sbs_context(z4, ref, group, tags, rk)
+    RC = ctx["RC"]
     proj = group[0]["proj"]
-    # EVERY FOLDER'S OWN MEASUREMENTS FOR EVERY ELEMENT ON THE SHEET -- read
-    # ONE FOLDER AT A TIME. Holding the reference's and every run's
-    # measurements together (hundreds of thousands of records each) is what
-    # exhausted the 32-bit address space. Each folder is read, the few cells
-    # this sheet needs from it are taken as short strings, and it is dropped
-    # before the next one is opened.
-    fill = {}                          # (tag, fault, criterion, element) -> (value, state)
-    try:
-        want = z4._want_buses(proj)
-        for k in order:
-            b = z4._bus_of_element(k[2]) or z4._bus_of_element(k[3])
-            if b is not None:
-                want.add(str(b))
-    except Exception:
-        pass
-    _todo = {}                         # tag -> [(key, fam, element)] needing a fill
-    for k in order:
-        fid, crit, el, bus = k
-        fam = z4._criterion_family(crit)
-        _el = el if z4._bus_of_element(el) is not None else bus
-        h = head[k]
-        if str(h[RC["base_value"]]).strip() in ("", "-") or str(h[RC["base_state"]]).strip() == "":
-            _todo.setdefault(rk, []).append((k, fam, _el))
-        for t in tags:
-            r = per[k].get(t)
-            if r is None or str(r[RC["project_value"]]).strip() in ("", "-") \
-                    or str(r[RC["project_state"]]).strip() == "":
-                _todo.setdefault(t, []).append((k, fam, _el))
-    for t, folder in [(rk, ref)] + [(tg, g["test"]) for g, tg in zip(group, tags)]:
-        if not _todo.get(t):
-            continue
-        try:
-            _free(z4, keep_want=True)
-            m = z4.read_measurements(folder, proj)
-            for k, fam, _el in _todo[t]:
-                fill[(t,) + k] = _meas_fill(z4, m, fam, k[0], _el)
-            del m
-        except Exception as e:
-            print("[pair]   measurements of %s could not be read (%s) -- cells with no "
-                  "report row show '-'" % (folder, e))
-        _free(z4, keep_want=True)
-    meas = dict((t, True) for t in [rk] + tags)        # which folders were read
-
-    def _meas_fill_cached(t, k):
-        return fill.get((t,) + k, ("-", "not measured in this run"))
     # ATTRIBUTE-MAJOR: value | base, studied, gia ... side by side, then the
     # states, then the classes, changes and past-limit -- one glance per row.
     _w = {"value": 11, "state": 22, "class": 26, "change": 9, "past_limit": 10}
@@ -854,74 +1116,57 @@ def _sbs_elements(z4, ref, group, tags, rk):
         f = k[0]
         m = re.match(r"^([A-Za-z]*)(\d+)$", f)
         return ((m.group(1), int(m.group(2))) if m else ("~", 0), f, k[1], k[2], k[3])
-    _order = {z4.CLS_NEW: 3, z4.CLS_PRE: 2}
-    for k in sorted(order, key=_fkey):
+    for k in sorted(ctx["order"], key=_fkey):
         fid, crit, el, bus = k
-        h = head[k]
+        b = ctx["base"][k]
         fam = z4._criterion_family(crit)
-        lim = _num(h[RC["limit"]])
-        # the element name carries the bus number in every list but one; when
-        # it does not, the bus_number column does
-        _el = el if z4._bus_of_element(el) is not None else bus
-        bval, bstate, bnote = h[RC["base_value"]], h[RC["base_state"]], h[RC["base_value_note"]]
-        if rk in meas and (str(bval).strip() in ("", "-") or str(bstate).strip() == ""):
-            v2, st2 = _meas_fill_cached(rk, k)
-            if str(bval).strip() in ("", "-"):
-                bval = v2
-                if str(bnote).strip() == "" and v2 != "-":
-                    bnote = "from the reference measurements"
-            if str(bstate).strip() == "":
-                bstate = st2
-        row = [fid, h[RC["planning_event"]], h[RC["fault_source"]], proj, crit, h[RC["measured"]],
-               el, bus, h[RC["area"]], h[RC["hops_from_fault"]], h[RC["hops_from_poi"]],
-               h[RC["limit"]], h[RC["unit"]]]
+        limit = _merge_one(b, "limit")            # to judge with
+        row = [fid, _merge_get(b, "planning_event", z4), _merge_get(b, "fault_source", z4), proj,
+               crit, _merge_get(b, "measured", z4), el, bus, _merge_get(b, "area", z4),
+               _merge_get(b, "hops_from_fault", z4), _merge_get(b, "hops_from_poi", z4),
+               _merge_get(b, "limit", z4), _merge_get(b, "unit", z4)]
         got = {}                                  # tag -> [value, state, class, change, past]
         worst, rank = "", -1
         for t in tags:
-            r = per[k].get(t)
-            if r is None:
+            r = ctx["det"][t].get(k)
+            f = ctx["fills"].get((t,) + k)
+            if r is None and not crit:
+                cells = ["-", "-", "-", "-", "-"]
+                cls = "-"
+            elif r is None:
                 # NOT IN THIS SCENARIO'S REPORT: what that run measured.
-                val, state = _meas_fill_cached(t, k)
-                v, b0 = _num(val), _num(bval)
-                if val == "-":
-                    cls = "not measured in this run"
-                elif lim is not None and v is not None and fam in ("overshoot", "steady", "angle", "eterm") and v > lim:
-                    cls = "over the limit in this run (measured)"
-                elif lim is not None and v is not None and fam == "recovery" and v < lim:
-                    cls = "under the limit in this run (measured)"
-                else:
-                    cls = "within limit here (measured)"
+                val, state = (f[0], f[1]) if f else (
+                    "-", "not measured in this run" if fam in _MEASURABLE
+                    else "no numeric value for this criterion")
+                cls = _measured_class(fam, val, state, limit)
+                v, b0, lim = (_num(val) if val != "-" else None), _base_num(z4, ctx, k), _num(limit)
                 chg = _fmt(v - b0, fam) if (v is not None and b0 is not None) else "-"
                 past = _fmt(v - lim, fam) if (v is not None and lim is not None) else "-"
                 cells = [val, state, cls, chg, past]
             else:
                 cells = [r[RC[c]] for _nm, c in _SBS_EL]
                 cls = str(r[RC["element_classification"]])
-                if t in meas and (str(cells[0]).strip() in ("", "-") or str(cells[1]).strip() == ""):
-                    v2, st2 = _meas_fill_cached(t, k)
-                    if str(cells[0]).strip() in ("", "-"):
-                        cells[0] = v2
-                    if str(cells[1]).strip() == "":
-                        cells[1] = st2
+                if f:
+                    if _empty(z4, cells[0]):
+                        cells[0] = f[0]
+                    if _empty(z4, cells[1]):
+                        cells[1] = f[1]
             got[t] = cells
-            rk2 = _order.get(cls, 1 if ("over the limit" in cls or "under the limit" in cls
-                                        or cls not in (z4.CLS_EL_OK, "", "within limit here (measured)",
-                                                       "not measured in this run",
-                                                       getattr(z4, "CLS_EL_UNKNOWN_T", "\0"),
-                                                       z4.CLS_EL_UNKNOWN)) else 0)
+            rk2 = _el_rank(z4, cls)
             if rk2 > rank:
                 rank, worst = rk2, ("%s: %s" % (t, cls) if rk2 > 0 else cls)
-        row.append(bval)
+        row.append(_merge_get(b, "base_value", z4, default="-"))
         for t in tags:
             row.append(got[t][0])
         row.append(worst or "-")
-        row.append(bstate)
+        row.append(_merge_get(b, "base_state", z4, default="-"))
         for t in tags:
             row.append(got[t][1])
         for ix in (2, 3, 4):
             for t in tags:
                 row.append(got[t][ix])
-        row += [bnote, h[RC["description"]]]
+        row += [_merge_get(b, "base_value_note", z4, default="-"),
+                _merge_get(b, "description", z4)]
         rows.append([("-" if (v is None or str(v).strip() == "") else v) for v in row])
     nw = header.index("worst_across_scenarios")
 
@@ -937,20 +1182,6 @@ def _sbs_elements(z4, ref, group, tags, rk):
     return header, rows, widths, _style
 
 
-def _long_sheet(z4, group, tags, key, cols):
-    """Every scenario's rows of one panel sheet, stacked, with the scenario
-       tag as the LAST column -- last so the panel's own colour rules, which
-       index columns from the left, still apply."""
-    rows = []
-    for g, t in zip(group, tags):
-        for r in (g.get(key) or []):
-            r = list(r)
-            while len(r) < len(cols):
-                r.append(z4.EMPTY_CELL)
-            rows.append([(z4.EMPTY_CELL if v in ("", None) else v) for v in r[:len(cols)]] + [t])
-    return rows
-
-
 # Columns that describe the fault / element or the REFERENCE side -- the same
 # in every run, so they appear once. Everything else is per run and is laid
 # out attribute-major: attr | run1, attr | run2 ... in adjacent columns.
@@ -961,6 +1192,9 @@ _KEYS = {"summary": ["fault"], "notrun": ["fault"], "poi": ["fault"],
          "new_el": ["fault", "criterion", "element", "bus_number"],
          "pre_el": ["fault", "criterion", "element", "bus_number"],
          "detail": ["fault", "criterion", "element", "bus_number"]}
+# per-run cells a run's measurements can fill when its report has no number
+_RUN_FILL = {"project_value": 0, "project_state": 1,
+             "secs_above_1_20_project": 2, "above_1.20_project_s": 2}
 
 
 def _is_shared(c):
@@ -969,29 +1203,83 @@ def _is_shared(c):
         or c.startswith("above_1.20_base") or c.startswith("secs_above_1_20_base")
 
 
-def _wide_sheet(z4, group, tags, key, cols, rk):
+def _class_style(z4, vals):
+    """Red when any run's class is NEW / 'PROJECT introduced', amber when any
+       is PRE-EXISTING / 'pre-existing (both cases)' -- the detail sheets and
+       the compact sheets word the same class differently."""
+    new = pre = False
+    for v in vals:
+        u = str(v).strip().upper()
+        if u == str(z4.CLS_NEW).upper() or u.startswith("PROJECT INTRODUCED"):
+            new = True
+        elif u.startswith(str(z4.CLS_PRE).upper()):
+            pre = True
+    return 2 if new else (3 if pre else None)
+
+
+def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None):
     """One panel sheet, every run side by side: the key and the shared /
        reference columns once, then each per-run column repeated per run,
-       adjacent. A run that has no row for that key reads 'not in this run'."""
+       adjacent, with the reference's own column right before its runs'.
+
+       NOTHING LEFT OUT. A violation listed for one run and not another is
+       still answered for the other: sheets 5 and 6 show that element's class
+       and values in the other run's own report; sheet 8 shows the run's
+       measured value, judged against the limit; sheet 7 says the fault WAS
+       compared there, with its verdict. 'not in this run' is left only where
+       the run truly has nothing -- a fault it never ran."""
     ix = dict((c, i) for i, c in enumerate(cols))
     keys = _KEYS.get(key, ["fault"])
     shared = [c for c in cols if c not in keys and _is_shared(c)]
     perrun = [c for c in cols if c not in keys and not _is_shared(c)]
-    per, order, head = {}, [], {}
+    per, order, merged = {}, [], {}
     for g, t in zip(group, tags):
+        cnt = {}
         for r in (g.get(key) or []):
             r = list(r) + [z4.EMPTY_CELL] * (len(cols) - len(r))
-            k = tuple(str(r[ix[c]]).strip() for c in keys)
+            k0 = tuple(str(r[ix[c]]).strip() for c in keys)
+            # A KEY THAT REPEATS WITHIN ONE RUN keeps every row: the n-th row
+            # of a run pairs with the n-th row of the others.
+            n = cnt.get(k0, 0) + 1
+            cnt[k0] = n
+            k = k0 + (n,)
             if k not in per:
                 per[k] = {}
                 order.append(k)
-                head[k] = [z4.EMPTY_CELL] * len(cols)
+                merged[k] = {}
             per[k][t] = r
-            # the shared cells: the first run that has a real value fills them
-            h = head[k]
             for c in shared:
-                if str(h[ix[c]]).strip() in ("", z4.EMPTY_CELL, "-") and str(r[ix[c]]).strip() not in ("", z4.EMPTY_CELL, "-"):
-                    h[ix[c]] = r[ix[c]]
+                _merge_add(merged[k], c, t, r[ix[c]], z4)
+    element_sheet = (len(keys) == 4 and ctx is not None)
+    # THE REFERENCE'S OWN NUMBERS WHERE NO PAIR HAD ONE, from its measurements.
+    if element_sheet:
+        _bmap = {"base_value": "base_value", "base_state": "base_state",
+                 "base_value_note": "base_value_note",
+                 "secs_above_1_20_base": "secs_above_1_20_base",
+                 "above_1.20_base_s": "secs_above_1_20_base"}
+        for k in order:
+            b = ctx["base"].get(k[:4])
+            if not b:
+                continue
+            for c, src in _bmap.items():
+                if c in ix and c not in merged[k] and src in b:
+                    merged[k][c] = b[src]
+    fallback = None
+    if ctx is not None:
+        if key == "detail":
+            fallback = lambda t, k: _detail_fallback(z4, ctx, t, k[:4])
+        elif key in ("new_el", "pre_el"):
+            def fallback(t, k):
+                r0 = ctx["det"][t].get(k[:4])
+                if r0 is not None:
+                    try:
+                        return z4._compact_view([r0])[0]
+                    except Exception:
+                        return None
+                return _compact_fallback(z4, ctx, t, k[:4])
+        elif key == "notrun":
+            fallback = lambda t, k: _notrun_fallback(z4, ctx, t, k[0])
+
     # THE BASE COLUMN SITS RIGHT BEFORE ITS OWN PROJECT COLUMNS: base_value |
     # base, project_value | studied, project_value | gia ... so the numbers to
     # be compared -- a bus voltage, a rotor angle, a machine's MW -- are read
@@ -1011,7 +1299,7 @@ def _wide_sheet(z4, group, tags, key, cols, rk):
     front = [c for c in shared if c not in paired]
     header = list(keys) + [("%s | %s" % (c, rk)) if (c.startswith("base") or c == "verdict_base") else c
                            for c in front]
-    layout = []                                   # (column, None) or (base column, None) per cell
+    layout = []                                   # (column, tag) per cell; tag None = the reference
     for c in perrun:
         b = _base_of(c)
         if b:
@@ -1020,89 +1308,112 @@ def _wide_sheet(z4, group, tags, key, cols, rk):
         for t in tags:
             header.append("%s | %s" % (c, t))
             layout.append((c, t))
-    rows = []
+    widths = [10] * len(keys) + [14] * len(front) + [14] * len(layout)
+    cls_cols = [i for i, hh in enumerate(header)
+                if hh.split(" | ")[0] in ("classification", "element_classification",
+                                          "fault_classification", "who_caused_it")]
 
     def _k(k):
         m = re.match(r"^([A-Za-z]*)(\d+)$", k[0])
         return ((m.group(1), int(m.group(2))) if m else ("~", 0),) + tuple(k)
-    for k in sorted(order, key=_k):
-        h = head[k]
-        row = list(k) + [h[ix[c]] for c in front]
-        for c, t in layout:
-            if t is None:
-                row.append(h[ix[c]])
-            else:
+
+    def _rows():
+        for k in sorted(order, key=_k):
+            mk = merged[k]
+            got = {}
+            for t in tags:
                 r = per[k].get(t)
-                row.append(r[ix[c]] if r is not None else "not in this run")
-        rows.append([(z4.EMPTY_CELL if v in ("", None) else v) for v in row])
-    widths = [10] * len(keys) + [14] * len(front) + [14] * len(layout)
-    cls_cols = [i for i, hh in enumerate(header)
-                if hh.split(" | ")[0] in ("classification", "element_classification", "fault_classification", "who_caused_it")]
+                if r is None and fallback is not None:
+                    try:
+                        r = fallback(t, k)
+                    except Exception:
+                        r = None
+                    if r is not None:
+                        r = list(r) + [z4.EMPTY_CELL] * (len(cols) - len(r))
+                got[t] = r
+            row = list(k[:len(keys)]) + [_merge_get(mk, c, z4) for c in front]
+            for c, t in layout:
+                if t is None:
+                    row.append(_merge_get(mk, c, z4))
+                    continue
+                r = got[t]
+                if r is None:
+                    row.append("not in this run")
+                    continue
+                v = r[ix[c]]
+                if element_sheet and c in _RUN_FILL and _empty(z4, v):
+                    f = ctx["fills"].get((t,) + tuple(k[:4]))
+                    if f and not (f[_RUN_FILL[c]] in ("-", "")):
+                        v = f[_RUN_FILL[c]]
+                row.append(v)
+            yield [(z4.EMPTY_CELL if v in ("", None) else v) for v in row]
 
     def _style(row):
-        vals = [str(row[i]) for i in cls_cols]
-        if any(v == z4.CLS_NEW or v.startswith(z4.CLS_NEW) for v in vals):
-            return 2
-        if any(v == z4.CLS_PRE or v.startswith(z4.CLS_PRE) for v in vals):
-            return 3
-        return None
-    return header, rows, widths, _style
+        return _class_style(z4, [row[i] for i in cls_cols])
+    return header, _rows(), widths, _style
 
 
 def _sbs_poi(z4, ref, group, tags, rk):
-    """POI power per fault, wide: the reference totals, then each scenario's
-       totals, new-plant and existing MW and the post-clearing minimum."""
+    """POI power per fault, wide, the reference's column right before the
+       runs' for every quantity the reference has: total P0 | base, studied,
+       gia; total end | base, studied, gia; ... then the runs' new-plant and
+       existing MW, reactive power and post-clearing minimum."""
     PC = dict((c, i) for i, c in enumerate(z4._POI_COLS))
-    per, order, poi_of = {}, [], {}
+    per, order, head = {}, [], {}
     for g, t in zip(group, tags):
         for r in (g.get("poi") or []):
             fid = str(r[PC["fault"]]).strip()
             if fid not in per:
                 per[fid] = {}
                 order.append(fid)
-                poi_of[fid] = r[PC["POI"]]
+                head[fid] = {}
             per[fid][t] = r
+            for c in ("POI", "base total P0 (MW)", "base total end (MW)", "base total Q0 (MVAr)"):
+                if c in PC:
+                    _merge_add(head[fid], c, t, r[PC[c]], z4)
     proj = group[0]["proj"]
-    header = ["fault", "project", "POI", "total P0 (MW) | %s" % rk, "total end (MW) | %s" % rk,
-              "total Q0 (MVAr) | %s" % rk]
-    widths = [8, 12, 9, 16, 16, 16]
-    for nm, w in (("total P0 (MW)", 14), ("total end (MW)", 14), ("new plant P0 (MW)", 16),
-                  ("new plant end (MW)", 16), ("existing P0 (MW)", 16), ("existing end (MW)", 16),
-                  ("total Q0 (MVAr)", 14), ("total Q end (MVAr)", 14),
-                  ("min P after clearing (MW)", 18), ("how measured", 40)):
+    blocks = [("total P0 (MW)", "base total P0 (MW)", "project total P0 (MW)", 14),
+              ("total end (MW)", "base total end (MW)", "project total end (MW)", 14),
+              ("new plant P0 (MW)", None, "project new plant P0 (MW)", 16),
+              ("new plant end (MW)", None, "project new plant end (MW)", 16),
+              ("existing P0 (MW)", None, "project existing P0 (MW)", 16),
+              ("existing end (MW)", None, "project existing end (MW)", 16),
+              ("total Q0 (MVAr)", "base total Q0 (MVAr)", "project total Q0 (MVAr)", 14),
+              ("total Q end (MVAr)", None, "project total Q end (MVAr)", 14),
+              ("min P after clearing (MW)", None, "project min P after clearing (MW)", 18),
+              ("how measured", None, "how the project total was measured", 40)]
+    blocks = [b for b in blocks if b[2] in PC]
+    header, widths = ["fault", "project", "POI"], [8, 12, 9]
+    for name, bcol, _pcol, w in blocks:
+        if bcol and bcol in PC:
+            header.append("%s | %s" % (name, rk)); widths.append(16)
         for t in tags:
-            header.append("%s | %s" % (nm, t)); widths.append(w)
-    src = ["project total P0 (MW)", "project total end (MW)", "project new plant P0 (MW)",
-           "project new plant end (MW)", "project existing P0 (MW)", "project existing end (MW)",
-           "project total Q0 (MVAr)", "project total Q end (MVAr)",
-           "project min P after clearing (MW)", "how the project total was measured"]
+            header.append("%s | %s" % (name, t)); widths.append(w)
     rows = []
     for fid in sorted(order, key=lambda x: (len(x), x)):
-        first = None
-        for t in tags:
-            if per[fid].get(t) is not None:
-                first = per[fid][t]
-                break
-        row = [fid, proj, poi_of[fid],
-               first[PC["base total P0 (MW)"]] if first is not None else "-",
-               first[PC["base total end (MW)"]] if first is not None else "-",
-               first[PC["base total Q0 (MVAr)"]] if first is not None else "-"]
-        for c in src:
+        h = head[fid]
+        row = [fid, proj, _merge_get(h, "POI", z4, default="-")]
+        for name, bcol, pcol, _w in blocks:
+            if bcol and bcol in PC:
+                row.append(_merge_get(h, bcol, z4, default="-"))
             for t in tags:
                 r = per[fid].get(t)
-                row.append(r[PC[c]] if r is not None else "not compared")
+                row.append(r[PC[pcol]] if r is not None else "not in this run")
         rows.append([("-" if (v is None or str(v).strip() == "") else v) for v in row])
+    _p0 = dict((t, header.index("total P0 (MW) | %s" % t)) for t in tags
+               if ("total P0 (MW) | %s" % t) in header)
+    _pe = dict((t, header.index("total end (MW) | %s" % t)) for t in tags
+               if ("total end (MW) | %s" % t) in header)
 
     def _style(row):
         # red when any scenario's POI total did not come back to 90 % of P0
-        try:
-            n = len(tags)
-            for i in range(n):
-                p0 = float(row[6 + i]); pe = float(row[6 + n + i])
-                if p0 > 1.0 and pe < 0.9 * p0:
-                    return 2
-        except (TypeError, ValueError, IndexError):
-            pass
+        for t in tags:
+            try:
+                p0, pe = float(row[_p0[t]]), float(row[_pe[t]])
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            if p0 > 1.0 and pe < 0.9 * p0:
+                return 2
         return None
     return header, rows, widths, _style
 
@@ -1121,34 +1432,181 @@ def _sbs_runs(z4, ref, group, tags, rk):
                      g["faults"], g["new"], g["pre"],
                      ", ".join(g.get("only_test") or []) or "-",
                      ", ".join(g.get("only_ref") or []) or "-",
-                     os.path.join(g["folder"], "00_COMPARISON_REPORT_%s.xlsx" % g["label"])])
+                     g.get("report") or g.get("folder") or "-"])
     return header, rows, widths, None
 
 
+# ---- the workbook, one sheet at a time, streamed ------------------------------
+_NUMRE = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+
+
+def _cellval(v):
+    """A number stays a number: '1.234' is written as 1.234, so a value column
+       sorts and filters numerically. Ids, words and phrases stay text."""
+    if isinstance(v, str):
+        s = v.strip()
+        if s and len(s) <= 15 and _NUMRE.match(s):
+            try:
+                return float(s) if "." in s else int(s)
+            except ValueError:
+                return v
+    return v
+
+
+def _stream_sheet(z4, fh, header, rows, widths, style_of, first):
+    """One worksheet written straight to a file, row by row -- the panel's
+       layout (coloured header, frozen top row, filter on every column) with
+       no sheet ever held whole in memory. Returns the number of data rows."""
+    ncol = len(header)
+    fh.write(('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+              '<sheetViews><sheetView workbookViewId="0"%s>'
+              '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+              '</sheetView></sheetViews>' % (' tabSelected="1"' if first else "")).encode("utf-8"))
+    if widths:
+        fh.write(("<cols>" + "".join('<col min="%d" max="%d" width="%d" customWidth="1"/>'
+                                     % (i + 1, i + 1, w) for i, w in enumerate(widths[:ncol]))
+                  + "</cols>").encode("utf-8"))
+    fh.write(b"<sheetData>")
+    fh.write(('<row r="1">' + "".join(z4._xl_cell(i, 1, h, 1) for i, h in enumerate(header))
+              + "</row>").encode("utf-8"))
+    n = 1
+    for row in rows:
+        n += 1
+        st = (style_of(row) if style_of else 0) or 0
+        fh.write(('<row r="%d">' % n
+                  + "".join(z4._xl_cell(i, n, _cellval(row[i] if i < len(row) else ""), st)
+                            for i in range(ncol))
+                  + "</row>").encode("utf-8"))
+    fh.write(b"</sheetData>")
+    fh.write(('<autoFilter ref="A1:%s%d"/>' % (z4._xl_col(max(ncol, 1) - 1), n)).encode("utf-8"))
+    fh.write(b"</worksheet>")
+    return n - 1
+
+
+def _write_workbook_streamed(z4, path, specs, csv_dir, csv_lab, legend=None, title_rows=None):
+    """Every sheet is BUILT, written to the workbook and to its CSV, and
+       dropped before the next one is built. specs: [(sheet name, csv stem,
+       builder)] -- builder() returns (header, rows, widths, style_of), rows
+       a list or a generator. Returns {csv stem: data rows written}."""
+    import zipfile, tempfile, gc, csv
+    names = [z4._xl_sheet_name(s[0]) for s in specs] + ["Key"]
+    ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+          '<Default Extension="xml" ContentType="application/xml"/>',
+          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>']
+    wb = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"',
+          ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+          '<sheets>']
+    rels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
+    for i, name in enumerate(names, start=1):
+        ct.append('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType='
+                  '"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i)
+        wb.append('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (z4._xl_esc(name), i, i))
+        rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
+                    '/officeDocument/2006/relationships/worksheet" Target="worksheets'
+                    '/sheet%d.xml"/>' % (i, i))
+    ct.append('<Override PartName="/xl/styles.xml" ContentType="application/vnd.'
+              'openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+    wb.append("</sheets></workbook>")
+    rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org'
+                '/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                % (len(names) + 1))
+    rels.append("</Relationships>")
+    counts = {}
+    tmp_xlsx = path + ".tmp"
+    z = zipfile.ZipFile(tmp_xlsx, "w", zipfile.ZIP_DEFLATED)
+    try:
+        z.writestr("[Content_Types].xml", "".join(ct))
+        z.writestr("_rels/.rels", z4._XL_RELS)
+        z.writestr("xl/workbook.xml", "".join(wb))
+        z.writestr("xl/_rels/workbook.xml.rels", "".join(rels))
+        z.writestr("xl/styles.xml", z4._XL_STYLES)
+        for i, (name, stem, build) in enumerate(specs, start=1):
+            try:
+                header, rows, widths, style_of = build()
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print("[pair] *** sheet '%s' could not be built: %s ***" % (name, e))
+                header, rows, widths, style_of = (["error"], [["this sheet could not be built: %s" % e]],
+                                                  [80], None)
+            cp = os.path.join(csv_dir, "SIDE_BY_SIDE_%s_%s.csv" % (stem, csv_lab))
+            try:
+                cfh = open(cp, "w", newline="", errors="replace")
+                cw = csv.writer(cfh)
+                cw.writerow(header)
+            except Exception as e:
+                print("[pair] could not write %s: %s" % (cp, e))
+                cfh, cw = None, None
+
+            def _tee(rows=rows, cw=cw):
+                for r in rows:
+                    if cw is not None:
+                        try:
+                            cw.writerow([("" if v is None else v) for v in r])
+                        except Exception:
+                            pass
+                    yield r
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xml")
+            try:
+                counts[stem] = _stream_sheet(z4, tmp, header, _tee(), widths, style_of, first=(i == 1))
+                tmp.close()
+                z.write(tmp.name, "xl/worksheets/sheet%d.xml" % i)
+            finally:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+                try:
+                    os.remove(tmp.name)
+                except Exception:
+                    pass
+                if cfh is not None:
+                    cfh.close()
+            del header, rows
+            gc.collect()
+        z.writestr("xl/worksheets/sheet%d.xml" % len(names),
+                   z4._xl_legend_sheet(legend or [], title_rows or []))
+    finally:
+        z.close()
+    # REPLACED IN ONE STEP: a workbook open in Excel cannot be overwritten, and
+    # a half-written one must never take the good one's name.
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+        os.rename(tmp_xlsx, path)
+    except Exception as e:
+        print("[pair] *** could not replace %s (%s) -- is it open in Excel? The new "
+              "workbook is at %s ***" % (path, e, tmp_xlsx))
+        return counts, tmp_xlsx
+    return counts, path
+
+
 def write_side_by_side(z4, ref, group):
-    """ONE WORKBOOK, EVERY SCENARIO THAT SHARES THIS REFERENCE.
-         1 Faults    one row per fault: base | as studied | GIA | ... verdicts
-         2 Elements  one row per fault x criterion x element: the VALUE of that
-                     bus / machine in the base, as studied, at SGF capacity ...
+    """ONE WORKBOOK, EVERY SCENARIO THAT SHARES THIS REFERENCE, every sheet with
+       the reference and every run in adjacent columns:
+         1 Faults          one row per fault: base | studied | GIA verdicts, classes, values
+         2 Elements        one row per fault x criterion x bus/machine: the VALUE in
+                           the base, as studied, at GIA ... measured where a run's
+                           report has no row
+         3 POI power       base | runs for every MW / MVAr quantity at the POI
+         4 Summary         the panel's summary sheet, wide
+         5 Project introduces   the panel's element sheets, wide -- every
+         6 Pre-existing         element any run lists, with every run's cells
+         7 Not compared    the panel's sheet, wide
+         8 All detail      every element row of every run, wide
+         9 Runs            which folders, how many faults, where each pair report is
        Built from the same rows the pair workbooks hold, so they never disagree."""
     group = [g for g in group if g.get("summary")]
     if len(group) < 2:
         return None
-    tags = _sbs_tags(group)
     proj = group[0]["proj"]
-    rk = "base" if "results_base" in _parts(ref) else _folder_tag(ref)
-    fh, fr, fw, fs = _sbs_faults(z4, ref, group, tags, rk)
-    eh, er, ew, es = _sbs_elements(z4, ref, group, tags, rk)
-    ph, pr, pw, ps = _sbs_poi(z4, ref, group, tags, rk)
-    uh, ur, uw, us = _sbs_runs(z4, ref, group, tags, rk)
-    # AND EVERY SHEET OF EVERY PAIR WORKBOOK, SIDE BY SIDE -- nothing the
-    # panel writes for one pair is missing from the workbook that holds them
-    # all, and every run's value sits next to the others' on the same row.
-    W = {}
-    for key, cols in (("summary", z4._SUMMARY_COLS), ("new_el", z4._COMPACT_COLS),
-                      ("pre_el", z4._COMPACT_COLS), ("notrun", z4._NOTRUN_COLS),
-                      ("detail", z4._REPORT_COLS)):
-        W[key] = _wide_sheet(z4, group, tags, key, cols, rk)
+    rk = _folder_tag(ref)
+    tags = _sbs_tags(group, rk)
     out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
     lab = re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_SIDE_BY_SIDE_vs_%s" % (proj, rk))
     d = os.path.join(out_root, lab)
@@ -1160,39 +1618,31 @@ def write_side_by_side(z4, ref, group):
     for g, t in zip(group, tags):
         title.append("%s = %s" % (t, g["test"]))
     title.append("generated %s" % time.strftime("%Y-%m-%d %H:%M"))
-    sheets = [("1 Faults", fh, fr, fw, fs),
-              ("2 Elements", eh, er, ew, es),
-              ("3 POI power", ph, pr, pw, ps),
-              ("4 Summary",) + W["summary"],
-              ("5 Project introduces",) + W["new_el"],
-              ("6 Pre-existing",) + W["pre_el"],
-              ("7 Not compared",) + W["notrun"],
-              ("8 All detail",) + W["detail"],
-              ("9 Runs", uh, ur, uw, us)]
-    _write_xlsx_lowmem(z4, xp, sheets, legend=z4._XL_LEGEND, title_rows=title)
+    ctx = _sbs_context(z4, ref, group, tags, rk)
+    specs = [("1 Faults", "FAULTS", lambda: _sbs_faults(z4, ref, group, tags, rk, ctx)),
+             ("2 Elements", "ELEMENTS", lambda: _sbs_elements(z4, ref, group, tags, rk, ctx)),
+             ("3 POI power", "POI", lambda: _sbs_poi(z4, ref, group, tags, rk)),
+             ("4 Summary", "SUMMARY",
+              lambda: _wide_sheet(z4, group, tags, "summary", z4._SUMMARY_COLS, rk, ctx)),
+             ("5 Project introduces", "INTRODUCES",
+              lambda: _wide_sheet(z4, group, tags, "new_el", z4._COMPACT_COLS, rk, ctx)),
+             ("6 Pre-existing", "PREEXISTING",
+              lambda: _wide_sheet(z4, group, tags, "pre_el", z4._COMPACT_COLS, rk, ctx)),
+             ("7 Not compared", "NOTCOMPARED",
+              lambda: _wide_sheet(z4, group, tags, "notrun", z4._NOTRUN_COLS, rk, ctx)),
+             ("8 All detail", "DETAIL",
+              lambda: _wide_sheet(z4, group, tags, "detail", z4._REPORT_COLS, rk, ctx)),
+             ("9 Runs", "RUNS", lambda: _sbs_runs(z4, ref, group, tags, rk))]
+    counts, xp = _write_workbook_streamed(z4, xp, specs, d, lab, legend=z4._XL_LEGEND,
+                                          title_rows=title)
     write_rerun_list(z4, os.path.join(d, "RERUN_%s.txt" % proj),
                      [(rk, ref, proj)] + [(t, g["test"], proj) for g, t in zip(group, tags)])
-    import csv
-    for stem, hdr, rws in (("FAULTS", fh, fr), ("ELEMENTS", eh, er), ("POI", ph, pr),
-                           ("SUMMARY", W["summary"][0], W["summary"][1]),
-                           ("INTRODUCES", W["new_el"][0], W["new_el"][1]),
-                           ("PREEXISTING", W["pre_el"][0], W["pre_el"][1]),
-                           ("NOTCOMPARED", W["notrun"][0], W["notrun"][1]),
-                           ("DETAIL", W["detail"][0], W["detail"][1]),
-                           ("RUNS", uh, ur)):
-        cp = os.path.join(d, "SIDE_BY_SIDE_%s_%s.csv" % (stem, lab))
-        try:
-            with open(cp, "w", newline="") as fhh:
-                w = csv.writer(fhh)
-                w.writerow(hdr)
-                for r in rws:
-                    w.writerow([("" if v is None else v) for v in r])
-        except Exception as e:
-            print("[pair] could not write %s: %s" % (cp, e))
-    print("[pair] side by side (%s): %d fault row(s), %d element row(s), %d POI row(s), "
-          "%d summary / %d detail / %d not-compared row(s), every run in adjacent columns -> %s"
-          % (" | ".join([rk] + tags), len(fr), len(er), len(pr), len(W["summary"][1]),
-             len(W["detail"][1]), len(W["notrun"][1]), xp))
+    print("[pair] side by side (%s): %s -- every run in adjacent columns -> %s"
+          % (" | ".join([rk] + tags),
+             ", ".join("%d %s" % (counts.get(s, 0), s.lower())
+                       for s in ("FAULTS", "ELEMENTS", "POI", "SUMMARY", "INTRODUCES",
+                                 "PREEXISTING", "NOTCOMPARED", "DETAIL")),
+             xp))
     return xp
 
 
@@ -1348,7 +1798,7 @@ def main(argv):
             groups[k] = []
             gorder.append(k)
         groups[k].append((ref, test, label))
-    done, n_done = [], 0
+    done = []
     for k in gorder:
         grp = []
         for ref, test, label in groups[k]:
@@ -1363,14 +1813,16 @@ def main(argv):
             if got:
                 grp.append(got)
         _free(z4)
-        if grp and SIDE_BY_SIDE:
+        if len(grp) == 1 and SIDE_BY_SIDE:
+            print("[pair] %s: one scenario against this reference -- its pair report IS the "
+                  "side-by-side (base and project values adjacent on every sheet)" % grp[0]["proj"])
+        if len(grp) > 1 and SIDE_BY_SIDE:
             try:
                 write_side_by_side(z4, grp[0]["ref"], grp)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 print("[pair] *** the side-by-side sheet failed: %s ***" % e)
-        n_done += len(grp)
         # the index needs only the numbers -- the rows go
         for g in grp:
             done.append(dict((kk, g[kk]) for kk in ("label", "faults", "new", "pre", "ref", "test", "folder")))
