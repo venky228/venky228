@@ -265,7 +265,7 @@ def _print_phase_times(total):
 #   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
 #   dyr_<value>\                              <- a full comparison per value
 
-PROJECTS   = ["SantaFe","IronStar","EmpirePrairie","EastFork"]                # one project at a time for a sweep
+PROJECTS   = ["SantaFe","IronStar","EmpirePrairie","EastFork"]             # one project at a time for a sweep
                                             # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
 # -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
 # "each"      one study per project in PROJECTS, each alone in the case (as before)
@@ -301,6 +301,9 @@ def _panel_projects():
        reads this: the launch, the fault-list build, the comparison filter
        and the file names, so the cluster studies cannot be built by phase 0
        and then not run, or run and then not compared."""
+    _one = (os.environ.get("SPP_CMP_ONE_PROJECT") or "").strip()
+    if _one:
+        return [_one]                 # a FAST_COMPARE child: this project only
     if not PROJECTS:
         return []
     _how = str(PROJECTS_RUN or "each").strip().lower()
@@ -377,10 +380,15 @@ ONE_PROJECT_AT_A_TIME = True    # with RUN_IN_PARALLEL = False: base THEN projec
 N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
 CORES_SPARE     = 2             # cores kept free for Windows / Excel / you (0-4)
 CORES_MAX       = 22            # ceiling on PSS/E sessions across BOTH cases; 0 = none; auto-clamped to the PC
-CORES_FOR_REPORTS = 12         # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
+CORES_FOR_REPORTS = 16         # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
 CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
 # -- SCORING: when and how results are scored --
 REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
+FAST_COMPARE    = True       # PIPELINE = "compare" only: compare what is ON DISK NOW, fast -- no re-scoring,
+                             # no report rebuilds, no sweep/extra tables. Faults missing from a merged report are
+                             # read from parts\ as always; a fault with NO verdict at all reads "not compared"
+                             # (listed at the end). False = the full, slow compare (scores and rebuilds first)
+FAST_COMPARE_PARALLEL = 4    # FAST_COMPARE: projects compared at once, each in its own process (1 = one at a time)
 FORCE_RESCORE   = False      # True = re-score every folder every launch (only after a criterion change)
 REPORTS_AFTER_ALL_PROJECTS = True  # True = the launchers simulate every project first; scoring runs once at the end for both cases (a relaunch no longer re-reads a finished project before the next one simulates) | False = each project is scored right after it simulates
 RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
@@ -393,7 +401,7 @@ FORCE_REPLOT    = False        # True = REDRAW every PDF from the .out files on 
 PLOT_SCOPE      = "compact"     # "compact" = SPP set + every violation (~5x fewer panels) | "full" = every kept channel
 PLOT_INRUN      = 1             # plotters trailing each running folder (1 = the old single plotter)
 PLOT_WORKERS    = 2             # plotters per case in the catch-up pass (0/1 = one)
-PLOT_TOTAL_MAX  = 3             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
+PLOT_TOTAL_MAX  = 6             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
 PLOT_ONE_PROJECT_AT_A_TIME = True   # True = finish one project's PDFs (base, then project case) before starting the next project's
 PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out stops before the end of the simulation (it did not run); False = draw it for diagnosis
 # ============================================================================
@@ -402,14 +410,14 @@ PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out s
 ROOT = ""                                   # "" = the folder this file is in; everything else follows it
 BASE_FOLDER = "Base"                        # the folder holding the BASE case (projects NOT modelled)
 PROJ_FOLDER = "Projects"                    # the folder holding the case WITH the projects
-CMP_FOLDER  = "comparison_SGF"                  # where the comparison output goes (created if absent)
+CMP_FOLDER  = "comparison_CQ"                  # where the comparison output goes (created if absent)
 # PROJECTS -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
 # ---- THE DECK EACH CASE READS ------------------------------------------------
 SHARED_DECK     = ""                        # "" = NO SHARED FILES: each case reads its own deck, in its own ...
 SHARED_DECK_SAV = "DIS2201-25SP-G03-CQ_F.sav" # only read while SHARED_DECK is set
 SHARED_DECK_DYR = "DIS2201-25SP-G03-CQ.dyr"
-BASE_SAV = "DIS2201-25SP-G03-CQ_F.sav"      # a bare name = this file, in BASE_FOLDER
-BASE_DYR = "DIS2201-25SP-G03-CQ.dyr"        # run z4_split_cases.py --copy to put them there
+BASE_SAV = "DIS2201-25SP-G03-CQ.sav"      # a bare name = this file, in BASE_FOLDER
+BASE_DYR = "2020MDWG-25S-DIS2201.dyr"        # run z4_split_cases.py --copy to put them there
 PROJ_SAV = "DIS2201-25SP-G03-CQ_F.sav"      # a bare name = this file, in PROJ_FOLDER
 PROJ_DYR = "DIS2201-25SP-G03-CQ.dyr"
 # -- A DIFFERENT DECK FOR ONE PROJECT'S RUNS -------------------------------------
@@ -17260,6 +17268,99 @@ def ensure_reports(mode_list):
     return n
 
 
+def _fast_compare(pipeline):
+    return bool(FAST_COMPARE) and str(pipeline).strip().lower() == "compare"
+
+
+def _fast_projects():
+    """The projects a compare covers: both studies have a folder for them."""
+    got = []
+    for mode in MODES:
+        try:
+            common, _ob, _ot = discover_projects(mode)
+        except Exception:
+            continue
+        for p in common:
+            if (not _panel_projects() or p in _panel_projects()) and p not in got:
+                got.append(p)
+    return got
+
+
+def _fast_unscored_note():
+    """How many .out files have no verdict -- counted, nothing re-scored."""
+    try:
+        for case in (CASE_BASE, CASE_TEST):
+            for proj in (_panel_projects() or [""]):
+                for mode in MODES:
+                    rdir = results_dir(case, proj, mode)
+                    if not os.path.isdir(rdir):
+                        continue
+                    outs, scored = _out_and_scored_sets(rdir, proj)
+                    miss = sorted(set(outs) - set(scored), key=lambda x: (len(x), x))
+                    miss = [m for m in miss if not str(m).upper().startswith("FLAT")]
+                    if miss:
+                        print("[fast] %-4s %-16s %d .out(s) with no verdict read 'not compared': %s%s"
+                              % (case.get("key", "?"), proj, len(miss), ", ".join(miss[:12]),
+                                 " ..." if len(miss) > 12 else ""))
+    except Exception as e:
+        print("[fast] could not count the unscored .out files (%s)" % e)
+
+
+def _fast_compare_parallel(projects):
+    """One process per project, FAST_COMPARE_PARALLEL at a time. Each is this
+       panel with SPP_CMP_ONE_PROJECT set, so it writes that project's own
+       comparison folder exactly as a one-project run does; its console goes to
+       <comparison folder>/FAST_COMPARE_<project>.log. Separate processes, so a 32-bit
+       python has its full 2 GB for each project."""
+    import subprocess
+    here = os.path.abspath(__file__)
+    todo = list(projects)
+    running, done = [], []
+    width = max(1, int(FAST_COMPARE_PARALLEL or 1))
+    print("[fast] comparing %d project(s), %d at a time: %s"
+          % (len(todo), width, ", ".join(todo)))
+    t0 = time.time()
+    while todo or running:
+        while todo and len(running) < width:
+            pj = todo.pop(0)
+            env = dict(os.environ)
+            env["SPP_CMP_ONE_PROJECT"] = pj
+            logp = os.path.join(COMPARE_DIR, "FAST_COMPARE_%s.log" % pj)
+            fh = open(logp, "w")
+            pr = subprocess.Popen([sys.executable, "-u", here], cwd=os.getcwd(), env=env,
+                                  stdout=fh, stderr=subprocess.STDOUT)
+            running.append((pj, pr, fh, logp, time.time()))
+            print("[fast]   %-16s started  (log: %s)" % (pj, logp))
+        time.sleep(2)
+        for item in list(running):
+            pj, pr, fh, logp, ts = item
+            rc = pr.poll()
+            if rc is None:
+                continue
+            fh.close()
+            running.remove(item)
+            done.append((pj, rc))
+            print("[fast]   %-16s %s in %.0f s"
+                  % (pj, "done" if rc == 0 else "*** FAILED rc=%s -- see its log ***" % rc,
+                     time.time() - ts))
+            try:
+                with open(logp) as lf:
+                    for ln in lf:
+                        if ln.startswith("[fast] ") and ("no verdict" in ln or "compared:" in ln):
+                            print("  " + ln.rstrip())
+            except Exception:
+                pass
+    bad = [p for p, rc in done if rc != 0]
+    print("")
+    print("[fast] %d of %d project(s) compared in %.0f s -> %s"
+          % (len(done) - len(bad), len(done), time.time() - t0,
+             os.path.join(COMPARE_DIR, "<project>")))
+    if bad:
+        print("[fast] FAILED: %s -- open FAST_COMPARE_<project>.log in %s" % (", ".join(bad), COMPARE_DIR))
+    print("[fast] (no ALL_PROJECTS workbook in this mode -- each project has its own)")
+    return 0 if not bad else 1
+
+
 def main():
     _banner("SPP STUDY COMPARISON")
     print("[compare] BASE  %-44s %s" % (CASE_BASE["label"], CASE_BASE["dir"]))
@@ -17992,9 +18093,14 @@ def main():
         mark_partial_runs()
     except Exception as _e:
         print("[compare] could not mark the partial runs: %s" % _e)
-    n = ensure_reports(MODES)
-    if not n:
-        print("[compare] every folder with .out files already has its criteria report.")
+    _fast = _fast_compare(pipeline)
+    if _fast:
+        print("[fast] FAST_COMPARE: no scoring and no report rebuilds -- comparing what is on")
+        print("[fast] disk now. Set FAST_COMPARE = False once for the full scoring pass.")
+    else:
+        n = ensure_reports(MODES)
+        if not n:
+            print("[compare] every folder with .out files already has its criteria report.")
 
     if _live_stop:
         _live_stop()            # phase 3 writes the final one; no double writer
@@ -18015,12 +18121,14 @@ def main():
     # Both cover the sweep and capacity folders too (..._dyr_Kqv2, ..._cap50),
     # which is where a mitigation study actually spends its time.
     try:
-        auto_remerge_stale_reports()
+        if not _fast:
+            auto_remerge_stale_reports()
     except Exception as _e:
         print("[auto-merge] the staleness check failed (%s) -- comparing what is "
               "on disk" % _e)
     try:
-        verify_scoring_coverage()
+        if not _fast:
+            verify_scoring_coverage()
     except Exception as _e:
         print("[coverage] the coverage check failed (%s) -- comparing what is "
               "on disk" % _e)
@@ -18076,8 +18184,20 @@ def main():
         else:
             print("[compare] comparing %s: %s" % (mode, ", ".join(wanted)))
     # ONE path builds a comparison, whether live or final -- see compare_now().
+    if _fast and not os.environ.get("SPP_CMP_ONE_PROJECT"):
+        _fp = _fast_projects()
+        if int(FAST_COMPARE_PARALLEL or 1) > 1 and len(_fp) > 1:
+            return _fast_compare_parallel(_fp)
     results, all_only_b, all_only_t = compare_now(quiet=False)
     all_only_b, all_only_t = set(all_only_b), set(all_only_t)
+    if _fast:
+        # THE COMPARISON IS WRITTEN. The sweep / capacity / surplus / overvoltage
+        # tables after this re-read every folder on disk; FAST_COMPARE skips them.
+        print("")
+        print("[fast] %d project(s) compared: %s" % (len(results), ", ".join(
+            sorted(set(r["project"] for r in results))) or "-"))
+        _fast_unscored_note()
+        return 0 if results else 1
 
     # ---- CAPACITY HEADROOM ---------------------------------------------------
     # After the comparison, because it re-runs the PROJECT case at reduced
