@@ -632,6 +632,7 @@ PSSE_FAULT_LOG = True                     # True = keep PSS/E's own messages for
 # The as-studied results (<proj>_spp) are never touched. A run whose folder already
 # scored every fault is NOT re-run.
 # Output: <comparison folder>\GEN_TEST_<proj>.txt / .csv (rewritten after each run)
+#         GEN_TEST_BEST_<proj>.txt = the "best of all" summary on its own
 #         GEN_TEST_GENS_<proj>.txt = the machines found and their distance
 GEN_TEST          = True           # True = run this test ONLY | False = normal panel
 GEN_TEST_DRY_RUN  = False          # True = list the machines and the run plan, simulate nothing
@@ -17751,7 +17752,13 @@ def _gt_write(runs, faults, gens):
          "=" * 150, "", "SOLVER SCENARIOS"]
     for sc in GEN_TEST_SCENARIOS:
         L.append("  %-22s %s" % (sc[0], _gt_scen_desc(sc)))
-    L += _gt_best(runs, faults, ref)
+    _best = _gt_best(runs, faults, ref)
+    L += _best
+    try:
+        with open(os.path.join(COMPARE_DIR, "GEN_TEST_BEST_%s.txt" % proj), "w") as fh:
+            fh.write("\n".join(L[:3] + _best) + "\n")
+    except Exception as e:
+        print("[gen-test] GEN_TEST_BEST not written (%s)" % e)
     L += ["", "%-22s %-40s " % ("scenario", "machine OFF") +
           " | ".join("%-26s" % f for f in faults), "-" * 150]
     for r in runs:
