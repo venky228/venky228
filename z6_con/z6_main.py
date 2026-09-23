@@ -17614,6 +17614,122 @@ def _gt_scen_desc(sc):
         float(dc or DELT_CYCLES or 4), it or 60, acc or 0.60, tol or 0.0000095)
 
 
+def _gt_score(m, faults):
+    """(passes, nc, over, max_pu, known) for one run; None when nothing scored."""
+    if not m or not any(m[f]["verdict"] in ("PASS", "FAIL") for f in faults):
+        return None
+    ps = sum(1 for f in faults if m[f]["verdict"] == "PASS")
+    nc = sum(m[f]["noconv"] or 0 for f in faults)
+    known = all(m[f]["noconv"] is not None for f in faults)
+    ov = sum(m[f]["n_over"] for f in faults)
+    mx = max([m[f]["max_pu"] or 0.0 for f in faults] or [0.0])
+    return ps, nc, ov, mx, known
+
+
+def _gt_key(sc):
+    return (-sc[0], sc[1], sc[2], sc[3])
+
+
+def _gt_best(runs, faults, ref):
+    """The common 'which is best' summary at the top of GEN_TEST_<proj>.txt."""
+    nf = len(faults)
+    L = ["", "=" * 150, "BEST OF ALL -- every run ranked: most faults PASS, then fewest non-converged",
+         "steps (nc), then fewest buses above 1.2 pu, then lowest peak voltage", "=" * 150]
+    sc_all = []
+    for r in runs:
+        x = _gt_score(r.get("m"), faults)
+        if x:
+            sc_all.append((x, r))
+    if not sc_all:
+        return L + ["  (no run has finished yet)"]
+
+    def lab(r):
+        g = r["gen"]
+        return ("OFF %d '%s' %s" % (g["bus"], g["id"], g["name"]))[:34] if g else "all in service"
+
+    def row(i, x, r):
+        return "  %3s  %-22s %-34s %3d/%-3d %8d%s %6d %7s" % (
+            i, r["sc"][0], lab(r), x[0], nf, x[1], "" if x[4] else "?", x[2],
+            "%.3f" % x[3] if x[3] else "-")
+    hdr = "  %3s  %-22s %-34s %7s %9s %6s %7s" % ("#", "scenario", "machine", "PASS", "nc", ">1.2", "max pu")
+    sc_all.sort(key=lambda t: _gt_key(t[0]))
+    L += ["", "A. OVERALL RANKING (top 15 of %d finished runs)" % len(sc_all), hdr]
+    for i, (x, r) in enumerate(sc_all[:15], 1):
+        L.append(row(i, x, r))
+    best_x, best_r = sc_all[0]
+    # B -- solver only
+    base = [(x, r) for x, r in sc_all if not r["gen"]]
+    L += ["", "B. BEST SOLVER SETTING (every machine in service)", hdr]
+    for i, (x, r) in enumerate(base, 1):
+        L.append(row(i, x, r))
+    # C -- per machine, over every scenario it ran in
+    per = {}
+    for x, r in sc_all:
+        g = r["gen"]
+        b = ref.get(r["sc"][0])
+        bx = _gt_score(b.get("m") if b else None, faults)
+        if not g or not bx:
+            continue
+        k = (g["bus"], g["id"])
+        e = per.setdefault(k, {"g": g, "n": 0, "better": 0, "dnc": 0, "dov": 0, "fix": 0,
+                               "best": None})
+        e["n"] += 1
+        e["dnc"] += bx[1] - x[1]
+        e["dov"] += bx[2] - x[2]
+        e["fix"] += max(0, x[0] - bx[0])
+        if _gt_key(x) < _gt_key(bx):
+            e["better"] += 1
+        if e["best"] is None or _gt_key(x) < _gt_key(e["best"][0]):
+            e["best"] = (x, r["sc"][0])
+    L += ["", "C. EACH MACHINE OFF, over every scenario it ran in (vs the same scenario, all in service)",
+          "  %-8s %-4s %-14s %-16s %6s %8s %11s %11s %9s  %s" % (
+              "bus", "id", "name", "kind", "runs", "better", "avg nc drop", "avg >1.2 dr",
+              "faults+", "its best scenario")]
+    pl = sorted(per.values(), key=lambda e: (-(e["dnc"] / float(e["n"])), -(e["dov"] / float(e["n"])),
+                                             -e["fix"]))
+    for e in pl:
+        g = e["g"]
+        L.append("  %-8s %-4s %-14s %-16s %6d %5d/%-2d %11.0f %11.1f %9d  %s" % (
+            g["bus"], g["id"], g["name"][:14], (g["kind"] or "")[:16], e["n"], e["better"], e["n"],
+            e["dnc"] / float(e["n"]), e["dov"] / float(e["n"]), e["fix"], e["best"][1]))
+    if not pl:
+        L.append("  (no machine-off run has finished yet)")
+    # D -- what it says
+    L += ["", "D. WHAT IT SAYS"]
+    s0 = ref.get(GEN_TEST_SCENARIOS[0][0])
+    s0x = _gt_score(s0.get("m") if s0 else None, faults)
+    L.append("  best of all : %s, %s -- %d/%d PASS, nc %d, %d bus(es) > 1.2 pu, peak %s"
+             % (best_r["sc"][0], lab(best_r), best_x[0], nf, best_x[1], best_x[2],
+                "%.3f" % best_x[3] if best_x[3] else "-"))
+    if base:
+        bx, br = base[0]
+        L.append("  best solver : %s (%s) -- %d/%d PASS, nc %d, %d bus(es) > 1.2 pu"
+                 % (br["sc"][0], _gt_scen_desc(br["sc"]), bx[0], nf, bx[1], bx[2]))
+        if s0x and (s0x[1] or s0x[2]) and bx[1] == 0 and bx[2] == 0:
+            L.append("  -> the solver setting ALONE removes both the non-convergence and the spikes:")
+            L.append("     the spikes are NUMERICAL, not a real system response.")
+        elif s0x and bx[1] == 0 and bx[2] > 0:
+            L.append("  -> the network converges with %s but spikes remain: they are likely REAL" % br["sc"][0])
+            L.append("     (a device response) -- see section C for which machine drives them.")
+        elif s0x and bx[1] > 0:
+            L.append("  -> no solver setting makes the network converge: look at section C and at the")
+            L.append("     model of the machine at the top of it.")
+    if pl:
+        e = pl[0]
+        if e["dnc"] > 0 or e["dov"] > 0:
+            L.append("  top machine : %d '%s' %s -- better in %d of %d scenarios, avg nc drop %.0f, "
+                     "avg >1.2 drop %.1f" % (e["g"]["bus"], e["g"]["id"], e["g"]["name"], e["better"],
+                                             e["n"], e["dnc"] / float(e["n"]), e["dov"] / float(e["n"])))
+            if e["better"] * 2 >= e["n"]:
+                L.append("  -> switching it off helps in most scenarios: its dynamic model / settings are")
+                L.append("     the prime suspect (check its REEC/REGC or exciter data, or ask its owner).")
+        else:
+            L.append("  -> no single machine off makes things better: no one machine causes it.")
+    if any(not x[4] for x, _r in sc_all):
+        L.append("  ? = some fault had no PSS/E log (PSSE_FAULT_LOG), so its nc count is missing")
+    return L
+
+
 def _gt_write(runs, faults, gens):
     proj = GEN_TEST_PROJECT
     txt = os.path.join(COMPARE_DIR, "GEN_TEST_%s.txt" % proj)
@@ -17635,6 +17751,7 @@ def _gt_write(runs, faults, gens):
          "=" * 150, "", "SOLVER SCENARIOS"]
     for sc in GEN_TEST_SCENARIOS:
         L.append("  %-22s %s" % (sc[0], _gt_scen_desc(sc)))
+    L += _gt_best(runs, faults, ref)
     L += ["", "%-22s %-40s " % ("scenario", "machine OFF") +
           " | ".join("%-26s" % f for f in faults), "-" * 150]
     for r in runs:
