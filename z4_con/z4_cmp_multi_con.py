@@ -2067,11 +2067,30 @@ def main(argv):
                 print("[pair] *** the side-by-side sheet failed: %s ***" % e)
         # the index needs only the numbers -- the rows go
         for g in grp:
-            done.append(dict((kk, g[kk]) for kk in ("label", "faults", "new", "pre", "ref", "test", "folder")))
+            done.append(dict((kk, g[kk]) for kk in ("label", "faults", "new", "pre", "ref", "test", "folder", "proj")))
         del grp
         _free(z4)
     if done:
         out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
+        # EVERY FAULT TO RE-RUN, EVERY FOLDER COMPARED, IN ONE FILE: per project,
+        # each base and each run once, with the RUN_CASES / ONLY_FAULTS lines to
+        # paste into the panel.
+        seen_f, entries = set(), []
+        for g in sorted(done, key=lambda x: str(x.get("proj"))):
+            for role, f in (("base", g["ref"]), ("run", g["test"])):
+                if _norm(f) in seen_f:
+                    continue
+                seen_f.add(_norm(f))
+                tag = _folder_tag(f)
+                entries.append(("%s  %s (%s)" % (g["proj"], tag, role), f, g["proj"]))
+        write_rerun_list(z4, os.path.join(out_root, "RERUN_ALL.txt"), entries)
+        # ... and each project's own, in that project's folder
+        for pr in sorted(set(e[2] for e in entries)):
+            pd = os.path.join(out_root, pr)
+            if not os.path.isdir(pd):
+                os.makedirs(pd)
+            write_rerun_list(z4, os.path.join(pd, "RERUN_%s_ALL.txt" % pr),
+                             [e for e in entries if e[2] == pr])
         idx = os.path.join(out_root, "PAIRS_INDEX.txt")
         try:
             with open(idx, "a") as fh:
