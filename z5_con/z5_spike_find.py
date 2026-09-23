@@ -70,7 +70,12 @@ NEARBY        = True          # PART C -- needs PSS/E (psspy): opens the case an
                               # switched shunts, SVC/STATCOMs, high-charging lines
 NEAR_BUSES_N  = 15            # top buses (all projects together) looked at
 NEAR_HOPS     = 3             # search this many buses out from each bad bus
-NEAR_TOP      = 15            # devices listed per bus, electrically closest first
+NEAR_TOP      = 15            # shunts / lines / FACTS listed per bus, closest first
+GEN_HOPS      = 8             # generators (sync AND async) searched further out: an IBR sits
+                              # POI -> main xfmr -> collector -> pad xfmr -> inverter, 3-4 buses
+NEAR_Q_REVIEW = True          # read each bad bus's WORST fault .out and review the nearby
+                              # generators' Q (before / during / after the fault) -> likely cause
+GEN_TOP       = 25            # generators listed per bus, closest (|Z|) first; the CSV has all
 LINE_CHG_MVAR = 20.0          # lines with at least this much charging are listed
 CASE_SAV      = {}            # {} = read BASE_SAV / PROJ_SAV from z5_cmp_all_con.py, e.g.
                               # {"base": r"C:\KV\Base\DIS2201-25SP-G03-CQ_Mitigated.sav"}
@@ -173,6 +178,7 @@ def rank_buses(rows, n_faults_total):
         b["faults"].add(r["fault"])
         if r["value"] > b["worst"]:
             b["worst"], b["worst_fault"] = r["value"], r["fault"]
+            b["worst_fault_bus"] = r["fault_bus"]
         if r["dur"] is not None:
             b["durs"].append(r["dur"])
         if r["hops"] is not None:
@@ -464,9 +470,24 @@ def trace_fault(res_dir, fault, fault_bus, buses):
         qmax = max(seg)
         e = et.get(key)
         eseg = [x for x in e[1][icl:iwin] if x == x] if e and len(e[1]) > iwin else []
+        q0 = v[ipre]
+        fseg = [x for x in v[ion:icl] if x == x]              # DURING the fault
+        iqm = icl + seg.index(qmax)
+        # back to pre-fault: first sample after the post-clearing max within
+        # max(5 Mvar, 10 %) of the pre-fault Q, looking up to 3 s after clearing
+        tol = max(5.0 / SYS_MVA_BASE, 0.10 * abs(q0))
+        iend = min(len(v), _idx(t, t_clr + 3.0) + 1)
+        t_back = None
+        for i in range(iqm, iend):
+            if v[i] == v[i] and abs(v[i] - q0) <= tol:
+                t_back = t[i] - t_clr
+                break
         mach.append({"machine": title.strip(), "bus": key[0], "id": key[1], "v": v,
-                     "q0": v[ipre] * SYS_MVA_BASE, "dq_max": (qmax - v[ipre]) * SYS_MVA_BASE,
-                     "t_qmax_after_clr": t[icl + seg.index(qmax)] - t_clr,
+                     "q0": q0 * SYS_MVA_BASE, "dq_max": (qmax - q0) * SYS_MVA_BASE,
+                     "t_qmax_after_clr": t[iqm] - t_clr,
+                     "q_fault_avg": (sum(fseg) / len(fseg) * SYS_MVA_BASE) if fseg else None,
+                     "q_fault_max": (max(fseg) * SYS_MVA_BASE) if fseg else None,
+                     "t_back": t_back, "dq_at": {},
                      "et": e[1] if e else None, "eterm_max": max(eseg) if eseg else None})
 
     def _at(m, i):
@@ -482,6 +503,7 @@ def trace_fault(res_dir, fault, fault_bus, buses):
         best = None
         for m in mach:
             dq, _e = _at(m, ib)
+            m["dq_at"][b["bus"]] = dq
             if dq >= SUSPECT_MVAR and (best is None or dq > best[1]):
                 best = (m, dq)
         if not mach:
@@ -517,6 +539,8 @@ def trace_fault(res_dir, fault, fault_bus, buses):
                           " -- see each bus's driver above"
                           % (s["machine"], s["dq_max"], s["t_qmax_after_clr"],
                              (", own terminal up to %.3f pu" % s["eterm_max"]) if s["eterm_max"] else ""))
+    # the Q review of every channelled machine, without the big series
+    res["mach"] = [dict((k, m[k]) for k in m if k not in ("v", "et")) for m in mach]
     return res
 
 
@@ -890,8 +914,9 @@ def load_network(psspy, sav, dyr):
     return net
 
 
-def nearby(net, bus):
-    """[(bus, hops, zdist)] within NEAR_HOPS, Dijkstra on |Z| (pu)."""
+def nearby(net, bus, max_hops=None):
+    """[(bus, hops, zdist)] within max_hops (NEAR_HOPS), Dijkstra on |Z| (pu)."""
+    max_hops = NEAR_HOPS if max_hops is None else max_hops
     import heapq
     best = {bus: (0.0, 0)}
     pq = [(0.0, 0, bus)]
@@ -899,7 +924,7 @@ def nearby(net, bus):
         z, h, n = heapq.heappop(pq)
         if best.get(n, (1e9, 0))[0] < z:
             continue
-        if h >= NEAR_HOPS:
+        if h >= max_hops:
             continue
         for m, dz, _w in net["adj"].get(n, []):
             nz = z + dz
@@ -944,7 +969,8 @@ def _advice(d, confirmed):
     return "generator with no recognised model -- check its .dyr records"
 
 
-def run_nearby(kind, combined, traced_all):
+def run_nearby(kind, combined, traced_all, res_dirs=None):
+    res_dirs = res_dirs or {}
     ps = _psspy()
     if ps is None:
         return None
@@ -962,6 +988,8 @@ def run_nearby(kind, combined, traced_all):
                 c = conf.setdefault(s["bus"], [])
                 c.append("%s %s %+.0f Mvar" % (proj, tr["fault"], s["dq_max"]))
     tag = KINDS[kind][2]
+    traces = _near_traces(combined[:NEAR_BUSES_N], res_dirs) if NEAR_Q_REVIEW else {}
+    cause_rows = []
     txt = os.path.join(_root(), "SPIKE_NEARBY_%s.txt" % tag)
     ncsv = os.path.join(_root(), "SPIKE_NEARBY_%s.csv" % tag)
     rows = []
@@ -969,7 +997,9 @@ def run_nearby(kind, combined, traced_all):
         W = f.write
         W("NEARBY DEVICES -- %s case %s   (%s)\n" % (tag, os.path.basename(sav), time.strftime("%Y-%m-%d %H:%M")))
         W("dyr: %s\n" % (dyr or "-"))
-        W("within %d buses of each bad bus, closest (by |Z| in pu) first\n" % NEAR_HOPS)
+        W("generators within %d buses, other devices within %d, closest first by |Z| (pu, sum of\n"
+          "branch impedances on the shortest electrical path -- smaller = more influence)\n"
+          % (GEN_HOPS, NEAR_HOPS))
         W("=" * 100 + "\n")
         for cb in combined[:NEAR_BUSES_N]:
             bus = cb["bus"]
@@ -980,43 +1010,63 @@ def run_nearby(kind, combined, traced_all):
             if bus not in net["bus"]:
                 W("   not in this case\n")
                 continue
+            reach = nearby(net, bus, max(NEAR_HOPS, GEN_HOPS))
             found = []
-            for n, h, z in nearby(net, bus):
+            for n, h, z in reach:
                 for d in net["dev"].get(n, []):
-                    found.append((z, h, n, d))
+                    is_gen = d["kind"] in ("IBR", "SYNC", "SVC/STATCOM") or d["kind"].startswith("GEN")
+                    if h <= (GEN_HOPS if is_gen else NEAR_HOPS):
+                        found.append((z, h, n, d, is_gen))
             if not found:
-                W("   no generator / shunt / FACTS / charging line within %d buses\n" % NEAR_HOPS)
+                W("   no generator within %d buses, no shunt / FACTS / charging line within %d\n"
+                  % (GEN_HOPS, NEAR_HOPS))
                 continue
-            W("   %-15s %-8s %-18s %4s %6s %8s %8s  %s\n"
-              % ("device", "bus", "name", "hops", "|Z|pu", "MW", "Mvar", "what to check"))
             seen = set()
-            nshow = 0
-            for z, h, n, d in found:
-                key = (d["kind"], d["bus"], d.get("id"), d.get("to"))
-                if key in seen:
+            for part, want_gen, cap in (("GENERATORS -- synchronous and asynchronous, within %d buses"
+                                         % GEN_HOPS, True, GEN_TOP),
+                                        ("SHUNTS / CAP BANKS / REACTORS / LINES / FACTS, within %d buses"
+                                         % NEAR_HOPS, False, NEAR_TOP)):
+                sel, _k = [], set()
+                for x in found:
+                    k = (x[3]["kind"], x[3]["bus"], x[3].get("id"), x[3].get("to"))
+                    if x[4] == want_gen and k not in _k:
+                        _k.add(k)
+                        sel.append(x)
+                W("   %s: %d\n" % (part, len(sel)))
+                if not sel:
                     continue
-                seen.add(key)
-                cf = "; ".join(conf.get(d["bus"], [])[:3]) if d["kind"] in ("IBR", "SYNC") else ""
-                adv = _advice(d, cf)
-                nm = net["bus"].get(n, {}).get("name", "")
-                lbl = d["kind"] + ((" " + str(d["id"])) if d.get("id") else "")
-                if d["kind"] == "LINE CHARGING":
-                    lbl = "LINE %s-%s" % (d["bus"], d["to"])
-                mw = d.get("mw")
-                mv = d.get("mvar")
-                if nshow < NEAR_TOP:
-                    W("   %-15s %-8s %-18s %4d %6.3f %8s %8s  %s\n"
-                      % (lbl[:15], n, nm[:18], h, z, "-" if mw is None else "%.0f" % mw,
-                         "-" if mv is None else "%.0f" % mv, adv))
-                    if d.get("models"):
-                        W("   %-15s models: %s\n" % ("", " ".join(d["models"][:6])))
-                nshow += 1
-                rows.append([tag, bus, cb["n"], "%.3f" % cb["worst"], d["kind"], n, nm, d.get("id", ""),
-                             h, "%.4f" % z, "" if mw is None else "%.1f" % mw,
-                             "" if mv is None else "%.1f" % mv, d.get("status", ""),
-                             " ".join(d.get("models", [])), cf, adv])
-            if nshow > NEAR_TOP:
-                W("   ... %d more in %s\n" % (nshow - NEAR_TOP, os.path.basename(ncsv)))
+                W("   %-15s %-8s %-18s %4s %6s %8s %8s  %s\n"
+                  % ("device", "bus", "name", "hops", "|Z|pu", "MW", "Mvar", "what to check"))
+                nshow = 0
+                for z, h, n, d, _g in sel:
+                    key = (d["kind"], d["bus"], d.get("id"), d.get("to"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    cf = "; ".join(conf.get(d["bus"], [])[:3]) if want_gen else ""
+                    adv = _advice(d, cf)
+                    nm = net["bus"].get(n, {}).get("name", "")
+                    lbl = d["kind"] + ((" " + str(d["id"])) if d.get("id") else "")
+                    if d["kind"] == "LINE CHARGING":
+                        lbl = "LINE %s-%s" % (d["bus"], d["to"])
+                    mw = d.get("mw")
+                    mv = d.get("mvar")
+                    if nshow < cap:
+                        W("   %-15s %-8s %-18s %4d %6.3f %8s %8s  %s\n"
+                          % (lbl[:15], n, nm[:18], h, z, "-" if mw is None else "%.0f" % mw,
+                             "-" if mv is None else "%.0f" % mv, adv))
+                        if d.get("models"):
+                            W("   %-15s models: %s\n" % ("", " ".join(d["models"][:6])))
+                    nshow += 1
+                    rows.append([tag, bus, cb["n"], "%.3f" % cb["worst"], d["kind"], n, nm, d.get("id", ""),
+                                 h, "%.4f" % z, "" if mw is None else "%.1f" % mw,
+                                 "" if mv is None else "%.1f" % mv, d.get("status", ""),
+                                 " ".join(d.get("models", [])), cf, adv])
+                if nshow > cap:
+                    W("   ... %d more in %s\n" % (nshow - cap, os.path.basename(ncsv)))
+            if NEAR_Q_REVIEW:
+                _q_review(W, cb, [x for x in found if x[4]], net, traces, cause_rows, tag,
+                          [x for x in found if not x[4]])
         W("\n" + "=" * 100 + "\n HOW TO USE IT\n"
           "  Start with the CONFIRMED machines and capacitive shunts closest to a bus that fails on\n"
           "  many faults. Test one change at a time on the worst faults (ONLY_FAULTS), in BOTH cases\n"
@@ -1026,8 +1076,131 @@ def run_nearby(kind, combined, traced_all):
         w.writerow(["case", "bad_bus", "faults_failed", "worst_pu", "device", "device_bus", "name", "id",
                     "hops", "zdist_pu", "mw", "mvar", "status", "models", "confirmed_by_out", "what_to_check"])
         w.writerows(rows)
+    if cause_rows:
+        ccsv = os.path.join(_root(), "SPIKE_CAUSE_%s.csv" % tag)
+        with open(ccsv, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["case", "bad_bus", "fault", "rank", "machine", "type", "gen_bus", "id", "hops",
+                        "zdist_pu", "q_prefault_mvar", "q_during_fault_avg", "q_during_fault_max",
+                        "dq_at_bus_peak_mvar", "dq_max_after_clear_mvar", "t_qmax_after_clear_s",
+                        "q_back_to_prefault_s", "eterm_max", "score", "reason"])
+            w.writerows(cause_rows)
+        print("[near] causes -> %s" % ccsv)
     print("[near] %s -> %s" % (kind, txt))
     return txt
+
+
+def _near_traces(buses, res_dirs):
+    """{(proj, fault): trace} -- each bad bus's WORST fault, one .out read per fault."""
+    want = {}
+    for cb in buses:
+        parts = cb["worst_where"].split(" ", 1)
+        if len(parts) != 2 or parts[0] not in res_dirs:
+            continue
+        want.setdefault((parts[0], parts[1]), {"fault_bus": cb.get("fault_bus", ""), "buses": []})
+        want[(parts[0], parts[1])]["buses"].append((cb["bus"], cb["label"]))
+    out = {}
+    for (proj, fid), w in sorted(want.items()):
+        print("[near] Q review: %s %s (%d bus(es))" % (proj, fid, len(w["buses"])))
+        try:
+            out[(proj, fid)] = trace_fault(res_dirs[proj], fid, w["fault_bus"], w["buses"])
+        except Exception as e:
+            out[(proj, fid)] = {"fault": fid, "error": "%s: %s" % (type(e).__name__, e)}
+        if (out[(proj, fid)].get("error") or "").startswith("dyntools not available"):
+            break
+    return out
+
+
+def _q_review(W, cb, gens, net, traces, cause_rows, tag, others=()):
+    """Each nearby generator's Q in the bus's worst fault, and the likely cause."""
+    parts = cb["worst_where"].split(" ", 1)
+    tr = traces.get(tuple(parts)) if len(parts) == 2 else None
+    W("   Q REVIEW in the worst fault (%s):\n" % cb["worst_where"])
+    if not tr:
+        W("     no .out read for it\n")
+        return
+    if tr.get("error"):
+        W("     %s\n" % tr["error"])
+        return
+    bb = [b for b in tr.get("buses", []) if b.get("bus") == cb["bus"] and not b.get("missing")]
+    if bb:
+        b = bb[0]
+        W("     bus peak %.3f pu at +%.4f s after clearing, above %.2f pu for %.3f s -> %s\n"
+          % (b["peak"], b["dt"], LIMIT_PU, b["above"], b["shape"]))
+    mach = tr.get("mach", [])
+    by_bid = dict(((m["bus"], m["id"]), m) for m in mach)
+    by_b = {}
+    for m in mach:
+        by_b.setdefault(m["bus"], m)
+    cand, noq = [], []
+    for z, h, n, d, _g in gens:
+        if d.get("status", 1) == 0:
+            continue
+        m = by_bid.get((d["bus"], d.get("id", ""))) or by_b.get(d["bus"])
+        if m is None:
+            noq.append((z, h, d))
+            continue
+        dq = m["dq_at"].get(cb["bus"], 0.0)
+        # influence ~ Mvar pushed at the peak / electrical distance
+        score = max(dq, 0.0) / (z + 0.02)
+        cand.append((score, dq, z, h, d, m))
+    cand.sort(key=lambda c: -c[0])
+    W("     %-24s %-6s %4s %6s %7s %8s %8s %8s %8s %7s %7s\n"
+      % ("generator", "type", "hops", "|Z|pu", "Q0", "Qfault", "dQ@peak", "dQmax", "t_qmax", "Q back", "Et max"))
+    for score, dq, z, h, d, m in cand[:GEN_TOP]:
+        W("     %-24s %-6s %4d %6.3f %7.0f %8s %8.0f %8.0f %8.3f %7s %7s\n"
+          % (m["machine"][:24], d["kind"][:6], h, z, m["q0"],
+             "-" if m["q_fault_avg"] is None else "%.0f" % m["q_fault_avg"], dq, m["dq_max"],
+             m["t_qmax_after_clr"], "never" if m["t_back"] is None else "%.2fs" % m["t_back"],
+             "-" if m["eterm_max"] is None else "%.3f" % m["eterm_max"]))
+    if noq:
+        W("     no Q channel in the .out (cannot be judged): %s\n"
+          % ", ".join("%s %s(%s)" % (d["kind"], d["bus"], d.get("id", "")) for z, h, d in noq[:10])
+          + ("" if len(noq) <= 10 else " ... +%d" % (len(noq) - 10)))
+    real = [c for c in cand if c[1] >= SUSPECT_MVAR]
+    if not real:
+        caps, _k = [], set()
+        for z, h, n, d, _g in others:
+            k = (d["kind"], d["bus"], d.get("id"), d.get("to"))
+            if k in _k or d.get("status", 1) == 0:
+                continue
+            _k.add(k)
+            if d["kind"] in ("FIXED CAP", "LINE CHARGING") or (
+                    d["kind"] == "SWITCHED SHUNT" and (d.get("mvar") or 0) > 0):
+                caps.append((z, h, d))
+        W("     LIKELY CAUSE: NOT a monitored generator -- none pushed +%.0f Mvar at this peak%s.\n"
+          % (SUSPECT_MVAR, (" (%d nearby generator(s) have no Q channel)" % len(noq)) if noq else ""))
+        for r, (z, h, d) in enumerate(caps[:3], 1):
+            lbl = ("LINE %s-%s" % (d["bus"], d["to"])) if d["kind"] == "LINE CHARGING" \
+                else "%s %s %s" % (d["kind"], d["bus"], d.get("id", ""))
+            W("     CAPACITIVE SUSPECT #%d: %s  %.0f Mvar, %d bus(es) / |Z| %.3f pu away\n"
+              % (r, lbl.strip(), d.get("mvar") or 0, h, z))
+            cause_rows.append([tag, cb["bus"], cb["worst_where"], "C%d" % r, lbl.strip(), d["kind"], d["bus"],
+                               d.get("id", ""), h, "%.4f" % z, "", "", "", "", "", "", "", "",
+                               "", "capacitive %.0f Mvar; no generator pushed vars at the peak"
+                               % (d.get("mvar") or 0)])
+        if not caps:
+            W("     no capacitive device within %d buses either -- the clearing step itself, or a\n"
+              "     generator with no Q channel\n" % NEAR_HOPS)
+    for r, (score, dq, z, h, d, m) in enumerate(real[:3], 1):
+        why = ["+%.0f Mvar above pre-fault at the bus peak" % dq, "%d bus(es) / |Z| %.3f pu away" % (h, z)]
+        if m["q_fault_avg"] is not None and m["q_fault_avg"] > m["q0"] + SUSPECT_MVAR:
+            why.append("was injecting %.0f Mvar during the fault" % m["q_fault_avg"])
+        if m["t_back"] is None:
+            why.append("Q did NOT return to pre-fault within 3 s")
+        elif m["t_back"] > 0.2:
+            why.append("Q took %.2f s to come back" % m["t_back"])
+        if m["eterm_max"] and m["eterm_max"] > LIMIT_PU:
+            why.append("own terminal reached %.3f pu" % m["eterm_max"])
+        W("     LIKELY CAUSE #%d: %s (%s %s) -- %s\n" % (r, m["machine"], d["kind"], d["bus"], "; ".join(why)))
+        cause_rows.append([tag, cb["bus"], cb["worst_where"], r, m["machine"], d["kind"], d["bus"],
+                           d.get("id", ""), h, "%.4f" % z, "%.1f" % m["q0"],
+                           "" if m["q_fault_avg"] is None else "%.1f" % m["q_fault_avg"],
+                           "" if m["q_fault_max"] is None else "%.1f" % m["q_fault_max"],
+                           "%.1f" % dq, "%.1f" % m["dq_max"], "%.4f" % m["t_qmax_after_clr"],
+                           "" if m["t_back"] is None else "%.3f" % m["t_back"],
+                           "" if m["eterm_max"] is None else "%.3f" % m["eterm_max"],
+                           "%.0f" % score, "; ".join(why)])
 
 
 def combine(per_proj):
@@ -1043,6 +1216,7 @@ def combine(per_proj):
             c["shapes"].add(b["shape"])
             if b["worst"] > c["worst"]:
                 c["worst"], c["worst_where"] = b["worst"], "%s %s" % (proj, b["worst_fault"])
+                c["fault_bus"] = b.get("worst_fault_bus", "")
     out = list(by.values())
     out.sort(key=lambda c: (-len(c["projects"]), -c["n"], -c["worst"]))
     return out
@@ -1053,9 +1227,10 @@ def main():
     if not folders:
         print("[spike] no 02_VIOLATIONS csv found under %s (Base\\results_base\\<proj>_spp ...)" % _root())
         return 1
-    lines, per_kind, traced_kind = [], {}, {}
+    lines, per_kind, traced_kind, res_dirs = [], {}, {}, {}
     for kind, proj, d, v in folders:
         print("[spike] %s %s  <- %s" % (kind, proj, v))
+        res_dirs.setdefault(kind, {})[proj] = d
         try:
             buses, traced, ln = run_folder(kind, proj, d, v)
             lines.append(ln)
@@ -1083,7 +1258,7 @@ def main():
                            c["worst_where"][:24], "/".join(sorted(c["shapes"]))))
             if NEARBY and comb:
                 try:
-                    t = run_nearby(kind, comb, traced_kind.get(kind, []))
+                    t = run_nearby(kind, comb, traced_kind.get(kind, []), res_dirs.get(kind, {}))
                 except Exception as e:
                     t = None
                     print("[near] %s FAILED: %s: %s" % (kind, type(e).__name__, e))
