@@ -57,12 +57,12 @@ import subprocess
 # ============================================================================
 REFERENCE = [            # the base folder(s) every scenario is compared AGAINST -- ONE or SEVERAL (an old and a new
                          # base): a project's results folder (...\SantaFe_spp) OR a parent holding all of them
-    r"C:\KV\Base\results_base\BASE_CQ_F",
+   r"C:\KV\Base\results_base\Base_CQ", r"C:\KV\Base\results_base\BASE_CQ_F",
     # r"C:\KV\Base\results_base",                             # a second base: both sit side by side in one workbook
 ]
 SCENARIOS = [            # the folders to compare against it -- results folders, or parents holding one per project
                          # (matched by name: SantaFe_spp with SantaFe_spp, IronStar_spp with IronStar_spp ...)
-    r"C:\KV\Projects\results_proj",
+    r"C:\KV\Projects\results_proj\Proj_SGF",
     r"C:\KV\Projects\results_proj\Sep21_full gia",
     # r"C:\KV\Projects\results_proj\SantaFe_spp_poi502",
     # r"C:\KV\Base\results_base_OLDBASE\SantaFe_spp",            # another base run works too
