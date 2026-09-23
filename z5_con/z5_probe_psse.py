@@ -21,7 +21,7 @@ sys.path.insert(0, HERE)
 import z5_spike_find as S                                  # same PSS/E path setup + dyr parser
 
 NEED = ("_psspy", "_dyntools", "case_files", "load_network", "nearby", "_chan_kind", "_mach_key")
-if [n for n in NEED if not hasattr(S, n)] or getattr(S, "VERSION", "") < "2026-09-23e":
+if [n for n in NEED if not hasattr(S, n)] or getattr(S, "VERSION", "") < "2026-09-23f":
     print("*** %s is an OLD copy (version %s) -- replace it with the latest z5_spike_find.py,\n"
           "*** then run this again." % (S.__file__, getattr(S, "VERSION", "none")))
     sys.exit(1)
@@ -97,7 +97,7 @@ def main():
         for n in ("BSWNOM", "BSWACT", "BSWMAX", "BSWMIN", "BINIT", "VSWHI", "VSWLO"):
             try_call("aswshreal %s" % n, ps.aswshreal, -1, 4, n)
         for n in ("SENDNUMBER", "STATUS"):
-            try_call("afactsint %s" % n, ps.afactsint, -1, 4, n)
+            try_call("afactsint %s" % n, ps.afactsint, -1, 1, 4, n)
 
         P("\n-- what z5_spike_find sees around bus %s --" % BUS)
         try:
@@ -156,7 +156,7 @@ def main():
             sel += [k for k, ttl in ids.items() if k != "time" and S._chan_kind(ttl) == "Q"][:2]
             t1 = time.time()
             try:
-                r = ch.get_data(sel)
+                r = ch.get_data(["time"] + sel)
                 P("  get_data(subset of %d) OK in %.1f s, %d samples" % (len(sel), time.time() - t1, len(r[2]["time"])))
                 for k in sel:
                     v = r[2][k]

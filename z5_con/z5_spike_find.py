@@ -47,7 +47,7 @@ report files above).
 from __future__ import print_function
 import os, sys, re, csv, glob, time
 
-VERSION = "2026-09-23e"      # z5_probe_psse.py checks this
+VERSION = "2026-09-23f"      # z5_probe_psse.py checks this
 
 # =========================== SETTINGS ======================================
 ROOT          = ""            # "" = the folder this file is in (the study root)
@@ -396,9 +396,16 @@ def _read_out(path, want_buses):
             sel = None
     except Exception:
         sel = None
-    try:
-        _sh, cid, cd = ch.get_data(sel) if sel else ch.get_data()
-    except Exception:
+    cid = cd = None
+    if sel:
+        # a channel subset comes back WITHOUT the time column on PSS/E 34 unless it is asked for
+        try:
+            _sh, cid, cd = ch.get_data(["time"] + sel)
+        except Exception:
+            cid = cd = None
+        if not cd or "time" not in cd:
+            cid = cd = None
+    if cd is None:
         _sh, cid, cd = ch.get_data()
     print("[out]   %s read in %.0f s (%d channels)"
           % (os.path.basename(path), time.time() - t0, len(cid) - 1))
@@ -783,6 +790,10 @@ def case_files(kind):
 
 
 _SYNC_M = ("GENROU", "GENSAL", "GENCLS", "GENTPJ", "GENROE", "GENSAE", "GENTPF", "GENQEC", "CIMTR")
+# exciters / governors / stabilisers / generator models: any of them = a synchronous unit
+_SYNC_PRE = ("GEN", "EX", "ES", "IEEE", "SEXS", "SCRX", "REXS", "BBSEX", "URST", "AC", "DC",
+             "PSS", "STAB", "TGOV", "GAST", "HYGOV", "GGOV", "WSIEG", "WEHGOV", "IEESGO", "URGS",
+             "CRCMGV", "DEGOV", "PIDGOV", "TGOV", "WPIDHY", "H6E", "WSHYGP", "ST", "CBEST")
 _SVC_M = ("CSVGN", "CSTCNT", "SVSMO", "CSTATT", "STCON", "ABBSVC", "SVC")
 _IBR_M = ("REGC", "REEC", "REPC", "WT3G", "WT4G", "WT1G", "WT2G", "PVGU", "PVEU", "PVDG",
           "GEWT", "GEPV", "DER_A", "DERA", "IBR", "INV", "SMA", "SUNG", "VEST", "SIEM", "NORDEX")
@@ -814,11 +825,11 @@ def _mtype(models, wmod):
         return "SVC/STATCOM"
     if any(k in ms for k in _IBR_M):
         return "IBR"
-    if any(k in ms for k in _SYNC_M):
+    if any(k in ms for k in _SYNC_M) or any(m.startswith(_SYNC_PRE) for m in (models or [])):
         return "SYNC"
     if wmod and wmod > 0:
         return "IBR"
-    return "GEN" if not models else "GEN(" + models[0] + ")"
+    return "GEN(no dyn model)" if not models else "GEN(" + models[0] + ")"
 
 
 def _arr(fn, sid, flag, names, *extra):
@@ -923,7 +934,16 @@ def load_network(psspy, sav, dyr):
                 "mvar": now, "bmax": g("BSWMAX"), "bmin": g("BSWMIN"),
                 "vhi": g("VSWHI"), "vlo": g("VSWLO")})
     # FACTS
-    ff = _arr(psspy.afactsint, -1, 4, ["SENDNUMBER", "STATUS"])
+    ff = {}
+    for n in ("SENDNUMBER", "STATUS"):
+        for args in ((-1, 1, 4, n), (-1, 4, n)):          # (sid, owner, flag, string) on PSS/E 34
+            try:
+                ierr, v = psspy.afactsint(*args)
+                if ierr == 0 and v:
+                    ff[n] = v[0]
+                    break
+            except Exception:
+                pass
     for i, n in enumerate(ff.get("SENDNUMBER", [])):
         dev(n, {"kind": "FACTS", "bus": n, "id": "", "status": ff.get("STATUS", [1] * (i + 1))[i]})
     print("[near] case: %d buses, %d with devices" % (len(net["bus"]), len(net["dev"])))
