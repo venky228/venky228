@@ -47,7 +47,7 @@ report files above).
 from __future__ import print_function
 import os, sys, re, csv, glob, time
 
-VERSION = "2026-09-23g"      # z5_probe_psse.py checks this
+VERSION = "2026-09-23h"      # z5_probe_psse.py checks this
 
 # =========================== SETTINGS ======================================
 ROOT          = ""            # "" = the folder this file is in (the study root)
@@ -66,6 +66,9 @@ SUSPECT_MVAR  = 10.0          # a machine pushing < this many Mvar extra is not 
 SUSPECT_TOP   = 10            # suspects listed per fault
 SYS_MVA_BASE  = 100.0         # machine P/Q channels are pu on this base
 MATCH_S       = 0.10          # a machine's Q peak within this of the bus peak = "in step"
+
+NC_WINDOW_S   = 0.05          # a solver message within this of the spike counts as "at the spike"
+CHATTER_PU    = 0.02          # step-to-step reversals bigger than this = saw-tooth (solver) signature
 
 NEARBY        = True          # PART C -- needs PSS/E (psspy): opens the case and lists what is
                               # electrically near each top bus: generators, cap banks, reactors,
@@ -260,6 +263,103 @@ def rank_faults(rows):
     out = list(by.values())
     out.sort(key=lambda f: (-len(f["buses"]), -f["worst"]))
     return out
+
+
+# ----------------------------- SOLVER CHECK ---------------------------------
+_NC_RX = re.compile(r"Network not converged at TIME\s*=\s*([-\d.E+]+)\s+(\d+)\s+([\d.E+-]+)\s+(\d+)", re.I)
+
+
+def solver_info(res_dir, fault_ids, kind_tag):
+    """{fault: {"diverged": why|None, "nc": [(t, iters, mismatch, bus)]}} plus notes.
+
+       Three sources: the engine's own 06_DIVERGED list, 00_INIT_NOT_CONVERGED,
+       and every 'Network not converged at TIME =' line in logs\\. The engine
+       sends PSS/E's output to a sink for the fault window when
+       PSSE_SILENT_RUNS = True, so for those runs the logs hold no such lines --
+       said in the notes, and the .out signal (Part B) is then the evidence."""
+    info = dict((f, {"diverged": None, "nc": []}) for f in fault_ids)
+    notes = []
+    for pat in ("06_DIVERGED_%s*.txt" % kind_tag, os.path.join("reports", "SPP_DIVERGED*_%s*.txt" % kind_tag)):
+        for pth in sorted(glob.glob(os.path.join(res_dir, pat))):
+            try:
+                with open(pth, errors="replace") as fh:
+                    for ln in fh:
+                        m = re.match(r"^(\S+)\s{2,}(\S.*)$", ln.rstrip())
+                        if m and m.group(1) in info and not info[m.group(1)]["diverged"]:
+                            info[m.group(1)]["diverged"] = m.group(2).strip()
+            except Exception:
+                pass
+    p = os.path.join(res_dir, "00_INIT_NOT_CONVERGED.txt")
+    if os.path.isfile(p):
+        notes.append("00_INIT_NOT_CONVERGED.txt exists -- some initialisations did not converge")
+    ids = sorted(fault_ids, key=len, reverse=True)
+    rx_id = re.compile(r"(?<![A-Za-z0-9])(%s)(?![0-9A-Za-z])" % "|".join(re.escape(x) for x in ids)) if ids else None
+    silenced, n_lines = False, 0
+    for pth in sorted(glob.glob(os.path.join(res_dir, "logs", "*"))):
+        if not os.path.isfile(pth) or os.path.getsize(pth) > 400 * 1024 * 1024:
+            continue
+        base = os.path.basename(pth)
+        mf = rx_id.search(base) if rx_id else None
+        cur = mf.group(1) if mf else None
+        try:
+            with open(pth, errors="replace") as fh:
+                for ln in fh:
+                    if "SILENCED for the fault window" in ln:
+                        silenced = True
+                    if rx_id and not mf and ("FAULT" in ln or "[" in ln):
+                        mm = rx_id.search(ln)
+                        if mm:
+                            cur = mm.group(1)
+                    if "not converged" in ln:
+                        m = _NC_RX.search(ln)
+                        if m and cur in info:
+                            n_lines += 1
+                            try:
+                                info[cur]["nc"].append((float(m.group(1)), int(m.group(2)),
+                                                        float(m.group(3)), int(m.group(4))))
+                            except ValueError:
+                                pass
+        except Exception:
+            pass
+    if silenced:
+        notes.append("PSSE_SILENT_RUNS was ON: PSS/E's own messages during the fault window were "
+                     "discarded, so 'no non-converged steps in the logs' does NOT prove convergence "
+                     "-- use the .out signal (Part B), or re-run one fault with PSSE_SILENT_RUNS = "
+                     "False in both engine files")
+    notes.append("%d 'Network not converged' line(s) found in logs\\" % n_lines)
+    return info, notes
+
+
+def _signal_check(t, v, icl, ip):
+    """What the voltage trace itself says about the solution around the spike.
+
+       A converged clearing jump is a clean step and a smooth decay. A network
+       solution that did not converge leaves NaN, or a saw-tooth (the value
+       reversing every step), or one sample far above both neighbours."""
+    lo = max(0, icl - 3)
+    hi = min(len(v), _idx(t, t[icl] + 10.0 / 60.0) + 1)
+    seg = v[lo:hi]
+    nan = sum(1 for x in seg if x != x or x in (float("inf"), float("-inf")))
+    rev, last = 0, 0.0
+    for i in range(lo + 1, hi):
+        d = v[i] - v[i - 1]
+        if d != d or abs(d) < CHATTER_PU:
+            continue
+        if last and (d > 0) != (last > 0):
+            rev += 1
+        last = d
+    lone = 0.0
+    if 0 < ip < len(v) - 1:
+        lone = v[ip] - max(v[ip - 1], v[ip + 1])
+    why = []
+    if nan:
+        why.append("%d NaN/Inf sample(s)" % nan)
+    if rev >= 4:
+        why.append("saw-tooth: %d reversals > %.2f pu in 10 cycles" % (rev, CHATTER_PU))
+    if lone > 0.10:
+        why.append("single-sample spike %.2f pu above both neighbours" % lone)
+    return {"nan": nan, "reversals": rev, "lone": lone,
+            "signal": ("NUMERICAL? " + "; ".join(why)) if why else "clean (step + smooth decay)"}
 
 
 # ----------------------------- PART B --------------------------------------
@@ -475,6 +575,7 @@ def trace_fault(res_dir, fault, fault_bus, buses):
                              "t_peak": t[ip], "dt": dt, "above": above,
                              "swing_peak": v[isp], "swing_dt": t[isp] - t_clr,
                              "shape": "SPIKE" if above <= SPIKE_S + 1e-9 else "SWING"})
+        res["buses"][-1].update(_signal_check(t, v, icl, ip))
     iwin = _idx(t, t_clr + 1.0)
     mach = []
     for key, (title, v) in q.items():
@@ -586,6 +687,24 @@ def run_folder(kind, proj, res_dir, vcsv):
     swing_faults.sort()
     buses = rank_buses(rows, len(faults_all))
     faults = rank_faults(rows)
+    sinfo, snotes = solver_info(res_dir, set(r["fault"] for r in rows), tag)
+    t_spk = {}
+    for r in rows:
+        if r["time"] is not None:
+            t_spk[r["fault"]] = min(t_spk.get(r["fault"], 1e9), r["time"])
+
+    def _solver_txt(fid):
+        si = sinfo.get(fid) or {}
+        out = []
+        if si.get("diverged"):
+            out.append("DIVERGED: %s" % si["diverged"][:60])
+        nc = si.get("nc") or []
+        if nc:
+            ts = t_spk.get(fid)
+            near = [x for x in nc if ts is not None and abs(x[0] - ts) <= NC_WINDOW_S]
+            out.append("%d non-converged step(s)%s" % (len(nc), (", %d AT THE SPIKE (worst mismatch %.3g at bus %d)"
+                       % (len(near), max(x[2] for x in near), max(near, key=lambda x: x[2])[3])) if near else ""))
+        return "; ".join(out)
     groups = group_buses(buses)
     stem = "%s_%s" % (tag, proj)
     txt = os.path.join(res_dir, "SPIKE_FINDER_%s.txt" % stem)
@@ -665,6 +784,18 @@ def run_folder(kind, proj, res_dir, vcsv):
         W("      %s\n" % (" ".join(swing_faults) if swing_faults else "-"))
         W("    faults with over-voltage spikes AND another violation (recovery / trip / damping): %d\n"
           % len([f for f in set(r["fault"] for r in rows) if f not in spike_only and f not in swing_faults]))
+        _nc_f = [f for f in sorted(set(r["fault"] for r in rows)) if _solver_txt(f)]
+        _nc_at = [f for f in _nc_f if "AT THE SPIKE" in _solver_txt(f) or "DIVERGED" in _solver_txt(f)]
+        W("\n 0b. SOLVER (non-convergence) -- is PSS/E itself contributing?\n")
+        W("    faults with an over-voltage that ALSO diverged or had a non-converged step AT the spike: %d\n"
+          % len(_nc_at))
+        for f in _nc_at[:30]:
+            W("      %-12s %s\n" % (f, _solver_txt(f)))
+        W("    faults with non-converged steps elsewhere in the run: %d\n" % (len(_nc_f) - len(_nc_at)))
+        for n_ in snotes:
+            W("    note: %s\n" % n_)
+        W("    Part B (section 5) adds the .out evidence for the traced faults: NaN, saw-tooth, or a\n"
+          "    single-sample spike = the solution, not the network; 'clean' = a real model response.\n")
         W("\n 1. BUSES, most faults first (all of them in %s)\n" % os.path.basename(bcsv))
         W(" %-22s %-6s %6s %6s %-10s %-6s %8s %5s  %s\n"
           % ("bus", "area", "faults", "worst", "in", "shape", "abv_s", "hops", "likely cause"))
@@ -708,6 +839,9 @@ def run_folder(kind, proj, res_dir, vcsv):
                  ("  <- WIDE-AREA CLEARING SPIKE (%d spikes, up to %d hops): the reactive current "
                   "injected DURING the fault is still flowing when it clears -- Part B/C name the plants"
                   % (nsp, hmax)) if wide else ""))
+            _st = _solver_txt(fr["fault"])
+            if _st:
+                W(" %-12s SOLVER: %s\n" % ("", _st))
 
         W("\n 5. WHO DRIVES IT (Part B, from the .out files)\n")
         if not READ_OUTS:
@@ -728,6 +862,7 @@ def run_folder(kind, proj, res_dir, vcsv):
                   % (b["label"][:20], b["pre"], b["peak"], b["dt"], b["above"], b["shape"],
                      b["swing_peak"], b["swing_dt"]))
                 W("   %-20s   driver: %s\n" % ("", b.get("driver", "-")))
+                W("   %-20s   solution: %s\n" % ("", b.get("signal", "-")))
             W(" VERDICT: %s\n" % tr["verdict"])
             sus = [s for s in tr["suspects"] if max(s["dq_at_spike"], s["dq_max"]) >= SUSPECT_MVAR]
             if sus:
@@ -1191,6 +1326,7 @@ def _q_review(W, cb, gens, net, traces, cause_rows, tag, others=()):
         b = bb[0]
         W("     bus peak %.3f pu at +%.4f s after clearing, above %.2f pu for %.3f s -> %s\n"
           % (b["peak"], b["dt"], LIMIT_PU, b["above"], b["shape"]))
+        W("     solution at the spike: %s\n" % b.get("signal", "-"))
     mach = tr.get("mach", [])
     by_bid = dict(((m["bus"], m["id"]), m) for m in mach)
     by_b = {}
