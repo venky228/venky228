@@ -104,8 +104,15 @@ def _f(x, d=None):
 
 
 def _bus(el):
-    m = re.search(r"\d{4,}", str(el))
-    return int(m.group(0)) if m else None
+    """The bus number in a label. The report writes 'GEN-2021-070 [765930]' --
+       the number IN BRACKETS is the bus (the first digits would be '2021').
+       Channel titles put the bus first ('VOLT 765930 [GEN-2021-070 34.5]')."""
+    s = str(el)
+    m = re.search(r"\[\s*(\d{4,})\s*\]", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?<![\d-])(\d{5,7})(?!\d)", s) or re.search(r"\d{4,}", s)
+    return int(m.group(1) if m.re.groups else m.group(0)) if m else None
 
 
 def _median(xs):
@@ -657,8 +664,15 @@ def run_folder(kind, proj, res_dir, vcsv):
 
         W("\n 4. FAULTS with the most overvoltage buses\n")
         for fr in faults[:20]:
-            W(" %-12s %4d bus(es)  worst %.3f at %s  (fault bus %s)\n"
-              % (fr["fault"], len(fr["buses"]), fr["worst"], fr["worst_bus"], fr["fault_bus"]))
+            fr_rows = [r for r in rows if r["fault"] == fr["fault"]]
+            nsp = sum(1 for r in fr_rows if r["dur"] is not None and r["dur"] <= SPIKE_S + 1e-9)
+            hmax = max([r["hops"] for r in fr_rows if r["hops"] is not None] or [0])
+            wide = len(fr["buses"]) >= 20 and nsp >= 0.8 * len(fr_rows)
+            W(" %-12s %4d bus(es)  worst %.3f at %s  (fault bus %s)%s\n"
+              % (fr["fault"], len(fr["buses"]), fr["worst"], fr["worst_bus"], fr["fault_bus"],
+                 ("  <- WIDE-AREA CLEARING SPIKE (%d spikes, up to %d hops): the reactive current "
+                  "injected DURING the fault is still flowing when it clears -- Part B/C name the plants"
+                  % (nsp, hmax)) if wide else ""))
 
         W("\n 5. WHO DRIVES IT (Part B, from the .out files)\n")
         if not READ_OUTS:
@@ -939,8 +953,9 @@ def _advice(d, confirmed):
     if st == 0:
         return "OUT of service -- no effect now"
     if k == "IBR":
-        s = ("fast Q after clearing: check REEC Vdip/Vup, Kqv, Iqh/Iql, Thld/Iqfrz and the REPC "
-             "voltage loop (Kc, Kp/Ki); a Q that does not ramp back holds V high")
+        s = ("Q still high after clearing: the fault-time reactive current (REEC Kqv, Iqh1) is held "
+             "(REEC Thld > 0 / Iqfrz) or ramps down slowly (REGC Iqrmin); also REEC Vdip/Vup and the "
+             "REPC voltage loop (Kc, Kp/Ki)")
         return ("CONFIRMED pushing vars (%s). " % confirmed + s) if confirmed else s
     if k == "SYNC":
         s = "exciter field forcing: check the AVR/exciter model and its limits; Q near QMAX pre-fault?"
