@@ -4282,12 +4282,6 @@ PLOT_NONFINITE = _env_bool("SPP_PLOT_NONFINITE", PLOT_NONFINITE)
 # work of its own.
 MERGE_ONLY = False
 MERGE_ONLY = _env_bool("SPP_MERGE_ONLY", MERGE_ONLY)
-# SPP_SAV_ONLY=<path>: build the PROJECT POWER FLOW exactly as a study does --
-# the input .sav, the new plant, the SGF at its rating, the EGF making up the
-# rest of the POI total, the area put back to its pre-project MW -- save that
-# solved case to <path> and stop. No .cnv / .snp / .cnl / .dyr, no study, and
-# nothing written into the study folder. Used by z4_proj_sav.py.
-SAV_ONLY = (os.environ.get("SPP_SAV_ONLY") or "").strip()
 
 # SCORE THE PART OF A DIVERGED RUN THAT SOLVED.
 #
@@ -4559,11 +4553,6 @@ NEW_PLANT_BUSES_FILE = os.path.join(STUDY_DIR, CASE_TAG + "_newplant_buses.txt")
 
 def _np_buses_write(buses):
     """Record the new plant's machine buses beside the snapshot."""
-    if SAV_ONLY:
-        print("  [newplant] SAV_ONLY: plant buses %s -- %s is left as it is"
-              % (", ".join("%s %d" % (r, int(b)) for r, b in buses),
-                 os.path.basename(NEW_PLANT_BUSES_FILE)))
-        return
     try:
         with open(NEW_PLANT_BUSES_FILE, "w") as fh:
             fh.write("# buses of the plant built by build_new_plant()\n")
@@ -14933,39 +14922,6 @@ def _np_record(cfg, lay, poi, mw_u, gsu_mva, mpt_mva):
         print("  [newplant] could not write NEW_PLANT.txt (%s)" % e)
 
 
-def _sav_only_save(members):
-    """SAV_ONLY: save the solved project case and a one-page note beside it."""
-    d = os.path.dirname(os.path.abspath(SAV_ONLY))
-    if d and not os.path.isdir(d):
-        os.makedirs(d)
-    ok = _pf_solved_code() in (0, None)
-    chk(psspy.save(SAV_ONLY), "save project case (%s)" % os.path.basename(SAV_ONLY))
-    lines = ["project case built by z4_spp_p_con.py (SAV_ONLY)",
-             "written   %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
-             "input     %s" % SOURCE_CASE,
-             "saved     %s" % SAV_ONLY,
-             "solved    %s" % ("yes" if ok else "NO -- solved code %s" % _pf_solved_code()),
-             "POI total %s MW  (measured: %s, share of the rest: %s, project machines: %s)"
-             % (POI_P_TARGET_MW, POI_P_MEASURE, POI_P_SHARE, POI_P_PROJECT_AT),
-             "EGF off   %s" % bool(POI_P_EXISTING_OFF),
-             "area hold %s" % bool(POI_HOLD_AREA_MW)]
-    for a, mw in sorted(_AREA_MW_BEFORE.items()):
-        now = _area_gen_mw(a)
-        lines.append("area %-5s before the project %.1f MW, now %s MW"
-                     % (a, mw, ("%.1f" % now) if now is not None else "?"))
-    for mr, mmw in members or []:
-        lines.append("plant %-14s POI %s  machines %s"
-                     % (mr.get("name"), mr.get("poi"),
-                        ", ".join("%s '%s'" % (b, m) for b, m in _member_gens(mr)) or "-"))
-    try:
-        with open(os.path.splitext(SAV_ONLY)[0] + ".txt", "w") as fh:
-            fh.write("\n".join(lines) + "\n")
-    except Exception as e:
-        print("  [sav-only] could not write the note (%s)" % e)
-    for ln in lines:
-        print("  [sav-only] " + ln)
-
-
 def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
     global _SF_ALL_BRANCHES, _SF_ALL_XFMR, _POI_TIES
     """Build .cnv + .snp following RUN1C1.IDV (Run1-create-snap) EXACTLY:
@@ -15291,10 +15247,6 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
             for _mr, _mmw in _bess_members():
                 with _member_scope(_mr, _mmw):
                     _bess_restore_q_limits(_mr, _mmw)
-        # SAV_ONLY: this dispatched, area-held, solved case IS the product.
-        if SAV_ONLY:
-            _sav_only_save(_mm)
-            return
         # 3b) SURPLUS BESS: save the MODIFIED power-flow case BEFORE the GNET/CONL
         #     conversions, so it re-loads as a normal solved case. The ORIGINAL is untouched.
         if ENABLE_BESS:
@@ -34552,20 +34504,6 @@ def plot_missing_outs():
     return n_done
 
 
-if __name__ == "__main__" and SAV_ONLY:
-    # BUILD THE PROJECT POWER FLOW, SAVE IT, STOP -- see SAV_ONLY.
-    try:
-        if not os.path.isdir(LOG_DIR):
-            os.makedirs(LOG_DIR)
-        build_case(outages=None, tag="SAV_ONLY")
-        _rc = 0 if os.path.isfile(SAV_ONLY) else 1
-    except SystemExit:
-        raise
-    except Exception as _e:
-        traceback.print_exc()
-        print("[sav-only] FAILED: %s" % _e)
-        _rc = 1
-    sys.exit(_rc)
 if __name__ == "__main__":
     rc = 0
     # ---- REBUILD THE REPORTS FROM parts\, RIGHT NOW ------------------------

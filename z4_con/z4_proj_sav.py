@@ -3,8 +3,10 @@
 z4_proj_sav.py -- one PROJECT .sav per project from a BASE .sav.
 
 For each project it builds the project power flow EXACTLY as the dynamic
-study does, because it is the study script (z4_spp_p_con.py) doing it, in its
-SAV_ONLY mode:
+study does, because it is the study script (z4_spp_p_con.py) doing it. That
+file is NOT changed: this script reads it, adds a "save the solved case and
+stop" step IN MEMORY, and runs that copy -- your study scripts on disk stay
+exactly as they are:
 
   1. the input base .sav is loaded, and the project area's generation is read
      BEFORE anything is added -- that is the MW the area is held to
@@ -112,6 +114,7 @@ def build_one(z4, proj, mw, base_sav, out_dir):
     if not os.path.isfile(script):
         print("[sav] *** %s not found -- cannot build %s ***" % (script, proj))
         return None
+    patched_engine_source(script)                 # stop now if the study script does not fit
     stem = os.path.splitext(os.path.basename(base_sav))[0]
     out = os.path.join(out_dir, "%s_%s_POI%sMW%s.sav"
                        % (stem, proj, _mw_txt(mw), "_EGFoff" if EGF_OFF else ""))
@@ -131,13 +134,15 @@ def build_one(z4, proj, mw, base_sav, out_dir):
     if SHARE:
         env["SPP_POI_P_SHARE"] = str(SHARE)
     env["SPP_SAV_ONLY"] = out
+    env["SPP_SAV_ENGINE"] = script
     if os.path.isfile(out):
         os.remove(out)                            # a stale file must not pass as this build
     log = os.path.splitext(out)[0] + ".log"
     print("[sav] %-14s POI %8.1f MW  -> %s" % (proj, mw, out))
     t0 = time.time()
     with open(log, "w") as fh:
-        p = subprocess.Popen([sys.executable, "-u", script], cwd=study_dir, env=env,
+        p = subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), "--engine"],
+                             cwd=study_dir, env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              universal_newlines=True)
         for line in p.stdout:
@@ -150,6 +155,106 @@ def build_one(z4, proj, mw, base_sav, out_dir):
     print("[sav] %-14s %s in %.0f s  (full log: %s)"
           % (proj, "DONE" if ok else "*** FAILED rc=%s ***" % rc, time.time() - t0, log))
     return out if ok else None
+
+
+# ---- THE STUDY SCRIPT, WITH A SAVE-AND-STOP STEP ADDED IN MEMORY ----------
+# Each patch is (text that must be found once in z4_spp_p_con.py, what it
+# becomes). If the study script has changed so a text is not found, nothing
+# runs -- a build that silently skipped a step would save the wrong case.
+_PATCHES = [
+    ('MERGE_ONLY = _env_bool("SPP_MERGE_ONLY", MERGE_ONLY)\n',
+     'MERGE_ONLY = _env_bool("SPP_MERGE_ONLY", MERGE_ONLY)\n'
+     'SAV_ONLY = (os.environ.get("SPP_SAV_ONLY") or "").strip()\n'),
+    ('def _np_buses_write(buses):\n'
+     '    """Record the new plant\'s machine buses beside the snapshot."""\n',
+     'def _np_buses_write(buses):\n'
+     '    """Record the new plant\'s machine buses beside the snapshot."""\n'
+     '    if SAV_ONLY:\n'
+     '        print("  [newplant] SAV_ONLY: plant buses not written to the study folder")\n'
+     '        return\n'),
+    ('        # 3b) SURPLUS BESS: save the MODIFIED power-flow case BEFORE the GNET/CONL\n',
+     '        if SAV_ONLY:\n'
+     '            _sav_only_save(_mm)\n'
+     '            return\n'
+     '        # 3b) SURPLUS BESS: save the MODIFIED power-flow case BEFORE the GNET/CONL\n'),
+    ('def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):\n',
+     '__SAV_ONLY_SAVE__\n'
+     'def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):\n'),
+    ('if __name__ == "__main__":\n    rc = 0\n',
+     'if __name__ == "__main__" and SAV_ONLY:\n'
+     '    try:\n'
+     '        if not os.path.isdir(LOG_DIR):\n'
+     '            os.makedirs(LOG_DIR)\n'
+     '        build_case(outages=None, tag="SAV_ONLY")\n'
+     '        _rc = 0 if os.path.isfile(SAV_ONLY) else 1\n'
+     '    except SystemExit:\n'
+     '        raise\n'
+     '    except Exception as _e:\n'
+     '        traceback.print_exc()\n'
+     '        print("[sav-only] FAILED: %s" % _e)\n'
+     '        _rc = 1\n'
+     '    sys.exit(_rc)\n'
+     'if __name__ == "__main__":\n    rc = 0\n'),
+]
+_SAVE_FN = '''
+def _sav_only_save(members):
+    """Save the solved project case and a one-page note beside it."""
+    d = os.path.dirname(os.path.abspath(SAV_ONLY))
+    if d and not os.path.isdir(d):
+        os.makedirs(d)
+    ok = _pf_solved_code() in (0, None)
+    chk(psspy.save(SAV_ONLY), "save project case (%s)" % os.path.basename(SAV_ONLY))
+    lines = ["project case built by z4_proj_sav.py",
+             "written   %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+             "input     %s" % SOURCE_CASE,
+             "saved     %s" % SAV_ONLY,
+             "solved    %s" % ("yes" if ok else "NO -- solved code %s" % _pf_solved_code()),
+             "POI total %s MW  (measured: %s, share of the rest: %s, project machines: %s)"
+             % (POI_P_TARGET_MW, POI_P_MEASURE, POI_P_SHARE, POI_P_PROJECT_AT),
+             "EGF off   %s" % bool(POI_P_EXISTING_OFF),
+             "area hold %s" % bool(POI_HOLD_AREA_MW)]
+    for a, mw in sorted(_AREA_MW_BEFORE.items()):
+        now = _area_gen_mw(a)
+        lines.append("area %-5s before the project %.1f MW, now %s MW"
+                     % (a, mw, ("%.1f" % now) if now is not None else "?"))
+    for mr, mmw in members or []:
+        lines.append("plant %-14s POI %s  machines %s"
+                     % (mr.get("name"), mr.get("poi"),
+                        ", ".join("%s '%s'" % (b, m) for b, m in _member_gens(mr)) or "-"))
+    try:
+        with open(os.path.splitext(SAV_ONLY)[0] + ".txt", "w") as fh:
+            fh.write("\\n".join(lines) + "\\n")
+    except Exception as e:
+        print("  [sav-only] could not write the note (%s)" % e)
+    for ln in lines:
+        print("  [sav-only] " + ln)
+
+'''
+
+
+def patched_engine_source(path):
+    """z4_spp_p_con.py's text with the save-and-stop step added."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        src = fh.read()
+    missing = []
+    for old, new in _PATCHES:
+        if src.count(old) != 1:
+            missing.append(old.strip().splitlines()[0])
+            continue
+        src = src.replace(old, new)
+    if missing:
+        raise SystemExit("[sav] *** %s does not have the lines this script expects -- "
+                         "nothing was built:\n      %s" % (path, "\n      ".join(missing)))
+    return src.replace("__SAV_ONLY_SAVE__\n", _SAVE_FN)
+
+
+def run_engine():
+    """The child process: run the patched study script as if it were started."""
+    path = os.environ["SPP_SAV_ENGINE"]
+    src = patched_engine_source(path)
+    sys.argv = [path]
+    g = {"__name__": "__main__", "__file__": path, "__builtins__": __builtins__}
+    exec(compile(src, path, "exec"), g)
 
 
 def main(argv):
@@ -186,4 +291,7 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--engine":
+        run_engine()
+        sys.exit(0)
     sys.exit(main(sys.argv))
