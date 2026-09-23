@@ -275,23 +275,65 @@ def main(argv):
     print("[sav] area held       : %s    EGF off: %s    share: %s"
           % (HOLD_AREA, EGF_OFF, SHARE or getattr(z4, "POI_P_SHARE", "capacity")))
     done, failed = [], []
+    res = {}                                      # project -> [(mw, path or None, why)]
     for proj in projects:
         lv = _levels(z4, proj)
         if not lv:
             print("[sav] %-14s no POI MW (POI_MW here or POI_P_TARGET_MW in the panel) -- skipped" % proj)
             failed.append(proj)
+            res.setdefault(proj, []).append((None, None, "no POI MW given"))
             continue
         for mw in lv:
             got = build_one(z4, proj, mw, base_sav, out_dir)
             (done if got else failed).append(got or "%s @ %g MW" % (proj, mw))
+            res.setdefault(proj, []).append((mw, got, "" if got else "build failed -- see its .log"))
     print("")
     print("[sav] %d case(s) written, %d failed" % (len(done), len(failed)))
     for d in done:
         print("      %s" % d)
     for f in failed:
         print("      FAILED: %s" % f)
+    write_rerun(os.path.join(out_dir, "RERUN_ALL.txt"), res, base_sav)
+    for proj in res:
+        write_rerun(os.path.join(out_dir, proj, "RERUN_%s.txt" % proj), {proj: res[proj]}, base_sav)
     return 0 if not failed else 1
 
+
+def write_rerun(path, res, base_sav):
+    """What was built, what failed, and the lines to paste into SETTINGS to
+       build only the failed ones again."""
+    L = ["PROJECT .sav BUILDS -- what to re-run in z4_proj_sav.py",
+         "generated %s" % time.strftime("%Y-%m-%d %H:%M"),
+         "input     %s" % base_sav, ""]
+    redo = {}
+    for proj in sorted(res):
+        L.append(proj)
+        for mw, got, why in res[proj]:
+            if got:
+                L.append("   OK      POI %g MW  -> %s" % (mw, got))
+            else:
+                L.append("   FAILED  %s%s" % (("POI %g MW  -- " % mw) if mw is not None else "", why))
+                if mw is not None:
+                    redo.setdefault(proj, []).append(mw)
+        L.append("")
+    if redo:
+        L += ["To build only the failed ones again, set in z4_proj_sav.py:",
+              "    PROJECTS = [%s]" % ", ".join('"%s"' % p for p in sorted(redo)),
+              "    POI_MW   = {%s}" % ", ".join('"%s": [%s]' % (p, ", ".join("%g" % m for m in redo[p]))
+                                            for p in sorted(redo)),
+              "    POI_PCT  = []",
+              "and run it again. The .log beside each failed .sav says why it failed."]
+    else:
+        L.append("Nothing to re-run: every build was written.")
+    try:
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with open(path, "w") as fh:
+            fh.write("\n".join(L) + "\n")
+        print("[sav] re-run list -> %s" % path)
+    except Exception as e:
+        print("[sav] could not write %s: %s" % (path, e))
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--engine":
