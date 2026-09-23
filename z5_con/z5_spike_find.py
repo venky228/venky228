@@ -47,6 +47,8 @@ report files above).
 from __future__ import print_function
 import os, sys, re, csv, glob, time
 
+VERSION = "2026-09-23e"      # z5_probe_psse.py checks this
+
 # =========================== SETTINGS ======================================
 ROOT          = ""            # "" = the folder this file is in (the study root)
 CASES         = ["base"]      # "base" and/or "proj"

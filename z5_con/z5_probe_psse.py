@@ -20,6 +20,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import z5_spike_find as S                                  # same PSS/E path setup + dyr parser
 
+NEED = ("_psspy", "_dyntools", "case_files", "load_network", "nearby", "_chan_kind", "_mach_key")
+if [n for n in NEED if not hasattr(S, n)] or getattr(S, "VERSION", "") < "2026-09-23e":
+    print("*** %s is an OLD copy (version %s) -- replace it with the latest z5_spike_find.py,\n"
+          "*** then run this again." % (S.__file__, getattr(S, "VERSION", "none")))
+    sys.exit(1)
+
 LOG = []
 
 
