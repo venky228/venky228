@@ -3552,6 +3552,18 @@ SLG_TRUE_UNBALANCED = False
 FAULT_X_BOLTED   = 0.02    # fallback pu fault reactance if a bus's pre-fault V can't be read
 THEVENIN_X_GUESS = 0.10    # assumed Thevenin reactance (pu) for sizing the retained-V fault
 
+# ---- PSS/E's OWN MESSAGES FOR THE FAULT RUN, KEPT IN A FILE ----------------
+# PSSE_SILENT_RUNS sends them to a throwaway sink, so "Network not converged at
+# TIME = ..." -- the one line that says the solver lost the solution -- is gone
+# for every scenario. With PSSE_FAULT_LOG (panel: PSSE_FAULT_LOG = True) the
+# same file device is used, but the file is KEPT, one per scenario:
+#     results\<proj>_spp\logs\psse\<fault>.txt
+# Nothing extra reaches the terminal, and one file per scenario means parallel
+# workers never share one. z5_spike_find.py reads them into one
+# SOLVER_LOG_<KIND>_<proj>.txt per project.
+PSSE_FAULT_LOG = _env_bool("SPP_PSSE_FAULT_LOG", False)
+_FAULT_LOG = {"path": None}
+
 # ---- MINUTE IMPEDANCE CHANGES TO THE FAULTED LINES ------------------------
 # The third item on SPP's system-adjustment list:
 #
@@ -15719,8 +15731,9 @@ def _silence_psse(on):
         if on:
             # Device 2 = File. Discard to a real throwaway SINK file (not the "NUL" device,
             # which this PSS/E build refuses to open). Bypasses the internal string buffers.
-            psspy.progress_output(2, NULL_SINK, [0, 0])
-            psspy.alert_output(2, NULL_SINK, [0, 0])
+            _flog = _FAULT_LOG.get("path") if PSSE_FAULT_LOG else None
+            psspy.progress_output(2, _flog or NULL_SINK, [0, 0])
+            psspy.alert_output(2, _flog or NULL_SINK, [0, 0])
             psspy.report_output(2, NULL_SINK, [0, 0])
         else:
             # Device 1 = Terminal/Standard Output.
@@ -16206,9 +16219,22 @@ def fault_run(fault, idx=None, total=None):
     ftype  = (fault.get("type") or "3PH").upper()
     fault_cyc = float(fault.get("cycles", 16))
     t_now = PRE_FAULT_S                              # sim clock; autotune advances it slightly
-    if PSSE_SILENT_RUNS:
-        print("  [%s] PSS/E output SILENCED for the fault window (PSSE_SILENT_RUNS=True; "
-              "guards the switching-capture writer)" % _ts()); sys.stdout.flush()
+    if PSSE_FAULT_LOG:
+        try:
+            _fd = os.path.join(LOG_DIR, "psse")
+            if not os.path.isdir(_fd):
+                os.makedirs(_fd)
+            _FAULT_LOG["path"] = os.path.join(_fd, "%s.txt" % fid)
+        except Exception as _e:
+            _FAULT_LOG["path"] = None
+            print("  [psse-log] could not make logs\\psse (%s) -- output discarded as before" % _e)
+    if PSSE_SILENT_RUNS or PSSE_FAULT_LOG:
+        if PSSE_FAULT_LOG and _FAULT_LOG["path"]:
+            print("  [%s] PSS/E output for the fault window -> %s (PSSE_FAULT_LOG)"
+                  % (_ts(), _FAULT_LOG["path"])); sys.stdout.flush()
+        else:
+            print("  [%s] PSS/E output SILENCED for the fault window (PSSE_SILENT_RUNS=True; "
+                  "guards the switching-capture writer)" % _ts()); sys.stdout.flush()
         _silence_psse(True)
     if ftype == "SLG":
         target_v = float(fault.get("retained_v", SLG_TARGET_VPU))
@@ -16391,8 +16417,9 @@ def fault_run(fault, idx=None, total=None):
                        "final trip %s-%s" % (frm, to), int(frm), int(to), str(ck))
 
     _set_out(out); chk(_run_to(SIM_END_S, SIM_END_S, "%s post-flt" % fid), "run post-fault")
-    if PSSE_SILENT_RUNS:
+    if PSSE_SILENT_RUNS or PSSE_FAULT_LOG:
         _silence_psse(False)      # restore PSS/E output after the fault window
+        _FAULT_LOG["path"] = None
     print("  -> %s (%s)" % (out, "OK" if os.path.isfile(out) else "MISSING"))
     if NAN_CHECK_IN_WORKER:
         _check_out_nan(out, "FAULT %s" % fid)

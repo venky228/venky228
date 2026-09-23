@@ -45,9 +45,9 @@ Nothing is re-run or re-scored; the results folders are only read (plus the
 report files above).
 """
 from __future__ import print_function
-import os, sys, re, csv, glob, time
+import os, sys, re, csv, glob, time, json, subprocess
 
-VERSION = "2026-09-23h"      # z5_probe_psse.py checks this
+VERSION = "2026-09-23j"      # z5_probe_psse.py checks this
 
 # =========================== SETTINGS ======================================
 ROOT          = ""            # "" = the folder this file is in (the study root)
@@ -295,7 +295,8 @@ def solver_info(res_dir, fault_ids, kind_tag):
     ids = sorted(fault_ids, key=len, reverse=True)
     rx_id = re.compile(r"(?<![A-Za-z0-9])(%s)(?![0-9A-Za-z])" % "|".join(re.escape(x) for x in ids)) if ids else None
     silenced, n_lines = False, 0
-    for pth in sorted(glob.glob(os.path.join(res_dir, "logs", "*"))):
+    for pth in (sorted(glob.glob(os.path.join(res_dir, "logs", "*"))) +
+                sorted(glob.glob(os.path.join(res_dir, "logs", "psse", "*.txt")))):
         if not os.path.isfile(pth) or os.path.getsize(pth) > 400 * 1024 * 1024:
             continue
         base = os.path.basename(pth)
@@ -328,6 +329,67 @@ def solver_info(res_dir, fault_ids, kind_tag):
                      "False in both engine files")
     notes.append("%d 'Network not converged' line(s) found in logs\\" % n_lines)
     return info, notes
+
+
+def write_solver_log(res_dir, tag, proj):
+    """SOLVER_LOG_<KIND>_<proj>.txt from logs\\psse\\<fault>.txt (PSSE_FAULT_LOG = True).
+
+       One row per scenario: how many network solutions did not converge, when
+       the first and last were, the worst mismatch and at which bus -- then the
+       other PSS/E messages worth reading (NaN, model not converged, SUSPECT,
+       limits hit). Returns the path, or None when there are no such files."""
+    files = sorted(glob.glob(os.path.join(res_dir, "logs", "psse", "*.txt")))
+    if not files:
+        return None
+    rx_other = re.compile(r"NaN|not converged|SUSPECT|exceed|overflow|IERR|error|diverg", re.I)
+    rows, detail = [], []
+    for pth in files:
+        fid = os.path.splitext(os.path.basename(pth))[0]
+        nc, other = [], {}
+        try:
+            with open(pth, errors="replace") as fh:
+                for ln in fh:
+                    m = _NC_RX.search(ln)
+                    if m:
+                        try:
+                            nc.append((float(m.group(1)), int(m.group(2)), float(m.group(3)), int(m.group(4))))
+                        except ValueError:
+                            pass
+                        continue
+                    if rx_other.search(ln):
+                        k = re.sub(r"[-\d.E+]{3,}", "#", ln.strip())[:110]
+                        other[k] = other.get(k, 0) + 1
+        except Exception as e:
+            other["could not read: %s" % e] = 1
+        w = max(nc, key=lambda x: x[2]) if nc else None
+        rows.append((fid, nc, w, other))
+    with open(os.path.join(res_dir, "SOLVER_LOG_%s_%s.txt" % (tag, proj)), "w") as f:
+        W = f.write
+        W("PSS/E SOLVER LOG -- %s %s   (%s)\n" % (tag, proj, time.strftime("%Y-%m-%d %H:%M")))
+        W("from logs\\psse\\<fault>.txt, written when PSSE_FAULT_LOG = True in the panel\n")
+        W("=" * 100 + "\n")
+        bad = [r for r in rows if r[1]]
+        W(" %d scenario(s) logged; %d with non-converged network solutions\n\n" % (len(rows), len(bad)))
+        W(" %-14s %6s %9s %9s %12s %9s  %s\n"
+          % ("scenario", "steps", "first s", "last s", "worst mism.", "at bus", "other messages"))
+        W(" " + "-" * 98 + "\n")
+        for fid, nc, w, other in sorted(rows, key=lambda r: (-len(r[1]), r[0])):
+            W(" %-14s %6d %9s %9s %12s %9s  %s\n"
+              % (fid, len(nc), "%.4f" % nc[0][0] if nc else "-", "%.4f" % nc[-1][0] if nc else "-",
+                 "%.4g" % w[2] if w else "-", w[3] if w else "-",
+                 ("%d kind(s)" % len(other)) if other else "-"))
+        W("\n OTHER PSS/E MESSAGES (numbers replaced by #), per scenario\n")
+        for fid, nc, w, other in rows:
+            if not other:
+                continue
+            W(" %s\n" % fid)
+            for k, n in sorted(other.items(), key=lambda x: -x[1])[:12]:
+                W("    %5dx  %s\n" % (n, k))
+        W("\n A small mismatch with the iteration limit hit = PSS/E ran out of iterations on an\n"
+          " almost-converged solution (SOLVER_RETRY_ON_NONCONV / more iterations can fix it).\n"
+          " A large mismatch = the network solution genuinely lost itself: the numbers at those\n"
+          " steps are not physical. Steps AT the clearing time line up with the spikes.\n")
+    return os.path.join(res_dir, "SOLVER_LOG_%s_%s.txt" % (tag, proj))
 
 
 def _signal_check(t, v, icl, ip):
@@ -688,6 +750,17 @@ def run_folder(kind, proj, res_dir, vcsv):
     buses = rank_buses(rows, len(faults_all))
     faults = rank_faults(rows)
     sinfo, snotes = solver_info(res_dir, set(r["fault"] for r in rows), tag)
+    try:
+        _sl = write_solver_log(res_dir, tag, proj)
+    except Exception as _e:
+        _sl = None
+        print("[solver] %s %s: solver log not written (%s)" % (tag, proj, _e))
+    if _sl:
+        snotes.append("per-scenario PSS/E messages summarised in %s" % os.path.basename(_sl))
+        print("[solver] %s" % _sl)
+    else:
+        snotes.append("no logs\\psse files -- set PSSE_FAULT_LOG = True in the panel and re-run "
+                      "the faults to capture PSS/E's own solver messages")
     t_spk = {}
     for r in rows:
         if r["time"] is not None:
@@ -1098,7 +1171,8 @@ def load_network(psspy, sav, dyr):
     # FACTS
     ff = {}
     for n in ("SENDNUMBER", "STATUS"):
-        for args in ((-1, 1, 4, n), (-1, 4, n)):          # (sid, owner, flag, string) on PSS/E 34
+        # the layout differs by version; (sid, owner, flag) and (sid, flag) both raised on 34.5
+        for args in ((-1, 1, 1, 4, n), (-1, 1, 1, 4, 1, n), (-1, 1, 4, n), (-1, 4, n)):
             try:
                 ierr, v = psspy.afactsint(*args)
                 if ierr == 0 and v:
@@ -1168,17 +1242,71 @@ def _advice(d, confirmed):
     return "generator with no recognised model -- check its .dyr records"
 
 
-def run_nearby(kind, combined, traced_all, res_dirs=None):
-    res_dirs = res_dirs or {}
+def _net_child(kind, out_json):
+    """CHILD PROCESS: open the case with psspy, write the network to JSON.
+
+       PSS/E is started in its own process because psseinit() in a process that
+       has already read .out files with dyntools died with 'Invalid
+       Floating-Point number' (psseng.dll) -- the parent reads the .outs, this
+       child only ever touches psspy, which is the order that works."""
     ps = _psspy()
     if ps is None:
+        return 2
+    sav, dyr = case_files(kind)
+    net = load_network(ps, sav, dyr)
+    js = {"bus": dict((str(k), v) for k, v in net["bus"].items()),
+          "adj": dict((str(k), [[m, z, w] for m, z, w in v]) for k, v in net["adj"].items()),
+          "dev": dict((str(k), v) for k, v in net["dev"].items())}
+    tmp = out_json + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(js, fh)
+    if os.path.exists(out_json):
+        os.remove(out_json)
+    os.rename(tmp, out_json)
+    return 0
+
+
+def _load_net_via_child(kind):
+    out_json = os.path.join(_root(), "_spike_net_%s.json" % kind)
+    if os.path.exists(out_json):
+        try:
+            os.remove(out_json)
+        except Exception:
+            pass
+    print("[near] %s: opening the case in a separate PSS/E process ..." % kind)
+    try:
+        rc = subprocess.call([sys.executable, "-u", os.path.abspath(__file__), "--net", kind, out_json],
+                             cwd=_root())
+    except Exception as e:
+        print("[near] could not start the PSS/E process: %s" % e)
         return None
+    if rc != 0 or not os.path.isfile(out_json):
+        print("[near] the PSS/E process ended with code %s and wrote no network -- nearby devices "
+              "skipped (Parts A/B are already written)" % rc)
+        return None
+    with open(out_json) as fh:
+        js = json.load(fh)
+    try:
+        os.remove(out_json)
+    except Exception:
+        pass
+    net = {"bus": dict((int(k), v) for k, v in js["bus"].items()),
+           "adj": dict((int(k), [(int(m), z, w) for m, z, w in v]) for k, v in js["adj"].items()),
+           "dev": dict((int(k), v) for k, v in js["dev"].items())}
+    print("[near] case: %d buses, %d with devices" % (len(net["bus"]), len(net["dev"])))
+    return net
+
+
+def run_nearby(kind, combined, traced_all, res_dirs=None):
+    res_dirs = res_dirs or {}
     sav, dyr = case_files(kind)
     if not sav or not os.path.isfile(sav):
         print("[near] %s case not found: %s -- set CASE_SAV" % (kind, sav))
         return None
     print("[near] %s: loading %s" % (kind, sav))
-    net = load_network(ps, sav, dyr)
+    net = _load_net_via_child(kind)
+    if net is None:
+        return None
     # machines Part B caught pushing vars, by bus
     conf = {}
     for proj, tr in traced_all:
@@ -1187,7 +1315,7 @@ def run_nearby(kind, combined, traced_all, res_dirs=None):
                 c = conf.setdefault(s["bus"], [])
                 c.append("%s %s %+.0f Mvar" % (proj, tr["fault"], s["dq_max"]))
     tag = KINDS[kind][2]
-    traces = _near_traces(combined[:NEAR_BUSES_N], res_dirs) if NEAR_Q_REVIEW else {}
+    traces = _near_traces(combined[:NEAR_BUSES_N], res_dirs, traced_all) if NEAR_Q_REVIEW else {}
     cause_rows = []
     txt = os.path.join(_root(), "SPIKE_NEARBY_%s.txt" % tag)
     ncsv = os.path.join(_root(), "SPIKE_NEARBY_%s.csv" % tag)
@@ -1289,7 +1417,7 @@ def run_nearby(kind, combined, traced_all, res_dirs=None):
     return txt
 
 
-def _near_traces(buses, res_dirs):
+def _near_traces(buses, res_dirs, traced_all=()):
     """{(proj, fault): trace} -- each bad bus's WORST fault, one .out read per fault."""
     want = {}
     for cb in buses:
@@ -1299,7 +1427,14 @@ def _near_traces(buses, res_dirs):
         want.setdefault((parts[0], parts[1]), {"fault_bus": cb.get("fault_bus", ""), "buses": []})
         want[(parts[0], parts[1])]["buses"].append((cb["bus"], cb["label"]))
     out = {}
+    done = dict(((pj, tr.get("fault")), tr) for pj, tr in traced_all)
     for (proj, fid), w in sorted(want.items()):
+        tr = done.get((proj, fid))
+        if tr and not tr.get("error"):
+            have = set(b.get("bus") for b in tr.get("buses", []) if not b.get("missing"))
+            if all(b in have for b, _l in w["buses"]):
+                out[(proj, fid)] = tr               # Part B already read this .out
+                continue
         print("[near] Q review: %s %s (%d bus(es))" % (proj, fid, len(w["buses"])))
         try:
             out[(proj, fid)] = trace_fault(res_dirs[proj], fid, w["fault_bus"], w["buses"])
@@ -1474,4 +1609,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--net":
+        sys.exit(_net_child(sys.argv[2], sys.argv[3]))
     sys.exit(main())

@@ -615,6 +615,10 @@ DELT_CYCLES = 4                             # None = the study's own step (1/4 c
                                             # runs its flat run cleanly but the FAULT runs go NaN (the network solution
                                             # loses itself at the switching); the run takes about twice as long
 ADJUSTMENTS_REPORT = True                   # collect every non-project change into SYSTEM_ADJUSTMENTS.txt and the report
+PSSE_FAULT_LOG = False                      # True = keep PSS/E's own messages for each fault run ("Network not
+                                            # converged at TIME = ...") in results\<proj>_spp\logs\psse\<fault>.txt
+                                            # instead of discarding them -- nothing extra on the terminal.
+                                            # z5_spike_find.py then writes SOLVER_LOG_<KIND>_<proj>.txt per project
 
 
 # ---- THE SPP CRITERIA --------------------------------------------------------
@@ -13634,6 +13638,7 @@ def _push_settings(env, case):
         env["SPP_SOLVER_RETRY_RECIPES"] = json.dumps(
             [list(r) for r in SOLVER_RETRY_RECIPES])
     env["SPP_ADJUSTMENTS_REPORT"] = "1" if ADJUSTMENTS_REPORT else "0"
+    env["SPP_PSSE_FAULT_LOG"] = "1" if PSSE_FAULT_LOG else "0"
     # A FORCED RESCORE HAS TO REACH THE SHARDS. Without this they resume from
     # their saved part files and write the OLD verdicts back out, so the run
     # produces exactly the report it was asked to replace.
