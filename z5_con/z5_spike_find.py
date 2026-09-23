@@ -26,10 +26,20 @@ PART B  (READ_OUTS = True -- needs PSS/E's dyntools, i.e. the PSS/E Python)
          spike is the NETWORK (capacitive: shunts / line charging / the
          clearing step) -- or a machine that has no Q channel.
 
+PART C  (NEARBY = True -- needs PSS/E's psspy)
+    Opens the case (.sav) and, for the top buses of ALL projects together,
+    lists what is electrically near each one -- generators (IBR / synchronous
+    / SVC, from the .dyr models), fixed and switched shunts (cap banks and
+    reactors), FACTS, and lines with big charging -- closest first, with what
+    to check on each. A machine Part B caught pushing vars is marked
+    CONFIRMED.
+
 Output, per results folder:   SPIKE_FINDER_<KIND>_<proj>.txt
                               SPIKE_BUSES_<KIND>_<proj>.csv
                               SPIKE_SUSPECTS_<KIND>_<proj>.csv   (Part B)
-and one line per folder in    <root>\\SPIKE_FINDER_ALL.txt
+in the study root:             SPIKE_FINDER_ALL.txt  (every project + the buses of all
+                                                     projects together)
+                              SPIKE_NEARBY_<KIND>.txt / .csv       (Part C)
 
 Nothing is re-run or re-scored; the results folders are only read (plus the
 report files above).
@@ -54,6 +64,17 @@ SUSPECT_MVAR  = 10.0          # a machine pushing < this many Mvar extra is not 
 SUSPECT_TOP   = 10            # suspects listed per fault
 SYS_MVA_BASE  = 100.0         # machine P/Q channels are pu on this base
 MATCH_S       = 0.10          # a machine's Q peak within this of the bus peak = "in step"
+
+NEARBY        = True          # PART C -- needs PSS/E (psspy): opens the case and lists what is
+                              # electrically near each top bus: generators, cap banks, reactors,
+                              # switched shunts, SVC/STATCOMs, high-charging lines
+NEAR_BUSES_N  = 15            # top buses (all projects together) looked at
+NEAR_HOPS     = 3             # search this many buses out from each bad bus
+NEAR_TOP      = 15            # devices listed per bus, electrically closest first
+LINE_CHG_MVAR = 20.0          # lines with at least this much charging are listed
+CASE_SAV      = {}            # {} = read BASE_SAV / PROJ_SAV from z5_cmp_all_con.py, e.g.
+                              # {"base": r"C:\KV\Base\DIS2201-25SP-G03-CQ_Mitigated.sav"}
+CASE_DYR      = {}            # same, for the .dyr (machine model names: IBR / SYNC / SVC)
 # ===========================================================================
 
 KINDS = {"base": ("Base", ("results_base", "results"), "BASE"),
@@ -661,9 +682,370 @@ def run_folder(kind, proj, res_dir, vcsv):
           "  only the faults in section 4 with ONLY_FAULTS and run this again.\n")
     print("[spike] %s -> %s" % (stem, txt))
     top = buses[0] if buses else None
-    return ("%-24s %4d bus(es) in %3d/%3d fault(s); SPIKE %d SWING %d; top %s (%d faults, %.3f pu)"
+    return buses, traced, ("%-24s %4d bus(es) in %3d/%3d fault(s); SPIKE %d SWING %d; top %s (%d faults, %.3f pu)"
             % (stem, len(buses), len(faults), len(faults_all), n_sp, n_sw,
                top["label"] if top else "-", top["n"] if top else 0, top["worst"] if top else 0.0))
+
+
+# ----------------------------- PART C --------------------------------------
+_PSSPY = [None]
+
+
+def _psspy():
+    if _PSSPY[0] is not None:
+        return _PSSPY[0] or None
+    _dyntools()                                     # sets the PSS/E paths as a side effect
+    try:
+        try:
+            import psse34                           # noqa: F401
+        except Exception:
+            pass
+        import psspy
+        psspy.psseinit(150000)
+        for fn, a in (("progress_output", (6, "", [0, 0])), ("report_output", (6, "", [0, 0])),
+                      ("alert_output", (6, "", [0, 0])), ("prompt_output", (6, "", [0, 0]))):
+            try:
+                getattr(psspy, fn)(*a)
+            except Exception:
+                pass
+        _PSSPY[0] = psspy
+        return psspy
+    except Exception as e:
+        print("[near] psspy not available (%s) -- run with the PSS/E Python" % e)
+        _PSSPY[0] = False
+        return None
+
+
+def _panel_setting(name):
+    p = os.path.join(_root(), "z5_cmp_all_con.py")
+    if not os.path.isfile(p):
+        return None
+    rx = re.compile(r'^%s\s*=\s*r?["\']([^"\']*)["\']' % name)
+    with open(p, encoding="latin-1") as fh:
+        for ln in fh:
+            m = rx.match(ln)
+            if m:
+                return m.group(1)
+    return None
+
+
+def case_files(kind):
+    sub, _r, tag = KINDS[kind]
+    folder = _panel_setting("%s_FOLDER" % ("BASE" if kind == "base" else "PROJ")) or sub
+    d = folder if os.path.isabs(folder) else os.path.join(_root(), folder)
+    sav = CASE_SAV.get(kind) or _panel_setting("%s_SAV" % tag)
+    dyr = CASE_DYR.get(kind) or _panel_setting("%s_DYR" % tag)
+    if sav and not os.path.isabs(sav):
+        sav = os.path.join(d, sav)
+    if dyr and not os.path.isabs(dyr):
+        dyr = os.path.join(d, dyr)
+    return sav, dyr
+
+
+_SYNC_M = ("GENROU", "GENSAL", "GENCLS", "GENTPJ", "GENROE", "GENSAE", "GENTPF", "GENQEC", "CIMTR")
+_SVC_M = ("CSVGN", "CSTCNT", "SVSMO", "CSTATT", "STCON", "ABBSVC", "SVC")
+_IBR_M = ("REGC", "REEC", "REPC", "WT3G", "WT4G", "WT1G", "WT2G", "PVGU", "PVEU", "PVDG",
+          "GEWT", "GEPV", "DER_A", "DERA", "IBR", "INV", "SMA", "SUNG", "VEST", "SIEM", "NORDEX")
+
+
+def read_dyr_models(path):
+    """{(bus, id): [model, ...]} from the .dyr -- names only."""
+    out = {}
+    if not path or not os.path.isfile(path):
+        return out
+    with open(path, encoding="latin-1") as fh:
+        txt = fh.read()
+    txt = re.sub(r"(?m)//.*$", "", txt)
+    for rec in txt.split("/"):
+        tk = re.findall(r"'[^']*'|\"[^\"]*\"|[^\s,]+", rec.strip())
+        if len(tk) < 3 or not re.match(r"^-?\d+$", tk[0]):
+            continue
+        model = tk[1].strip("'\"").upper()
+        mid = tk[2].strip("'\"").strip()
+        if model == "USRMDL" and len(tk) > 3:
+            model = tk[3].strip("'\"").upper()
+        out.setdefault((int(tk[0]), mid), []).append(model)
+    return out
+
+
+def _mtype(models, wmod):
+    ms = " ".join(models or [])
+    if any(k in ms for k in _SVC_M):
+        return "SVC/STATCOM"
+    if any(k in ms for k in _IBR_M):
+        return "IBR"
+    if any(k in ms for k in _SYNC_M):
+        return "SYNC"
+    if wmod and wmod > 0:
+        return "IBR"
+    return "GEN" if not models else "GEN(" + models[0] + ")"
+
+
+def _arr(fn, sid, flag, names, *extra):
+    """One psspy a* call per name, so an unknown name costs only that column."""
+    out = {}
+    for n in names:
+        try:
+            if extra:
+                ierr, v = fn(sid, extra[0], extra[1], flag, extra[2], n)
+            else:
+                ierr, v = fn(sid, flag, n)
+            if ierr == 0 and v:
+                out[n] = v[0]
+        except Exception:
+            pass
+    return out
+
+
+def load_network(psspy, sav, dyr):
+    ierr = psspy.case(sav)
+    if ierr:
+        raise RuntimeError("psspy.case(%s) ierr=%s" % (sav, ierr))
+    net = {"bus": {}, "adj": {}, "dev": {}}
+    b = _arr(psspy.abusint, -1, 2, ["NUMBER", "AREA"])
+    br = _arr(psspy.abusreal, -1, 2, ["BASE", "PU"])
+    bc = _arr(psspy.abuschar, -1, 2, ["NAME"])
+    for i, n in enumerate(b.get("NUMBER", [])):
+        net["bus"][n] = {"kv": br.get("BASE", [0] * (i + 1))[i], "pu": br.get("PU", [0] * (i + 1))[i],
+                         "name": (bc.get("NAME", [""] * (i + 1))[i] or "").strip(),
+                         "area": b.get("AREA", [""] * (i + 1))[i]}
+
+    def link(a, c, z, what):
+        net["adj"].setdefault(a, []).append((c, z, what))
+        net["adj"].setdefault(c, []).append((a, z, what))
+
+    def dev(bus, d):
+        net["dev"].setdefault(bus, []).append(d)
+    # branches + 2-winding transformers (flag 3 = in-service incl. transformers)
+    bi = _arr(psspy.abrnint, -1, 3, ["FROMNUMBER", "TONUMBER"], 1, 1, 1)
+    bz = {}
+    try:
+        ierr, v = psspy.abrncplx(-1, 1, 1, 3, 1, "RX")
+        if ierr == 0:
+            bz = v[0]
+    except Exception:
+        pass
+    bch = _arr(psspy.abrnreal, -1, 3, ["CHARGING"], 1, 1, 1).get("CHARGING", [])
+    bid = _arr(psspy.abrnchar, -1, 3, ["ID"], 1, 1, 1).get("ID", [])
+    fr, to = bi.get("FROMNUMBER", []), bi.get("TONUMBER", [])
+    for i in range(min(len(fr), len(to))):
+        z = abs(bz[i]) if i < len(bz) else 0.05
+        link(fr[i], to[i], max(z, 1e-4), "branch")
+        if i < len(bch) and bch[i] * 100.0 >= LINE_CHG_MVAR:
+            d = {"kind": "LINE CHARGING", "bus": fr[i], "to": to[i],
+                 "id": (bid[i] if i < len(bid) else "").strip(),
+                 "mvar": bch[i] * 100.0, "status": 1}
+            dev(fr[i], d)
+            dev(to[i], d)
+    # 3-winding transformers: star them through winding 1
+    t3 = _arr(psspy.atr3int, -1, 1, ["WIND1NUMBER", "WIND2NUMBER", "WIND3NUMBER"], 1, 1, 1)
+    w1, w2, w3 = t3.get("WIND1NUMBER", []), t3.get("WIND2NUMBER", []), t3.get("WIND3NUMBER", [])
+    for i in range(len(w1)):
+        for w in ((w2[i] if i < len(w2) else 0), (w3[i] if i < len(w3) else 0)):
+            if w:
+                link(w1[i], w, 0.1, "3w-xfmr")
+    # machines
+    models = read_dyr_models(dyr)
+    mi = _arr(psspy.amachint, -1, 4, ["NUMBER", "STATUS", "WMOD"])
+    mr = _arr(psspy.amachreal, -1, 4, ["PGEN", "QGEN", "QMAX", "QMIN", "MBASE"])
+    mc = _arr(psspy.amachchar, -1, 4, ["ID"])
+    for i, n in enumerate(mi.get("NUMBER", [])):
+        mid = (mc.get("ID", [""] * (i + 1))[i] or "").strip()
+        md = models.get((n, mid), [])
+        g = lambda k: mr.get(k, [None] * (i + 1))[i]
+        dev(n, {"kind": _mtype(md, mi.get("WMOD", [0] * (i + 1))[i]), "bus": n, "id": mid,
+                "status": mi.get("STATUS", [1] * (i + 1))[i], "mw": g("PGEN"), "mvar": g("QGEN"),
+                "qmax": g("QMAX"), "qmin": g("QMIN"), "mbase": g("MBASE"),
+                "models": [m for m in md if not m.startswith(("CMLD", "CLOD", "LDFR", "IEEL"))]})
+    # fixed shunts (Mvar at 1 pu, + = capacitor)
+    fi = _arr(psspy.afxshuntint, -1, 4, ["NUMBER", "STATUS"])
+    fc = _arr(psspy.afxshuntchar, -1, 4, ["ID"])
+    fq = []
+    try:
+        ierr, v = psspy.afxshuntcplx(-1, 4, "SHUNTNOM")
+        if ierr == 0:
+            fq = v[0]
+    except Exception:
+        pass
+    for i, n in enumerate(fi.get("NUMBER", [])):
+        q = fq[i].imag if i < len(fq) else None
+        dev(n, {"kind": "FIXED CAP" if (q or 0) > 0 else "FIXED REACTOR", "bus": n,
+                "id": (fc.get("ID", [""] * (i + 1))[i] or "").strip(),
+                "status": fi.get("STATUS", [1] * (i + 1))[i], "mvar": q})
+    # switched shunts
+    si = _arr(psspy.aswshint, -1, 4, ["NUMBER", "STATUS", "MODE"])
+    sr = _arr(psspy.aswshreal, -1, 4, ["BSWNOM", "BSWMAX", "BSWMIN", "VSWHI", "VSWLO", "BINIT"])
+    for i, n in enumerate(si.get("NUMBER", [])):
+        g = lambda k: sr[k][i] if k in sr and i < len(sr[k]) else None
+        now = g("BSWNOM") if g("BSWNOM") is not None else g("BINIT")
+        dev(n, {"kind": "SWITCHED SHUNT", "bus": n, "id": "",
+                "status": si.get("STATUS", [1] * (i + 1))[i], "mode": si.get("MODE", [None] * (i + 1))[i],
+                "mvar": now, "bmax": g("BSWMAX"), "bmin": g("BSWMIN"),
+                "vhi": g("VSWHI"), "vlo": g("VSWLO")})
+    # FACTS
+    ff = _arr(psspy.afactsint, -1, 4, ["SENDNUMBER", "STATUS"])
+    for i, n in enumerate(ff.get("SENDNUMBER", [])):
+        dev(n, {"kind": "FACTS", "bus": n, "id": "", "status": ff.get("STATUS", [1] * (i + 1))[i]})
+    print("[near] case: %d buses, %d with devices" % (len(net["bus"]), len(net["dev"])))
+    return net
+
+
+def nearby(net, bus):
+    """[(bus, hops, zdist)] within NEAR_HOPS, Dijkstra on |Z| (pu)."""
+    import heapq
+    best = {bus: (0.0, 0)}
+    pq = [(0.0, 0, bus)]
+    while pq:
+        z, h, n = heapq.heappop(pq)
+        if best.get(n, (1e9, 0))[0] < z:
+            continue
+        if h >= NEAR_HOPS:
+            continue
+        for m, dz, _w in net["adj"].get(n, []):
+            nz = z + dz
+            if nz < best.get(m, (1e9, 0))[0]:
+                best[m] = (nz, h + 1)
+                heapq.heappush(pq, (nz, h + 1, m))
+    return sorted(((n, h, z) for n, (z, h) in best.items()), key=lambda x: x[2])
+
+
+def _advice(d, confirmed):
+    k, st = d["kind"], d.get("status", 1)
+    if st == 0:
+        return "OUT of service -- no effect now"
+    if k == "IBR":
+        s = ("fast Q after clearing: check REEC Vdip/Vup, Kqv, Iqh/Iql, Thld/Iqfrz and the REPC "
+             "voltage loop (Kc, Kp/Ki); a Q that does not ramp back holds V high")
+        return ("CONFIRMED pushing vars (%s). " % confirmed + s) if confirmed else s
+    if k == "SYNC":
+        s = "exciter field forcing: check the AVR/exciter model and its limits; Q near QMAX pre-fault?"
+        return ("CONFIRMED pushing vars (%s). " % confirmed + s) if confirmed else s
+    if k == "SVC/STATCOM":
+        return "voltage device: check its response (gain, slope, Vref) -- overshoot on recovery"
+    if k == "FIXED CAP":
+        return "holds V up the instant the fault clears: test it out of service / smaller in this dispatch"
+    if k == "FIXED REACTOR":
+        return "pulls V down -- already helping; putting a bigger one in / keeping it on helps"
+    if k == "SWITCHED SHUNT":
+        q = d.get("mvar")
+        if q is not None and q > 0:
+            s = "CAPACITIVE now (%.0f Mvar): test switching steps off" % q
+        elif q is not None and q < 0:
+            s = "inductive now (%.0f Mvar) -- helping" % q
+        else:
+            s = "check its switched-in Mvar"
+        if d.get("mode") == 0:
+            s += "; MODE 0 = locked (never switches in the run)"
+        return s
+    if k == "LINE CHARGING":
+        return "long/lightly loaded line: its charging lifts V when load/flow drops after clearing"
+    if k == "FACTS":
+        return "FACTS device: check its voltage control response"
+    return "generator with no recognised model -- check its .dyr records"
+
+
+def run_nearby(kind, combined, traced_all):
+    ps = _psspy()
+    if ps is None:
+        return None
+    sav, dyr = case_files(kind)
+    if not sav or not os.path.isfile(sav):
+        print("[near] %s case not found: %s -- set CASE_SAV" % (kind, sav))
+        return None
+    print("[near] %s: loading %s" % (kind, sav))
+    net = load_network(ps, sav, dyr)
+    # machines Part B caught pushing vars, by bus
+    conf = {}
+    for proj, tr in traced_all:
+        for s in tr.get("suspects", []):
+            if max(s["dq_at_spike"], s["dq_max"]) >= SUSPECT_MVAR and isinstance(s["bus"], int):
+                c = conf.setdefault(s["bus"], [])
+                c.append("%s %s %+.0f Mvar" % (proj, tr["fault"], s["dq_max"]))
+    tag = KINDS[kind][2]
+    txt = os.path.join(_root(), "SPIKE_NEARBY_%s.txt" % tag)
+    ncsv = os.path.join(_root(), "SPIKE_NEARBY_%s.csv" % tag)
+    rows = []
+    with open(txt, "w") as f:
+        W = f.write
+        W("NEARBY DEVICES -- %s case %s   (%s)\n" % (tag, os.path.basename(sav), time.strftime("%Y-%m-%d %H:%M")))
+        W("dyr: %s\n" % (dyr or "-"))
+        W("within %d buses of each bad bus, closest (by |Z| in pu) first\n" % NEAR_HOPS)
+        W("=" * 100 + "\n")
+        for cb in combined[:NEAR_BUSES_N]:
+            bus = cb["bus"]
+            bi = net["bus"].get(bus, {})
+            W("\n BUS %s  %s %.0f kV  area %s   fails in %d fault(s) over %s, worst %.3f pu (%s)\n"
+              % (bus, bi.get("name", "?"), bi.get("kv", 0) or 0, bi.get("area", "?"),
+                 cb["n"], ", ".join(sorted(cb["projects"])), cb["worst"], cb["worst_where"]))
+            if bus not in net["bus"]:
+                W("   not in this case\n")
+                continue
+            found = []
+            for n, h, z in nearby(net, bus):
+                for d in net["dev"].get(n, []):
+                    found.append((z, h, n, d))
+            if not found:
+                W("   no generator / shunt / FACTS / charging line within %d buses\n" % NEAR_HOPS)
+                continue
+            W("   %-15s %-8s %-18s %4s %6s %8s %8s  %s\n"
+              % ("device", "bus", "name", "hops", "|Z|pu", "MW", "Mvar", "what to check"))
+            seen = set()
+            nshow = 0
+            for z, h, n, d in found:
+                key = (d["kind"], d["bus"], d.get("id"), d.get("to"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                cf = "; ".join(conf.get(d["bus"], [])[:3]) if d["kind"] in ("IBR", "SYNC") else ""
+                adv = _advice(d, cf)
+                nm = net["bus"].get(n, {}).get("name", "")
+                lbl = d["kind"] + ((" " + str(d["id"])) if d.get("id") else "")
+                if d["kind"] == "LINE CHARGING":
+                    lbl = "LINE %s-%s" % (d["bus"], d["to"])
+                mw = d.get("mw")
+                mv = d.get("mvar")
+                if nshow < NEAR_TOP:
+                    W("   %-15s %-8s %-18s %4d %6.3f %8s %8s  %s\n"
+                      % (lbl[:15], n, nm[:18], h, z, "-" if mw is None else "%.0f" % mw,
+                         "-" if mv is None else "%.0f" % mv, adv))
+                    if d.get("models"):
+                        W("   %-15s models: %s\n" % ("", " ".join(d["models"][:6])))
+                nshow += 1
+                rows.append([tag, bus, cb["n"], "%.3f" % cb["worst"], d["kind"], n, nm, d.get("id", ""),
+                             h, "%.4f" % z, "" if mw is None else "%.1f" % mw,
+                             "" if mv is None else "%.1f" % mv, d.get("status", ""),
+                             " ".join(d.get("models", [])), cf, adv])
+            if nshow > NEAR_TOP:
+                W("   ... %d more in %s\n" % (nshow - NEAR_TOP, os.path.basename(ncsv)))
+        W("\n" + "=" * 100 + "\n HOW TO USE IT\n"
+          "  Start with the CONFIRMED machines and capacitive shunts closest to a bus that fails on\n"
+          "  many faults. Test one change at a time on the worst faults (ONLY_FAULTS), in BOTH cases\n"
+          "  (a base-case fix belongs in both: DYR_APPLY_TO=\"both\" / an idv in DYRECHANGE_IDV).\n")
+    with open(ncsv, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["case", "bad_bus", "faults_failed", "worst_pu", "device", "device_bus", "name", "id",
+                    "hops", "zdist_pu", "mw", "mvar", "status", "models", "confirmed_by_out", "what_to_check"])
+        w.writerows(rows)
+    print("[near] %s -> %s" % (kind, txt))
+    return txt
+
+
+def combine(per_proj):
+    """Buses of every project together: the same base case fails the same buses."""
+    by = {}
+    for proj, buses in per_proj:
+        for b in buses:
+            c = by.setdefault(b["bus"], {"bus": b["bus"], "label": b["label"], "n": 0, "worst": 0.0,
+                                         "worst_where": "", "projects": set(), "shapes": set(),
+                                         "area": b["area"]})
+            c["n"] += b["n"]
+            c["projects"].add(proj)
+            c["shapes"].add(b["shape"])
+            if b["worst"] > c["worst"]:
+                c["worst"], c["worst_where"] = b["worst"], "%s %s" % (proj, b["worst_fault"])
+    out = list(by.values())
+    out.sort(key=lambda c: (-len(c["projects"]), -c["n"], -c["worst"]))
+    return out
 
 
 def main():
@@ -671,21 +1053,48 @@ def main():
     if not folders:
         print("[spike] no 02_VIOLATIONS csv found under %s (Base\\results_base\\<proj>_spp ...)" % _root())
         return 1
-    lines = []
+    lines, per_kind, traced_kind = [], {}, {}
     for kind, proj, d, v in folders:
         print("[spike] %s %s  <- %s" % (kind, proj, v))
         try:
-            lines.append(run_folder(kind, proj, d, v))
+            buses, traced, ln = run_folder(kind, proj, d, v)
+            lines.append(ln)
+            per_kind.setdefault(kind, []).append((proj, buses))
+            traced_kind.setdefault(kind, []).extend((proj, t) for t in traced)
         except Exception as e:
             lines.append("%s %s FAILED: %s: %s" % (kind, proj, type(e).__name__, e))
             print("[spike] %s" % lines[-1])
     allp = os.path.join(_root(), "SPIKE_FINDER_ALL.txt")
+    near = []
     with open(allp, "w") as f:
         f.write("SPIKE FINDER -- %s\n" % time.strftime("%Y-%m-%d %H:%M"))
+        f.write("per project (full report in each results folder):\n")
         for ln in lines:
-            f.write(ln + "\n")
+            f.write("  " + ln + "\n")
+        for kind in per_kind:
+            comb = combine(per_kind[kind])
+            f.write("\n %s -- BUSES OF ALL PROJECTS TOGETHER (most projects, then most faults)\n"
+                    % KINDS[kind][2])
+            f.write(" %-22s %-6s %8s %7s %6s  %-24s %s\n"
+                    % ("bus", "area", "projects", "faults", "worst", "worst in", "shape"))
+            for c in comb[:TOP_BUSES]:
+                f.write(" %-22s %-6s %8d %7d %6.3f  %-24s %s\n"
+                        % (c["label"][:22], str(c["area"])[:6], len(c["projects"]), c["n"], c["worst"],
+                           c["worst_where"][:24], "/".join(sorted(c["shapes"]))))
+            if NEARBY and comb:
+                try:
+                    t = run_nearby(kind, comb, traced_kind.get(kind, []))
+                except Exception as e:
+                    t = None
+                    print("[near] %s FAILED: %s: %s" % (kind, type(e).__name__, e))
+                    f.write(" nearby devices FAILED: %s: %s\n" % (type(e).__name__, e))
+                if t:
+                    near.append(t)
+                    f.write(" nearby devices for the top %d: %s\n" % (NEAR_BUSES_N, os.path.basename(t)))
     print("\n".join(lines))
     print("[spike] summary -> %s" % allp)
+    for t in near:
+        print("[spike] nearby  -> %s" % t)
     return 0
 
 
