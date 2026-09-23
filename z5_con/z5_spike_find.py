@@ -47,7 +47,7 @@ report files above).
 from __future__ import print_function
 import os, sys, re, csv, glob, time, json, subprocess
 
-VERSION = "2026-09-23k"      # z5_probe_psse.py checks this
+VERSION = "2026-09-23l"      # z5_probe_psse.py checks this
 
 # =========================== SETTINGS ======================================
 ROOT          = ""            # "" = the folder this file is in (the study root)
@@ -1070,22 +1070,48 @@ _IBR_M = ("REGC", "REEC", "REPC", "WT3G", "WT4G", "WT1G", "WT2G", "PVGU", "PVEU"
 
 
 def read_dyr_models(path):
-    """{(bus, id): [model, ...]} from the .dyr -- names only."""
+    """{(bus, id): [model, ...]} from the .dyr -- names only.
+
+       Read the way PSS/E reads it: on each line, the first '/' outside quotes
+       ENDS the record and everything after it is a comment. So
+           / Generic Generator Converter Model
+       is an empty record plus a comment, and the next line's
+           765912 'REGCA1' 1
+       starts a new record. (Splitting the whole file on '/' glued those
+       comments onto the next record and lost every model behind one.)"""
     out = {}
     if not path or not os.path.isfile(path):
         return out
-    with open(path, encoding="latin-1") as fh:
-        txt = fh.read()
-    txt = re.sub(r"(?m)//.*$", "", txt)
-    for rec in txt.split("/"):
-        tk = re.findall(r"'[^']*'|\"[^\"]*\"|[^\s,]+", rec.strip())
+    cur = []
+
+    def _flush():
+        rec = " ".join(cur).strip()
+        del cur[:]
+        if not rec:
+            return
+        tk = re.findall(r"'[^']*'|\"[^\"]*\"|[^\s,]+", rec)
         if len(tk) < 3 or not re.match(r"^-?\d+$", tk[0]):
-            continue
+            return
         model = tk[1].strip("'\"").upper()
         mid = tk[2].strip("'\"").strip()
         if model == "USRMDL" and len(tk) > 3:
             model = tk[3].strip("'\"").upper()
         out.setdefault((int(tk[0]), mid), []).append(model)
+    with open(path, encoding="latin-1") as fh:
+        for ln in fh:
+            q, cut = False, None
+            for i, ch in enumerate(ln):
+                if ch == "'":
+                    q = not q
+                elif ch == "/" and not q:
+                    cut = i
+                    break
+            if cut is None:
+                cur.append(ln)
+            else:
+                cur.append(ln[:cut])
+                _flush()
+    _flush()
     return out
 
 
