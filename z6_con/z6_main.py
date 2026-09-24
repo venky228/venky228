@@ -17351,13 +17351,35 @@ def _gt_has_machine(net, b):
     return any(d.get("kind") not in skip and d.get("status", 1) == 1 for d in net["dev"].get(b, []))
 
 
-_GT_ELEM = re.compile(r"(?<![\d.])(\d{4,})-(\d{4,})-(?:(\d{4,})-)?\d+(?:\.\d+)?-(\w{1,2})(?![\w.])")
+_GT_ELEM = re.compile(r"(?<![\d.])(\d{4,})-(\d{4,})-(?:(\d{4,})-)?(?:\d+(?:\.\d+)?)?-(\w{1,2})(?![\w.])")
+
+
+_GT_FBUS = {}                       # fault id -> faulted bus, from the fault list
+
+
+def _gt_elems(text, three=False):
+    """[(a, b, ck, c), ...] from a fault-list cell: "from-to-kv-ckt;..." or,
+       three=True, "w1-w2-w3-ckt;...". Unreadable parts are skipped."""
+    out = []
+    for part in str(text or "").split(";"):
+        bits = [x.strip() for x in part.strip().split("-")]
+        try:
+            if three and len(bits) >= 4:
+                out.append((int(bits[0]), int(bits[1]), bits[3] or "1", int(bits[2])))
+            elif not three and len(bits) >= 2 and bits[1]:
+                out.append((int(bits[0]), int(bits[1]),
+                            (bits[3] if len(bits) > 3 else "") or "1", 0))
+        except ValueError:
+            continue
+    return out
 
 
 def _gt_fault_trips(faults):
-    """{fault: [(a, b, ck, c), ...]} -- the branches each GEN_TEST fault trips,
-       read from the project's fault list ("765911-531469-345-1" elements).
-       None when no list is found."""
+    """{fault: [(a, b, ck, c), ...]} -- every branch each GEN_TEST fault opens:
+       its trip elements AND its pre-outage (P6/N-1-1), a 3-winding
+       transformer as one element with its third bus. Read by column name
+       from the project's fault list; a file without the columns falls back to
+       the "765911-531469-345-1" elements on the line. None when none found."""
     paths = [shared_faults_path(GEN_TEST_PROJECT)]
     paths += glob.glob(os.path.join(results_dir(_gt_case(), GEN_TEST_PROJECT, GEN_TEST_MODE),
                                     "faults", "*.csv"))
@@ -17368,7 +17390,28 @@ def _gt_fault_trips(faults):
         out = {}
         try:
             with open(p, encoding="latin-1") as fh:
-                for ln in fh:
+                txt = fh.read()
+            head = txt.split("\n", 1)[0]
+            if "fault_id" in head:
+                dl = "\t" if head.count("\t") > head.count(",") else ","
+                for r in csv.DictReader(txt.splitlines(), delimiter=dl):
+                    fid = (r.get("fault_id") or "").strip().upper()
+                    if fid not in want:
+                        continue
+                    w3 = _gt_elems(r.get("trip_3wind"), True)
+                    el = [e for e in _gt_elems(r.get("trip_elements"))
+                          if not any(set(e[:2]) <= set((t[0], t[1], t[3])) and e[2] == t[2]
+                                     for t in w3)]
+                    if not el and not w3 and (r.get("trip_from") or "").strip():
+                        el = _gt_elems("%s-%s--%s" % (r.get("trip_from"), r.get("trip_to"),
+                                                      r.get("trip_ckt") or "1"))
+                    out[fid] = el + w3 + _gt_elems(r.get("pre_outage"))
+                    try:
+                        _GT_FBUS[fid] = int(float(r.get("fault_bus") or 0))
+                    except ValueError:
+                        pass
+            else:
+                for ln in txt.splitlines():
                     m = re.match(r"^\s*\"?([A-Za-z_]*\d+)", ln)
                     if not m or m.group(1).upper() not in want:
                         continue
@@ -17380,6 +17423,10 @@ def _gt_fault_trips(faults):
             print("[gen-test] could not read the fault list %s: %s" % (p, e))
             continue
         if out:
+            miss = sorted(want - set(out), key=_fault_key)
+            if miss:
+                print("[gen-test] fault list %s has no row for %s -- not checked against the "
+                      "line runs" % (p, ", ".join(miss)))
             return out
     return None
 
@@ -17389,18 +17436,25 @@ def _gt_edges(br):
     return [(a, b), (a, c)] if c else [(a, b)]
 
 
-def _gt_fault_conflict(net, br, trips):
-    """Why opening branch `br` spoils a fault of the run, or "".
+def _gt_fault_conflicts(net, br, trips):
+    """{fault: why} for the faults that opening branch `br` spoils.
        * the fault trips `br` itself: PSS/E is asked to open an open branch,
          and the event is a bus fault with nothing removed;
        * `br` open plus the fault's trips cut buses off the grid that neither
-         cuts off alone: the fault then islands them (e.g. the POI)."""
+         cuts off alone: the fault then islands them (e.g. the POI).
+       The run's other faults are unaffected and still run."""
     key = (frozenset([x for x in (br[0], br[1], br[3]) if x]), br[2])
     alone = set(frozenset(x) for x in _gt_islands(net, _gt_edges(br)))
+    # a 3-winding transformer is starred through winding 1 in the network; the
+    # fault list may name its windings in another order -- take the case's
+    w1 = dict(((frozenset((r[0], r[1], r[6])), r[2]), (r[0], r[1], r[2], r[6]))
+              for r in net.get("brn", []) if len(r) > 6 and r[6])
+    out = {}
     for f in sorted(trips, key=_fault_key):
-        tr = trips[f]
+        tr = [w1.get((frozenset((t[0], t[1], t[3])), t[2]), t) if t[3] else t for t in trips[f]]
         if any((frozenset([x for x in (t[0], t[1], t[3]) if x]), t[2]) == key for t in tr):
-            return "%s trips this branch" % f
+            out[f] = "trips this branch"
+            continue
         if not tr:
             continue
         te = [e for t in tr for e in _gt_edges(t)]
@@ -17409,8 +17463,14 @@ def _gt_fault_conflict(net, br, trips):
                if frozenset(x) not in base and frozenset(x) not in alone]
         if new:
             big = max(new, key=len)
-            return "%s would island %d bus(es) incl. %s" % (f, len(big), min(big))
-    return ""
+            out[f] = "islands %d bus(es) incl. %s" % (len(big), min(big))
+    return out
+
+
+def _gt_run_faults(g, faults):
+    """The faults this plan entry runs: all, less those its opened line spoils."""
+    sk = (g or {}).get("skip") or {}
+    return [f for f in faults if f not in sk]
 
 
 def _gt_each_lines():
@@ -17438,12 +17498,13 @@ def _gt_each_lines():
             want[(frozenset(bs), ck)] = x
     kv = lambda n: net["bus"].get(n, {}).get("kv") or 0.0
     nm = lambda n: (net["bus"].get(n, {}).get("name") or "").strip()
-    trips = _gt_fault_trips(_gt_expand(GEN_TEST_FAULTS)) if GEN_TEST_LINES_SKIP_FAULTED else {}
+    allf = _gt_expand(GEN_TEST_FAULTS)
+    trips = _gt_fault_trips(allf) if GEN_TEST_LINES_SKIP_FAULTED else {}
     if trips is None:
         print("[gen-test] *** fault list not found -- line runs are NOT checked against the "
               "faults' trips ***")
         trips = {}
-    out, radial, found, clash = [], [], set(), []
+    out, radial, found, clash, part = [], [], set(), [], []
     for r in net["brn"]:
         a, b, ck, z, typ, p = r[:6]
         c = r[6] if len(r) > 6 else 0
@@ -17472,13 +17533,19 @@ def _gt_each_lines():
                 radial.append(_gt_brname(br))
                 continue
             dscn = sorted(list(x)[0] for x in dead)
-        why = _gt_fault_conflict(net, (a, b, ck, c), trips) if trips else ""
-        if why:
+        skip = _gt_fault_conflicts(net, (a, b, ck, c), trips) if trips else {}
+        for f in allf:
+            if _GT_FBUS.get(f) in dscn:
+                skip[f] = "faulted bus %s is disconnected with it" % _GT_FBUS[f]
+        why = ", ".join("%s %s" % (f, skip[f]) for f in sorted(skip, key=_fault_key))
+        if skip and not [f for f in allf if f not in skip]:
             clash.append("%s (%s)" % (_gt_brname(br), why))
             continue
+        if skip:
+            part.append("%s: %s" % (_gt_brname(br), why))
         h = max(near.get(x, (0, 0))[0] for x in (a, b)) if a in near and b in near else ""
         out.append({"bus": a, "id": ("BR%dT%dC%s" % (b, c, ck)) if c else ("BR%dC%s" % (b, ck)),
-                    "branches": [br], "dscn": dscn,
+                    "branches": [br], "dscn": dscn, "skip": skip,
                     "hops": h, "z": z, "mw": p, "mvar": None, "kind": typ,
                     "name": "-".join(nm(x)[:8] for x in bs),
                     "models": ["%s %s kV%s" % (_gt_brname(br), "/".join("%.0f" % kv(x) for x in bs),
@@ -17493,8 +17560,10 @@ def _gt_each_lines():
         print("[gen-test] %d radial line(s)/transformer(s) skipped (opening them cuts buses off "
               "the grid): %s" % (len(radial), ", ".join(radial)))
     if clash:
-        print("[gen-test] %d line(s)/transformer(s) skipped (they clash with a fault of the "
+        print("[gen-test] %d line(s)/transformer(s) skipped (they clash with EVERY fault of the "
               "run): %s" % (len(clash), "; ".join(clash)))
+    for x in part:
+        print("[gen-test] line run %s -- fault(s) left out of this run, the rest run" % x)
     print("[gen-test] %d line(s)/transformer(s) %s, each OPENED on its own: %s"
           % (len(out), "from GEN_TEST_LINES_LIST" if want is not None else
              "within %s buses of POI %s (>= %.0f kV)" % (GEN_TEST_LINES_HOPS, GEN_TEST_POI,
@@ -17716,28 +17785,37 @@ def _gt_measure(rdir, faults):
     return res
 
 
-def _gt_done(rdir, faults):
+def _gt_done(rdir, faults, g=None):
     """Finished = every fault scored, or the study wrote ALL_DONE AND its
        criteria report (a fault it gave up on has no verdict but is not run
        again either).
 
        NOT the flag alone: each worker writes ALL_DONE_w<N>.flag when IT has
        nothing left, while the other workers are still simulating -- a run
-       stopped then was skipped on the next launch with no results."""
+       stopped then was skipped on the next launch with no results.
+
+       A fault the entry's opened line spoils (g["skip"]) is not needed, and
+       reads SKIP -- also when an older run on disk scored it: that result
+       was a fault with nothing removed, or an island."""
     m = _gt_measure(rdir, faults)
-    ok = all(m[f]["verdict"] in ("PASS", "FAIL") for f in faults)
+    for f in ((g or {}).get("skip") or {}):
+        if f in m:
+            m[f] = {"verdict": "SKIP", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {}}
+    need = _gt_run_faults(g, faults)
+    ok = all(m[f]["verdict"] in ("PASS", "FAIL") for f in need)
     if (not ok and glob.glob(os.path.join(rdir, "flags", "ALL_DONE*.flag"))
             and _gt_find(rdir, "SPP_CRITERIA_REPORT", "csv")
-            and any(m[f]["verdict"] in ("PASS", "FAIL") for f in faults)):
+            and any(m[f]["verdict"] in ("PASS", "FAIL") for f in need)):
         ok = True
     return ok, m
 
 
 def _gt_env(sc, g, faults):
     tag, dc, it, acc, tol = sc
+    fl = ",".join(_gt_run_faults(g, faults)) if g and g.get("skip") else ",".join(GEN_TEST_FAULTS)
     env = {"SPP_RUN_TAG": _gt_tag(sc, g),
-           "SPP_ONLY_FAULTS": ",".join(GEN_TEST_FAULTS),
-           "SPP_REPORT_FAULTS": ",".join(GEN_TEST_FAULTS),
+           "SPP_ONLY_FAULTS": fl,
+           "SPP_REPORT_FAULTS": fl,
            "SPP_PSSE_FAULT_LOG": "1",
            "SPP_DELT_CYCLES": str(float(dc or DELT_CYCLES or 4)),
            "SPP_DYN_TOL": repr(float(tol)) if tol else "0",
@@ -17818,7 +17896,10 @@ def _gt_scen_desc(sc):
 
 
 def _gt_score(m, faults):
-    """(passes, nc, over, max_pu, known) for one run; None when nothing scored."""
+    """(passes, nc, over, max_pu, known, n_faults) for one run; None when
+       nothing scored. SKIP faults (left out of a line run) do not count."""
+    if m:
+        faults = [f for f in faults if f in m and m[f]["verdict"] != "SKIP"]
     if not m or not any(m[f]["verdict"] in ("PASS", "FAIL") for f in faults):
         return None
     ps = sum(1 for f in faults if m[f]["verdict"] == "PASS")
@@ -17826,7 +17907,7 @@ def _gt_score(m, faults):
     known = all(m[f]["noconv"] is not None for f in faults)
     ov = sum(m[f]["n_over"] for f in faults)
     mx = max([m[f]["max_pu"] or 0.0 for f in faults] or [0.0])
-    return ps, nc, ov, mx, known
+    return ps, nc, ov, mx, known, len(faults)
 
 
 def _gt_label(g):
@@ -17848,10 +17929,11 @@ def _gt_best(runs, faults, ref):
     L = ["", "=" * 150, "BEST OF ALL -- every run ranked: most faults PASS, then fewest non-converged",
          "steps (nc), then fewest buses above 1.2 pu, then lowest peak voltage", "=" * 150]
     sc_all = []
+    part = []                       # line runs with a fault left out: section C only
     for r in runs:
         x = _gt_score(r.get("m"), faults)
         if x:
-            sc_all.append((x, r))
+            (sc_all if x[5] == nf else part).append((x, r))
     if not sc_all:
         return L + ["  (no run has finished yet)"]
 
@@ -17861,7 +17943,7 @@ def _gt_best(runs, faults, ref):
 
     def row(i, x, r):
         return "  %3s  %-22s %-34s %3d/%-3d %8d%s %6d %7s" % (
-            i, r["sc"][0], lab(r), x[0], nf, x[1], "" if x[4] else "?", x[2],
+            i, r["sc"][0], lab(r), x[0], x[5], x[1], "" if x[4] else "?", x[2],
             "%.3f" % x[3] if x[3] else "-")
     hdr = "  %3s  %-22s %-34s %7s %9s %6s %7s" % ("#", "scenario", "machine", "PASS", "nc", ">1.2", "max pu")
     sc_all.sort(key=lambda t: _gt_key(t[0]))
@@ -17876,10 +17958,13 @@ def _gt_best(runs, faults, ref):
         L.append(row(i, x, r))
     # C -- per machine, over every scenario it ran in
     per = {}
-    for x, r in sc_all:
+    for x, r in sc_all + part:
         g = r["gen"]
         b = ref.get(r["sc"][0])
-        bx = _gt_score(b.get("m") if b else None, faults)
+        # against the SAME faults: a line run that left F02 out is held to the
+        # all-in-service run's other faults, not to its total
+        fs = [f for f in faults if (r.get("m") or {}).get(f, {}).get("verdict") != "SKIP"]
+        bx = _gt_score(b.get("m") if b else None, fs)
         if not g or not bx:
             continue
         k = (g["bus"], g["id"])
@@ -18138,9 +18223,10 @@ def _gt_write(runs, faults, gens):
         b = ref.get(r["sc"][0])
         if not g or not m or not b:
             continue
-        dnc = sum((b["m"][f]["noconv"] or 0) - (m[f]["noconv"] or 0) for f in faults)
-        dov = sum(b["m"][f]["n_over"] - m[f]["n_over"] for f in faults)
-        fixed = [f for f in faults if b["m"][f]["verdict"] == "FAIL" and m[f]["verdict"] == "PASS"]
+        fs = [f for f in faults if m[f]["verdict"] != "SKIP"]
+        dnc = sum((b["m"][f]["noconv"] or 0) - (m[f]["noconv"] or 0) for f in fs)
+        dov = sum(b["m"][f]["n_over"] - m[f]["n_over"] for f in fs)
+        fixed = [f for f in fs if b["m"][f]["verdict"] == "FAIL" and m[f]["verdict"] == "PASS"]
         eff.append((dnc, dov, r["sc"][0], g, fixed))
     eff.sort(key=lambda x: (-x[0], -x[1]))
     if eff:
@@ -18238,7 +18324,7 @@ def _gt_state(r, done):
 
 def _gt_finish(r, rc, t0):
     tag = _gt_tag(r["sc"], r["gen"])
-    done, r["m"] = _gt_done(r["rdir"], r["faults"])
+    done, r["m"] = _gt_done(r["rdir"], r["faults"], r["gen"])
     r["noswitch"] = "" if done else _gt_switch_failure(r)
     r["note"] = ("%.0f min" % ((time.time() - t0) / 60.0)) + (
         "" if done else ("  NOT RUN -- %s" % r["noswitch"]) if r["noswitch"]
@@ -18289,7 +18375,7 @@ def _gt_status_write(runs, faults, npar, t_start):
 
     def outs(r):
         # THIS RUN'S FAULTS ONLY: the build's FLAT.out sits in the same folder
-        return sum(1 for f in faults
+        return sum(1 for f in _gt_run_faults(r["gen"], faults)
                    if os.path.isfile(os.path.join(r["rdir"], "outs", "%s.out" % f)))
 
     def res(r):
@@ -18298,7 +18384,7 @@ def _gt_status_write(runs, faults, npar, t_start):
         if not x:
             return ""
         return "%d/%d PASS  nc %d%s  >1.2 %d  max %s" % (
-            x[0], nf, x[1], "" if x[4] else "?", x[2], "%.3f" % x[3] if x[3] else "-")
+            x[0], x[5], x[1], "" if x[4] else "?", x[2], "%.3f" % x[3] if x[3] else "-")
 
     L = ["GEN-OFF / SOLVER TEST STATUS -- %s  (updated %s, started %s)"
          % (GEN_TEST_PROJECT, time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -18309,7 +18395,8 @@ def _gt_status_write(runs, faults, npar, t_start):
     live = [r for r in runs if r.get("state") == "RUNNING"]
     for r in live:
         L.append("  #%-4d %-22s %-34s %5.0f min  outs %d/%d  %s"
-                 % (r["k"], r["sc"][0], mach(r["gen"]), (now - r["t0"]) / 60.0, outs(r), nf,
+                 % (r["k"], r["sc"][0], mach(r["gen"]), (now - r["t0"]) / 60.0, outs(r),
+                    len(_gt_run_faults(r["gen"], faults)),
                     r["rdir"]))
         if r.get("log"):
             L.append("         last: %s" % _gt_tail(r["log"]))
@@ -18427,8 +18514,9 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             env = _gt_env(sc, g, faults)
             # THIS RUN'S SHARE, NOT THE MACHINE: nf sessions each, no handover
             # file to grow on, and no shared live-status file to fight over.
-            env["SPP_LAUNCH_WORKERS"] = str(nf)
-            env["SPP_LAUNCH_REPORT_WORKERS"] = str(nf)
+            nrf = max(1, len(_gt_run_faults(g, faults)))
+            env["SPP_LAUNCH_WORKERS"] = str(nrf)
+            env["SPP_LAUNCH_REPORT_WORKERS"] = str(nrf)
             env["SPP_SLOTS_FILE"] = os.path.join(ldir, ".slots_%s.txt" % tag)
             env["SPP_LIVE_STATUS_ALL"] = ""
             box = {}
@@ -18445,7 +18533,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             th.start()
             live[tag] = (th, r, t0, box)
             r["state"], r["t0"], r["log"] = "RUNNING", t0, lp
-            last = (tag, r["rdir"], t0, faults)
+            last = (tag, r["rdir"], t0, _gt_run_faults(g, faults))
             continue
         if time.time() - t_say >= 300.0 and live:
             t_say = time.time()
@@ -18515,7 +18603,7 @@ def run_gen_test():
             return None
         have.add(tag)
         rdir = _gt_rdir(tag)
-        done, m = _gt_done(rdir, faults)
+        done, m = _gt_done(rdir, faults, g)
         r = {"sc": sc, "gen": g, "rdir": rdir, "m": m if (done or os.path.isdir(rdir)) else None,
              "note": "done earlier -- not re-run" if done else "",
              "state": "DONE earlier" if done else "WAITING", "k": len(runs) + 1}
@@ -18541,7 +18629,7 @@ def run_gen_test():
     if _gmode == "best2":
         for g in gens:
             for sc in GEN_TEST_SCENARIOS:
-                if _gt_done(_gt_rdir(_gt_tag(sc, g)), faults)[0]:
+                if _gt_done(_gt_rdir(_gt_tag(sc, g)), faults, g)[0]:
                     add(sc, g)
     else:
         gsc = GEN_TEST_SCENARIOS if _gmode == "all" else \
