@@ -272,15 +272,13 @@ GEN_TEST_BY_PROJECT = {
             "V110_K2_A10":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
             "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],  # more absorb headroom
             # REECA1 Kqv on top of V110_K2: reactive current per pu outside Vdip..Vup
-            # (above Vup it ABSORBS). Lower Vup = acts on the post-clearing spike.
+            # (above Vup it ABSORBS)
             "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
                              ("REECA1", {"Kqv": 0.0})],                                # no Iq injection: is Kqv the driver?
-            "V110_K2_KQV5": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECA1", {"Kqv": 5.0})],
-            "V110_K2_KQV3_VUP110": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                                    ("REECA1", {"Kqv": 3.0, "Vup": 1.10})],
-            "V110_K2_KQV5_VUP110": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                                    ("REECA1", {"Kqv": 5.0, "Vup": 1.10})],
+            "V110_K2_KQV2": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 2.0})],
+            "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 4.0})],
         },
     },
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
