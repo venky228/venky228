@@ -3115,7 +3115,7 @@ NEW_PLANT_MACHINE_KIND = "ASYNC"
 #
 # "" turns it off and leaves only the recorded plant buses. A different
 # numbering block is just a different prefix here.
-NEW_GEN_BUS_PREFIX = "999"
+NEW_GEN_BUS_PREFIX = "9990"               # 999000..999099 -- the same block as z6_spp_p.py; "999" also caught other 999xxx buses (GI-86 at 999950..999954)
 
 # >>> LAYOUT: how signals are laid out in the pure-Python PDF/SVG plots.
 #   PLOT_INDIVIDUAL = True  -> ONE panel per SIGNAL (each channel gets its own plot)
