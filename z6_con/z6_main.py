@@ -258,6 +258,7 @@ GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus
 GEN_TEST_EXTRA_GENS = [(763676, "1")]        # machines always tested, however far [(bus, id)]
 GEN_TEST_POI_GROUP = True                    # True = also all machines at the POI off together
 GEN_TEST_POI_GROUP_GENS = []                 # [] = found automatically | [(bus, id), ...]
+GEN_TEST_POI_GROUP_ONLY = False              # True = of the machine runs, ONLY all POI machines off together
 GEN_TEST_CAPS_OFF = True                     # True = also one run with all caps near the POI off
 GEN_TEST_CAPS_HOPS = 5                       # radius for that run
 GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]        # solver scenario(s) for it
@@ -19084,6 +19085,18 @@ def run_gen_test():
     gens = _gt_find_gens()
     if gens is None:
         return 2
+    if GEN_TEST_POI_GROUP_ONLY:
+        # the one-at-a-time machines (and GEN_TEST_EXTRA_GENS) are left out;
+        # the all-in-service reference runs, caps and lines follow their own switches
+        grp = [g for g in gens if g.get("group")]
+        if not grp:
+            print("[gen-test] *** GEN_TEST_POI_GROUP_ONLY: no POI group was formed -- set "
+                  "GEN_TEST_POI_GROUP = True (and GEN_TEST_POI_GROUP_GENS if the POI "
+                  "machines are not found) ***")
+            return 2
+        print("[gen-test] GEN_TEST_POI_GROUP_ONLY: machine runs = all POI machines off together "
+              "only (%d one-at-a-time machine(s) left out)" % (len(gens) - len(grp)))
+        gens = grp
     gens = gens + _gt_each_caps()
     lines = _gt_each_lines()
     gp = os.path.join(_gt_dir(), "GEN_TEST_GENS_%s.txt" % GEN_TEST_PROJECT)
