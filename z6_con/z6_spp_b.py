@@ -11452,14 +11452,13 @@ def _new_facility_buses():
     # Used only to decide whether the walk may step onto a bus, never on its own
     # to declare a bus "new": a bus is reached only from a bus already known to
     # be part of this facility.
-    pfx3 = "".join(c for c in str(NEW_GEN_BUS_PREFIX or "").strip()
-                   if c.isdigit())[:3]
+    # NOT the whole 999xxx: other plants in the deck sit there too (GI-86 at
+    # 999950..999954), and walking onto them called them new generation. The
+    # builder uses units +0..+99, GSU high sides +100..+199, collector/HV
+    # +200/+201 of the block, so the walk stays inside block start .. +299.
     wlo = whi = 0
-    if len(pfx3) == 3:
-        try:
-            wlo, whi = int(pfx3 + "000"), int(pfx3 + "999")
-        except Exception:
-            wlo = whi = 0
+    if hi:
+        wlo, whi = lo, lo + 299
     if hi:
         # Anything in the NARROW prefix range that the case actually has is part
         # of the facility whether or not anything recorded it.
