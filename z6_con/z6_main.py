@@ -18050,6 +18050,13 @@ def _gt_key(sc):
     return (-sc[0], sc[1], sc[2], sc[3])
 
 
+def _gt_spike_key(sc):
+    """Section C / D order: the SPIKES first (buses > 1.2 pu, then the peak),
+       non-convergence only as the tie-break -- opening a line that trims 'not
+       converged' steps but raises the peak does not help the spikes."""
+    return (-sc[0], sc[2], round(sc[3] or 0.0, 3), sc[1])
+
+
 def _gt_best(runs, faults, ref):
     """The common 'which is best' summary at the top of GEN_TEST_<proj>.txt."""
     nf = len(faults)
@@ -18095,28 +18102,33 @@ def _gt_best(runs, faults, ref):
         if not g or not bx:
             continue
         k = (g["bus"], g["id"])
-        e = per.setdefault(k, {"g": g, "n": 0, "better": 0, "dnc": 0, "dov": 0, "fix": 0,
-                               "best": None})
+        e = per.setdefault(k, {"g": g, "n": 0, "better": 0, "dnc": 0, "dov": 0, "dmx": 0.0,
+                               "fix": 0, "best": None})
         e["n"] += 1
         e["dnc"] += bx[1] - x[1]
         e["dov"] += bx[2] - x[2]
+        e["dmx"] += (bx[3] or 0.0) - (x[3] or 0.0)
         e["fix"] += max(0, x[0] - bx[0])
-        if _gt_key(x) < _gt_key(bx):
+        if _gt_spike_key(x) < _gt_spike_key(bx):
             e["better"] += 1
-        if e["best"] is None or _gt_key(x) < _gt_key(e["best"][0]):
+        if e["best"] is None or _gt_spike_key(x) < _gt_spike_key(e["best"][0]):
             e["best"] = (x, r["sc"][0])
     L += ["", "C. EACH MACHINE / CAP OFF OR LINE / TRANSFORMER OPENED (id BR<to>[T<3rd>]C<ckt>), over every scenario it ran in "
-          "(vs the same scenario, all in service)",
-          "  %-8s %-10s %-14s %-16s %6s %8s %11s %11s %9s  %s" % (
-              "bus", "id", "name", "kind", "runs", "better", "avg nc drop", "avg >1.2 dr",
-              "faults+", "its best scenario")]
-    pl = sorted(per.values(), key=lambda e: (-(e["dnc"] / float(e["n"])), -(e["dov"] / float(e["n"])),
-                                             -e["fix"]))
+          "(vs the same scenario, all in service) -- ranked by the SPIKES: buses > 1.2 pu cleared,",
+          "  then peak pu drop; 'better' = fewer buses > 1.2 pu (or the same and a lower peak);",
+          "  a negative drop = WORSE with it out",
+          "  %-8s %-10s %-14s %-16s %6s %8s %11s %11s %11s %9s  %s" % (
+              "bus", "id", "name", "kind", "runs", "better", "avg >1.2 dr", "avg pk drop",
+              "avg nc drop", "faults+", "its best scenario (>1.2 / peak)")]
+    pl = sorted(per.values(), key=lambda e: (-e["fix"], -(e["dov"] / float(e["n"])),
+                                             -(e["dmx"] / float(e["n"])), -(e["dnc"] / float(e["n"]))))
     for e in pl:
         g = e["g"]
-        L.append("  %-8s %-10s %-14s %-16s %6d %5d/%-2d %11.0f %11.1f %9d  %s" % (
+        bxx = e["best"][0]
+        L.append("  %-8s %-10s %-14s %-16s %6d %5d/%-2d %11.1f %11.3f %11.0f %9d  %s (%d / %s)" % (
             g["bus"], g["id"], g["name"][:14], (g["kind"] or "")[:16], e["n"], e["better"], e["n"],
-            e["dnc"] / float(e["n"]), e["dov"] / float(e["n"]), e["fix"], e["best"][1]))
+            e["dov"] / float(e["n"]), e["dmx"] / float(e["n"]), e["dnc"] / float(e["n"]), e["fix"],
+            e["best"][1], bxx[2], "%.3f" % bxx[3] if bxx[3] else "-"))
     if not pl:
         L.append("  (no machine-off run has finished yet)")
     # D -- what it says
@@ -18141,10 +18153,14 @@ def _gt_best(runs, faults, ref):
             L.append("     model of the machine at the top of it.")
     if pl:
         e = pl[0]
-        if e["dnc"] > 0 or e["dov"] > 0:
-            L.append("  top element : %s -- better in %d of %d scenarios, avg nc drop %.0f, "
-                     "avg >1.2 drop %.1f" % (_gt_label(e["g"]), e["better"],
-                                             e["n"], e["dnc"] / float(e["n"]), e["dov"] / float(e["n"])))
+        if e["dov"] > 0 or e["dmx"] > 0.005 * e["n"]:
+            bxx = e["best"][0]
+            L.append("  top element : %s -- better in %d of %d scenarios, avg >1.2 drop %.1f, "
+                     "avg peak drop %.3f pu, avg nc drop %.0f" % (
+                         _gt_label(e["g"]), e["better"], e["n"], e["dov"] / float(e["n"]),
+                         e["dmx"] / float(e["n"]), e["dnc"] / float(e["n"])))
+            L.append("                best with it out: %s -- %d bus(es) > 1.2 pu, peak %s, nc %d"
+                     % (e["best"][1], bxx[2], "%.3f" % bxx[3] if bxx[3] else "-", bxx[1]))
             if e["g"].get("branches") and e["better"] * 2 >= e["n"]:
                 L.append("  -> opening this line helps: the problem comes THROUGH it -- look at what")
                 L.append("     sits at its far end (machines, caps, controls) and its loading.")
@@ -18152,7 +18168,7 @@ def _gt_best(runs, faults, ref):
                 L.append("  -> switching it off helps in most scenarios: its dynamic model / settings are")
                 L.append("     the prime suspect (check its REEC/REGC or exciter data, or ask its owner).")
         else:
-            L.append("  -> no single machine off makes things better: no one machine causes it.")
+            L.append("  -> nothing taken out lowers the spikes: no one machine / line causes them.")
     if any(not x[4] for x, _r in sc_all):
         L.append("  ? = some fault had no PSS/E log (PSSE_FAULT_LOG), so its nc count is missing")
     return L
