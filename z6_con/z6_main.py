@@ -18314,21 +18314,20 @@ def _gt_reset(r):
     rdir = r.get("rdir")
     if not rdir or not os.path.isdir(rdir):
         return
-    import shutil
-    shutil.rmtree(rdir, ignore_errors=True)
-    if os.path.isdir(rdir):
-        old = rdir + "_stopped_%s" % time.strftime("%H%M%S")
-        try:
-            os.rename(rdir, old)
-            print("[gen-test] %s: leftover folder of a stopped attempt could not be deleted "
-                  "(a file is open) -- moved to %s" % (os.path.basename(rdir), old))
-        except Exception as e:
-            print("[gen-test] *** %s: leftover folder of a stopped attempt could not be "
-                  "cleared (%s) -- close anything using it and run again ***"
-                  % (os.path.basename(rdir), e))
-        return
-    print("[gen-test] %s: leftover results of a stopped attempt cleared -- runs from the start"
-          % os.path.basename(rdir))
+    # MOVED ASIDE, NEVER DELETED. The folder is cleared because a run about to
+    # start is judged unfinished -- but that judgement can be wrong (a folder
+    # the report reader could not read, a launch pointed at the wrong place),
+    # and deleting on it destroyed finished results. Moving keeps them: rename
+    # <run>_prev_<time> back to <run> to restore one.
+    old = rdir + "_prev_%s" % time.strftime("%m%d_%H%M%S")
+    try:
+        os.rename(rdir, old)
+        print("[gen-test] %s: earlier attempt's folder kept as %s -- runs from the start"
+              % (os.path.basename(rdir), os.path.basename(old)))
+    except Exception as e:
+        print("[gen-test] *** %s: earlier attempt's folder could not be moved aside (%s) -- "
+              "close anything using it and run again ***" % (os.path.basename(rdir), e))
+        r["reset_failed"] = True
 
 
 def _gt_dir(*parts):
@@ -19021,6 +19020,9 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
                      _gt_label(g) if g
                      else "all machines in service", _gt_scen_desc(sc), lp))
             _gt_reset(r)
+            if r.pop("reset_failed", False):
+                r["state"] = "INCOMPLETE"
+                continue
             env = _gt_env(sc, g, faults)
             # THIS RUN'S SHARE, NOT THE MACHINE: nf sessions each, no handover
             # file to grow on, and no shared live-status file to fight over.
@@ -19187,6 +19189,29 @@ def run_gen_test():
         return 0
     todo = [r for r in runs if not r["note"]]
     print("[gen-test] %d run(s) to simulate, %d already done" % (len(todo), len(runs) - len(todo)))
+    # THE STUDY MUST BE THERE BEFORE ANYTHING STARTS. Without it every run
+    # ended INCOMPLETE in seconds (rc 2) and the queue raced through all of
+    # them -- each one moving its folder aside on the way.
+    _why = []
+    _sp = _study_path(_gt_case(), _why)
+    if todo and (not _sp or not os.path.isfile(_sp)):
+        print("[gen-test] *** the %s case cannot run -- nothing was started:" % _gt_case()["key"])
+        for _w in _why or ["the study script was not found"]:
+            print("[gen-test]     %s" % _w)
+        return 2
+    # AND A LAUNCH THAT FINDS NOTHING DONE WHEN THE FOLDERS SAY OTHERWISE IS
+    # POINTED AT THE WRONG PLACE, OR CANNOT READ THEM: stop and say so rather
+    # than re-run (and move aside) everything
+    _had = [r for r in todo if os.path.isdir(r["rdir"])
+            and glob.glob(os.path.join(r["rdir"], "reports", "SPP_CRITERIA_REPORT*.csv"))]
+    if todo and len(_had) >= 3 and len(runs) - len(todo) == 0:
+        print("[gen-test] *** %d run folder(s) hold a criteria report, yet NONE counts as done."
+              % len(_had))
+        print("[gen-test]     e.g. %s" % _had[0]["rdir"])
+        print("[gen-test]     Nothing was started. Check GEN_TEST_FAULTS / ONLY_FAULTS against those")
+        print("[gen-test]     reports; to re-run everything anyway set GEN_TEST_FORCE_RERUN = True.")
+        if not globals().get("GEN_TEST_FORCE_RERUN"):
+            return 2
     npar = max(1, _gt_parallel(len(faults)))
     # THE REPORTS FROM WHAT IS ALREADY ON DISK, NOW -- not only once the first
     # run of this launch finishes, which is a quarter of an hour of an empty
@@ -19245,6 +19270,9 @@ def _gt_execute(todo, runs, faults, gens, npar):
                 _gt_label(g) if g else "all machines in service"))
         print("[gen-test] %s | folder %s" % (_gt_scen_desc(sc), r["rdir"]))
         _gt_reset(r)
+        if r.pop("reset_failed", False):
+            r["state"] = "INCOMPLETE"
+            continue
         t0 = time.time()
         r["state"], r["t0"] = "RUNNING", t0
         try:
