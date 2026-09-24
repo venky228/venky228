@@ -18284,7 +18284,7 @@ def _gt_add_hops_group(gens):
            "hops": "", "z": None,
            "mw": sum(g["mw"] for g in one) if known else None,
            "mvar": sum(g["mvar"] or 0.0 for g in one) if known else None,
-           "kind": "GROUP of %d" % len(mem), "name": "ALL IN %s BUSES" % GEN_TEST_HOPS,
+           "kind": "GROUP of %d" % len(mem), "name": "ALL GENS OFF %s BUSES" % GEN_TEST_HOPS,
            "models": ["%d:%s" % k for k in mem]}
     print("[gen-test] NODES group: %d machine(s) within %s buses of POI %s switched off TOGETHER: %s"
           % (len(mem), GEN_TEST_HOPS, GEN_TEST_POI, ", ".join("%d '%s'" % k for k in mem)))
@@ -18608,6 +18608,8 @@ def _gt_label(g):
         return "EDIT %s: %s" % (str(g.get("id") or "EGF")[3:] or "EGF", _gt_egf_text(g["egf"]))
     if g.get("branches"):
         return "OPEN %s %s %s" % (g.get("kind") or "LINE", _gt_brname(g["branches"][0]), g["name"])
+    if g.get("group") and str(g.get("id")) == "ALL%dBUS" % int(GEN_TEST_HOPS):
+        return g["name"]            # "ALL GENS OFF 7 BUSES" (id ALL7BUS stays the folder name)
     return "OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])
 
 
