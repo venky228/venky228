@@ -241,7 +241,7 @@ SIM_END_S = 10                               # s per fault
 RUN_NPLT = 2                                 # write every N steps (1 = every step, huge)
 
 # ---- 3. GEN / CAP / LINE TEST --------------------------------------------------
-# GEN_TEST = True runs ONLY this test (normal study skipped). Results: comparison\GEN_TEST_*.txt
+# GEN_TEST = True runs ONLY this test (normal study skipped). Results: comparison_scenarios\<project>\BASE_CASE\gen_test\GEN_TEST_*.txt
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
 GEN_TEST_CASE = "base"                       # "base" | "proj" -- case the test runs on
@@ -334,7 +334,8 @@ POI_P_FAULTS = "all"                         # "all" | "failing" at each level
 ROOT = ""                                    # "" = this file's folder
 BASE_FOLDER = "Base"                         # base case folder (no projects)
 PROJ_FOLDER = "Projects"                     # case folder with the projects
-CMP_FOLDER = "comparison"                    # comparison output folder
+CMP_FOLDER = "comparison"                    # comparison output folder (base vs project)
+SCEN_CMP_FOLDER = "comparison_scenarios"     # scenario comparisons + gen test, per project, kept apart
 BASE_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"  # base .sav (in BASE_FOLDER)
 BASE_DYR = "2020MDWG-25S-DIS2201.dyr"
 PROJ_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"  # project .sav (in PROJ_FOLDER)
@@ -684,6 +685,20 @@ TEST_DIR    = _case_dir(PROJ_FOLDER, "Project")    # the case with the projects 
 # case's results. Same rule as the two above: a bare name hangs off STUDY_ROOT,
 # an absolute path is taken as it stands.
 COMPARE_DIR = _case_dir(CMP_FOLDER, "comparison")
+# THE SCENARIOS ARE NOT THE STUDY. Base-case scenarios (the gen test, the
+# existing machines edited or off) and the pairs they make are written to a
+# tree of their own, one folder per project, so comparison\ holds only the
+# base-vs-project answer:
+#   comparison_scenarios\<project>\
+#       EGF_CASES_<project>_<mode>.txt/.csv        every fault, every case
+#       BASE_CASE\gen_test\                         GEN_TEST_* and its logs
+#       BASE_CASE\egf_edited_vs_as_is\              base edited vs base as it is
+#       BASE_CASE\egf_off_vs_as_is\
+#       PROJECT_VS_BASE\egf_edited\                 project vs base, both changed
+#       PROJECT_VS_BASE\egf_off\
+#       PROJECT_CASE\egf_edited_vs_as_is\           project edited vs project as it is
+#       PROJECT_CASE\egf_off_vs_as_is\
+SCEN_DIR = _case_dir(SCEN_CMP_FOLDER, "comparison_scenarios")
 
 # ---- SHARED_DECK, RESOLVED ---------------------------------------------------
 # Done here because it needs STUDY_ROOT, and stated out loud because "both cases
@@ -3989,19 +4004,21 @@ def _sel_tag():
 # threaded through every writer, because EVERY writer needs it and none of them
 # has anything else to say about it.
 _CMP_SUB = []
+_CMP_ROOT = [None]      # None = COMPARE_DIR; SCEN_DIR inside _scen_into()
 
 
 def cmp_dir():
     """The folder this comparison's files belong in, created if need be."""
-    parts = [COMPARE_DIR] + [x for x in _CMP_SUB if x]
+    root = _CMP_ROOT[0] or COMPARE_DIR
+    parts = [root] + [x for x in _CMP_SUB if x]
     d = os.path.join(*parts)
     if not os.path.isdir(d):
         try:
             os.makedirs(d)
         except Exception as e:
             print("[compare] could not create %s (%s) -- writing to %s"
-                  % (d, e, COMPARE_DIR))
-            return COMPARE_DIR
+                  % (d, e, root))
+            return root
     return d
 
 
@@ -4078,6 +4095,37 @@ def cmp_path(stem, ext):
     except Exception:
         pass
     return os.path.join(d, "%s%s.%s" % (stem, _sel_tag(), ext))
+
+
+class _scen_into(object):
+    """with _scen_into("SantaFe", "BASE_CASE", "egf_off_vs_as_is"): ... --
+       everything written inside goes to comparison_scenarios\SantaFe\...,
+       ALWAYS per project (COMPARE_BY_PROJECT does not apply here), and never
+       into comparison\."""
+
+    def __init__(self, proj, *parts):
+        self.parts = [str(proj or "ALL")] + [x for x in parts if x]
+
+    def __enter__(self):
+        self._saved = (_CMP_ROOT[0], list(_CMP_SUB))
+        _CMP_ROOT[0] = SCEN_DIR
+        _CMP_SUB[:] = self.parts
+        return self
+
+    def __exit__(self, *exc):
+        _CMP_ROOT[0] = self._saved[0]
+        _CMP_SUB[:] = self._saved[1]
+        return False
+
+
+def scen_dir(proj, *parts):
+    """comparison_scenarios\<proj>\<parts>, created."""
+    d = os.path.join(SCEN_DIR, str(proj or "ALL"), *[x for x in parts if x])
+    try:
+        os.makedirs(d)
+    except Exception:
+        pass
+    return d
 
 
 class _cmp_into(object):
@@ -8731,7 +8779,7 @@ def run_egf_variants(proj, mode):
 
 
 def _egf_write(res, proj, sub, label, runtimes_suffix=None):
-    with _cmp_into(proj if COMPARE_BY_PROJECT else "", sub):
+    with _scen_into(proj, *sub.split("/")):
         _RUN_OUTPUT[0] = label
         try:
             if ONE_REPORT:
@@ -8762,15 +8810,16 @@ def compare_egf_variants(proj, mode):
         if not (os.path.isdir(db) or os.path.isdir(dt)):
             continue
         done.append(tag)
+        nm = "egf_edited" if tag == EGF_TAG else "egf_off"
         pairs = [
-            ("%s_vs_base_%s" % (tag, tag),
-             "%s -- PROJECT vs BASE, both with the change" % what,
-             dict(test_suffix=sfx, base_suffix=sfx), (db, dt)),
-            ("%s_base_vs_asis" % tag,
+            ("BASE_CASE/%s_vs_as_is" % nm,
              "%s -- BASE with the change vs BASE as it is" % what,
              dict(test_case=CASE_BASE, test_suffix=sfx, base_case=CASE_BASE, base_suffix=""),
              (results_dir(CASE_BASE, proj, mode), db)),
-            ("%s_proj_vs_asis" % tag,
+            ("PROJECT_VS_BASE/%s" % nm,
+             "%s -- PROJECT vs BASE, both with the change" % what,
+             dict(test_suffix=sfx, base_suffix=sfx), (db, dt)),
+            ("PROJECT_CASE/%s_vs_as_is" % nm,
              "%s -- PROJECT with the change vs PROJECT as it is" % what,
              dict(test_suffix=sfx, base_case=CASE_TEST, base_suffix=""),
              (results_dir(CASE_TEST, proj, mode), dt))]
@@ -8798,7 +8847,7 @@ def compare_egf_variants(proj, mode):
                       % (proj, sub, e))
     if done:
         try:
-            with _cmp_into(proj if COMPARE_BY_PROJECT else ""):
+            with _scen_into(proj):
                 write_egf_table(proj, mode, done)
         except Exception as e:
             print("[egf] %s: the all-cases table could not be written (%s)" % (proj, e))
@@ -8850,7 +8899,7 @@ def write_egf_table(proj, mode, tags):
         for nm, d, c in data)]
     if not faults:
         L.append("  (no case has scored a fault yet)")
-    name = "EGF_CASES_%s_%s" % (proj, mode)
+    name = os.path.join(cmp_dir(), "EGF_CASES_%s_%s" % (proj, mode))
     with open(name + ".txt", "w") as fh:
         fh.write("\n".join(L) + "\n")
     with csv_open(name + ".csv", "w") as fh:
@@ -18255,7 +18304,7 @@ def _gt_reset(r):
     # THE EARLIER ATTEMPT'S CONSOLE LOG is kept as <run>.prev.log, so a reason
     # it stopped for is not read back as this attempt's (the log is appended)
     r.pop("noswitch", None)
-    lp = os.path.join(COMPARE_DIR, "gen_test_logs", _gt_tag(r["sc"], r["gen"]) + ".log")
+    lp = os.path.join(_gt_dir("gen_test_logs"), _gt_tag(r["sc"], r["gen"]) + ".log")
     if os.path.isfile(lp):
         try:
             if os.path.exists(lp[:-4] + ".prev.log"):
@@ -18281,6 +18330,14 @@ def _gt_reset(r):
         return
     print("[gen-test] %s: leftover results of a stopped attempt cleared -- runs from the start"
           % os.path.basename(rdir))
+
+
+def _gt_dir(*parts):
+    """comparison_scenarios\<GEN_TEST_PROJECT>\BASE_CASE\gen_test (PROJECT_CASE
+       when GEN_TEST_CASE = "proj") -- kept out of comparison\."""
+    side = "PROJECT_CASE" if str(GEN_TEST_CASE).strip().lower().startswith("proj") \
+        else "BASE_CASE"
+    return scen_dir(GEN_TEST_PROJECT, side, "gen_test", *parts)
 
 
 def _gt_scen_desc(sc):
@@ -18551,9 +18608,9 @@ def _gt_impact(runs, faults, proj):
     if not rows:
         L.append("(no element-off run has finished yet)")
     try:
-        with open(os.path.join(COMPARE_DIR, "GEN_TEST_IMPACT_%s.txt" % proj), "w") as fh:
+        with open(os.path.join(_gt_dir(), "GEN_TEST_IMPACT_%s.txt" % proj), "w") as fh:
             fh.write("\n".join(L) + "\n")
-        with csv_open(os.path.join(COMPARE_DIR, "GEN_TEST_IMPACT_%s.csv" % proj), "w") as fh:
+        with csv_open(os.path.join(_gt_dir(), "GEN_TEST_IMPACT_%s.csv" % proj), "w") as fh:
             w = csv.writer(fh)
             w.writerow(["fault", "scenario", "impact", "element_out", "kind", "buses_over_1p2_in_service",
                         "buses_over_1p2_out", "buses_cleared", "buses_new", "peak_pu_in_service",
@@ -18569,8 +18626,8 @@ def _gt_impact(runs, faults, proj):
 
 def _gt_write(runs, faults, gens):
     proj = GEN_TEST_PROJECT
-    txt = os.path.join(COMPARE_DIR, "GEN_TEST_%s.txt" % proj)
-    csvp = os.path.join(COMPARE_DIR, "GEN_TEST_%s.csv" % proj)
+    txt = os.path.join(_gt_dir(), "GEN_TEST_%s.txt" % proj)
+    csvp = os.path.join(_gt_dir(), "GEN_TEST_%s.csv" % proj)
     ref = dict((r["sc"][0], r) for r in runs if not r["gen"] and r.get("m"))
 
     def cell(m):
@@ -18592,7 +18649,7 @@ def _gt_write(runs, faults, gens):
     L += _best
     _gt_impact(runs, faults, proj)
     try:
-        with open(os.path.join(COMPARE_DIR, "GEN_TEST_BEST_%s.txt" % proj), "w") as fh:
+        with open(os.path.join(_gt_dir(), "GEN_TEST_BEST_%s.txt" % proj), "w") as fh:
             fh.write("\n".join(L[:3] + _best) + "\n")
     except Exception as e:
         print("[gen-test] GEN_TEST_BEST not written (%s)" % e)
@@ -18618,7 +18675,7 @@ def _gt_write(runs, faults, gens):
     L += ["", "=" * 150] + _nh
     L += ns or ["  (none)"]
     try:
-        with open(os.path.join(COMPARE_DIR, "GEN_TEST_NOT_RUN_%s.txt" % proj), "w") as fh:
+        with open(os.path.join(_gt_dir(), "GEN_TEST_NOT_RUN_%s.txt" % proj), "w") as fh:
             fh.write("GEN TEST -- %s  (%s)\n" % (proj, time.strftime("%Y-%m-%d %H:%M")) + "\n".join(_nh)
                      + "\n\n  %-22s %-44s %s\n" % ("scenario", "what the run takes out", "why it did not run")
                      + "\n".join(ns or ["  (none)"]) + "\n")
@@ -18709,7 +18766,9 @@ def _gt_switch_failure(r):
     """The engine's 'could not be switched off / opened' message for this run,
        from its console log or the logs in its folder -- "" when there is none."""
     tag = _gt_tag(r["sc"], r["gen"])
-    paths = [r.get("log") or os.path.join(COMPARE_DIR, "gen_test_logs", tag + ".log")] + glob.glob(os.path.join(r.get("rdir") or "", "logs", "*.log")) \
+    # the old place (comparison\gen_test_logs) too, for runs logged before the move
+    paths = [r.get("log") or os.path.join(_gt_dir("gen_test_logs"), tag + ".log"),
+             os.path.join(COMPARE_DIR, "gen_test_logs", tag + ".log")] + glob.glob(os.path.join(r.get("rdir") or "", "logs", "*.log")) \
         + glob.glob(os.path.join(r.get("rdir") or "", "logs", "*.txt"))
     for p in paths:
         if not p or not os.path.isfile(p):
@@ -18821,7 +18880,7 @@ def _gt_status_write(runs, faults, npar, t_start):
             mins = "%.0f" % (((r.get("t1") or now) - r["t0"]) / 60.0)
         L.append("  %-5d %-22s %-34s %-12s %8s  %s"
                  % (r["k"], r["sc"][0], mach(r["gen"]), s_, mins, res(r) or r.get("noswitch") or ""))
-    p = os.path.join(COMPARE_DIR, "GEN_TEST_STATUS_%s.txt" % GEN_TEST_PROJECT)
+    p = os.path.join(_gt_dir(), "GEN_TEST_STATUS_%s.txt" % GEN_TEST_PROJECT)
     tmp = p + ".tmp"
     try:
         with open(tmp, "w") as fh:
@@ -18881,7 +18940,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
        Starts are spaced: a run starts only once the one started before it has
        built its snapshot (or GEN_TEST_START_GAP_MIN has passed), so no two
        dyre_new builds write the case folder's conec/conet at the same time."""
-    ldir = os.path.join(COMPARE_DIR, "gen_test_logs")
+    ldir = _gt_dir("gen_test_logs")
     try:
         os.makedirs(ldir)
     except Exception:
@@ -18978,7 +19037,7 @@ def run_gen_test():
         return 2
     gens = gens + _gt_each_caps()
     lines = _gt_each_lines()
-    gp = os.path.join(COMPARE_DIR, "GEN_TEST_GENS_%s.txt" % GEN_TEST_PROJECT)
+    gp = os.path.join(_gt_dir(), "GEN_TEST_GENS_%s.txt" % GEN_TEST_PROJECT)
     with open(gp, "w") as fh:
         fh.write("machines within %s buses of POI %s (in service, |MW| >= %s), closest first\n\n"
                  % (GEN_TEST_HOPS, GEN_TEST_POI, GEN_TEST_MIN_MW))
@@ -19086,7 +19145,7 @@ def run_gen_test():
     finally:
         _gt_status_stop(_stat)
     _gt_write(runs, faults, gens)
-    print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, COMPARE_DIR))
+    print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, _gt_dir()))
     return 0
 
 
