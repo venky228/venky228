@@ -236,8 +236,8 @@ PLOT_WORKERS = 2                             # plotters per case
 PLOT_TOTAL_MAX = 4                           # cap on plotters
 # simulation time
 FLAT_RUN_S = 5                               # s, no-fault run
-PRE_FAULT_S = 5                              # s before the fault
-SIM_END_S = 10                               # s per fault
+PRE_FAULT_S = 3                              # s before the fault
+SIM_END_S = 8                               # s per fault
 RUN_NPLT = 2                                 # write every N steps (1 = every step, huge)
 
 # ---- 3. GEN / CAP / LINE TEST --------------------------------------------------
@@ -251,7 +251,7 @@ GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-l
 GEN_TEST_PROJECTS = ["SantaFe", "EmpirePrairie"]  # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
 GEN_TEST_PROJECT = "SantaFe"                 # the one project run when GEN_TEST_PROJECTS = []
 GEN_TEST_CASE = "base"                       # "base" | "proj"
-GEN_TEST_FAULTS = ["F01-F04"]                # same syntax as ONLY_FAULTS
+GEN_TEST_FAULTS = ["F01-F03"]                # same syntax as ONLY_FAULTS
 # -- 3b. per project: POI bus, machines always tested however far (EXTRA_GENS), and the
 # .dyr changes tried on the EXISTING gens at its feeders, BESS untouched (EGF_EDITS,
 # {} = none; each entry = one run). REGCA1 Khv only acts above Volim -- change both.
@@ -281,15 +281,17 @@ GEN_TEST_BY_PROJECT = {
         "POI": 761383,
         "EXTRA_GENS": [],
         "EGF_EDITS": {                               # deck REGCA1: Volim 1.2 / Khv 0.2 / Accel 0.7
-            # only values OTHER than the deck's -- Accel stays the deck 0.7 unless named
-            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0})],                 # base of the rest
+            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7})],   # base of the rest
             "V110_K2_A05":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],
             "V110_K2_A10":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
-            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Iolim": -1.5})],
+            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],
             # needs REECA1 at the feeders -- a model not there stops only that run (listed in its log)
-            "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0}), ("REECA1", {"Kqv": 0.0})],
-            "V110_K2_KQV2": [("REGCA1", {"Volim": 1.10, "Khv": 2.0}), ("REECA1", {"Kqv": 2.0})],
-            "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0}), ("REECA1", {"Kqv": 4.0})],
+            "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 0.0})],
+            "V110_K2_KQV2": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 2.0})],
+            "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 4.0})],
         },
     },
 }
@@ -308,7 +310,7 @@ GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus
 GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together
 GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own
 GEN_TEST_LINES_EACH = True                    # each nearby line / transformer opened on its own
-GEN_TEST_LINES_HOPS = 4                      # lines: both ends within this many buses of the POI
+GEN_TEST_LINES_HOPS = 3                      # lines: both ends within this many buses of the POI
 # -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
@@ -317,7 +319,7 @@ GEN_TEST_SCENARIOS = [
     ("s3_it250_a030",        None, 250,  0.30, None),     # 250 iterations, acceleration 0.30
     ("s4_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
-GEN_TEST_GEN_SCENARIOS = "all"               # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
+GEN_TEST_GEN_SCENARIOS = "best2"             # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
 # rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
