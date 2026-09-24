@@ -260,6 +260,10 @@ GEN_TEST_POI_GROUP = True                    # True = also all machines at the P
 GEN_TEST_POI_GROUP_GENS = []                 # [] = found automatically | [(bus, id), ...]
 GEN_TEST_POI_GROUP_ONLY = False              # True = of the machine runs, ONLY all POI machines off together
 GEN_TEST_REFERENCE_RUNS = True               # False = do not RUN the all-in-service runs (finished ones are still used)
+# the EXISTING machines at GEN_TEST_PROJECT's feeders (not the BESS) with their model
+# constants changed -- each entry is one more element run, in the machine-run scenarios.
+# REGCA1 Khv only acts above Volim; this deck has Volim 0, so change them together.
+GEN_TEST_EGF_EDITS = {"KHV": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}   # {} = none
 GEN_TEST_CAPS_OFF = True                     # True = also one run with all caps near the POI off
 GEN_TEST_CAPS_HOPS = 5                       # radius for that run
 GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]        # solver scenario(s) for it
@@ -17730,6 +17734,34 @@ def _gt_caps_entry(caps):
             "models": ["%d%s" % (b, (":" + i) if i else "") + ":" + k for b, i, k, _q, _h in caps]}
 
 
+def _gt_egf_entries():
+    """GEN_TEST_EGF_EDITS: one element run per entry -- the existing machines
+       at GEN_TEST_PROJECT's feeders with the listed model constants changed."""
+    out = []
+    for name, rows in sorted((GEN_TEST_EGF_EDITS or {}).items()):
+        edits = []
+        for e in rows or []:
+            try:
+                m, d = e
+                if not isinstance(d, dict) or not d:
+                    raise ValueError("no {constant: value}")
+                edits.append([str(m).strip().strip("'\""),
+                              dict((str(c).strip(), v) for c, v in d.items())])
+            except Exception as ex:
+                raise RuntimeError("GEN_TEST_EGF_EDITS[%r]: %r is not (model, {constant: value}) (%s)"
+                                   % (name, e, ex))
+        if not edits:
+            continue
+        nm = re.sub(r"[^A-Za-z0-9]", "", str(name)) or "EDIT"
+        out.append({"bus": int(GEN_TEST_POI), "id": "EGF%s" % nm, "egf": edits, "hops": "",
+                    "z": None, "mw": None, "mvar": None, "kind": "EGF .dyr EDIT",
+                    "name": "EDIT %s" % nm, "models": [_gt_egf_text(edits)]})
+    if out:
+        print("[gen-test] existing-gen model edits, each run as its own element: %s"
+              % "  |  ".join("%s = %s" % (g["id"], g["models"][0]) for g in out))
+    return out
+
+
 def _gt_each_caps():
     """GEN_TEST_CAPS_EACH: one "machine" entry per capacitor bank near the POI,
        so each is switched off on its own under the machines' scenarios."""
@@ -18264,13 +18296,17 @@ def _gt_env(sc, g, faults):
            "SPP_PSSE_FAULT_LOG": "1",
            "SPP_DELT_CYCLES": str(float(dc or DELT_CYCLES or 4)),
            "SPP_DYN_TOL": repr(float(tol)) if tol else "0",
-           "SPP_MACHINES_OFF": ("" if g.get("caps") or g.get("branches") else
+           "SPP_MACHINES_OFF": ("" if g.get("caps") or g.get("branches") or g.get("egf") else
                                 ";".join("%d:%s" % m for m in g["group"]) if g.get("group")
                                 else "%d:%s" % (g["bus"], g["id"])) if g else "",
            "SPP_SHUNTS_OFF": ";".join("%d:%s:%s" % c for c in g["caps"]) if g and g.get("caps") else "",
            "SPP_BRANCHES_OFF": ";".join(":".join(str(v) for v in c) for c in g["branches"])
                                if g and g.get("branches") else "",
            "SPP_BUSES_DSCN": ";".join(str(b) for b in g.get("dscn") or []) if g else ""}
+    if g and g.get("egf"):
+        # the existing machines at the project's feeders, constants changed
+        # (z6_spp_*.py: egf_dyr_with_edits) -- nothing switched off
+        env["SPP_EGF_DYR_EDITS"] = json.dumps([[m, d] for m, d in g["egf"]])
     if it or acc:
         env["SPP_SOLVER_RETRY"] = "1"
         env["SPP_SOLVER_RETRY_RECIPES"] = json.dumps([[tag, it, acc]])
@@ -18378,10 +18414,17 @@ def _gt_scored(m, faults):
     return [f for f in faults if m and f in m and m[f]["verdict"] in ("PASS", "FAIL")]
 
 
+def _gt_egf_text(edits):
+    return "; ".join("%s %s" % (m, ",".join("%s=%s" % kv for kv in sorted(
+        ((str(c), v) for c, v in d.items())))) for m, d in edits)
+
+
 def _gt_label(g):
     """What a plan entry takes out, as the reports name it."""
     if not g:
         return "all in service"
+    if g.get("egf"):
+        return "EDIT existing gens: %s" % _gt_egf_text(g["egf"])
     if g.get("branches"):
         return "OPEN %s %s %s" % (g.get("kind") or "LINE", _gt_brname(g["branches"][0]), g["name"])
     return "OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])
@@ -19098,7 +19141,7 @@ def run_gen_test():
         print("[gen-test] GEN_TEST_POI_GROUP_ONLY: machine runs = all POI machines off together "
               "only (%d one-at-a-time machine(s) left out)" % (len(gens) - len(grp)))
         gens = grp
-    gens = gens + _gt_each_caps()
+    gens = gens + _gt_egf_entries() + _gt_each_caps()
     lines = _gt_each_lines()
     gp = os.path.join(_gt_dir(), "GEN_TEST_GENS_%s.txt" % GEN_TEST_PROJECT)
     with open(gp, "w") as fh:
