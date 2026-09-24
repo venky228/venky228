@@ -259,6 +259,7 @@ GEN_TEST_EXTRA_GENS = [(763676, "1")]        # machines always tested, however f
 GEN_TEST_POI_GROUP = True                    # True = also all machines at the POI off together
 GEN_TEST_POI_GROUP_GENS = []                 # [] = found automatically | [(bus, id), ...]
 GEN_TEST_POI_GROUP_ONLY = False              # True = of the machine runs, ONLY all POI machines off together
+GEN_TEST_REFERENCE_RUNS = True               # False = do not RUN the all-in-service runs (finished ones are still used)
 GEN_TEST_CAPS_OFF = True                     # True = also one run with all caps near the POI off
 GEN_TEST_CAPS_HOPS = 5                       # radius for that run
 GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]        # solver scenario(s) for it
@@ -19140,9 +19141,15 @@ def run_gen_test():
              "state": "DONE earlier" if done else "WAITING", "k": len(runs) + 1}
         runs.append(r)
         return r
-    # 1) every solver scenario, every machine in service
+    # 1) every solver scenario, every machine in service -- the reference each
+    #    element-off run is compared with. GEN_TEST_REFERENCE_RUNS = False runs
+    #    none of them, but those already finished are still read and used.
     for sc in GEN_TEST_SCENARIOS:
-        add(sc, None)
+        if GEN_TEST_REFERENCE_RUNS or _gt_done(_gt_rdir(_gt_tag(sc, None)), faults, None)[0]:
+            add(sc, None)
+        else:
+            print("[gen-test] %s all in service: not run (GEN_TEST_REFERENCE_RUNS = False) -- "
+                  "its element-off runs have nothing to be compared with" % sc[0])
     # 1b) every capacitor bank near the POI off, default solver setting
     caps = _gt_find_caps()
     if caps:
