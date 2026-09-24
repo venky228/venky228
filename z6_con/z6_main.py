@@ -19134,6 +19134,14 @@ def run_gen_test():
     todo = [r for r in runs if not r["note"]]
     print("[gen-test] %d run(s) to simulate, %d already done" % (len(todo), len(runs) - len(todo)))
     npar = max(1, _gt_parallel(len(faults)))
+    # THE REPORTS FROM WHAT IS ALREADY ON DISK, NOW -- not only once the first
+    # run of this launch finishes, which is a quarter of an hour of an empty
+    # folder when the finished runs already answer most of the question
+    try:
+        _gt_write(runs, faults, gens)
+    except Exception as e:
+        print("[gen-test] the reports could not be written yet (%s) -- they are "
+              "written again as each run finishes" % e)
     _stat = _gt_status_start(runs, faults, npar)
     print("[gen-test] live status of every run -> %s" % _stat["path"])
     try:
