@@ -639,9 +639,9 @@ GEN_TEST_DRY_RUN  = False          # True = list the machines and the run plan, 
 GEN_TEST_CASE     = "base"         # "base" | "proj" -- which case the test runs on
 GEN_TEST_PROJECT  = "SantaFe"
 GEN_TEST_MODE     = "spp"
-GEN_TEST_FAULTS   = ["F01-F03"]    # same syntax as ONLY_FAULTS
+GEN_TEST_FAULTS   = ["F01-F04"]    # same syntax as ONLY_FAULTS
 GEN_TEST_POI      = 765911         # the bus the radius is measured from
-GEN_TEST_HOPS     = 5              # machines within this many buses of the POI
+GEN_TEST_HOPS     = 7              # machines within this many buses of the POI
 GEN_TEST_MIN_MW   = 5.0            # skip machines below this |MW| (SVC/STATCOM always kept)
 GEN_TEST_MAX_GENS = 0              # 0 = every machine found | N = the N electrically closest
 GEN_TEST_GENS     = []             # [] = find them automatically | or fixed: [(765912, "1"), (539670, "1")]
@@ -659,7 +659,11 @@ GEN_TEST_SCENARIOS = [
     ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10
     ("s7_delt8_it400_a010",  8,    400,  0.10, None),     # same, 1/8-cycle time step
 ]
-GEN_TEST_GEN_SCENARIOS = "all"     # "all" | ["s0_asis", "s1_delt8"] -- scenarios each machine-off run uses
+GEN_TEST_GEN_SCENARIOS = "all"     # scenarios each machine-off run uses:
+                                   #   "all"   = every scenario
+                                   #   "best2" = s0_asis + the BEST solver scenario (picked automatically
+                                   #             from the all-in-service runs, section B) -- ~4x fewer runs
+                                   #   ["s0_asis", "s1_delt8"] = these
 GEN_TEST_CLEAN_BUILD = True        # True = delete each finished run's own .sav/.cnv/.snp/.cnl (disk space);
                                    # the results folder (.out, reports, logs) is always kept
 GEN_TEST_PARALLEL = "auto"         # runs AT ONCE: "auto" = (cores - CORES_SPARE, max CORES_MAX) // faults
@@ -18090,10 +18094,12 @@ def run_gen_test():
     if bad:
         print("[gen-test] *** scenario tag(s) %s: use letters, digits, _ and keep them unique ***" % bad)
         return 2
-    gsc = GEN_TEST_SCENARIOS if GEN_TEST_GEN_SCENARIOS == "all" else \
-        [sc for sc in GEN_TEST_SCENARIOS if sc[0] in GEN_TEST_GEN_SCENARIOS]
-    miss = [] if GEN_TEST_GEN_SCENARIOS == "all" else \
-        [t for t in GEN_TEST_GEN_SCENARIOS if t not in tags]
+    _gmode = GEN_TEST_GEN_SCENARIOS.strip().lower() if isinstance(GEN_TEST_GEN_SCENARIOS, str) else None
+    if _gmode not in (None, "all", "best2"):
+        print("[gen-test] *** GEN_TEST_GEN_SCENARIOS = %r: use \"best2\", \"all\" or a list ***"
+              % GEN_TEST_GEN_SCENARIOS)
+        return 2
+    miss = [] if _gmode else [t for t in GEN_TEST_GEN_SCENARIOS if t not in tags]
     if miss:
         print("[gen-test] *** GEN_TEST_GEN_SCENARIOS names %s, not in GEN_TEST_SCENARIOS ***" % miss)
         return 2
@@ -18114,17 +18120,54 @@ def run_gen_test():
                 "" if g["z"] is None else "%.4f" % g["z"], " ".join(g["models"])))
     print("[gen-test] %d machine(s) within %s buses of %s -> %s"
           % (len(gens), GEN_TEST_HOPS, GEN_TEST_POI, gp))
-    plan = [(sc, None) for sc in GEN_TEST_SCENARIOS] + [(sc, g) for g in gens for sc in gsc]
-    print("[gen-test] plan: %d run(s) x %d fault(s) (%s) -- %d solver scenario(s), "
-          "%d machine(s) x %d scenario(s)"
-          % (len(plan), len(faults), ", ".join(faults), len(GEN_TEST_SCENARIOS), len(gens), len(gsc)))
     runs = []
-    for sc, g in plan:
-        rdir = _gt_rdir(_gt_tag(sc, g))
+    have = set()
+
+    def add(sc, g):
+        tag = _gt_tag(sc, g)
+        if tag in have:
+            return None
+        have.add(tag)
+        rdir = _gt_rdir(tag)
         done, m = _gt_done(rdir, faults)
-        runs.append({"sc": sc, "gen": g, "rdir": rdir, "m": m if (done or os.path.isdir(rdir)) else None,
-                     "note": "done earlier -- not re-run" if done else "",
-                     "state": "DONE earlier" if done else "WAITING", "k": len(runs) + 1})
+        r = {"sc": sc, "gen": g, "rdir": rdir, "m": m if (done or os.path.isdir(rdir)) else None,
+             "note": "done earlier -- not re-run" if done else "",
+             "state": "DONE earlier" if done else "WAITING", "k": len(runs) + 1}
+        runs.append(r)
+        return r
+    # 1) every solver scenario, every machine in service
+    for sc in GEN_TEST_SCENARIOS:
+        add(sc, None)
+    # 2) machine-off runs. "best2" picks its two scenarios once step 1 is
+    #    scored; until then only machine runs ALREADY FINISHED on disk are
+    #    listed, so nothing an earlier "all" run produced drops out of the report.
+    if _gmode == "best2":
+        for g in gens:
+            for sc in GEN_TEST_SCENARIOS:
+                if _gt_done(_gt_rdir(_gt_tag(sc, g)), faults)[0]:
+                    add(sc, g)
+    else:
+        gsc = GEN_TEST_SCENARIOS if _gmode == "all" else \
+            [sc for sc in GEN_TEST_SCENARIOS if sc[0] in GEN_TEST_GEN_SCENARIOS]
+        for g in gens:
+            for sc in gsc:
+                add(sc, g)
+
+    def add_best2():
+        """s0 (as-is) + the best solver scenario of step 1, for every machine."""
+        pick = _gt_best2(runs, faults)
+        print("[gen-test] best2: machine-off runs use %s  (best solver of the %d all-in-service "
+              "runs; set GEN_TEST_GEN_SCENARIOS = \"all\" for every scenario)"
+              % (" + ".join(sc[0] for sc in pick), len(GEN_TEST_SCENARIOS)))
+        return [r for r in (add(sc, g) for g in gens for sc in pick) if r and not r["note"]]
+
+    base_ready = all(r["note"] for r in runs if not r["gen"])
+    if _gmode == "best2" and base_ready:
+        add_best2()
+    print("[gen-test] plan: %d run(s) x %d fault(s) (%s) -- %d solver scenario(s), %d machine(s)%s"
+          % (len(runs), len(faults), ", ".join(faults), len(GEN_TEST_SCENARIOS), len(gens),
+             ("  [best2: machine runs are added once the %d solver runs finish]"
+              % len(GEN_TEST_SCENARIOS)) if (_gmode == "best2" and not base_ready) else ""))
     if GEN_TEST_DRY_RUN:
         for i, r in enumerate(runs, 1):
             g = r["gen"]
@@ -18136,17 +18179,49 @@ def run_gen_test():
         return 0
     todo = [r for r in runs if not r["note"]]
     print("[gen-test] %d run(s) to simulate, %d already done" % (len(todo), len(runs) - len(todo)))
-    npar = min(_gt_parallel(len(faults)), max(1, len(todo)))
+    npar = max(1, _gt_parallel(len(faults)))
     _stat = _gt_status_start(runs, faults, npar)
     print("[gen-test] live status of every run -> %s" % _stat["path"])
+    try:
+        _gt_execute(todo, runs, faults, gens, npar)
+        if _gmode == "best2" and not base_ready:
+            more = add_best2()
+            print("[gen-test] %d machine-off run(s) added" % len(more))
+            _gt_execute(more, runs, faults, gens, npar)
+    finally:
+        _gt_status_stop(_stat)
+    _gt_write(runs, faults, gens)
+    print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, COMPARE_DIR))
+    return 0
+
+
+def _gt_best2(runs, faults):
+    """GEN_TEST_SCENARIOS[0] + the best-ranked all-in-service scenario."""
+    first = GEN_TEST_SCENARIOS[0]
+    sc_all = []
+    for r in runs:
+        if r["gen"]:
+            continue
+        x = _gt_score(r.get("m"), faults)
+        if x:
+            sc_all.append((_gt_key(x), GEN_TEST_SCENARIOS.index(r["sc"]), r["sc"]))
+    sc_all.sort(key=lambda t: (t[0], t[1]))
+    pick = [first]
+    for _k, _i, sc in sc_all:
+        if sc[0] != first[0]:
+            pick.append(sc)
+            break
+    return pick
+
+
+def _gt_execute(todo, runs, faults, gens, npar):
+    """Run todo: several at once (npar > 1) or one after another."""
+    if not todo:
+        return
+    npar = min(npar, len(todo))
     if npar > 1:
-        try:
-            _gt_run_parallel(todo, runs, faults, gens, npar)
-        finally:
-            _gt_status_stop(_stat)
-        _gt_write(runs, faults, gens)
-        print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, COMPARE_DIR))
-        return 0
+        _gt_run_parallel(todo, runs, faults, gens, npar)
+        return
     for k, r in enumerate(todo, 1):
         sc, g = r["sc"], r["gen"]
         tag = _gt_tag(sc, g)
@@ -18160,19 +18235,10 @@ def run_gen_test():
                            extra_env=_gt_env(sc, g, faults))
         except Exception as e:
             rc = "raised %s" % e
-        done, r["m"] = _gt_done(r["rdir"], faults)
+        r["faults"] = faults
+        done = _gt_finish(r, rc, t0)
         r["state"], r["t1"] = ("DONE" if done else "INCOMPLETE"), time.time()
-        r["note"] = ("%.0f min" % ((time.time() - t0) / 60.0)) + ("" if done else "  INCOMPLETE rc=%s" % rc)
-        if done:
-            _gt_clean_build(tag)
-        else:
-            print("[gen-test] *** %s did not score every fault (rc=%s) -- see %s\\logs ***"
-                  % (tag, rc, r["rdir"]))
         _gt_write(runs, faults, gens)
-    _gt_status_stop(_stat)
-    _gt_write(runs, faults, gens)
-    print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, COMPARE_DIR))
-    return 0
 
 
 def main():
