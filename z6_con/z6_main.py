@@ -281,17 +281,15 @@ GEN_TEST_BY_PROJECT = {
         "POI": 761383,
         "EXTRA_GENS": [],
         "EGF_EDITS": {                               # deck REGCA1: Volim 1.2 / Khv 0.2 / Accel 0.7
-            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7})],   # base of the rest
+            # only values OTHER than the deck's -- Accel stays the deck 0.7 unless named
+            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0})],                 # base of the rest
             "V110_K2_A05":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],
             "V110_K2_A10":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
-            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],
+            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Iolim": -1.5})],
             # needs REECA1 at the feeders -- a model not there stops only that run (listed in its log)
-            "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECA1", {"Kqv": 0.0})],
-            "V110_K2_KQV2": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECA1", {"Kqv": 2.0})],
-            "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECA1", {"Kqv": 4.0})],
+            "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0}), ("REECA1", {"Kqv": 0.0})],
+            "V110_K2_KQV2": [("REGCA1", {"Volim": 1.10, "Khv": 2.0}), ("REECA1", {"Kqv": 2.0})],
+            "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0}), ("REECA1", {"Kqv": 4.0})],
         },
     },
 }
