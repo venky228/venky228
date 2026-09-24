@@ -19064,7 +19064,12 @@ def run_gen_test():
     if bad:
         print("[gen-test] *** scenario tag(s) %s: use letters, digits, _ and keep them unique ***" % bad)
         return 2
-    _gmode = GEN_TEST_GEN_SCENARIOS.strip().lower() if isinstance(GEN_TEST_GEN_SCENARIOS, str) else None
+    _gspec = GEN_TEST_GEN_SCENARIOS
+    # ["all"] / ["best2"] mean the same as the bare words
+    if (isinstance(_gspec, (list, tuple)) and len(_gspec) == 1
+            and str(_gspec[0]).strip().lower() in ("all", "best2")):
+        _gspec = str(_gspec[0])
+    _gmode = _gspec.strip().lower() if isinstance(_gspec, str) else None
     if _gmode not in (None, "all", "best2"):
         print("[gen-test] *** GEN_TEST_GEN_SCENARIOS = %r: use \"best2\", \"all\" or a list ***"
               % GEN_TEST_GEN_SCENARIOS)
