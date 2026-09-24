@@ -11811,46 +11811,81 @@ def _brn_status(a, b, ck, c=0):
     return None
 
 
+def _api_intgar(f2, stat0=None):
+    """(length of INTGAR, 0-based STATUS position) for a psspy *_chng call, read
+       from its help text ("INTGAR(n) ... STAT") and default arguments. stat0 is
+       used when the text does not say. (n, None) = not found."""
+    import re as _re
+    doc = getattr(f2, "__doc__", None) or ""
+    n = 0
+    m = _re.search(r"INTGAR\s+(?:is\s+)?(?:an\s+)?array\s+of\s+(\d+)", doc, _re.I)
+    if m:
+        n = int(m.group(1))
+    idx = [int(x) for x in _re.findall(r"INTGAR\s*\(\s*(\d+)\s*\)", doc, _re.I)]
+    n = max([n] + idx)
+    try:
+        import inspect as _ins
+        d = _ins.signature(f2).parameters["intgar"].default
+        if isinstance(d, (list, tuple)) and len(d) > n:
+            n = len(d)
+    except Exception:
+        pass
+    stat = None
+    for m in _re.finditer(r"INTGAR\s*\(\s*(\d+)\s*\)\s*[=:]?\s*([^\n]*)", doc, _re.I):
+        t = m.group(2).strip().upper()
+        if t.startswith("STAT") or "STATUS" in t[:40]:
+            stat = int(m.group(1)) - 1
+            break
+    if stat is None:
+        stat = stat0
+    if not n:
+        n = {None: 0}.get(stat, (stat or 0) + 1)
+    return n, stat
+
+
 def _switch_branches_off():
     """Every BRANCHES_OFF entry opened with the load-flow calls (a line with
        branch_chng_3, a transformer with two_winding_chng_6), then its STATUS
        read back. Any that stays in service stops the run."""
     done, left = 0, []
     for a, b, ck, c in BRANCHES_OFF:
-        tries = ((("three_wnd_imped_chng_4", lambda f2: f2(a, b, c, ck, [0] + [_i] * 11, [_f] * 30,
-                                                           [_f] * 3, "")),
-                  ("three_wnd_imped_chng_3", lambda f2: f2(a, b, c, ck, [0] + [_i] * 11, [_f] * 28,
-                                                           [_f] * 3, ""))) if c else
-                 (("branch_chng_3", lambda f2: f2(a, b, ck, [0, _i, _i, _i, _i, _i],
-                                                 [_f] * 12, [_f] * 12, "")),
-                 ("branch_chng", lambda f2: f2(a, b, ck, [0, _i, _i, _i, _i, _i], [_f] * 12)),
-                 ("two_winding_chng_6", lambda f2: f2(a, b, ck, [0] + [_i] * 15, [_f] * 26,
-                                                      [_f] * 3, "", "")),
-                 ("two_winding_chng_5", lambda f2: f2(a, b, ck, [0] + [_i] * 15, [_f] * 24,
-                                                      [_f] * 3, "", ""))))
+        tries = ((("three_wnd_imped_chng_4", None), ("three_wnd_imped_chng_3", None)) if c else
+                 (("branch_chng_3", 0), ("branch_chng", 0),
+                  ("two_winding_chng_6", 0), ("two_winding_chng_5", 0)))
         ok, why = False, "no branch API in this build"
-        for nm, call in tries:
+        for nm, stat0 in tries:
             f2 = getattr(psspy, nm, None)
             if f2 is None:
                 continue
+            n_i, stat = _api_intgar(f2, stat0)
+            if stat is None or stat >= n_i:
+                why = "%s: STATUS position in INTGAR not found in its help text" % nm
+                continue
+            ia = [_i] * n_i
+            ia[stat] = 0
             try:
-                ie = call(f2)
+                # ONLY INTGAR: the other arrays keep psspy's own 'unchanged' defaults,
+                # whatever their length in this build
+                try:
+                    ie = f2(a, b, c, ck, intgar=ia) if c else f2(a, b, ck, intgar=ia)
+                except TypeError:
+                    ie = f2(a, b, c, ck, ia) if c else f2(a, b, ck, ia)
                 ie = ie[0] if isinstance(ie, (list, tuple)) else ie
             except Exception as e:
                 why = "%s: %s" % (nm, e)
                 continue
-            if ie in (0, None):
-                ok, why = True, nm
-                break
-            why = "%s ierr=%s" % (nm, ie)
-        if ok:
+            if ie not in (0, None):
+                why = "%s ierr=%s" % (nm, ie)
+                continue
+            # READ BACK: a call that answered 0 but changed nothing tries the next API
+            why = "%s (INTGAR %d of %d)" % (nm, stat + 1, n_i)
             st = _brn_status(a, b, ck, c)
-            if st is None:
-                why += ", status not read back"
-            elif st != 0:
-                ok, why = False, why + " answered 0 but STATUS is still %d" % st
-            else:
-                why += ", STATUS read back 0"
+            if st is not None and st != 0:
+                why += " answered 0 but STATUS is still %d" % st
+                continue
+            ok = True
+            why += ", status not read back" if st is None else ", STATUS read back 0"
+            break
         print("  [line-off]   %s: %s" % (_brn_txt(a, b, ck, c), why))
         if ok:
             done += 1
