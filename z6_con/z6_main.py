@@ -18537,13 +18537,13 @@ def _gt_best(runs, faults, ref):
 
     def lab(r):
         g = r["gen"]
-        return _gt_label(g)[:34]
+        return _gt_label(g)[:50]
 
     def row(i, x, r):
-        return "  %3s  %-22s %-34s %3d/%-3d %8d%s %6d %7s" % (
+        return "  %3s  %-22s %-50s %3d/%-3d %8d%s %6d %7s" % (
             i, r["sc"][0], lab(r), x[0], x[5], x[1], "" if x[4] else "?", x[2],
             "%.3f" % x[3] if x[3] else "-")
-    hdr = "  %3s  %-22s %-34s %7s %9s %6s %7s" % ("#", "scenario", "machine", "PASS", "nc", ">1.2", "max pu")
+    hdr = "  %3s  %-22s %-50s %7s %9s %6s %7s" % ("#", "scenario", "machine", "PASS", "nc", ">1.2", "max pu")
     sc_all.sort(key=lambda t: _gt_key(t[0]))
     L += ["", "A. OVERALL RANKING (top 15 of %d finished runs)" % len(sc_all), hdr]
     for i, (x, r) in enumerate(sc_all[:15], 1):
@@ -18588,7 +18588,7 @@ def _gt_best(runs, faults, ref):
         for x, r in sorted(part, key=lambda t: _gt_key(t[0])):
             nov = [f for f in faults if (r.get("m") or {}).get(f, {}).get("verdict") not in
                    ("PASS", "FAIL", "SKIP")]
-            L.append("     %-22s %-34s scored %d/%d%s" % (
+            L.append("     %-22s %-50s scored %d/%d%s" % (
                 r["sc"][0], lab(r), x[5], nf,
                 ("   NO VERDICT: " + ", ".join(nov)) if nov else "   (line run: rest left out)"))
     L += ["", "C. EACH MACHINE / CAP OFF OR LINE / TRANSFORMER OPENED (id BR<to>[T<3rd>]C<ckt>), over every scenario it ran in "
@@ -18713,14 +18713,14 @@ def _gt_impact(runs, faults, proj):
                  % (f, sc, sr[0]["v_b"], sr[0]["over_b"], "%.3f" % sr[0]["pk_b"] if sr[0]["pk_b"] else "-",
                     "-" if sr[0]["nc_b"] is None else sr[0]["nc_b"]))
         for x in con[:6]:
-            L.append("      contributes : %-44s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s"
-                     % (_gt_label(x["g"])[:44], x["over_b"], x["over_o"],
+            L.append("      contributes : %-50s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s"
+                     % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
                         "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-",
                         "-" if x["nc_b"] is None else x["nc_b"], "-" if x["nc_o"] is None else x["nc_o"],
                         x["v_b"], x["v_o"]))
         for x in hol[:3]:
-            L.append("      holds down  : %-44s buses %d -> %d, peak %s -> %s"
-                     % (_gt_label(x["g"])[:44], x["over_b"], x["over_o"],
+            L.append("      holds down  : %-50s buses %d -> %d, peak %s -> %s"
+                     % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
                         "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-"))
         if not con and not hol:
             L.append("      no single element changes this fault")
@@ -18737,11 +18737,11 @@ def _gt_impact(runs, faults, proj):
             L += ["", "  scenario %s -- everything in service: %s, %d bus(es) > 1.2 pu, peak %s, nc %s"
                   % (sc, b0["v_b"], b0["over_b"], "%.3f" % b0["pk_b"] if b0["pk_b"] else "-",
                      "-" if b0["nc_b"] is None else b0["nc_b"]),
-                  "  %-3s %-12s %-46s %-14s %-12s %-15s %-11s %s"
+                  "  %-3s %-12s %-50s %-14s %-12s %-15s %-11s %s"
                   % ("#", "impact", "element taken out", "kind", "buses>1.2", "peak pu", "nc", "verdict")]
             for i, x in enumerate(sr, 1):
-                L.append("  %-3d %-12s %-46s %-14s %-12s %-15s %-11s %s" % (
-                    i, x["eff"], _gt_label(x["g"])[:46], (x["g"].get("kind") or "")[:14],
+                L.append("  %-3d %-12s %-50s %-14s %-12s %-15s %-11s %s" % (
+                    i, x["eff"], _gt_label(x["g"])[:50], (x["g"].get("kind") or "")[:14],
                     "%d -> %d" % (x["over_b"], x["over_o"]),
                     "%s -> %s" % ("%.3f" % x["pk_b"] if x["pk_b"] else "-",
                                   "%.3f" % x["pk_o"] if x["pk_o"] else "-"),
@@ -18758,7 +18758,7 @@ def _gt_impact(runs, faults, proj):
         for bus, pk in sorted(bb.items(), key=lambda t: -t[1]):
             best = sorted(sr, key=lambda x: x["bo"].get(bus, 0.0))[:3]
             L.append("  %-28s %.3f pu  -> %s" % (bus[:28], pk, "  |  ".join(
-                "%s: %s" % (_gt_label(x["g"])[4:40].strip(),
+                "%s: %s" % (_gt_label(x["g"])[4:].strip(),
                             ("%.3f" % x["bo"][bus]) if bus in x["bo"] else "below 1.2")
                 for x in best)))
         L.append("")
@@ -18813,12 +18813,12 @@ def _gt_write(runs, faults, gens):
             fh.write("\n".join(L[:3] + _best) + "\n")
     except Exception as e:
         print("[gen-test] GEN_TEST_BEST not written (%s)" % e)
-    L += ["", "%-22s %-40s " % ("scenario", "machine OFF / line OPEN") +
+    L += ["", "%-22s %-50s " % ("scenario", "machine OFF / line OPEN") +
           " | ".join("%-26s" % f for f in faults), "-" * 150]
     for r in runs:
         g = r["gen"]
-        gl = _gt_label(g)[:40] if g else "(none -- all in service)"
-        L.append("%-22s %-40s " % (r["sc"][0], gl) +
+        gl = _gt_label(g)[:50] if g else "(none -- all in service)"
+        L.append("%-22s %-50s " % (r["sc"][0], gl) +
                  " | ".join(cell((r.get("m") or {}).get(f)) for f in faults) +
                  ("   " + r["note"] if r.get("note") else ""))
     # runs that could not take their element out: nothing was simulated
@@ -18828,7 +18828,7 @@ def _gt_write(runs, faults, gens):
             continue
         why = r.get("noswitch") or _gt_switch_failure(r)
         if why:
-            ns.append("  %-22s %-44s %s" % (r["sc"][0], _gt_label(r["gen"])[:44], why))
+            ns.append("  %-22s %-50s %s" % (r["sc"][0], _gt_label(r["gen"])[:50], why))
     _nh = ["NOT RUN -- a setting of the run could not be applied, so it was stopped before simulating",
            "(machine / cap bank / line not taken out, POI power not met, solver values refused)",
            "%d run(s)" % len(ns)]
@@ -18865,8 +18865,8 @@ def _gt_write(runs, faults, gens):
     else:
         L.append("  (nothing to compare yet)")
     for dnc, dov, sc, g, fixed, nfs in eff[:40]:
-        L.append("  %-22s %7d %9d %6s  %-44s %s%s" % (
-            sc, dnc, dov, "%d/%d" % (nfs, len(faults)), _gt_label(g)[:44], g["kind"],
+        L.append("  %-22s %7d %9d %6s  %-50s %s%s" % (
+            sc, dnc, dov, "%d/%d" % (nfs, len(faults)), _gt_label(g)[:50], g["kind"],
             ("  FIXES " + ",".join(fixed)) if fixed else ""))
     with open(txt, "w") as fh:
         fh.write("\n".join(L) + "\n")
@@ -19004,7 +19004,7 @@ def _gt_status_write(runs, faults, npar, t_start):
             (n_wait + n_run) * avg / max(1, npar) / 3600.0, avg / 60.0, npar)
 
     def mach(g):
-        return _gt_label(g)[:34]
+        return _gt_label(g)[:50]
 
     def outs(r):
         # THIS RUN'S FAULTS ONLY: the build's FLAT.out sits in the same folder
@@ -19029,7 +19029,7 @@ def _gt_status_write(runs, faults, npar, t_start):
          "=" * 150, "", "RUNNING NOW"]
     live = [r for r in runs if r.get("state") == "RUNNING"]
     for r in live:
-        L.append("  #%-4d %-22s %-34s %5.0f min  outs %d/%d  %s"
+        L.append("  #%-4d %-22s %-50s %5.0f min  outs %d/%d  %s"
                  % (r["k"], r["sc"][0], mach(r["gen"]), (now - r["t0"]) / 60.0, outs(r),
                     len(_gt_run_faults(r["gen"], faults)),
                     r["rdir"]))
@@ -19038,13 +19038,13 @@ def _gt_status_write(runs, faults, npar, t_start):
     if not live:
         L.append("  (nothing)")
     L += ["", "ALL RUNS (plan order)",
-          "  %-5s %-22s %-34s %-12s %8s  %s" % ("#", "scenario", "machine", "state", "min", "result")]
+          "  %-5s %-22s %-50s %-12s %8s  %s" % ("#", "scenario", "machine", "state", "min", "result")]
     for r in runs:
         s_ = r.get("state") or "WAITING"
         mins = ""
         if r.get("t0"):
             mins = "%.0f" % (((r.get("t1") or now) - r["t0"]) / 60.0)
-        L.append("  %-5d %-22s %-34s %-12s %8s  %s"
+        L.append("  %-5d %-22s %-50s %-12s %8s  %s"
                  % (r["k"], r["sc"][0], mach(r["gen"]), s_, mins, res(r) or r.get("noswitch") or ""))
     p = os.path.join(_gt_dir(), "GEN_TEST_STATUS_%s.txt" % GEN_TEST_PROJECT)
     tmp = p + ".tmp"
