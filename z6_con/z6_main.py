@@ -282,7 +282,7 @@ GEN_TEST_BY_PROJECT = {
 # -- 3c. machine runs (each one, and each EGF_EDITS run, is done in every GEN_TEST_GEN_SCENARIOS)
 GEN_TEST_REFERENCE_RUNS = True               # all in service (needed to compare; finished ones are reused)
 GEN_TEST_EACH_GEN = True                      # each machine within GEN_TEST_HOPS off on its own
-GEN_TEST_EXCLUDE_POI_GENS = False            # True = POI plants left out of the one-at-a-time runs and the HOPS group
+GEN_TEST_EXCLUDE_POI_GENS = True             # True = POI plants left out of the one-at-a-time runs and the HOPS group
 GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = True                   # all machines within GEN_TEST_HOPS off together
 GEN_TEST_POI_OFF_BASE = True                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
