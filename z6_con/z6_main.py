@@ -244,13 +244,15 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 # GEN_TEST = True runs ONLY this test (normal study skipped).
 # Results: comparison_scenarios\<project>\BASE_CASE\gen_test\  (all projects: comparison_scenarios\GEN_TEST_ALL_PROJECTS.txt)
 # Preview the plan without simulating:  python z6_gt_report.py
+# -- 3a. on / off, projects, faults
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
+GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
 GEN_TEST_PROJECTS = []                       # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
 GEN_TEST_PROJECT = "SantaFe"                 # the one project run when GEN_TEST_PROJECTS = []
 GEN_TEST_CASE = "base"                       # "base" | "proj"
 GEN_TEST_FAULTS = ["F01-F04"]                # same syntax as ONLY_FAULTS
-# per project: POI bus, machines always tested however far (EXTRA_GENS), and the
+# -- 3b. per project: POI bus, machines always tested however far (EXTRA_GENS), and the
 # .dyr changes tried on the EXISTING gens at its feeders, BESS untouched (EGF_EDITS,
 # {} = none; each entry = one run). REGCA1 Khv only acts above Volim -- change both.
 # Any other GEN_TEST_ setting may be given here too, without the GEN_TEST_ prefix.
@@ -261,27 +263,27 @@ GEN_TEST_BY_PROJECT = {
     "EastFork":      {"POI": 531623, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCAU1 already Volim 1.2 / Khv 0.2 / Accel 0.7
     "EmpirePrairie": {"POI": 761383, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCA1 already Volim 1.2 / Khv 0.2 / Accel 0.7
 }
-# which runs (each machine / group / EGF_EDITS run is done in every GEN_TEST_GEN_SCENARIOS)
+# -- 3c. machine runs (each one, and each EGF_EDITS run, is done in every GEN_TEST_GEN_SCENARIOS)
 GEN_TEST_REFERENCE_RUNS = True               # all in service (needed to compare; finished ones are reused)
 GEN_TEST_EACH_GEN = True                     # each machine within GEN_TEST_HOPS off on its own
 GEN_TEST_EXCLUDE_POI_GENS = False            # True = POI plants left out of the one-at-a-time runs and the HOPS group
 GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = False                  # all machines within GEN_TEST_HOPS off together
-GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together (s0_asis)
-GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own (s0_asis)
-GEN_TEST_LINES_EACH = True                   # each nearby line / transformer opened on its own (s0_asis)
 GEN_TEST_HOPS = 5                            # "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
 GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus, id)]
-# solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
+# -- 3d. cap and line runs (solver scenario s0_asis only)
+GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together
+GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own
+GEN_TEST_LINES_EACH = True                   # each nearby line / transformer opened on its own
+# -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
     ("s3_it400_a020",        None, 400,  0.20, None),     # reference: finished with everything in service and the POI plants off
     ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10 -- fewest non-converged steps
     ("s8_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
-GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s6_it400_a010", "s8_it100_a080"]  # "all" | "best2" | [...] -- scenarios for the runs above
-GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
+GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s6_it400_a010", "s8_it100_a080"]  # "all" | "best2" | [...] -- for the 3c runs
 # rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
