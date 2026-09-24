@@ -261,7 +261,7 @@ GEN_TEST_CAPS_OFF = True                     # True = also one run with all caps
 GEN_TEST_CAPS_HOPS = 5                       # radius for that run
 GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]        # solver scenario(s) for it
 GEN_TEST_CAPS_LIST = []                      # [] = auto | [(763674, "1", "F"), (539715, "", "S")]
-GEN_TEST_CAPS_EACH = True                    # True = also each cap bank off on its own
+GEN_TEST_CAPS_EACH = False                   # True = also each cap bank off on its own
 GEN_TEST_CAPS_EACH_HOPS = None               # None = GEN_TEST_HOPS
 GEN_TEST_LINES_EACH = True                   # True = also each nearby line opened on its own (radial skipped)
 GEN_TEST_LINES_HOPS = 2                      # both ends within this many buses of the POI
@@ -280,8 +280,9 @@ GEN_TEST_SCENARIOS = [
     ("s5_delt8_it400_a020",  8,    400,  0.20, None),     # all together
     ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10
     ("s7_delt8_it400_a010",  8,    400,  0.10, None),     # same, 1/8-cycle time step
+    ("s8_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
-GEN_TEST_GEN_SCENARIOS = "all"               # "all" | "best2" (s0 + best solver) | ["s0_asis", ...]
+GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s6_it400_a010", "s8_it100_a080"]  # "all" | "best2" | [...] -- machine-off runs
 GEN_TEST_CLEAN_BUILD = True                  # True = delete each finished run's .sav/.cnv/.snp (disk)
 GEN_TEST_START_GAP_MIN = 20                  # max minutes between run starts
 
