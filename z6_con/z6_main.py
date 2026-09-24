@@ -244,6 +244,7 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 # GEN_TEST = True runs ONLY this test (normal study skipped). Results: comparison_scenarios\<project>\BASE_CASE\gen_test\GEN_TEST_*.txt
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
+GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
 GEN_TEST_CASE = "base"                       # "base" | "proj" -- case the test runs on
 GEN_TEST_PROJECT = "SantaFe"
 GEN_TEST_MODE = "spp"
@@ -19210,7 +19211,7 @@ def run_gen_test():
         print("[gen-test]     e.g. %s" % _had[0]["rdir"])
         print("[gen-test]     Nothing was started. Check GEN_TEST_FAULTS / ONLY_FAULTS against those")
         print("[gen-test]     reports; to re-run everything anyway set GEN_TEST_FORCE_RERUN = True.")
-        if not globals().get("GEN_TEST_FORCE_RERUN"):
+        if not GEN_TEST_FORCE_RERUN:
             return 2
     npar = max(1, _gt_parallel(len(faults)))
     # THE REPORTS FROM WHAT IS ALREADY ON DISK, NOW -- not only once the first
