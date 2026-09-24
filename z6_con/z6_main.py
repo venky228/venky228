@@ -247,6 +247,16 @@ GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate no
 GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
 GEN_TEST_CASE = "base"                       # "base" | "proj" -- case the test runs on
 GEN_TEST_PROJECT = "SantaFe"
+GEN_TEST_PROJECTS = []                       # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"] one after another
+# per project: any GEN_TEST_<NAME> setting, written without the GEN_TEST_ prefix. A
+# project not listed, or a name it does not give, uses the value set above.
+GEN_TEST_BY_PROJECT = {
+    "SantaFe":       {"POI": 765911, "EXTRA_GENS": [(763676, "1")],
+                      "EGF_EDITS": {"KHV": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}},
+    "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
+    "EastFork":      {"POI": 531623, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCAU1 already Volim 1.2 / Khv 0.2 / Accel 0.7
+    "EmpirePrairie": {"POI": 761383, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCA1 already Volim 1.2 / Khv 0.2 / Accel 0.7
+}
 GEN_TEST_MODE = "spp"
 GEN_TEST_FAULTS = ["F01-F04"]                # same syntax as ONLY_FAULTS
 GEN_TEST_POI = 765911                        # bus the radius is measured from
@@ -19100,6 +19110,137 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
         time.sleep(5)
 
 
+_GT_LAST = {}          # project -> (runs, faults) of its last gen test
+
+
+def _gt_write_all(projs):
+    """comparison_scenarios\GEN_TEST_ALL_PROJECTS.txt/.csv -- every project, every
+       element run against the all-in-service run of the same scenario, on the
+       faults BOTH scored, and the best option per project."""
+    L = ["GEN TEST -- ALL PROJECTS  (%s)" % time.strftime("%Y-%m-%d %H:%M"),
+         "each element run vs everything in service, same solver scenario, on the faults both runs",
+         "scored. >1.2 = buses above 1.2 pu (summed over those faults), peak = highest pu.",
+         "BEST = most buses above 1.2 pu cleared, then the biggest peak drop; a result resting on",
+         "fewer faults than the test ran says so.", ""]
+    rows_csv = []
+    best_all = []
+    for pj in projs:
+        if pj not in _GT_LAST:
+            L += ["=" * 130, "%s -- not run in this launch" % pj, ""]
+            continue
+        runs, faults = _GT_LAST[pj]
+        ref = dict((r["sc"][0], r) for r in runs if not r["gen"] and r.get("m"))
+        L += ["=" * 130, "%s  (faults %s)" % (pj, ", ".join(faults)), "=" * 130,
+              "  %-18s %-52s %6s %13s %15s %12s %9s" % (
+                  "scenario", "element run", "faults", ">1.2 in->out", "peak in->out",
+                  "nc in->out", "PASS"), "  " + "-" * 128]
+        cand = []
+        for r in runs:
+            g, m = r["gen"], r.get("m")
+            b = ref.get(r["sc"][0])
+            if not g or not m or not b:
+                continue
+            fs = [f for f in _gt_scored(m, faults) if f in _gt_scored(b["m"], faults)]
+            if not fs:
+                continue
+            x, bx = _gt_score(m, fs), _gt_score(b["m"], fs)
+            lab = _gt_label(g)
+            L.append("  %-18s %-52s %6s %6d->%-6d %7.3f->%-7.3f %5d->%-6d %4d->%-4d" % (
+                r["sc"][0], lab[:52], "%d/%d" % (len(fs), len(faults)), bx[2], x[2],
+                bx[3] or 0.0, x[3] or 0.0, bx[1], x[1], bx[0], x[0]))
+            rows_csv.append([pj, r["sc"][0], lab, len(fs), len(faults), bx[2], x[2],
+                             "%.3f" % (bx[3] or 0.0), "%.3f" % (x[3] or 0.0), bx[1], x[1],
+                             bx[0], x[0]])
+            cand.append((x[0] - bx[0], bx[2] - x[2], (bx[3] or 0.0) - (x[3] or 0.0),
+                         len(fs) == len(faults), r["sc"][0], lab, x, bx, fs))
+        if not cand:
+            L += ["  (no element run and its reference both finished yet)", ""]
+            continue
+        # full-fault results first: a run that only scored F04 cannot be 'best'
+        cand.sort(key=lambda c: (not c[3], -c[0], -c[1], -c[2]))
+        c = cand[0]
+        L += ["", "  BEST for %s: %s in %s -- %d -> %d bus(es) above 1.2 pu, peak %.3f -> %.3f pu%s"
+              % (pj, c[5], c[4], c[7][2], c[6][2], c[7][3] or 0.0, c[6][3] or 0.0,
+                 "" if c[3] else "  (on %s ONLY)" % ",".join(c[8]))]
+        if c[6][2] == 0:
+            L.append("    -> clears every bus above 1.2 pu on those faults")
+        elif c[1] <= 0 and c[2] <= 0:
+            L.append("    -> nothing tried lowers the spikes for this project")
+        else:
+            L.append("    -> %d bus(es) still above 1.2 pu: this helps but does not solve it alone"
+                     % c[6][2])
+        L.append("")
+        best_all.append((pj, c))
+    if best_all:
+        L += ["=" * 130, "SUGGESTED, per project:"]
+        for pj, c in best_all:
+            L.append("  %-14s %s (%s): >1.2 %d -> %d, peak %.3f -> %.3f%s" % (
+                pj, c[5], c[4], c[7][2], c[6][2], c[7][3] or 0.0, c[6][3] or 0.0,
+                "" if c[3] else "  [%s only]" % ",".join(c[8])))
+    d = SCEN_DIR
+    try:
+        os.makedirs(d)
+    except Exception:
+        pass
+    p = os.path.join(d, "GEN_TEST_ALL_PROJECTS.txt")
+    with open(p, "w") as fh:
+        fh.write("\n".join(L) + "\n")
+    with csv_open(os.path.join(d, "GEN_TEST_ALL_PROJECTS.csv"), "w") as fh:
+        w = csv.writer(fh)
+        w.writerow(["project", "scenario", "element run", "faults compared", "faults in test",
+                    "buses>1.2 in service", "buses>1.2 element run", "peak in service",
+                    "peak element run", "nc in service", "nc element run", "PASS in service",
+                    "PASS element run"])
+        w.writerows(rows_csv)
+    print("[gen-test] all projects side by side, and the best option each -> %s" % p)
+
+
+def run_gen_tests():
+    """GEN_TEST_PROJECTS: the gen test once per project, one after another, each
+       with its GEN_TEST_BY_PROJECT values. [] = GEN_TEST_PROJECT alone."""
+    projs = [str(p).strip() for p in (GEN_TEST_PROJECTS or []) if str(p).strip()]
+    if not projs:
+        projs = [GEN_TEST_PROJECT]
+    g = globals()
+    names = set()
+    for pj in projs:
+        for k in ((GEN_TEST_BY_PROJECT or {}).get(pj) or {}):
+            nm = "GEN_TEST_" + str(k).strip().upper()
+            if nm not in g:
+                print("[gen-test] *** GEN_TEST_BY_PROJECT[%r]: %r is not a GEN_TEST_ setting ***"
+                      % (pj, k))
+                return 2
+            names.add(nm)
+    saved = dict((nm, g[nm]) for nm in names | set(["GEN_TEST_PROJECT"]))
+    rcs = []
+    try:
+        for i, pj in enumerate(projs, 1):
+            for nm, v in saved.items():            # start every project from the panel values
+                g[nm] = v
+            g["GEN_TEST_PROJECT"] = pj
+            for k, v in ((GEN_TEST_BY_PROJECT or {}).get(pj) or {}).items():
+                g["GEN_TEST_" + str(k).strip().upper()] = v
+            # per-project reads: the fault list and, if the cases differ, the network
+            _GT_FBUS.clear()
+            _GT_NET[0], _GT_NET[1] = None, False
+            if len(projs) > 1:
+                _banner("GEN TEST %d/%d -- %s (POI %s)" % (i, len(projs), pj, GEN_TEST_POI))
+            rc = run_gen_test()
+            rcs.append((pj, rc))
+            if rc not in (0, None):
+                print("[gen-test] %s ended with code %s -- going on with the next project" % (pj, rc))
+    finally:
+        for nm, v in saved.items():
+            g[nm] = v
+    if len(projs) > 1:
+        print("[gen-test] projects: %s" % ", ".join("%s rc %s" % x for x in rcs))
+    try:
+        _gt_write_all(projs)
+    except Exception as e:
+        print("[gen-test] the all-projects summary could not be written (%s)" % e)
+    return 0 if all(rc in (0, None) for _p, rc in rcs) else 2
+
+
 def run_gen_test():
     _banner("GEN-OFF / SOLVER TEST -- %s (%s case)" % (GEN_TEST_PROJECT, GEN_TEST_CASE))
     faults = _gt_expand(GEN_TEST_FAULTS)
@@ -19187,10 +19328,21 @@ def run_gen_test():
     # 1) every solver scenario, every machine in service -- the reference each
     #    element-off run is compared with. GEN_TEST_REFERENCE_RUNS = False runs
     #    none of them, but those already finished are still read and used.
+    # With a LIST of machine-run scenarios, only the scenarios some element run
+    # uses need a reference: the others would be runs compared with nothing.
+    if _gmode is None:
+        _need = set(GEN_TEST_GEN_SCENARIOS)
+        if GEN_TEST_CAPS_OFF or GEN_TEST_CAPS_EACH:
+            _need |= set(GEN_TEST_CAPS_SCENARIOS)
+        if lines:
+            _need |= set(GEN_TEST_LINES_SCENARIOS)
+    else:
+        _need = set(sc[0] for sc in GEN_TEST_SCENARIOS)
     for sc in GEN_TEST_SCENARIOS:
-        if GEN_TEST_REFERENCE_RUNS or _gt_done(_gt_rdir(_gt_tag(sc, None)), faults, None)[0]:
+        _fin = _gt_done(_gt_rdir(_gt_tag(sc, None)), faults, None)[0]
+        if _fin or (GEN_TEST_REFERENCE_RUNS and sc[0] in _need):
             add(sc, None)
-        else:
+        elif not GEN_TEST_REFERENCE_RUNS:
             print("[gen-test] %s all in service: not run (GEN_TEST_REFERENCE_RUNS = False) -- "
                   "its element-off runs have nothing to be compared with" % sc[0])
     # 1b) every capacitor bank near the POI off, default solver setting
@@ -19235,6 +19387,7 @@ def run_gen_test():
               % (" + ".join(sc[0] for sc in pick), len(GEN_TEST_SCENARIOS)))
         return [r for r in (add(sc, g) for g in gens for sc in pick) if r and not r["note"]]
 
+    _GT_LAST[GEN_TEST_PROJECT] = (runs, faults)   # for the all-projects summary
     base_ready = all(r["note"] for r in runs if not r["gen"])
     if _gmode == "best2" and base_ready:
         add_best2()
@@ -19457,7 +19610,7 @@ def main():
         if not _fixed_solver_apply():
             return 2
     elif GEN_TEST:
-        return run_gen_test()
+        return run_gen_tests()
 
     # MERGE ONLY -- see the setting at the top. Checked before anything else,
     # because it neither simulates nor plots and must not wait on the phases

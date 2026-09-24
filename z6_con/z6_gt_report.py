@@ -9,7 +9,8 @@
            GEN_TEST_<project>.txt/.csv, GEN_TEST_BEST_<project>.txt,
            GEN_TEST_IMPACT_<project>.txt/.csv, GEN_TEST_NOT_RUN_<project>.txt
 
-   with the settings of z6_main.py (same folder). Runs still going or waiting
+   with the settings of z6_main.py (same folder) -- every project in
+   GEN_TEST_PROJECTS, or GEN_TEST_PROJECT alone. Runs still going or waiting
    show as not done. The running gen test rewrites the same files as each of
    its runs finishes, so this is only for reading them before that.
 
@@ -29,4 +30,4 @@ import z6_main as M
 
 M.GEN_TEST_DRY_RUN = True          # list the plan, write the reports, simulate nothing
 print("[gt-report] reports only -- nothing is simulated, no run folder is touched")
-sys.exit(M.run_gen_test())
+sys.exit(M.run_gen_tests())
