@@ -12177,6 +12177,10 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         #      added are in the loaded case now, and this is the last moment
         #      before the snapshot freezes the model set.
         dyr_drop_loaded_models()
+        # 11b) THE RUN'S OWN SOLVER VALUES, so the .snp opened in PSS/E shows
+        #      what the faults are solved with (nothing is solved between here
+        #      and the save; every run sets them again at its initialisation).
+        _snap_solver_params()
         # 12) SNAP
         chk(psspy.snap([-1, -1, -1, -1, -1], snp), "save .snp")
         _snapshot_sig_mark(snp)          # WHICH user models this snapshot runs with
@@ -12293,6 +12297,30 @@ def _check_models_accessible(tag="INIT"):
     if ABORT_ON_MODEL_NOT_ACCESSIBLE:
         raise RuntimeError("user model(s) not accessible: %s -- see the block above"
                            % ", ".join(names))
+
+
+def _snap_solver_params():
+    """Put the fault runs' MAXITER / ACCEL / TOL / DELT into the case before the
+       snapshot is saved: the first solver recipe when one is in use (the one
+       every fault starts on), else the initialisation values."""
+    niter, accel = SOLV_NITER, SOLV_ACCEL_INIT
+    if SOLVER_RETRY_ON_NONCONV and SOLVER_RETRY_RECIPES:
+        try:
+            _lbl, _n, _a = SOLVER_RETRY_RECIPES[0][:3]
+            if _n:
+                niter = int(_n)
+            if _a is not None:
+                accel = float(_a)
+        except Exception:
+            pass
+    try:
+        psspy.dynamics_solution_param_2([niter, _i, _i, _i, _i, _i, _i, _i],
+                                        [accel, SOLV_TOL_INIT, SOLV_DELT, SOLV_FREQFILTER,
+                                         _f, _f, _f, _f])
+        print("  [snap] saved with MAXITER %d, ACCEL %g, TOL %g, DELT %.6f s"
+              % (niter, accel, SOLV_TOL_INIT, SOLV_DELT))
+    except Exception as e:
+        print("  [snap] solver values not written into the snapshot (%s)" % e)
 
 
 def restore_and_init(snp=SNP_FILE, cnv=CNV_CASE):

@@ -18633,8 +18633,9 @@ def _fixed_solver_apply():
        for the whole study, and every results folder not made with exactly
        those values moved aside so all faults are simulated again. False =
        a folder could not be moved (stop rather than reuse old results)."""
-    global DELT_CYCLES, SOLVER_RETRY_ON_NONCONV, SOLVER_RETRY_RECIPES, DYN_TOL
+    global DELT_CYCLES, SOLVER_RETRY_ON_NONCONV, SOLVER_RETRY_RECIPES, DYN_TOL, FORCE_REBUILD
     sig = _fixed_solver_sig()
+    fresh = False
     DELT_CYCLES = float(FIXED_DELT_CYCLES)
     SOLVER_RETRY_ON_NONCONV = True          # the one recipe below is applied from the first step
     SOLVER_RETRY_RECIPES = [("fixed %s" % sig, int(FIXED_MAXITER), float(FIXED_ACCEL))]
@@ -18670,6 +18671,7 @@ def _fixed_solver_apply():
                               "it (Explorer, Excel, a python.exe) and run again ***" % (rdir, e))
                         ok = False
                         continue
+                fresh = True
                 try:
                     os.makedirs(rdir)
                     with open(mark, "w") as fh:
@@ -18677,6 +18679,10 @@ def _fixed_solver_apply():
                 except Exception as e:
                     print("[fixed] *** could not start %s (%s) ***" % (rdir, e))
                     ok = False
+    if fresh:
+        # a new start: the snapshot is rebuilt, so the .snp holds these values
+        FORCE_REBUILD = True
+        print("[fixed] snapshot rebuilt this run -- opened in PSS/E it shows these values")
     return ok
 
 
