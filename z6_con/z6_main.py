@@ -190,18 +190,18 @@ def _print_phase_times(total):
 #   SETTINGS -- everything you change is in this block (details: NOTES ON THE
 #   SETTINGS at the bottom of this file). Most-used groups first:
 #
-#   1. WHAT TO RUN             2. GEN / CAP / LINE TEST   3. SOLVER
-#   4. POI POWER               5. CASES AND FOLDERS       6. PROJECTS TOGETHER
-#   7. SPP CRITERIA            8. SIMULATION LENGTH       9. FAULT LIST
+#   1. WHAT TO RUN             2. WORKERS / SIM TIME      3. GEN / CAP / LINE TEST
+#   4. SOLVER                  5. POI POWER               6. CASES AND FOLDERS
+#   7. PROJECTS TOGETHER       8. SPP CRITERIA            9. FAULT LIST
 #   10. CLEARING / RECLOSE     11. DYNAMIC MODELS         12. .dyr SWEEP
 #   13. COLLECTOR SYSTEM       14. NEW FACILITY           15. EXTRA STUDIES
-#   16. CORES AND SPEED        17. RESUME RULES           18. SCORING
-#   19. PLOTS                  20. REPORTS                21. WATCHDOG / LICENCE
+#   16. RESUME RULES           17. SCORING                18. PLOTS
+#   19. REPORTS                20. WATCHDOG / LICENCE
 #
 #   None = leave the study scripts' own value. Values go to BOTH cases.
 # ============================================================================
 
-# ---- 1. WHAT TO RUN ----------------------------------------------------------
+# ---- 1. WHAT TO RUN ------------------------------------------------------------
 PROJECTS = ["SantaFe"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
 MODES = ["spp"]                              # fault set: spp | con | table | custom | manual
@@ -219,7 +219,24 @@ COMPARE_REQUIRE_COMPLETE = False             # True = no comparison if a project
 RUN_STUDIES = False                          # old setting -- PIPELINE wins
 RUN_MISSING = False                          # old setting -- same as PIPELINE = "missing"
 
-# ---- 2. GEN / CAP / LINE TEST ------------------------------------------------
+# ---- 2. WORKERS, CORES AND SIMULATION TIME -------------------------------------
+RUN_IN_PARALLEL = True                       # True = base and project at once
+ONE_PROJECT_AT_A_TIME = True                 # with RUN_IN_PARALLEL False: base then project per project
+N_WORKERS = "auto"                           # "auto" | PSS/E sessions per case
+CORES_SPARE = 2                              # cores kept free
+CORES_MAX = 22                               # max PSS/E sessions, both cases (0 = none)
+CORES_FOR_REPORTS = 6                        # of CORES_MAX, for scoring + plots
+CORES_MAX_INCLUDES_REPORTS = True            # True = scoring shares the ceiling
+REPORT_WORKERS = "auto"                      # scoring shards per case: "auto" | 1..8
+DYNAMIC_WORK = True                          # True = shared queue of scenarios
+GEN_TEST_PARALLEL = "auto"                   # GEN TEST: "auto" | N runs at once | 1
+# simulation time
+FLAT_RUN_S = 5                               # s, no-fault run
+PRE_FAULT_S = 5                              # s before the fault
+SIM_END_S = 10                               # s per fault
+RUN_NPLT = 2                                 # write every N steps (1 = every step, huge)
+
+# ---- 3. GEN / CAP / LINE TEST --------------------------------------------------
 # GEN_TEST = True runs ONLY this test (normal study skipped). Results: comparison\GEN_TEST_*.txt
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
@@ -261,10 +278,9 @@ GEN_TEST_SCENARIOS = [
 ]
 GEN_TEST_GEN_SCENARIOS = "all"               # "all" | "best2" (s0 + best solver) | ["s0_asis", ...]
 GEN_TEST_CLEAN_BUILD = True                  # True = delete each finished run's .sav/.cnv/.snp (disk)
-GEN_TEST_PARALLEL = "auto"                   # "auto" | N runs at once | 1
 GEN_TEST_START_GAP_MIN = 20                  # max minutes between run starts
 
-# ---- 3. SOLVER ---------------------------------------------------------------
+# ---- 4. SOLVER -----------------------------------------------------------------
 # FIXED_SOLVER = True runs the WHOLE study (all faults, both cases) on the FIXED_* values
 FIXED_SOLVER = False                         # True = use the FIXED_* values below for everything
 FIXED_DELT_CYCLES = 8                        # time step: 4 = 1/4 cycle (SPP) | 8 = 1/8 cycle
@@ -278,7 +294,7 @@ SOLVER_RETRY_MAX_NONCONV = 6                 # non-converged steps allowed befor
 SOLVER_RETRY_RECIPES = [("iterations 200, accel 0.50", 200, 0.50), ("iterations 400, accel 0.30", 400, 0.30), ("iterations 600, accel 0.10", 600, 0.10)]  # [("label", MAXITER, ACCEL), ...]
 PSSE_FAULT_LOG = True                        # True = keep PSS/E messages per fault (logs\psse)
 
-# ---- 4. POI POWER ------------------------------------------------------------
+# ---- 5. POI POWER --------------------------------------------------------------
 # POI_P_TARGET_MW: MW at the POI per project (BESS + existing together)
 POI_P_TARGET_MW = {
     "SantaFe":        984.2,      # 984.2, 502 MW BESS + the rest from 765912/765922/765932/765935
@@ -309,7 +325,7 @@ POI_P_LEVELS_PCT = []                        # [] = off | [100, 80, ...] % of PO
 POI_P_COMPARE = True                         # full comparison per level
 POI_P_FAULTS = "all"                         # "all" | "failing" at each level
 
-# ---- 5. CASES AND FOLDERS ----------------------------------------------------
+# ---- 6. CASES AND FOLDERS ------------------------------------------------------
 ROOT = ""                                    # "" = this file's folder
 BASE_FOLDER = "Base"                         # base case folder (no projects)
 PROJ_FOLDER = "Projects"                     # case folder with the projects
@@ -328,7 +344,7 @@ PROJ_DYR_BY_PROJECT = {}
 ADD_PROJECTS = []                            # extra project rows (see NOTES)
 SEARCH_DEPTH = 4                             # folder levels searched for files
 
-# ---- 6. PROJECTS TOGETHER ----------------------------------------------------
+# ---- 7. PROJECTS TOGETHER ------------------------------------------------------
 # used when PROJECTS_RUN = together / both
 TOGETHER_NAME = "AllProjects"                # results folder / label
 TOGETHER_SPLIT = True                        # True = one comparison per member | False = one for all
@@ -336,7 +352,7 @@ TOGETHER_PROJECTS = []                       # [] = PROJECTS
 TOGETHER_MW = {}                             # {project: MW} in the together study
 TOGETHER_STEP_MISMATCH_MVA = 0.1             # solve to this after each plant is added
 
-# ---- 7. SPP CRITERIA ---------------------------------------------------------
+# ---- 8. SPP CRITERIA -----------------------------------------------------------
 V_RECOVERY_PU = 0.70                         # recover above this after clearing
 V_RECOVERY_S = 2.5                           # within this many s
 V_OVERSHOOT_PU = 1.20                        # no swing above this
@@ -360,13 +376,7 @@ MISMATCH_MVA = 0.04                          # both cases solved to this mismatc
 MISMATCH_PASSES = 20                         # solve passes allowed
 MISMATCH_ABORT = True                        # True = stop if not reached
 
-# ---- 8. SIMULATION LENGTH ----------------------------------------------------
-FLAT_RUN_S = 5                               # s, no-fault run
-PRE_FAULT_S = 5                              # s before the fault
-SIM_END_S = 10                               # s per fault
-RUN_NPLT = 2                                 # write every N steps (1 = every step, huge)
-
-# ---- 9. FAULT LIST -----------------------------------------------------------
+# ---- 9. FAULT LIST -------------------------------------------------------------
 AUTO_SPP_FAULTS = False                      # False: the _con set reads SPP_FAULTS_CON_<project>.csv (z4_disis_con.py)
 MAKE_FAULT_LIST = False                      # False: never build/copy a list here
 REGEN_FAULTS = None                          # "if-missing" | "always" | "never"
@@ -397,7 +407,7 @@ CUSTOM_KV_MIN = 100
 CUSTOM_MAX_BUSES = 4
 CUSTOM_INCLUDE_POI = True
 
-# ---- 10. CLEARING / RECLOSE --------------------------------------------------
+# ---- 10. CLEARING / RECLOSE ----------------------------------------------------
 NORMAL_CLEAR_CYCLES = None                   # a number = that many cycles at every kV
 SPP_STUCK_CYCLES = None                      # P4 stuck breaker (SPP 16)
 RECLOSE_WAIT_CYCLES = None                   # SPP 20
@@ -407,7 +417,7 @@ RECLOSE_SKIP_IF_ISLANDS = None               # True = drop a reclose that would 
 FAULT_LINE_MIN_X_PU = 0.0                    # 0 = off | raise a faulted line's |X| to this
 FAULT_LINE_X_WARN_PU = 0.0001                # name faulted lines with |X| below this
 
-# ---- 11. DYNAMIC MODELS ------------------------------------------------------
+# ---- 11. DYNAMIC MODELS --------------------------------------------------------
 DYR_EDITS = []                               # [("REECCU1", {"Kqv": 0.0}), ...]
 DYR_EDITS_BY_PROJECT = {}                    # {"SantaFe": [("REECCU1", {"Kqv": 0.0})]}
 DYR_APPLY_TO = "project"                     # "project" | "base" | "both"
@@ -423,7 +433,7 @@ ABORT_ON_MODEL_NOT_ACCESSIBLE = True         # stop on 'MODEL NOT ACCESSIBLE'
 INIT_NAN_ABORT = False                       # stop on NaN after init
 ADJUSTMENTS_REPORT = True                    # list every non-project change in SYSTEM_ADJUSTMENTS.txt
 
-# ---- 12. .dyr SWEEP ----------------------------------------------------------
+# ---- 12. .dyr SWEEP ------------------------------------------------------------
 # one study per value, each compared with the base
 DYR_SWEEP = {}                               # e.g. {"REECCU1": {"Kqv": [0.0, 2.0]}}
 DYR_SWEEP_BY_PROJECT = {}                    # {"SantaFe": {"REECCU1": {"Kqv": [0.5, 1.5]}}}
@@ -433,7 +443,7 @@ DYR_SWEEP_COMPARE = True                     # full comparison per value
 DYR_SWEEP_SKIP_DECK = True                   # skip a value the deck already has
 DYR_DECK_VALUES = {}                         # override the deck values read from the template
 
-# ---- 13. COLLECTOR SYSTEM ----------------------------------------------------
+# ---- 13. COLLECTOR SYSTEM ------------------------------------------------------
 COLLECTOR_ON = True                          # False = leave every collector alone
 # COLLECTOR_BRANCHES: per project: (gen bus, from, to, ckt, R, X, B); None = keep
 COLLECTOR_BRANCHES = {
@@ -468,7 +478,7 @@ COLLECTOR_BY_PROJECT = {}                    # (R, X, B) per project
 COLLECTOR_Z_BASE_MVA = None                  # MVA base of R/X/B
 COLLECTOR_APPLY_TO = "project"               # "project" | "both" | "base"
 
-# ---- 14. NEW FACILITY --------------------------------------------------------
+# ---- 14. NEW FACILITY ----------------------------------------------------------
 # BESS built as its own plant, buses 999001+
 NEW_PLANT_RUN = False                        # True = extra study with the new plant built
 NEW_PLANT_PROJECTS = []                      # [] = every project
@@ -488,7 +498,7 @@ NEW_PLANT = {
     "tie":       {"r": 0.0000, "x": 0.0005, "b": 0.0},
 }
 
-# ---- 15. EXTRA STUDIES -------------------------------------------------------
+# ---- 15. EXTRA STUDIES ---------------------------------------------------------
 # SURPLUS_SCENARIOS: BP-7250 7.6 SGF/EGF runs (see NOTES)
 SURPLUS_SCENARIOS = [
     # {"tag": "s1_egfoff", "label": "SGF 100 %, EGF off",
@@ -505,18 +515,7 @@ PROJECT_OFF_RUN = False                      # True = extra study with the proje
 PROJECT_OFF_PROJECTS = []                    # [] = every project
 PROJECT_OFF_COMPARE = False
 
-# ---- 16. CORES AND SPEED -----------------------------------------------------
-RUN_IN_PARALLEL = True                       # True = base and project at once
-ONE_PROJECT_AT_A_TIME = True                 # with RUN_IN_PARALLEL False: base then project per project
-N_WORKERS = "auto"                           # "auto" | PSS/E sessions per case
-CORES_SPARE = 2                              # cores kept free
-CORES_MAX = 22                               # max PSS/E sessions, both cases (0 = none)
-CORES_FOR_REPORTS = 6                        # of CORES_MAX, for scoring + plots
-CORES_MAX_INCLUDES_REPORTS = True            # True = scoring shares the ceiling
-REPORT_WORKERS = "auto"                      # scoring shards per case: "auto" | 1..8
-DYNAMIC_WORK = True                          # True = shared queue of scenarios
-
-# ---- 17. RESUME RULES --------------------------------------------------------
+# ---- 16. RESUME RULES ----------------------------------------------------------
 RUN_ONLY_MISSING_OUT = True                  # True = simulate only faults with no .out
 MAX_SCENARIO_ATTEMPTS = 3                    # give up after this many crashes
 RETRY_GAVE_UP_ROUNDS = 0                     # extra rounds for scenarios that gave up
@@ -528,7 +527,7 @@ TRUNCATED_FRAC = 0.80                        # no longer used
 RESTORE_TRUNCATED_DONE = True
 OUT_EMPTY_BYTES = 1048576                    # .out under this = empty
 
-# ---- 18. SCORING -------------------------------------------------------------
+# ---- 17. SCORING ---------------------------------------------------------------
 FORCE_RESCORE = False                        # True = re-score everything every launch
 RESCORE_STALE_REPORTS = True                 # re-score a report older than its .out
 STALE_REPORT_TOL_S = 120
@@ -540,7 +539,7 @@ VERIFY_SCORING_COVERAGE = True
 FAST_COMPARE = False                         # PIPELINE "compare": compare disk as is, fast
 FAST_COMPARE_PARALLEL = 4                    # projects at once
 
-# ---- 19. PLOTS ---------------------------------------------------------------
+# ---- 18. PLOTS -----------------------------------------------------------------
 MAKE_PLOTS = None                            # None = draw | False = no PDFs (faster)
 PLOT_MISSING_OUTS = False                    # draw PDFs for .out files without one
 FORCE_REPLOT = False                         # True = redraw every PDF
@@ -566,7 +565,7 @@ PLOT_PASS_MAX_MIN = 0                        # 0 = no cap
 PLOT_RISKY_ISOLATED = True                   # retry a refused .out in its own process
 PLOT_ISOLATED_S = 1800
 
-# ---- 20. REPORTS -------------------------------------------------------------
+# ---- 19. REPORTS ---------------------------------------------------------------
 WRITE_CSV = False                            # False = .txt + .xlsx only
 WRITE_XLSX = True
 ONE_REPORT = True                            # one COMPARISON_REPORT instead of 8 files
@@ -584,7 +583,7 @@ SWEEP_PLAN_EVERY = 60                        # s
 LIVE_COMPARE_EVERY = 300                     # s (0 = end only)
 LIVE_STATUS_ALL = "LIVE_STATUS.txt"          # "" = off
 
-# ---- 21. WATCHDOG / LICENCE --------------------------------------------------
+# ---- 20. WATCHDOG / LICENCE ----------------------------------------------------
 KILL_GRACE_MIN = 30                          # min of silence before a watchdog acts
 SCENARIO_MAX_MIN = 75                        # kill + requeue a scenario running longer (0 = off)
 STARTUP_SILENT_MIN = 15
