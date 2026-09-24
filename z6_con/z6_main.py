@@ -3772,13 +3772,19 @@ def _criterion_family(criterion):
     # INFO rows that describe; they carry the words of a criterion without being
     # one, and read as one they would hand the overshoot or angle delta a
     # number that belongs to no limit.
-    if c.startswith(("transient voltage:", "rotor angle:", "***")):
+    if c.startswith(("transient voltage:", "rotor angle:", "generator tripping:", "***")):
+        return ""
+    # BEFORE the "swing" test below: "Rotor angles measured relative to the
+    # system swing machine" is a yes/no statement, and matched "swing" first --
+    # an overshoot family for a row with no voltage in it.
+    if "relative to the system swing" in c or "measured relative" in c:
         return ""
     if "terminal voltage" in c and "eterm" in c:
         return "eterm"                  # existing-machine terminals: recorded, not a BES criterion
     if "recovery" in c:
         return "recovery"
-    if "transient voltage" in c or "swing" in c or "overshoot" in c:
+    if ("transient voltage" in c or "swing" in c or "overshoot" in c
+            or "overvoltage" in c or "over-voltage" in c):
         return "overshoot"
     if "steady" in c:
         return "steady"
@@ -4080,6 +4086,25 @@ class _cmp_into(object):
         return False
 
 
+def _planned_fault_ids(proj, rb, rt):
+    """The fault ids the study was set to run: the shared fault list for the
+       project, else either side's own faults\\SPP_FAULTS.csv. [] if none."""
+    for p in (shared_faults_path(proj),
+              os.path.join(rt, "faults", "SPP_FAULTS.csv"),
+              os.path.join(rb, "faults", "SPP_FAULTS.csv")):
+        if not p or not os.path.isfile(p):
+            continue
+        try:
+            with csv_open(p) as fh:
+                ids = [(r.get("fault_id") or "").strip() for r in csv.DictReader(fh)]
+            ids = [f for f in ids if f]
+            if ids:
+                return ids
+        except Exception as e:
+            print("[compare] could not read the fault list %s (%s)" % (p, e))
+    return []
+
+
 @_timed("comparison")
 def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
     """Everything about one project, both cases, ready to be written out.
@@ -4181,6 +4206,20 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
                            "study" % (nb_, tb_, nt_, tt_))
     crit_ok = bool(src_cb) and bool(src_ct)
     faults = sorted(set(cb) | set(ct) | set(sb) | set(st), key=_fault_key)
+    # EVERY PLANNED FAULT, NOT ONLY THE ONES THAT LEFT A TRACE. A fault with no
+    # .out on either side, in a folder whose RUN_SUMMARY was never written (a
+    # run stopped before the report phase), was on no sheet at all -- a gap
+    # that reads as full coverage. The fault list adds it, and it lands on
+    # sheet 4 as "not run in both cases". Main comparison only: a sweep level
+    # runs a chosen subset, and its other faults are not missing.
+    if not test_suffix and not base_suffix:
+        _plan = _planned_fault_ids(proj, rb, rt)
+        _add = [f for f in _plan if f not in set(faults)]
+        if _add:
+            print("[compare] %s %s: %d planned fault(s) have no result in either case "
+                  "(listed as not run): %s%s" % (proj, mode, len(_add), ", ".join(_add[:12]),
+                                                 " ..." if len(_add) > 12 else ""))
+            faults = sorted(set(faults) | set(_add), key=_fault_key)
     if ONLY_EVENTS:
         # The event comes from the study's own compliance table, so a fault the
         # studies never labelled cannot be matched -- and is dropped rather than
@@ -6129,38 +6168,57 @@ def _cmp_bus_map():
     if _CMP_BMAP["tried"]:
         return _CMP_BMAP
     _CMP_BMAP["tried"] = True
+    # EVERY MAP, MERGED -- not the first one found. Each project case knows its
+    # OWN plant buses (999001.. for a new plant) and no other project's, so
+    # stopping at the first file (IronStar's, when it is listed first) left
+    # every SantaFe plant bus "no path in BUS_MAP.csv". The first file to name
+    # a bus keeps its kV/area: project cases first, then the base; suffixed run
+    # folders (_poi502, _cap50 ...) after the plain one.
+    _seen = set()
+    _paths = []
     for case in (CASE_TEST, CASE_BASE):
         for mode in (list(MODES) or ["spp"]):
             for proj in (list(PROJECTS) or [""]):
-                p = os.path.join(results_dir(case, proj, mode), "flags",
-                                 "BUS_MAP.csv")
-                if not os.path.isfile(p):
-                    continue
-                try:
-                    with csv_open(p) as fh:
-                        for r in csv.reader(fh):
-                            if not r:
-                                continue
-                            t = (r[0] or "").strip().upper()
-                            try:
-                                if t == "B" and len(r) >= 4:
-                                    b = int(r[1])
-                                    _CMP_BMAP["kv"][b] = float(r[2])
-                                    _CMP_BMAP["area"][b] = str(r[3]).strip()
-                                elif t == "A" and len(r) >= 2:
-                                    _CMP_BMAP["aname"][str(r[1]).strip()] = \
-                                        (r[2].strip() if len(r) > 2 else "")
-                                elif t == "L" and len(r) >= 3:
-                                    a, b = int(r[1]), int(r[2])
-                                    _CMP_BMAP["adj"].setdefault(a, set()).add(b)
-                                    _CMP_BMAP["adj"].setdefault(b, set()).add(a)
-                            except (TypeError, ValueError):
-                                continue
-                    print("[compare] topology read from %s: %d bus(es), %d link(s)"
-                          % (p, len(_CMP_BMAP["kv"]), len(_CMP_BMAP["adj"])))
-                    return _CMP_BMAP
-                except Exception as e:
-                    print("[compare] could not read %s (%s)" % (p, e))
+                _rd = results_dir(case, proj, mode)
+                for p in ([os.path.join(_rd, "flags", "BUS_MAP.csv")]
+                          + sorted(glob.glob(_rd + "_*" + os.sep + "flags"
+                                             + os.sep + "BUS_MAP.csv"))):
+                    if p not in _seen:
+                        _seen.add(p)
+                        _paths.append(p)
+    _nread = 0
+    for p in _paths:
+        if not os.path.isfile(p):
+            continue
+        try:
+            with csv_open(p) as fh:
+                for r in csv.reader(fh):
+                    if not r:
+                        continue
+                    t = (r[0] or "").strip().upper()
+                    try:
+                        if t == "B" and len(r) >= 4:
+                            b = int(r[1])
+                            if b not in _CMP_BMAP["kv"]:
+                                _CMP_BMAP["kv"][b] = float(r[2])
+                                _CMP_BMAP["area"][b] = str(r[3]).strip()
+                        elif t == "A" and len(r) >= 2:
+                            _CMP_BMAP["aname"].setdefault(
+                                str(r[1]).strip(), (r[2].strip() if len(r) > 2 else ""))
+                        elif t == "L" and len(r) >= 3:
+                            a, b = int(r[1]), int(r[2])
+                            _CMP_BMAP["adj"].setdefault(a, set()).add(b)
+                            _CMP_BMAP["adj"].setdefault(b, set()).add(a)
+                    except (TypeError, ValueError):
+                        continue
+            _nread += 1
+            print("[compare] topology read from %s (now %d bus(es), %d with links)"
+                  % (p, len(_CMP_BMAP["kv"]), len(_CMP_BMAP["adj"])))
+        except Exception as e:
+            print("[compare] could not read %s (%s)" % (p, e))
+    if not _nread:
+        print("[compare] no BUS_MAP.csv in any results folder -- area and hop columns "
+              "will read 'no path'")
     return _CMP_BMAP
 
 
@@ -6435,6 +6493,7 @@ _REPORT_WIDTHS = [26, 22, 14, 9, 8, 8, 12, 8, 9, 15, 18, 22, 15, 18, 10,
 CLS_EL_UNKNOWN = "UNKNOWN -- base value not available"
 CLS_EL_UNKNOWN_T = "UNKNOWN -- project value not available"
 CLS_EL_OK = "within limit on both sides"
+CLS_EL_NOVAL = "no element value -- see the verdict columns"
 
 
 def _project_only_bus(bus):
@@ -6504,6 +6563,12 @@ def _element_class(fam, kind, bv, tv, lim, base_scored=False, new_bus=False,
         # Over the limit in the base, nothing measured with the projects.
         # Not a resolution -- an absence.
         return CLS_EL_UNKNOWN_T
+    if t_v is None and b_v is None:
+        # NOTHING TO JUDGE, not "fine on both sides": a criterion with no
+        # number (system stability, voltages within scale, record length) or
+        # an element with no value on either side. It used to read "within
+        # limit on both sides" next to a FAIL/FAIL verdict (F69).
+        return CLS_EL_NOVAL
     return CLS_EL_OK
 
 # Column positions are looked up BY NAME everywhere they are needed. The list
@@ -6900,7 +6965,8 @@ _COMPACT_WIDTHS = [14, 9, 20, 18, 10, 7, 9, 9, 11, 12, 9, 24, 24, 34, 15, 17, 12
 _VERDICT_LABEL = {CLS_NEW: "PROJECT introduced",
                   CLS_PRE: "pre-existing (both cases)",
                   CLS_RESOLVED: "resolved by project",
-                  CLS_EL_OK: "within limit both sides"}
+                  CLS_EL_OK: "within limit both sides",
+                  CLS_EL_NOVAL: "no element value"}
 
 
 def _compact_view(rows):
@@ -7194,6 +7260,25 @@ def _violation_cause(res, r):
                         ("; %d NEW with the projects, %d pre-existing"
                          % (n_new, n_pre)) if n_new else
                         ("; all %d pre-existing" % n_pre if n_pre else "")))
+    if not cause and r.get("unswitched"):
+        # EMPTIED ON PURPOSE -- see compare_project: a trip or reclose did not
+        # take, so the event is not the one named and is not compared.
+        _u = r["unswitched"]
+        return ("not compared -- see sheet 4",
+                "NOT COMPARED: a trip/reclose did not take (%s) -- see sheet 4 and "
+                "UNSWITCHED_BRANCHES" % "; ".join(
+                    "%s: %s" % (k, v) for k, v in (("base", _u.get("base")),
+                                                   ("project", _u.get("test"))) if v))
+    if not cause and r.get("vio_gap"):
+        return ("elements not compared -- see sheet 4",
+                "the %s study FAILS this fault but lists no element for it, so the "
+                "elements cannot be compared -- re-score that study" % r["vio_gap"])
+    if not cause and r.get("one_sided"):
+        _has = [s for s, v in (("base", r.get("vb")), ("project", r.get("vt")))
+                if norm_verdict(v) in ("PASS", "FAIL")]
+        return ("not compared -- see sheet 4",
+                "NOT COMPARED: scored in the %s case only -- sheet 4 gives the other "
+                "side's state and why" % (" and ".join(_has) or "neither"))
     if not cause and (r.get("vt") or "").upper() == "FAIL":
         # FAIL with an empty element list is a data problem, not a clean cell.
         return ("", "FAIL, but no element list reached the comparison -- the "
@@ -7216,7 +7301,33 @@ def _summary_rows(results, want=None):
                 _c, _fam, _amt = got
                 crit = _short_crit(_c["criterion"])
                 bv, tv, unit = _c["mb"], _c["mt"], _c["unit"]
-                shown = _limit_for(_fam, res.get("limits") or {})
+                _lim = res.get("limits") or {}
+                shown = _limit_for(_fam, _lim)
+                if shown is None:
+                    # A BAND, A THRESHOLD OR "NO TRIPPING" -- said in words, as
+                    # the Detail sheet says it, rather than left empty.
+                    shown = _limit_text(_fam, _lim) or None
+                if bv is None or tv is None:
+                    # THE CRITERION CARRIES NO SINGLE NUMBER (a trip, a band):
+                    # the worst ELEMENT's value on each side, from the same
+                    # element table the Detail sheet prints.
+                    _e = (r.get("elements") or {}).get(
+                        {"angle": "undamped", "trip": "tripped"}.get(_fam, _fam)) or {}
+                    def _worst_val(d, _k={"angle": "undamped", "trip": "tripped"}.get(_fam, _fam)):
+                        _best = None
+                        for _el, _vv in (d or {}).items():
+                            try:
+                                _a = exceedance(_k, _vv, _lim)[0]
+                            except Exception:
+                                _a = None
+                            _key = _a if _a is not None else -1e9
+                            if _best is None or _key > _best[0]:
+                                _best = (_key, _vv)
+                        return _best[1] if _best else None
+                    if bv is None:
+                        bv = _worst_val(_e.get("vb"))
+                    if tv is None:
+                        tv = _worst_val(_e.get("vt"))
                 past = round(_amt, 3) if _amt is not None else ""
             else:
                 crit = bv = tv = unit = ""
@@ -7350,6 +7461,13 @@ def _why_side_missing(side_name, rdir, fid):
                 "(%s); the launcher gave up after MAX_SCENARIO_ATTEMPTS, so it is not "
                 "scored. See results\\logs\\FAULT_%s_strt-prog.txt; fix the event, then "
                 "PIPELINE = \"missing\" re-runs it" % (side_name, det or "partial", fid))
+    if st == "partial":
+        # A PARTIAL RUN IS NOT "NOT RUN". It simulated part of the record
+        # (.partial marker) and has no verdict yet -- score what exists, or
+        # re-run it for the full length.
+        return ("the %s case ran this fault PART-WAY (%s) and has no verdict for "
+                "it yet -- score the partial record (PIPELINE = \"compare\") or "
+                "re-run it (PIPELINE = \"missing\")" % (side_name, det or "stopped early"))
     return ("the %s case has no result for this fault -- it was not run there"
             % side_name)
 
@@ -7414,6 +7532,8 @@ def _notrun_reason(sb, st, vb, vt):
             return "crashed"
         if x.startswith("simulated"):
             return "not scored"
+        if x.startswith("PARTIAL"):
+            return "partial"
         return "not run"
     kb, kt = _k(sb, vb), _k(st, vt)
     if kb == kt:
@@ -8179,19 +8299,24 @@ def write_one_report(results, only_base, only_test):
             # EMPTY_CELL where they have nothing; 1 and 4 wrote "" -- so a PASS
             # fault's worst_criterion, or an unscored side's verdict, showed as
             # an empty cell, which reads as forgotten. Same word everywhere.
-            def _filled(rows):
-                return [[(EMPTY_CELL if v in ("", None) else v) for v in r] for r in rows]
-            _sheets = [("1 Summary", _SUMMARY_COLS, _filled(_sum_all), _SUMMARY_WIDTHS,
-                        _xl_style_of_summary),
-                       ("2 Project introduces", _COMPACT_COLS, _new_el,
+            # EVERY SHEET, and every row padded to its header: the writer
+            # would otherwise pad a short row with truly empty cells.
+            def _filled(rows, cols):
+                n = len(cols)
+                return [[(EMPTY_CELL if v in ("", None) else v)
+                         for v in (list(r) + [""] * (n - len(r)))] for r in rows]
+            _sheets = [("1 Summary", _SUMMARY_COLS, _filled(_sum_all, _SUMMARY_COLS),
+                        _SUMMARY_WIDTHS, _xl_style_of_summary),
+                       ("2 Project introduces", _COMPACT_COLS, _filled(_new_el, _COMPACT_COLS),
                         _COMPACT_WIDTHS, _xl_style_compact),
-                       ("3 Pre-existing", _COMPACT_COLS, _pre_el,
+                       ("3 Pre-existing", _COMPACT_COLS, _filled(_pre_el, _COMPACT_COLS),
                         _COMPACT_WIDTHS, _xl_style_compact),
-                       ("4 Not compared", _NOTRUN_COLS, _filled(_notrun),
+                       ("4 Not compared", _NOTRUN_COLS, _filled(_notrun, _NOTRUN_COLS),
                         _NOTRUN_WIDTHS, _xl_style_of_notrun),
-                       ("5 All detail", _REPORT_COLS, _detail,
+                       ("5 All detail", _REPORT_COLS, _filled(_detail, _REPORT_COLS),
                         _REPORT_WIDTHS, _xl_style_of),
-                       ("6 POI power", _POI_COLS, _poi_rows, _POI_WIDTHS, _xl_style_poi)]
+                       ("6 POI power", _POI_COLS, _filled(_poi_rows, _POI_COLS),
+                        _POI_WIDTHS, _xl_style_poi)]
             write_xlsx_multi(xp, _sheets, legend=_XL_LEGEND,
                        title_rows=["SPP DYNAMIC STABILITY -- COMPARISON REPORT",
                                    "base %s" % CASE_BASE["dir"],

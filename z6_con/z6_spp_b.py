@@ -2675,7 +2675,13 @@ PEAK_MIN_PROMINENCE_FRAC = 0.02
 #
 # Set this False to score strictly on the ratios as written and let such
 # machines fail.
-SPPR_FLOOR_LIMITED_AS_REVIEW = True
+# SPP Rev 3.0 AS WRITTEN: a machine at >= 16 deg must meet SPPR1 or SPPR5;
+# the document's only alternative is a modal (Prony) damping ratio, and its
+# "individual basis" review is for machines BELOW 16 deg. So the default is
+# False -- such a machine FAILS, with the about-settle numbers still in the
+# detail. True (or env SPP_SPPR_FLOOR_REVIEW=1) restores the review list.
+SPPR_FLOOR_LIMITED_AS_REVIEW = False
+SPPR_FLOOR_LIMITED_AS_REVIEW = _env_bool("SPP_SPPR_FLOOR_REVIEW", SPPR_FLOOR_LIMITED_AS_REVIEW)
 
 # The smallest ring amplitude about the settling value that may serve as the
 # base of the about-settle ratios, as a fraction of the judged deviation. A
@@ -16179,6 +16185,7 @@ def make_plots(path, is_flat, kb, tclear=None):
                              % (float(t[-1]), float(SIM_END_S)))
     except Exception:
         _partial_note = ""
+    _REC_EXTRA[0] = 0.0 if is_flat else _final_clear_extra(name)
     panels = _panel_list(ch, kb, fbus, tclear, t)
     if not panels:
         print("  %s: nothing to plot" % name)
@@ -17202,6 +17209,12 @@ def spp_plot_keep(title, cat):
 PLOT_VIOLATION_TAG = "[[VIOLATION]]"
 
 
+# seconds from the first to the final clearing of the scenario being plotted
+# (unsuccessful reclose), so a plot marks recovery on the window evaluate_case
+# scores -- set by the plot writers from _final_clear_extra
+_REC_EXTRA = [0.0]
+
+
 def _post_clear_index(taxis, tclear, extra_s=0.0):
     """First sample index at or after tclear + extra_s, or None.
 
@@ -17303,7 +17316,7 @@ def _volt_violation_worst(v, tclear=None, taxis=None):
                               "admittance is removed, NOT judged]" % _mx_all)
         # THE RECOVERY WINDOW STARTS AT CLEARING + V_RECOVERY_S. See
         # _post_clear_index for what it used to be and what that cost.
-        i0 = _post_clear_index(taxis, tclear, V_RECOVERY_S)
+        i0 = _post_clear_index(taxis, tclear, V_RECOVERY_S + _REC_EXTRA[0])
         if i0 is None and taxis:
             # No clearing time, but the axis is known: the fault is applied at
             # PRE_FAULT_S and no clearing on this study is longer than a
@@ -17441,7 +17454,7 @@ def _volt_panel_forced(cat, v, tclear=None, taxis=None):
             return True
         # MEASURED FROM CLEARING, not from a fraction of the record. See
         # _post_clear_index.
-        i0 = _post_clear_index(taxis, tclear, V_RECOVERY_S)
+        i0 = _post_clear_index(taxis, tclear, V_RECOVERY_S + _REC_EXTRA[0])
         if i0 is None and taxis:
             i0 = _post_clear_index(taxis, PRE_FAULT_S + 1.0, V_RECOVERY_S)
         tail = v[i0:] if i0 is not None else v[int(len(v) * 0.4):]
@@ -18004,6 +18017,7 @@ def svg_plots(path, is_flat, kb, tclear=None):
     name = os.path.splitext(os.path.basename(path))[0]
     t, ch = load_out(path)
     fbus = _fault_bus_of(name)
+    _REC_EXTRA[0] = 0.0 if is_flat else _final_clear_extra(name)
     panels = _panel_list(ch, kb, fbus, tclear, t)
     if not panels:
         return None
@@ -18344,6 +18358,7 @@ def pdf_plots(path, is_flat, kb, tclear=None):
        panel; PER_PAGE panels per page, across as many pages as needed."""
     name = os.path.splitext(os.path.basename(path))[0]
     t, ch = load_out(path)
+    _REC_EXTRA[0] = 0.0 if is_flat else _final_clear_extra(name)
     panels = _panel_list(ch, kb, _fault_bus_of(name), tclear, t)
     if not panels:
         return None
@@ -19054,6 +19069,12 @@ def evaluate_case(path, kind, tclear, kb):
     # V_OVERSHOOT_BLANK_S is now a setting, defaulting to 0.0 = judge from the
     # instant of clearing. Raise it only if you have a documented reason to
     # ignore the first few ms, and know it makes the check less strict.
+    # WHAT WAS MEASURED AT ALL -- see the NOT MEASURED pass before the return.
+    _n_meas = {"Voltage recovery": ("BES bus-voltage", len(volts)),
+               "Transient voltage <=": ("BES bus-voltage", len(volts)),
+               "Steady-state voltage": ("BES bus-voltage", len(volts)),
+               "No generator tripping": ("machine PELEC / ETERM", len(pelecs) + len(eterms)),
+               "Rotor-angle damping": ("machine rotor-angle", len(angles))}
     # THIS SCENARIO MAY HAVE DISCONNECTED THE PROJECT -- SAY SO HERE.
     # See _build_island_notes. Printed FIRST, before any criterion, because it
     # changes how every one of them should be read.
@@ -19076,7 +19097,16 @@ def evaluate_case(path, kind, tclear, kb):
     # exactly what happens to the recovery window. Scoring must say the run is
     # too short rather than judge it on whatever sample the record ended at.
     i_clr = idx_after(t, tclear + V_OVERSHOOT_BLANK_S)
-    i_rec = idx_after(t, tclear + V_RECOVERY_S)
+    # FROM THE FINAL CLEARING. An unsuccessful reclose clears the fault twice;
+    # SPP's 0.70 pu test counts its 2.5 s from the last one (see
+    # _final_clear_extra). The overshoot test still starts at the first.
+    _t_rc = 0.0 if kind == "flat" else _final_clear_extra(case)
+    i_rec = idx_after(t, tclear + _t_rc + V_RECOVERY_S)
+    if _t_rc:
+        add("Transient voltage: recovery measured from the FINAL clearing", None,
+            "unsuccessful reclose -- the fault is cleared at %.3f s and again at "
+            "%.3f s; the >= 0.70 pu test starts %.1f s after the second, at %.3f s"
+            % (tclear, tclear + _t_rc, V_RECOVERY_S, tclear + _t_rc + V_RECOVERY_S))
     i_ss  = idx_after(t, t[-1] - SS_WINDOW_S)
     _short = [nm for nm, ix in (("post-clearing", i_clr),
                                 ("recovery (clear + %.1f s)" % V_RECOVERY_S, i_rec),
@@ -19197,7 +19227,7 @@ def evaluate_case(path, kind, tclear, kb):
     add("Voltage recovery >= %.2f pu within %.1f s" % (V_RECOVERY_PU, V_RECOVERY_S),
         not v_low,
         ("OK -- lowest of %d bus(es) after t=%.2fs is %.3f pu (%s @ %.2fs)"
-         % (len(volts), tclear + V_RECOVERY_S, v_low_worst[0], v_low_worst[2], v_low_worst[1]))
+         % (len(volts), tclear + _t_rc + V_RECOVERY_S, v_low_worst[0], v_low_worst[2], v_low_worst[1]))
         if not v_low else
         ("%d bus(es) low, worst %.3f pu (%s @ %.2fs): "
          % (len(v_low), v_low_worst[0], v_low_worst[2], v_low_worst[1]) + ", ".join(v_low[:VIOLATION_LIST_MAX]) + _more(v_low)))
@@ -19555,6 +19585,29 @@ def evaluate_case(path, kind, tclear, kb):
                     poi_rows.append([_poi, _unit, "tie from bus %s" % (_f or "?")] + _pstat(_v) + [""])
     except Exception as _e:
         print("  [score] POI power rows not built (%s)" % _e)
+    # WHAT THE EVENT REMOVES IS NOT A TRIP. Units the fault list drops with the
+    # elements (drop_machines), and the project's own units when the event
+    # disconnects the project from the POI (see _isl above), go offline because
+    # the event takes them -- SPP's criterion is about units that trip in
+    # RESPONSE. They are listed on their own INFO row, never dropped silently.
+    _evd = set() if kind == "flat" else _event_dropped_buses(case)
+    _ev_out = []
+    if _evd or _isl:
+        def _bus_of(_s):
+            _mb = re.search(r"\d{3,}", _s.split("(")[0])
+            return int(_mb.group(0)) if _mb else None
+        _ev_out = [x for x in trips if _bus_of(x) in _evd]
+        trips = [x for x in trips if _bus_of(x) not in _evd]
+        _ev_p = [x for x in proj_trips if _isl or _bus_of(x) in _evd]
+        proj_trips = [x for x in proj_trips if x not in _ev_p]
+        _ev_out += _ev_p
+    if _ev_out:
+        add("Generator tripping: units the EVENT removes (not judged)", None,
+            "%d unit(s) go offline because the event takes them (%s): %s"
+            % (len(_ev_out), "drop_machines of the fault" if _evd and not _isl else
+               "the event disconnects the project from the POI" if not _evd else
+               "drop_machines / project disconnected", ", ".join(_ev_out[:VIOLATION_LIST_MAX])
+               + _more(_ev_out)))
     add("No generator tripping (PELEC + ETERM)",
         not (trips or proj_trips),
         ("None -- %d machine(s) checked on power and %d on terminal voltage, "
@@ -20016,6 +20069,17 @@ def evaluate_case(path, kind, tclear, kb):
         "review":    review_all,     # (label, deg)  < 16 deg and not converging
     }
     # ANYTHING NOT FAIL PASSES THE CASE: INFO rows record, they do not judge.
+    # NOTHING MEASURED IS NOT A PASS. A criterion judged over zero channels
+    # reads "lowest of 0 bus(es) ... 9.990 pu" and passed: a fault whose .out
+    # lost its channels (a monitoring spec that found nothing, a channel set
+    # that did not load) was reported compliant. It fails, and says why.
+    for _r in rows:
+        for _pre, (_what, _n) in _n_meas.items():
+            if _n == 0 and _r["Result"] == "PASS" and _r["Criterion"].startswith(_pre):
+                _r["Result"] = "FAIL"
+                _r["Detail"] = ("NOT MEASURED -- no %s channel in this .out, so the "
+                                "criterion cannot be judged; check the monitoring "
+                                "(add_channels) for this run. (%s)" % (_what, _r["Detail"]))
     return rows, ("PASS" if all(r["Result"] != "FAIL" for r in rows) else "FAIL")
 
 # WHICH CASE THIS SCRIPT RUNS. It goes in every report's NAME and on every
@@ -23458,7 +23522,7 @@ def _is_done(scen_id, out_path):
     return True
 
 
-_FAULT_CYCLES_CACHE = {"loaded": False, "map": {}}
+_FAULT_CYCLES_CACHE = {"loaded": False, "map": {}, "rc": {}, "drop": {}}
 
 
 def _tclear_from_faultlist(scen_id):
@@ -23531,6 +23595,26 @@ def _tclear_from_faultlist(scen_id):
                                     _val = None
                         if _val is not None:
                             _FAULT_CYCLES_CACHE["map"][_fid] = _val
+                        # UNITS THE EVENT ITSELF DROPS (drop_machines "bus-id;...")
+                        _dm = set()
+                        for _x in (_r.get("drop_machines") or "").split(";"):
+                            _mb = re.match(r"\s*(\d+)", _x)
+                            if _mb:
+                                _dm.add(int(_mb.group(1)))
+                        if _dm:
+                            _FAULT_CYCLES_CACHE["drop"][_fid] = _dm
+                        # UNSUCCESSFUL RECLOSE: the fault is cleared a SECOND
+                        # time, reclose_wait + clear_cycles after the first --
+                        # see fault_run step d. Kept for the recovery window.
+                        if (_r.get("reclose") or "").strip() in ("1", "True", "true"):
+                            try:
+                                _w = float((_r.get("reclose_wait") or "").strip()
+                                           or RECLOSE_WAIT_CYCLES)
+                                _cc = float((_r.get("clear_cycles") or _r.get("cycles")
+                                             or "0").strip() or 0)
+                                _FAULT_CYCLES_CACHE["rc"][_fid] = (_w + _cc) * CYC
+                            except Exception:
+                                pass
             except Exception:
                 continue
     _c = _FAULT_CYCLES_CACHE["map"].get(str(scen_id).strip().upper())
@@ -23539,6 +23623,38 @@ def _tclear_from_faultlist(scen_id):
     if _c[0] == "t":
         return float(_c[1])
     return float(PRE_FAULT_S) + float(_c[1]) / 60.0
+
+
+def _final_clear_extra(scen_id):
+    """Seconds from the FIRST clearing (the tclear every marker carries) to the
+       LAST one. 0 for an ordinary fault; for an unsuccessful reclose (P1.2,
+       P6) the fault is re-applied reclose_wait later, held clear_cycles, and
+       cleared again -- SPP's "2.5 seconds after the fault is cleared" counts
+       from that final clearing."""
+    if not SIMULATE_RECLOSE:
+        return 0.0
+    try:
+        _tclear_from_faultlist(scen_id)            # loads the fault lists once
+    except Exception:
+        pass
+    _s = str(scen_id).strip().upper()
+    _m = _FAULT_CYCLES_CACHE.get("rc") or {}
+    if _s in _m:
+        return float(_m[_s])
+    _h = re.split(r"[_\s]", _s)[0]
+    return float(_m.get(_h, 0.0))
+
+
+def _event_dropped_buses(scen_id):
+    """Buses whose units the fault EVENT removes on purpose (the fault list's
+       drop_machines) -- their disconnection is the event, not a trip."""
+    try:
+        _tclear_from_faultlist(scen_id)            # loads the fault lists once
+    except Exception:
+        pass
+    _s = str(scen_id).strip().upper()
+    _m = _FAULT_CYCLES_CACHE.get("drop") or {}
+    return _m.get(_s) or _m.get(re.split(r"[_\s]", _s)[0]) or set()
 
 
 def _read_done_tclear(scen_id):
