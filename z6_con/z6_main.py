@@ -319,7 +319,7 @@ GEN_TEST_SCENARIOS = [
     ("s3_it250_a030",        None, 250,  0.30, None),     # 250 iterations, acceleration 0.30
     ("s4_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
-GEN_TEST_GEN_SCENARIOS = ["s0_asis"]         # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
+GEN_TEST_GEN_SCENARIOS = "best2"               # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
 # rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
