@@ -320,6 +320,7 @@ GEN_TEST_SCENARIOS = [
     ("s4_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
 GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s2_it300_a020"]  # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
+GEN_TEST_POIALL_SCENARIOS = "all"             # all POI plants off (POIALL): "all" | [...] | None = as GEN_TEST_GEN_SCENARIOS
 # rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
@@ -19501,6 +19502,24 @@ def run_gen_test():
     if miss:
         print("[gen-test] *** GEN_TEST_GEN_SCENARIOS names %s, not in GEN_TEST_SCENARIOS ***" % miss)
         return 2
+    # the POIALL run (all POI plants off) in its own scenarios: "all" | [...] | None = as the 3c runs
+    _pspec = GEN_TEST_POIALL_SCENARIOS
+    if isinstance(_pspec, (list, tuple)) and len(_pspec) == 1 and str(_pspec[0]).strip().lower() == "all":
+        _pspec = "all"
+    if _pspec is None:
+        _poi_tags = None
+    elif isinstance(_pspec, str) and _pspec.strip().lower() == "all":
+        _poi_tags = list(tags)
+    elif isinstance(_pspec, (list, tuple)) and _pspec:
+        _poi_tags = [str(t).strip() for t in _pspec]
+        miss = [t for t in _poi_tags if t not in tags]
+        if miss:
+            print("[gen-test] *** GEN_TEST_POIALL_SCENARIOS names %s, not in GEN_TEST_SCENARIOS ***" % miss)
+            return 2
+    else:
+        print("[gen-test] *** GEN_TEST_POIALL_SCENARIOS = %r: use \"all\", a list or None ***"
+              % (GEN_TEST_POIALL_SCENARIOS,))
+        return 2
     gens = _gt_add_hops_group(_gt_find_gens())
     if gens is None:
         return 2
@@ -19570,6 +19589,8 @@ def run_gen_test():
             _need |= set(GEN_TEST_CAPS_SCENARIOS)
         if lines:
             _need |= set(GEN_TEST_LINES_SCENARIOS)
+        if _poi_tags and any(g.get("id") == "POIALL" and g.get("group") for g in gens):
+            _need |= set(_poi_tags)
     else:
         _need = set(sc[0] for sc in GEN_TEST_SCENARIOS)
     for sc in GEN_TEST_SCENARIOS:
@@ -19611,6 +19632,14 @@ def run_gen_test():
             for g in gens:
                 for sc in GEN_TEST_SCENARIOS:
                     if sc not in gsc and _gt_done(_gt_rdir(_gt_tag(sc, g)), faults, g)[0]:
+                        add(sc, g)
+    # 2b) GEN_TEST_POIALL_SCENARIOS: the POIALL run also in its own scenarios
+    #     (its POI-off runs below still follow GEN_TEST_GEN_SCENARIOS)
+    if _poi_tags:
+        for g in gens:
+            if g.get("id") == "POIALL" and g.get("group"):
+                for sc in GEN_TEST_SCENARIOS:
+                    if sc[0] in _poi_tags:
                         add(sc, g)
     # 3) GEN_TEST_POI_OFF_BASE: each cap / line / machine run AGAIN with the POI
     #    plants off too, in the scenarios the POIALL run is in (caps and lines
