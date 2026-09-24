@@ -18650,6 +18650,16 @@ def spp_damping(seg):
             info["span"] = _span
             return False, info
         return True, info                      # genuinely nothing oscillating
+    # "MINIMUM VALUE" AS FIGURE 2 DRAWS IT: the lowest trough AFTER the 1st
+    # positive peak, not the lowest point after clearing. A machine whose angle
+    # first dips and then rises to its 1st peak (common far from the fault)
+    # has an earlier minimum below every later trough; measuring from it adds
+    # the same offset to both sides of the ratio, pushes SPPR towards 1 and
+    # fails machines SPP's own method passes. The 16-deg gate is unchanged --
+    # Rev 3.0 defines that one as absolute maximum to absolute minimum.
+    info["vmin_all"] = vmin
+    vmin = min(seg[peaks[0][0]:])
+    info["vmin"] = vmin
     base = peaks[0][1] - vmin
     info["p1"] = peaks[0][1]
     if base <= 1e-9:
