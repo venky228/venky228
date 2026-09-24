@@ -11613,19 +11613,80 @@ if SHUNTS_OFF:
           % ", ".join("%d '%s' %s" % s_ for s_ in SHUNTS_OFF))
 
 
+def _swsh_off(bus):
+    """The switched shunt at `bus` -> STATUS 0. (ok, how).
+
+       PSS/E 34's switched_shunt_chng_3 takes INTGAR(12) = N1..N8, MODSW, ADJM,
+       STAT, SWREM -- STAT is [10]; later builds take a longer list with STAT at
+       [11]. A list of the wrong length is refused before anything changes, so
+       each shape is tried in turn and the first accepted wins. The status is
+       then read back, so a call that answered 0 but changed nothing is caught."""
+    why = "no switched-shunt API in this build"
+    ok = False
+    for nm, ni, stat, nr in (("switched_shunt_chng_3", 12, 10, 12),
+                             ("switched_shunt_chng_3", 12, 10, 13),
+                             ("switched_shunt_chng_3", 14, 11, 13),
+                             ("switched_shunt_chng_3", 14, 11, 14)):
+        f2 = getattr(psspy, nm, None)
+        if f2 is None:
+            continue
+        ia = [_i] * ni
+        ia[stat] = 0
+        try:
+            ie = f2(int(bus), ia, [_f] * nr, "")
+            ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+        except Exception as e:
+            why = "%s(%d ints, %d reals): %s" % (nm, ni, nr, e)
+            continue
+        if ie in (0, None):
+            ok, why = True, "%s(%d ints, STAT [%d])" % (nm, ni, stat)
+            break
+        why = "%s ierr=%s" % (nm, ie)
+        break
+    if not ok:
+        return False, why
+    st = None
+    f3 = getattr(psspy, "aswshint", None)
+    for flag in (2, 4):
+        if f3 is None or st is not None:
+            break
+        try:
+            ie, arr = f3(-1, flag, ["NUMBER", "STATUS"])
+            if ie == 0:
+                for n_, s_ in zip(arr[0], arr[1]):
+                    if int(n_) == int(bus):
+                        st = int(s_)
+                        break
+        except Exception:
+            pass
+    if st is None:
+        return True, why + ", status not read back"
+    if st != 0:
+        return False, why + " answered 0 but STATUS is still %d" % st
+    return True, why + ", STATUS read back 0"
+
+
+def _swsh_ierr(bus):
+    """_swsh_off as an ierr: 0 when done, else the reason (for the event loop)."""
+    ok, why = _swsh_off(bus)
+    return 0 if ok else why
+
+
 def _switch_shunts_off():
     """Every SHUNTS_OFF entry STATUS 0, with the same calls the event switching
-       uses (fixed: shunt_chng; switched: switched_shunt_chng_3, STAT = [11])."""
+       uses (fixed: shunt_chng; switched: _swsh_off)."""
     done, left = 0, []
     for b, sid, kind in SHUNTS_OFF:
         if kind == "S":
-            calls = (("switched_shunt_chng_3",
-                      lambda f2: f2(int(b), [_i] * 11 + [0] + [_i] * 2, [_f] * 13, "")),
-                     ("switched_shunt_chng",
-                      lambda f2: f2(int(b), [_i] * 11 + [0], [_f] * 12, "")))
-        else:
-            calls = (("shunt_chng", lambda f2: f2(int(b), sid, 0, [_f, _f])),
-                     ("shunt_data", lambda f2: f2(int(b), sid, 0, [_f, _f])))
+            ok, why = _swsh_off(b)
+            print("  [caps-off]   %d switched shunt: %s" % (b, why))
+            if ok:
+                done += 1
+            else:
+                left.append("%d '%s' %s (%s)" % (b, sid, kind, why))
+            continue
+        calls = (("shunt_chng", lambda f2: f2(int(b), sid, 0, [_f, _f])),
+                 ("shunt_data", lambda f2: f2(int(b), sid, 0, [_f, _f])))
         ok, why = False, "no API in this build"
         for nm, call in calls:
             f2 = getattr(psspy, nm, None)
@@ -11647,9 +11708,10 @@ def _switch_shunts_off():
     print("  [caps-off] %d of %d shunt(s) taken OUT OF SERVICE" % (done, len(SHUNTS_OFF)))
     for x in left:
         print("  [caps-off]   could not switch off %s" % x)
-    if done == 0:
-        raise RuntimeError("SPP_SHUNTS_OFF was set but no shunt could be taken out of "
-                           "service: %s" % ", ".join(left))
+    if left:
+        raise RuntimeError("SPP_SHUNTS_OFF: %d of %d shunt(s) could not be taken out of "
+                           "service, so this run would not test what it is named for: %s"
+                           % (len(left), len(SHUNTS_OFF), ", ".join(left)))
 
 
 def _switch_machines_off():
@@ -16461,10 +16523,7 @@ def fault_run(fault, idx=None, total=None):
         for _nm, _call in (
                 ("shunt_chng", lambda f2: f2(int(_sb), _one, 0, [_f, _f])),
                 ("shunt_data", lambda f2: f2(int(_sb), _one, 0, [_f, _f])),
-                ("switched_shunt_chng_3",
-                 lambda f2: f2(int(_sb), [_i] * 11 + [0] + [_i] * 2, [_f] * 13, "")),
-                ("switched_shunt_chng",
-                 lambda f2: f2(int(_sb), [_i] * 11 + [0], [_f] * 12, ""))):
+                ("switched_shunt_chng_3", lambda f2: _swsh_ierr(_sb))):
             _f2 = getattr(psspy, _nm, None)
             if _f2 is None:
                 continue
