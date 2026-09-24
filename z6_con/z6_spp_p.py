@@ -6099,6 +6099,12 @@ def _dsp_or_stop(ints, reals, what):
                            "run would not use the solver values it is named for" % (what, ie))
 
 
+# THE RECIPE IN USE, re-applied by restore_and_init(): every flat/fault run
+# starts with rstr + the init values, which would otherwise put MAXITER/ACCEL
+# back to SOLV_NITER/SOLV_ACCEL_INIT right after the recipe set them.
+_SOLVER_NOW = [None, None]      # [MAXITER, ACCEL]; None = the init value
+
+
 def _apply_solver_recipe(niter, accel):
     """Push one recipe into PSS/E. Only MAXITER and ACCEL are ever written -- every other
        slot is passed as the 'unchanged' sentinel, so tolerance, time step and frequency
@@ -6108,6 +6114,8 @@ def _apply_solver_recipe(niter, accel):
              _f,                      # TOL   -- never changed
              _f,                      # DELT  -- never changed
              _f, _f, _f, _f, _f]      # FILTERTIME and the large-step group -- never changed
+    _SOLVER_NOW[0] = int(niter) if niter else None
+    _SOLVER_NOW[1] = float(accel) if accel is not None else None
     _dsp_or_stop(ints, reals, "MAXITER %s / ACCEL %s" % (niter, accel))
     return True
 
@@ -15879,9 +15887,14 @@ def restore_and_init(snp=SNP_FILE, cnv=CNV_CASE):
         else: load_user_dlls()
         load_bess_dlls()          # the BESS model library must be loaded before strt_2
         # INIT dynamics params -- Run3 uses ACCEL 0.60, TOL 0.0000095 (build TOL 0.0001)
-        _dsp_or_stop([SOLV_NITER, _i, _i, _i, _i, _i, _i, _i],
-                     [SOLV_ACCEL_INIT, SOLV_TOL_INIT, SOLV_DELT, SOLV_FREQFILTER, _f, _f, _f, _f],
-                     "TOL %g / DELT %.6f s" % (SOLV_TOL_INIT, SOLV_DELT))
+        _ni = _SOLVER_NOW[0] or SOLV_NITER
+        _ac = SOLV_ACCEL_INIT if _SOLVER_NOW[1] is None else _SOLVER_NOW[1]
+        _dsp_or_stop([_ni, _i, _i, _i, _i, _i, _i, _i],
+                     [_ac, SOLV_TOL_INIT, SOLV_DELT, SOLV_FREQFILTER, _f, _f, _f, _f],
+                     "MAXITER %d / ACCEL %g / TOL %g / DELT %.6f s"
+                     % (_ni, _ac, SOLV_TOL_INIT, SOLV_DELT))
+        print("  [solver] init: MAXITER %d, ACCEL %g, TOL %g, DELT %.6f s"
+              % (_ni, _ac, SOLV_TOL_INIT, SOLV_DELT))
         psspy.fact(); psspy.tysl(0)
         # THE PROJECT MACHINE IDS MUST BE RIGHT BEFORE THE CHANNELS ARE ADDED.
         #

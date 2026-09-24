@@ -4674,6 +4674,8 @@ def _write_all_projects_report(passes, done_so_far):
             if not os.path.isdir(_d):
                 continue
             _nm = os.path.basename(_d)
+            if "_gt_" in _nm or "_before_fixed_" in _nm:
+                continue          # gen-test runs / results moved aside by FIXED_SOLVER
             _pj, _sep, _md = _nm.rpartition("_")
             if not _sep or not _pj:
                 continue

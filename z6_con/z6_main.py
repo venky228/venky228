@@ -13919,7 +13919,7 @@ def stale_results(shared):
         if not os.path.isdir(base):
             continue
         for d in sorted(glob.glob(os.path.join(base, "*_*"))):
-            if not os.path.isdir(d) or d.endswith(".old"):
+            if not os.path.isdir(d) or d.endswith(".old") or _side_folder(d):
                 continue
             if not glob.glob(os.path.join(d, "outs", "*.out")):
                 continue
@@ -15925,6 +15925,14 @@ def _report_stale_by(case, proj, mode):
     return newest - t_rep
 
 
+def _side_folder(name):
+    """A gen-test run (..._gt_...) or results moved aside by FIXED_SOLVER
+       (..._before_fixed_...): kept on disk, never plotted, re-scored or
+       compared by the normal study."""
+    n = os.path.basename(str(name))
+    return "_gt_" in n or "_before_fixed_" in n
+
+
 def _result_folders_for(case, proj, mode):
     """Every results folder this project/mode owns in one case.
 
@@ -15939,6 +15947,8 @@ def _result_folders_for(case, proj, mode):
     try:
         for n in sorted(os.listdir(base)):
             if n == pref or n.startswith(pref + "_"):
+                if _side_folder(n):
+                    continue
                 d = os.path.join(base, n)
                 if os.path.isdir(d):
                     out.append(d)
@@ -18564,7 +18574,7 @@ def _fixed_solver_apply():
        for the whole study, and every results folder not made with exactly
        those values moved aside so all faults are simulated again. False =
        a folder could not be moved (stop rather than reuse old results)."""
-    global DELT_CYCLES, SOLVER_RETRY_ON_NONCONV, SOLVER_RETRY_RECIPES, DYN_TOL, FORCE_REBUILD
+    global DELT_CYCLES, SOLVER_RETRY_ON_NONCONV, SOLVER_RETRY_RECIPES, DYN_TOL
     sig = _fixed_solver_sig()
     fresh = False
     DELT_CYCLES = float(FIXED_DELT_CYCLES)
@@ -18618,9 +18628,14 @@ def _fixed_solver_apply():
                     print("[fixed] *** could not start %s (%s) ***" % (rdir, e))
                     ok = False
     if fresh:
-        # a new start: the snapshot is rebuilt, so the .snp holds these values
-        FORCE_REBUILD = True
-        print("[fixed] snapshot rebuilt this run -- opened in PSS/E it shows these values")
+        # NOT FORCE_REBUILD: that goes to every worker, and each one (and every
+        # relaunch) would rebuild the snapshot again mid-run. The fresh folder has
+        # no FLAT_RUN.done, so the build step rebuilds it once on its own.
+        if RUN_FLAT is False:
+            print("[fixed] RUN_FLAT = False: the snapshot is reused -- the faults still run on "
+                  "these values (set at every fault's start), the .snp just shows older ones")
+        else:
+            print("[fixed] snapshot rebuilt by the flat run -- opened in PSS/E it shows these values")
     return ok
 
 
