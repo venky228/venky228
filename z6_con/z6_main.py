@@ -646,6 +646,11 @@ GEN_TEST_MIN_MW   = 5.0            # skip machines below this |MW| (SVC/STATCOM 
 GEN_TEST_MAX_GENS = 0              # 0 = every machine found | N = the N electrically closest
 GEN_TEST_GENS     = []             # [] = find them automatically | or fixed: [(765912, "1"), (539670, "1")]
 GEN_TEST_EXCLUDE  = []             # machines never switched off: [(bus, "id"), ...]
+GEN_TEST_POI_GROUP = True          # True = ALSO run with EVERY machine connected at the POI off together
+                                   # (one extra "machine" in the plan, run under the same scenarios)
+GEN_TEST_POI_GROUP_GENS = []       # [] = found automatically: the machines behind the POI, reached from it
+                                   # through buses BELOW the POI kV only (their own GSU / collector) |
+                                   # or fixed: [(765912, "1"), (765922, "1"), ...]
 # Solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL). None = the study's own value
 # (DELT 1/4 cycle from DELT_CYCLES above, MAXITER 60, ACCEL 0.60, TOL 0.0000095).
 # Tags: letters, digits and _ only (they become folder names).
@@ -17472,9 +17477,13 @@ def _gt_find_gens():
     """Machines within GEN_TEST_HOPS of GEN_TEST_POI, closest (|Z|) first."""
     excl = set((int(b), str(i).strip()) for b, i in GEN_TEST_EXCLUDE)
     if GEN_TEST_GENS:
-        return [{"bus": int(b), "id": str(i).strip(), "hops": "", "z": None, "mw": None,
+        gens = [{"bus": int(b), "id": str(i).strip(), "hops": "", "z": None, "mw": None,
                  "mvar": None, "kind": "", "name": "", "models": []}
                 for b, i in GEN_TEST_GENS if (int(b), str(i).strip()) not in excl]
+        if GEN_TEST_POI_GROUP and not GEN_TEST_POI_GROUP_GENS:
+            print("[gen-test] POI group skipped: with GEN_TEST_GENS set by hand, list the POI's")
+            print("[gen-test]   machines in GEN_TEST_POI_GROUP_GENS as well")
+        return _gt_add_group(gens, None, excl)
     here = os.path.dirname(os.path.abspath(__file__))
     for d in (here, STUDY_ROOT):
         if os.path.isfile(os.path.join(d, "z6_spike_find.py")):
@@ -17511,7 +17520,68 @@ def _gt_find_gens():
                          "models": d.get("models") or []})
     if GEN_TEST_MAX_GENS:
         gens = gens[:int(GEN_TEST_MAX_GENS)]
-    return gens
+    return _gt_add_group(gens, net, excl)
+
+
+def _gt_poi_members(net, excl):
+    """Machines connected at the POI: reached from it through buses BELOW the
+       POI kV only -- the plants' own transformers and collectors -- so a plant
+       on the wider grid (reached over a line at POI kV or above) is not one."""
+    skip = ("LINE CHARGING", "SWITCHED SHUNT", "FIXED CAP", "FIXED REACTOR", "FACTS")
+    kv0 = float(net["bus"].get(GEN_TEST_POI, {}).get("kv") or 0.0)
+    seen = {GEN_TEST_POI: 0}
+    todo = [GEN_TEST_POI]
+    while todo:
+        n = todo.pop(0)
+        if seen[n] >= int(GEN_TEST_HOPS):
+            continue
+        for m, _z, _w in net["adj"].get(n, []):
+            if m in seen:
+                continue
+            kv = float(net["bus"].get(m, {}).get("kv") or 0.0)
+            if kv0 and kv >= kv0 - 0.01:
+                continue
+            seen[m] = seen[n] + 1
+            todo.append(m)
+    out = []
+    for b in sorted(seen, key=lambda x: (seen[x], x)):
+        for d in net["dev"].get(b, []):
+            if d.get("kind") in skip or d.get("status", 1) != 1:
+                continue
+            mw = d.get("mw") or 0.0
+            if abs(mw) < GEN_TEST_MIN_MW and not str(d.get("kind")).startswith("SVC"):
+                continue
+            mid = str(d.get("id") or "").strip()
+            if (b, mid) not in excl:
+                out.append((b, mid, mw, d.get("mvar") or 0.0))
+    return out
+
+
+def _gt_add_group(gens, net, excl):
+    """GEN_TEST_POI_GROUP: one more entry, every POI machine off at once, put
+       FIRST among the machines so it runs before the one-at-a-time list."""
+    if not GEN_TEST_POI_GROUP:
+        return gens
+    if GEN_TEST_POI_GROUP_GENS:
+        mem = [(int(b), str(i).strip(), None, None) for b, i in GEN_TEST_POI_GROUP_GENS
+               if (int(b), str(i).strip()) not in excl]
+    elif net is not None:
+        mem = _gt_poi_members(net, excl)
+    else:
+        return gens
+    if len(mem) < 2:
+        print("[gen-test] POI group skipped: %d machine(s) found at POI %s -- the one-at-a-time "
+              "runs already cover it" % (len(mem), GEN_TEST_POI))
+        return gens
+    grp = {"bus": int(GEN_TEST_POI), "id": "POIALL", "group": [(b, i) for b, i, _p, _q in mem],
+           "hops": "", "z": None,
+           "mw": sum(p for _b, _i, p, _q in mem if p is not None) if mem[0][2] is not None else None,
+           "mvar": sum(q for _b, _i, _p, q in mem if q is not None) if mem[0][3] is not None else None,
+           "kind": "GROUP of %d" % len(mem), "name": "ALL AT POI",
+           "models": ["%d:%s" % (b, i) for b, i, _p, _q in mem]}
+    print("[gen-test] POI group: %d machine(s) at POI %s switched off TOGETHER: %s"
+          % (len(mem), GEN_TEST_POI, ", ".join("%d '%s'" % (b, i) for b, i, _p, _q in mem)))
+    return [grp] + list(gens)
 
 
 def _gt_rdir(tag):
@@ -17609,7 +17679,8 @@ def _gt_env(sc, g, faults):
            "SPP_PSSE_FAULT_LOG": "1",
            "SPP_DELT_CYCLES": str(float(dc or DELT_CYCLES or 4)),
            "SPP_DYN_TOL": repr(float(tol)) if tol else "0",
-           "SPP_MACHINES_OFF": ("%d:%s" % (g["bus"], g["id"])) if g else ""}
+           "SPP_MACHINES_OFF": (";".join("%d:%s" % m for m in g["group"]) if g.get("group")
+                                else "%d:%s" % (g["bus"], g["id"])) if g else ""}
     if it or acc:
         env["SPP_SOLVER_RETRY"] = "1"
         env["SPP_SOLVER_RETRY_RECIPES"] = json.dumps([[tag, it, acc]])
