@@ -257,7 +257,7 @@ GEN_TEST_FAULTS = ["F01-F04"]                # same syntax as ONLY_FAULTS
 # {} = none; each entry = one run). REGCA1 Khv only acts above Volim -- change both.
 # Any other GEN_TEST_ setting may be given here too, without the GEN_TEST_ prefix.
 GEN_TEST_BY_PROJECT = {
-    "SantaFe":       {"POI": 765911, "EXTRA_GENS": [(763676, "1")],
+    "SantaFe":       {"POI": 765911, "EXTRA_GENS": [],
                       "EGF_EDITS": {"KHV": [("REGCA1", {"Volim": 1.2, "Khv": 1.0, "Accel": 0.7})]}},
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
     "EastFork":      {"POI": 531623, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCAU1 already Volim 1.2 / Khv 0.2 / Accel 0.7
@@ -265,7 +265,7 @@ GEN_TEST_BY_PROJECT = {
 }
 # -- 3c. machine runs (each one, and each EGF_EDITS run, is done in every GEN_TEST_GEN_SCENARIOS)
 GEN_TEST_REFERENCE_RUNS = True               # all in service (needed to compare; finished ones are reused)
-GEN_TEST_EACH_GEN = True                     # each machine within GEN_TEST_HOPS off on its own
+GEN_TEST_EACH_GEN = False                     # each machine within GEN_TEST_HOPS off on its own
 GEN_TEST_EXCLUDE_POI_GENS = False            # True = POI plants left out of the one-at-a-time runs and the HOPS group
 GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = False                  # all machines within GEN_TEST_HOPS off together
@@ -275,7 +275,7 @@ GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus
 # -- 3d. cap and line runs (solver scenario s0_asis only)
 GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together
 GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own
-GEN_TEST_LINES_EACH = True                   # each nearby line / transformer opened on its own
+GEN_TEST_LINES_EACH = False                   # each nearby line / transformer opened on its own
 # -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
@@ -19102,7 +19102,15 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
     nf = len(faults)
     print("[gen-test] PARALLEL: %d run(s) at once x %d PSS/E each = %d sessions; "
           "each run's console -> %s\\<run>.log" % (npar, nf, npar * nf, ldir))
-    queue = list(todo)
+    # .dyr EDIT RUNS LAST, AND ONE AT A TIME INTO THEIR FAULTS. An edited deck
+    # makes the build recompile the case folder's ONE dsusr.dll; a run whose
+    # PSS/E sessions are just starting loads that same file. Two edit runs a
+    # minute apart (s0 and s6 KHV) did exactly that and the first died in its
+    # first minute. So the edit runs wait until every other run has started,
+    # and a second edit run starts only once the one before it is simulating
+    # (a fault .out written) or has ended.
+    queue = [r for r in todo if not (r.get("gen") or {}).get("egf")] + \
+            [r for r in todo if (r.get("gen") or {}).get("egf")]
     live = {}                       # tag -> (thread, run, t0, box)
     last = None                     # (tag, rdir, t0) of the newest start
     k = 0
@@ -19123,6 +19131,10 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             _gt_write(runs, faults, gens)
         spaced = (last is None or last[0] not in live or _gt_built(*last)
                   or (time.time() - last[2]) >= gap_s)
+        if spaced and queue and (queue[0].get("gen") or {}).get("egf"):
+            spaced = not any((lr.get("gen") or {}).get("egf")
+                             and not glob.glob(os.path.join(lr["rdir"], "outs", "*.out"))
+                             for _th, lr, _t0, _bx in live.values())
         if queue and len(live) < npar and spaced:
             r = queue.pop(0)
             k += 1
