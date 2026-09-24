@@ -17574,7 +17574,8 @@ def _gt_find(rdir, stem, ext):
 
 def _gt_measure(rdir, faults):
     """{fault: {verdict, noconv, n_over, max_pu}} from what the run wrote."""
-    res = dict((f, {"verdict": "?", "noconv": None, "n_over": 0, "max_pu": None}) for f in faults)
+    res = dict((f, {"verdict": "?", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {}})
+               for f in faults)
     cp = _gt_find(rdir, "SPP_CRITERIA_REPORT", "csv")
     if cp:
         try:
@@ -17617,7 +17618,10 @@ def _gt_measure(rdir, faults):
                         continue
                     for f in faults:
                         if _gt_match(fid, f):
-                            buses[f].add((r.get("element") or "").strip())
+                            el = (r.get("element") or "").strip()
+                            buses[f].add(el)
+                            if val > res[f]["bus_pu"].get(el, 0.0):
+                                res[f]["bus_pu"][el] = val
                             if res[f]["max_pu"] is None or val > res[f]["max_pu"]:
                                 res[f]["max_pu"] = val
         except Exception as e:
@@ -17857,6 +17861,132 @@ def _gt_best(runs, faults, ref):
     return L
 
 
+def _gt_impact(runs, faults, proj):
+    """GEN_TEST_IMPACT_<proj>.txt / .csv: PER FAULT, which machine / cap bank /
+       line / transformer drives the spike. Each element-off run is compared
+       with the SAME scenario with everything in service:
+         A. per fault, every element ranked by how much taking it out helps
+            (buses over 1.2 pu cleared, peak pu drop, 'not converged' drop)
+         B. per fault, each bus that spikes in the all-in-service run and the
+            element whose removal brings THAT bus down the most."""
+    ref = dict((r["sc"][0], r) for r in runs if not r["gen"] and r.get("m"))
+    rows = []
+    for r in runs:
+        g, m = r["gen"], r.get("m")
+        b = ref.get(r["sc"][0])
+        if not g or not m or not b:
+            continue
+        for f in faults:
+            mb, mo = b["m"].get(f) or {}, m.get(f) or {}
+            if mo.get("verdict") not in ("PASS", "FAIL") or mb.get("verdict") not in ("PASS", "FAIL"):
+                continue
+            bb, bo = mb.get("bus_pu") or {}, mo.get("bus_pu") or {}
+            rows.append({"f": f, "sc": r["sc"][0], "g": g,
+                         "cleared": len([x for x in bb if x not in bo]),
+                         "new": len([x for x in bo if x not in bb]),
+                         "over_b": len(bb), "over_o": len(bo),
+                         "pk_b": mb.get("max_pu") or 0.0, "pk_o": mo.get("max_pu") or 0.0,
+                         "nc_b": mb.get("noconv"), "nc_o": mo.get("noconv"),
+                         "v_b": mb.get("verdict"), "v_o": mo.get("verdict"), "bb": bb, "bo": bo})
+    for x in rows:
+        x["dpk"] = (x["pk_b"] or 0.0) - (x["pk_o"] or 0.0)
+        x["dnc"] = ((x["nc_b"] or 0) - (x["nc_o"] or 0)) if x["nc_b"] is not None and x["nc_o"] is not None else 0
+        d = (x["over_b"] - x["over_o"], round(x["dpk"], 3), x["dnc"],
+             (x["v_o"] == "PASS") - (x["v_b"] == "PASS"))
+        up, down = any(v > 0 for v in d), any(v < 0 for v in d)
+        x["eff"] = ("CONTRIBUTES" if up and not down else "HOLDS DOWN" if down and not up
+                    else "MIXED" if up else "no effect")
+    key = lambda x: (-(x["over_b"] - x["over_o"]), -x["dpk"], -x["dnc"])
+    L = ["GEN TEST -- WHICH ELEMENT DRIVES THE SPIKE, PER FAULT -- %s  (%s)"
+         % (proj, time.strftime("%Y-%m-%d %H:%M")),
+         "Each run with one element out vs the SAME solver scenario with everything in service.",
+         "buses>1.2 = buses above 1.2 pu (in service -> element out), peak = highest pu, nc = 'not converged' steps.",
+         "Top of each list = taking it out helps most = it CONTRIBUTES most to the spike.",
+         "impact: CONTRIBUTES = better with it out (it drives the spike / non-convergence)",
+         "        HOLDS DOWN  = worse with it out (it keeps the voltage down)   MIXED / no effect", ""]
+    # SUMMARY -- per fault, the elements that matter (first scenario that has them)
+    L += ["SUMMARY -- per fault, the elements with an impact (scenario: first with element runs)", ""]
+    for f in faults:
+        fr = [x for x in rows if x["f"] == f]
+        if not fr:
+            L.append("  %-8s (no element-off run finished yet)" % f)
+            continue
+        sc = [t[0] for t in GEN_TEST_SCENARIOS if any(x["sc"] == t[0] for x in fr)][0]
+        sr = sorted([x for x in fr if x["sc"] == sc], key=key)
+        con = [x for x in sr if x["eff"] in ("CONTRIBUTES", "MIXED")]
+        hol = [x for x in sr if x["eff"] == "HOLDS DOWN"]
+        L.append("  %-8s [%s] in service: %s, %d bus(es) > 1.2, peak %s, nc %s"
+                 % (f, sc, sr[0]["v_b"], sr[0]["over_b"], "%.3f" % sr[0]["pk_b"] if sr[0]["pk_b"] else "-",
+                    "-" if sr[0]["nc_b"] is None else sr[0]["nc_b"]))
+        for x in con[:6]:
+            L.append("      contributes : %-44s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s"
+                     % (_gt_label(x["g"])[:44], x["over_b"], x["over_o"],
+                        "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-",
+                        "-" if x["nc_b"] is None else x["nc_b"], "-" if x["nc_o"] is None else x["nc_o"],
+                        x["v_b"], x["v_o"]))
+        for x in hol[:3]:
+            L.append("      holds down  : %-44s buses %d -> %d, peak %s -> %s"
+                     % (_gt_label(x["g"])[:44], x["over_b"], x["over_o"],
+                        "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-"))
+        if not con and not hol:
+            L.append("      no single element changes this fault")
+    L.append("")
+    for f in faults:
+        fr = [x for x in rows if x["f"] == f]
+        L += ["=" * 130, "%s  A. ELEMENTS RANKED" % f, "=" * 130]
+        if not fr:
+            L += ["  (no element-off run finished for this fault yet)", ""]
+            continue
+        for sc in [t[0] for t in GEN_TEST_SCENARIOS if any(x["sc"] == t[0] for x in fr)]:
+            sr = sorted([x for x in fr if x["sc"] == sc], key=key)
+            b0 = sr[0]
+            L += ["", "  scenario %s -- everything in service: %s, %d bus(es) > 1.2 pu, peak %s, nc %s"
+                  % (sc, b0["v_b"], b0["over_b"], "%.3f" % b0["pk_b"] if b0["pk_b"] else "-",
+                     "-" if b0["nc_b"] is None else b0["nc_b"]),
+                  "  %-3s %-12s %-46s %-14s %-12s %-15s %-11s %s"
+                  % ("#", "impact", "element taken out", "kind", "buses>1.2", "peak pu", "nc", "verdict")]
+            for i, x in enumerate(sr, 1):
+                L.append("  %-3d %-12s %-46s %-14s %-12s %-15s %-11s %s" % (
+                    i, x["eff"], _gt_label(x["g"])[:46], (x["g"].get("kind") or "")[:14],
+                    "%d -> %d" % (x["over_b"], x["over_o"]),
+                    "%s -> %s" % ("%.3f" % x["pk_b"] if x["pk_b"] else "-",
+                                  "%.3f" % x["pk_o"] if x["pk_o"] else "-"),
+                    "%s -> %s" % ("-" if x["nc_b"] is None else x["nc_b"],
+                                  "-" if x["nc_o"] is None else x["nc_o"]),
+                    "%s -> %s" % (x["v_b"], x["v_o"])))
+        # B -- per spiking bus, the element that lowers it most (first scenario with runs)
+        sc = [t[0] for t in GEN_TEST_SCENARIOS if any(x["sc"] == t[0] for x in fr)][0]
+        sr = [x for x in fr if x["sc"] == sc]
+        bb = sr[0]["bb"]
+        L += ["", "%s  B. EACH BUS ABOVE 1.2 pu (scenario %s) -- the element whose removal lowers it most" % (f, sc)]
+        if not bb:
+            L.append("  (no bus above 1.2 pu with everything in service)")
+        for bus, pk in sorted(bb.items(), key=lambda t: -t[1]):
+            best = sorted(sr, key=lambda x: x["bo"].get(bus, 0.0))[:3]
+            L.append("  %-28s %.3f pu  -> %s" % (bus[:28], pk, "  |  ".join(
+                "%s: %s" % (_gt_label(x["g"])[4:40].strip(),
+                            ("%.3f" % x["bo"][bus]) if bus in x["bo"] else "below 1.2")
+                for x in best)))
+        L.append("")
+    if not rows:
+        L.append("(no element-off run has finished yet)")
+    try:
+        with open(os.path.join(COMPARE_DIR, "GEN_TEST_IMPACT_%s.txt" % proj), "w") as fh:
+            fh.write("\n".join(L) + "\n")
+        with csv_open(os.path.join(COMPARE_DIR, "GEN_TEST_IMPACT_%s.csv" % proj), "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(["fault", "scenario", "impact", "element_out", "kind", "buses_over_1p2_in_service",
+                        "buses_over_1p2_out", "buses_cleared", "buses_new", "peak_pu_in_service",
+                        "peak_pu_out", "peak_drop", "nc_in_service", "nc_out", "verdict_in_service",
+                        "verdict_out"])
+            for x in sorted(rows, key=lambda x: (x["f"], x["sc"]) + key(x)):
+                w.writerow([x["f"], x["sc"], x["eff"], _gt_label(x["g"]), x["g"].get("kind") or "", x["over_b"],
+                            x["over_o"], x["cleared"], x["new"], x["pk_b"] or "", x["pk_o"] or "",
+                            round(x["dpk"], 4), x["nc_b"], x["nc_o"], x["v_b"], x["v_o"]])
+    except Exception as e:
+        print("[gen-test] GEN_TEST_IMPACT not written (%s)" % e)
+
+
 def _gt_write(runs, faults, gens):
     proj = GEN_TEST_PROJECT
     txt = os.path.join(COMPARE_DIR, "GEN_TEST_%s.txt" % proj)
@@ -17880,6 +18010,7 @@ def _gt_write(runs, faults, gens):
         L.append("  %-22s %s" % (sc[0], _gt_scen_desc(sc)))
     _best = _gt_best(runs, faults, ref)
     L += _best
+    _gt_impact(runs, faults, proj)
     try:
         with open(os.path.join(COMPARE_DIR, "GEN_TEST_BEST_%s.txt" % proj), "w") as fh:
             fh.write("\n".join(L[:3] + _best) + "\n")
