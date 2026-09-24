@@ -1019,7 +1019,7 @@ def _delivered_all(feeders):
 
 
 def _hops_from_all(max_hops=None):
-    """{bus: hops from the NEAREST POI} on the fault-list topology."""
+    """{bus: nodes from the NEAREST POI} on the fault-list topology."""
     out = {}
     for _pb in POI_BUSES:
         for b, h in hops_from(_pb, max_hops).items():
@@ -2324,7 +2324,7 @@ if _evh:
         import json as _json
         for _k, _v in _json.loads(_evh).items():
             SPP_EVENT_HOPS[str(_k)] = int(_v)
-        print("[faults] event hops from z6_main.py: %s"
+        print("[faults] event nodes from z6_main.py: %s"
               % ", ".join("%s=%d" % (k, SPP_EVENT_HOPS[k]) for k in sorted(SPP_EVENT_HOPS)))
     except Exception as _e:
         print("[faults] SPP_EVENT_HOPS could not be read (%s) -- using this file's table"
@@ -5266,7 +5266,7 @@ def _three_wind_legs():
 
 
 def _radius(center, hops):
-    """Buses within 'hops' branch-hops of 'center'. Global branch list + per-bus
+    """Buses within 'nodes' branch-nodes of 'center'. Global branch list + per-bus
        iterator union (so transformer legs are included)."""
     center = int(center)
     adj = {}
@@ -5340,7 +5340,7 @@ def find_area_async_gens(areas, kv_min=0.0, cap=300):
     return _find_area_gens_by_wmod(areas, kv_min, cap, want_synchronous=False)
 
 def find_sync_gens(center, hops, kv_min, cap=50):
-    """CONVENTIONAL / SYNCHRONOUS machines within 'hops' of 'center'
+    """CONVENTIONAL / SYNCHRONOUS machines within 'nodes' of 'center'
        (WMOD==0 AND terminal kV >= kv_min)."""
     buses = _radius(center, hops)
     found = []
@@ -5773,7 +5773,7 @@ def _bsys_spec(sid, spec):
         if kvmin > 0: buses = {b for b in buses if kvmin <= _basekv(b) <= kvmax}
         buses = sorted(buses)
         psspy.bsys(sid, 0, [0.0, 0.0], 0, [], len(buses), buses, 0, [], 0, [])
-        return "%d buses <=%d hops" % (len(buses), spec.get("hops", 5))
+        return "%d buses <=%d nodes" % (len(buses), spec.get("hops", 5))
     if spec["kind"] == "areas":
         ar = spec["areas"]; usekv = 1 if kvmin > 0 else 0
         psspy.bsys(sid, usekv, [kvmin, kvmax], len(ar), ar, 0, [], 0, [], 0, [])
@@ -5784,7 +5784,7 @@ _COMMON_SLACK = {}          # cached result of pick_common_slack()
 
 
 def _multi_source_hops(sources):
-    """{bus -> hops to the NEAREST of `sources`}. One breadth-first walk seeded
+    """{bus -> nodes to the NEAREST of `sources`}. One breadth-first walk seeded
        with every source at distance 0, rather than one walk per source."""
     adj = {}
     for x, y in _branches():
@@ -5836,12 +5836,12 @@ def pick_common_slack(verbose=True):
        -- and this project set sits inside one part of the SPP footprint, so a
        single nearby machine serves all of them.
 
-       Distance is hops to the NEAREST project POI, from one breadth-first walk
+       Distance is nodes to the NEAREST project POI, from one breadth-first walk
        seeded with all of them. That makes the answer identical in every process
        -- build, each worker, the report -- because it depends on the case and
        BESS_PROJECTS, never on which project happens to be running.
 
-       Order: reachable from the projects at all, then fewest hops, then inside
+       Order: reachable from the projects at all, then fewest nodes, then inside
        STUDY_AREAS, then largest MBASE. Returns (bus, id, why)."""
     if _COMMON_SLACK:
         return _COMMON_SLACK["bus"], _COMMON_SLACK["id"], _COMMON_SLACK["why"]
@@ -5904,7 +5904,7 @@ def pick_common_slack(verbose=True):
                 pass
             print("  [slack]   bus %-8d area %-5s %-14s %-10s MBASE %-9s %s"
                   % (b, by_area.get(b, "?"), str(nm).strip(),
-                     ("%d hops" % h) if h < 10 ** 6 else "unreachable",
+                     ("%d nodes" % h) if h < 10 ** 6 else "unreachable",
                      ("%.0f" % mbase[b]) if b in mbase else "no machine",
                      "in STUDY_AREAS" if not insp else ""))
 
@@ -5923,7 +5923,7 @@ def pick_common_slack(verbose=True):
         why = "SWING_BUS set explicitly -- overrides the distance search"
     else:
         h, insp, negmb, b = rows[0]
-        why = ("nearest slack machine to the project set -- %d hop(s) from the "
+        why = ("nearest slack machine to the project set -- %d node(s) from the "
                "closest POI, area %s%s, MBASE %s"
                % (h, by_area.get(b, "?"),
                   " (in STUDY_AREAS)" if not insp else " (OUTSIDE STUDY_AREAS)",
@@ -5937,9 +5937,9 @@ def pick_common_slack(verbose=True):
 
 
 def _poi_island(poi_bus):
-    """{bus -> hops from the POI} for every bus reachable from it. One
+    """{bus -> nodes from the POI} for every bus reachable from it. One
        breadth-first walk over an adjacency map built ONCE -- _neighbors()/sf_neighbors() rescan the whole branch list
-       per bus, which is fine for a 5-hop radius and hopeless for 35,000."""
+       per bus, which is fine for a 5-node radius and hopeless for 35,000."""
     adj = {}
     for x, y in _branches():
         x, y = int(x), int(y)
@@ -6039,7 +6039,7 @@ def pick_swing_machine():
     for b, a in sorted(cands, key=_rank)[:12]:
         print("  [swing]   bus %-8d area %-5d MBASE %-9s %-9s %s"
               % (b, a, ("%.0f" % mbase[b]) if b in mbase else "no machine",
-                 ("%d hops" % island[b]) if (island and b in island) else "-",
+                 ("%d nodes" % island[b]) if (island and b in island) else "-",
                  ("IN the POI's island" if (island and b in island) else
                   ("NOT in the POI's island" if island else "island unknown"))
                  + (", SPP study area" if _in_spp(a) else "")))
@@ -6058,7 +6058,7 @@ def pick_swing_machine():
         inside.sort(key=_rank)
         b, a = inside[0]
         return (b, mid_of.get(b, "1"),
-                "nearest swing machine to the POI -- %d hops, area %d%s, MBASE %s, "
+                "nearest swing machine to the POI -- %d nodes, area %d%s, MBASE %s, "
                 "of %d in the POI's island"
                 % (island.get(b, -1), a, " (SPP study area)" if _in_spp(a) else "",
                    ("%.0f" % mbase[b]) if b in mbase else "unknown", len(inside)))
@@ -6172,9 +6172,9 @@ def area_footprint_report(max_hops=12):
 
        So the choice must not be made by reading area numbers. This measures
        each one against the case actually loaded: how many buses and machines
-       it contributes, and -- the number that matters -- how many BRANCH HOPS
+       it contributes, and -- the number that matters -- how many BRANCH NODES
        its nearest bus is from the POI. An area whose nearest bus is twenty
-       hops away contributes channels and no findings; one that touches the POI
+       nodes away contributes channels and no findings; one that touches the POI
        cannot be dropped whatever its number is.
 
        Printed once, during channel setup. It reads the case and changes
@@ -6216,10 +6216,10 @@ def area_footprint_report(max_hops=12):
           % AREA_KV_MIN)
     print("  [areas]   mach ch = machines x %d quantities (ANGL/PELEC/QELEC/"
           "ETERM/SPD)" % 5)
-    print("  [areas]   hops    = branch hops from POI %d to this area's NEAREST "
+    print("  [areas]   nodes    = branch nodes from POI %d to this area's NEAREST "
           "bus" % POI_BUS)
     print("  [areas]   %-6s %8s %8s %8s %6s   %s"
-          % ("area", "buses", "volt ch", "mach ch", "hops", "verdict"))
+          % ("area", "buses", "volt ch", "mach ch", "nodes", "verdict"))
     tot_v = tot_m = 0
     drop = []
     for a in want:
@@ -6238,9 +6238,9 @@ def area_footprint_report(max_hops=12):
         elif h <= POI_RADIUS_HOPS:
             v = "touches the POI radius -- KEEP"
         elif h <= max_hops:
-            v = "%d hops out -- judgement call" % h
+            v = "%d nodes out -- judgement call" % h
         else:
-            v = "more than %d hops away -- candidate to remove" % max_hops
+            v = "more than %d nodes away -- candidate to remove" % max_hops
             drop.append(a)
         print("  [areas]   %-6d %8d %8d %8d %6s   %s"
               % (a, d["bus"], nv, nm, ("-" if h is None else h), v))
@@ -6839,7 +6839,7 @@ def add_channels():
     if MONITOR_SYNC_IN_RADIUS:
         global _DETECTED_SYNC
         _DETECTED_SYNC = find_sync_gens(SYNC_CENTER_BUS, SYNC_RADIUS_HOPS, SYNC_KV_MIN, SYNC_MAX_GENS)
-        print("  detected %d synchronous gen(s) within %d hops of bus %d (kV>=%.0f)"
+        print("  detected %d synchronous gen(s) within %d nodes of bus %d (kV>=%.0f)"
               % (len(_DETECTED_SYNC), SYNC_RADIUS_HOPS, SYNC_CENTER_BUS, SYNC_KV_MIN))
         for bus, mid in _DETECTED_SYNC:
             tag = "SYNC%d" % bus
@@ -11958,7 +11958,7 @@ def _new_facility_buses():
 
        The walk is what catches the collector and HV buses of a per-role layout:
        they carry no machine and are in no record older than this build, but
-       they are one and two hops from a unit and they are in the 999 block. It
+       they are one and two nodes from a unit and they are in the 999 block. It
        stops at the POI because the POI is not in that block -- and the tie to
        it is still reported, as the branch that crosses the boundary."""
     roles = {}
@@ -16996,7 +16996,7 @@ _POI_HOPS = None            # {bus: hops_from_POI}, filled on first use
 
 
 def _poi_hop_map(max_hops=None):
-    """{bus number -> hops from POI}. Same adjacency as _radius(): the global branch
+    """{bus number -> nodes from POI}. Same adjacency as _radius(): the global branch
        list unioned with the per-bus iterator, so transformer legs are included."""
     global _POI_HOPS
     if _POI_HOPS is not None:
@@ -17033,22 +17033,22 @@ def _poi_hop_map(max_hops=None):
             frontier = nxt
             if not frontier:
                 break
-        print("  [poi-dist] mapped %d bus(es) within %d hop(s) of POI %s"
+        print("  [poi-dist] mapped %d bus(es) within %d node(s) of POI %s"
               % (len(hops), depth, _poi_text()))
     except Exception as e:
-        print("  [poi-dist] hop map failed (%s) -- labels will omit the distance" % e)
+        print("  [poi-dist] node map failed (%s) -- labels will omit the distance" % e)
     _POI_HOPS = hops
     return _POI_HOPS
 
 
 def _hop_text(bus):
-    """'POI' / '1 hop from POI' / '3 hops from POI' / '>8 hops from POI'."""
+    """'POI' / '1 node from POI' / '3 nodes from POI' / '>8 nodes from POI'."""
     h = _poi_hop_map().get(int(bus))
     if h is None:
         return "no path to %s in the case" % _poi_word()
     if h == 0:
         return "POI"
-    return "%d hop%s from %s" % (h, "" if h == 1 else "s", _poi_word())
+    return "%d node%s from %s" % (h, "" if h == 1 else "s", _poi_word())
 
 
 def _machine_kind(title):
@@ -17080,7 +17080,7 @@ def _machine_kind(title):
 
 
 def _fault_subtitle(fault_bus):
-    """'   |  fault at bus 530555 (2 hops from POI)' for a plot title."""
+    """'   |  fault at bus 530555 (2 nodes from POI)' for a plot title."""
     if not fault_bus:
         return ""
     try:
@@ -17192,7 +17192,7 @@ def _area_text(bus):
 
 
 def _hops_to_fault(bus, fault_bus):
-    """Hops from the faulted bus, or None when it cannot be established."""
+    """Nodes from the faulted bus, or None when it cannot be established."""
     if not fault_bus or bus is None:
         return None
     try:
@@ -17207,7 +17207,7 @@ def _where_text(label, fault_bus, short=False):
        This is the question every violation raises and none of the reports
        answered. "103 buses over 1.20 pu" is a different finding depending on
        whether they are in the project's own area next to the fault -- which the
-       project has to answer for -- or three areas away and six hops out, which
+       project has to answer for -- or three areas away and six nodes out, which
        is the system telling you something about itself.
 
        short=True gives "534 / 2h" for a table column; the long form is for a
@@ -17229,27 +17229,27 @@ def _where_text(label, fault_bus, short=False):
         bits.append("area %d%s" % (ar, (" %s" % nm) if nm else ""))
     if fault_bus:
         if h is None:
-            bits.append("more than %d hops from fault bus %s"
+            bits.append("more than %d nodes from fault bus %s"
                         % (FAULT_DIST_MAX_HOPS, fault_bus))
         elif h == 0:
             bits.append("AT the fault bus %s" % fault_bus)
         else:
-            bits.append("%d hop%s from fault bus %s"
+            bits.append("%d node%s from fault bus %s"
                         % (h, "" if h == 1 else "s", fault_bus))
     return ", ".join(bits)
 
 
 def _case_violation_where(case, kinds=("recovery", "overshoot", "steady",
                                       "tripped", "undamped")):
-    """(areas, furthest hops, nearest hops) for one scenario's violations.
+    """(areas, furthest nodes, nearest nodes) for one scenario's violations.
 
-       areas is [(area number, how many elements)] worst first. The hops are
+       areas is [(area number, how many elements)] worst first. The nodes are
        measured from the bus that scenario faulted.
 
        WHY A REPORT NEEDS THIS. "103 buses over 1.20 pu" is a different finding
        depending on where they are. All of them in the project's own area, at
        and beside the faulted bus, is the project answering for its own fault.
-       The same count spread over four areas and six hops out is the system
+       The same count spread over four areas and six nodes out is the system
        saying something about itself, and the mitigation is nothing alike."""
     vio = SPP_VIOLATIONS.get(case) or {}
     fb = _fault_bus_of(case)
@@ -17272,7 +17272,7 @@ def _case_violation_where(case, kinds=("recovery", "overshoot", "steady",
 
 
 def _case_where_text(case):
-    """'areas 534 (91), 541 (12); 0 to 4 hops from the fault' for one scenario."""
+    """'areas 534 (91), 541 (12); 0 to 4 nodes from the fault' for one scenario."""
     areas, far, near = _case_violation_where(case)
     if not areas and far is None:
         return ""
@@ -17285,13 +17285,13 @@ def _case_where_text(case):
     if far is not None:
         bits.append("%s from the fault"
                     % ("at the fault bus" if far == 0 else
-                       ("%d hop%s" % (far, "" if far == 1 else "s") if near == far
-                        else "%d to %d hops" % (near, far))))
+                       ("%d node%s" % (far, "" if far == 1 else "s") if near == far
+                        else "%d to %d nodes" % (near, far))))
     return "; ".join(bits)
 
 
 def _fault_hop_text(bus, fault_bus):
-    """'at fault bus' / '2 hops from fault', or '' when there is no fault bus."""
+    """'at fault bus' / '2 nodes from fault', or '' when there is no fault bus."""
     if not fault_bus:
         return ""
     try:
@@ -17302,18 +17302,18 @@ def _fault_hop_text(bus, fault_bus):
         return "no path to the faulted bus in the case"
     if h == 0:
         return "at fault bus %d" % int(fault_bus)
-    return "%d hop%s from fault bus %d" % (h, "" if h == 1 else "s", int(fault_bus))
+    return "%d node%s from fault bus %d" % (h, "" if h == 1 else "s", int(fault_bus))
 
 
 def plot_label(title, cat, fault_bus=None):
     """The label a PLOT should show: the channel, what kind of machine it is, and
        HOW FAR THE BUS IS -- from the POI and from the bus that was faulted.
 
-           VOLT   |  539803 (3 hops from POI, 1 hop from fault bus 530555)
-           ANGLE  |  GEN640014 [SYNC] (2 hops from POI, at fault bus 640014)
+           VOLT   |  539803 (3 nodes from POI, 1 node from fault bus 530555)
+           ANGLE  |  GEN640014 [SYNC] (2 nodes from POI, at fault bus 640014)
 
        The distance is on EVERY quantity now, not just bus voltages: a rotor
-       angle 6 hops out and a rotor angle at the POI are different findings, and
+       angle 6 nodes out and a rotor angle at the POI are different findings, and
        the plot was the one place that never said which one you were looking at.
        DISTANCE_ON_ETERM is kept as the switch for the ETERM channels, since
        those duplicate a bus voltage and the extra text is redundant there."""
@@ -22106,7 +22106,7 @@ def write_compliance_table(all_rows, verdicts):
                         # sorted by area or by distance -- which is how you find
                         # out whether one area carries every finding.
                         "Fault Bus", "Fault Area", "Violation Areas",
-                        "Nearest Hops", "Furthest Hops"])
+                        "Nearest Nodes", "Furthest Nodes"])
             for _r in rows:
                 _fb = _fault_bus_of(_r[0])
                 _ar, _nm = _bus_area(_fb) if _fb else (None, "")
@@ -22738,7 +22738,7 @@ def write_what_failed_report(cases, verdicts, rows, crit_rows=None):
 
         # ---- THE TABLE ---------------------------------------------------
         _hdr = (" %-20s %-9s %-8s %-14s %-7s %-6s %-5s %-24s %-11s %-9s %-9s %s"
-                % ("Fault", "Fault bus", "Bus", "Name", "kV", "Area", "Hops",
+                % ("Fault", "Fault bus", "Bus", "Name", "kV", "Area", "Nodes",
                    "What failed", "Measured", "Limit", "Past lim", "At"))
         f.write(_hdr + "\n")
         f.write(" " + "-" * (W - 2) + "\n")
@@ -22786,9 +22786,9 @@ def write_what_failed_report(cases, verdicts, rows, crit_rows=None):
             else:
                 _far += 1
         f.write("\n DISTANCE FROM THE FAULT\n")
-        f.write("   %3d element(s) at or next to the faulted bus (0-1 hops)\n" % _near)
-        f.write("   %3d element(s) 2 to %d hops away\n" % (_far, FAULT_DIST_MAX_HOPS))
-        f.write("   %3d element(s) further than %d hops, or not on the mapped path\n"
+        f.write("   %3d element(s) at or next to the faulted bus (0-1 nodes)\n" % _near)
+        f.write("   %3d element(s) 2 to %d nodes away\n" % (_far, FAULT_DIST_MAX_HOPS))
+        f.write("   %3d element(s) further than %d nodes, or not on the mapped path\n"
                 % (_unk, FAULT_DIST_MAX_HOPS))
         _areas = {}
         for d in recs:
@@ -22810,7 +22810,7 @@ def write_what_failed_report(cases, verdicts, rows, crit_rows=None):
                 "            overshoot, then steady state, then damping), and within\n"
                 "            each by how far past the limit. Distance past a limit only\n"
                 "            ranks like against like -- degrees do not rank against pu.\n")
-        f.write(" Hops     = levels from the FAULTED bus. 0 = the faulted bus itself.\n")
+        f.write(" Nodes     = levels from the FAULTED bus. 0 = the faulted bus itself.\n")
         f.write(" Limits   : recover >= %.2f pu by %.1f s | no swing above %.2f pu |\n"
                 % (V_RECOVERY_PU, V_RECOVERY_S, V_OVERSHOOT_PU))
         f.write("            steady state %.2f-%.2f pu | rotor angle < %d deg deviation\n"
@@ -23189,7 +23189,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                     # commonest and most important case in the list.
                     _hs = ("" if _hh is None else
                            ("at the faulted bus" if _hh == 0 else
-                            "%d hop%s from the fault"
+                            "%d node%s from the fault"
                             % (_hh, "" if _hh == 1 else "s")))
                     if _k == "overshoot":
                         f.write(" %-30s %-16s %9d   %-9s %-6s  %-26s %s%s\n"
@@ -24514,7 +24514,7 @@ _SF_HOPS = None
 
 
 def sf_hop_map(poi_bus, max_hops):
-    """{bus number -> hops from the POI}, breadth-first over sf_neighbors() -- the same
+    """{bus number -> nodes from the POI}, breadth-first over sf_neighbors() -- the same
        adjacency the fault generator itself uses, so transformer legs are included.
        Cached per process; the cache is cleared with the other topology caches."""
     global _SF_HOPS
@@ -24558,7 +24558,7 @@ def sf_diagnose_poi(poi_bus):
               "junction bus with no branches)")
 
 def sf_lines_around(poi_bus, hops, kv_min):
-    """[(frm,to,kv,ckt)] for every transmission LINE within 'hops' of the POI at
+    """[(frm,to,kv,ckt)] for every transmission LINE within 'nodes' of the POI at
        max-end-kV >= kv_min. A branch is a LINE if it is NOT in the transformer set
        (authoritative), so transformers are never miscounted as lines even when their
        two ends share a base kV."""
@@ -24583,7 +24583,7 @@ def sf_lines_around(poi_bus, hops, kv_min):
     return lines
 
 def sf_transformers_around(poi_bus, hops, kv_min):
-    """[(hi,lo,hikv,lokv,ckt)] for every TRANSFORMER within 'hops' of the POI whose
+    """[(hi,lo,hikv,lokv,ckt)] for every TRANSFORMER within 'nodes' of the POI whose
        HIGH side is >= kv_min. (These are the branches sf_lines_around skips.)"""
     buses = sf_radius_buses(poi_bus, hops)
     xfmrs, seenkey = [], set()
@@ -24629,7 +24629,7 @@ def sf_machines_at(bus):
 
 
 def sf_gens_around(poi_bus, hops, kv_min):
-    """[(bus,id,kv)] for machines within 'hops' of the POI at terminal kV >= kv_min."""
+    """[(bus,id,kv)] for machines within 'nodes' of the POI at terminal kV >= kv_min."""
     buses = sf_radius_buses(poi_bus, hops)
     found = []
     try:
@@ -24973,7 +24973,7 @@ def sf_build_spp_faults(poi_bus, hops, kv_min):
     par = {}
     for (a, b, kv, ck) in lines:
         par.setdefault(tuple(sorted((a, b))), []).append((a, b, kv, ck))
-    print("  [make_spp_faults] POI %d within %d hop(s) >= %g kV: %d line(s), %d transformer(s)"
+    print("  [make_spp_faults] POI %d within %d node(s) >= %g kV: %d line(s), %d transformer(s)"
           % (poi_bus, hops, kv_min, len(lines), len(xfmrs)))
 
     def on(ev): return SPP_EVENTS.get(ev, False)
@@ -25561,7 +25561,7 @@ def sf_build_spp_faults(poi_bus, hops, kv_min):
         d = _hops.get(int(f["fault_bus"]), _FAR)
         _byhop[d] = _byhop.get(d, 0) + 1
     print("  [make_spp_faults] ordered from the POI outward: %s"
-          % ", ".join("%s hop%s=%d" % (("%d" % d) if d != _FAR else "no path",
+          % ", ".join("%s node%s=%d" % (("%d" % d) if d != _FAR else "no path",
                                        "" if d == 1 else "s", _byhop[d])
                       for d in sorted(_byhop)))
     # per-event tally
@@ -26146,7 +26146,7 @@ def sf_write_spp_descriptions(faults, base):
     with open(base + ".csv", "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["Fault ID", "SPP Contingency", "Planning Event", "Fault Bus",
-                    "Fault Bus Name", "kV", "Hops from POI",
+                    "Fault Bus Name", "kV", "Nodes from POI",
                     "Contingency Description"])
         for f, txt in zip(faults, texts):
             a = int(f["fault_bus"])
@@ -26194,13 +26194,13 @@ def fault_hops(f):
 
 
 def fault_hops_text(f):
-    """'at the POI' / '1 hop from POI' / '>8 hops from POI'."""
+    """'at the POI' / '1 node from POI' / '>8 nodes from POI'."""
     h = fault_hops(f)
     if h is None:
         return "no path to POI in the case"
     if h == 0:
         return "at the POI"
-    return "%d hop%s from %s" % (h, "" if h == 1 else "s", _poi_word())
+    return "%d node%s from %s" % (h, "" if h == 1 else "s", _poi_word())
 
 
 def fault_source(f):
@@ -26364,7 +26364,7 @@ def sf_write_definitions(faults, base):
     # --- human-readable, mirrors SPP Table 6-2 ---
     with open(base + ".txt", "w") as fout:
         fout.write("Table 6-2. Fault Definitions\n")
-        fout.write("POI bus %d (%s)   Generated %s   hops=%d   kV>=%g\n"
+        fout.write("POI bus %d (%s)   Generated %s   nodes=%d   kV>=%g\n"
                    % (POI_BUS, sf_nm(POI_BUS), time.strftime("%Y-%m-%d %H:%M:%S"),
                       SPP_FAULT_HOPS, SPP_FAULT_KV_MIN))
         fout.write("=" * 78 + "\n")
@@ -26384,7 +26384,7 @@ def sf_write_definitions(faults, base):
     with open(base + ".csv", "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["Fault ID", "Planning Event", "Fault Type", "Fault Bus",
-                    "Fault Bus Name", "kV", "Hops from POI", "SPP Contingency",
+                    "Fault Bus Name", "kV", "Nodes from POI", "SPP Contingency",
                     "Clear Cycles", "Retained V (pu)",
                     "Prior Outage", "Trip Elements", "Description (1 line)"])
         for f in faults:
@@ -26453,7 +26453,7 @@ def _dist_nbrs(bus):
        Deliberately NOT sf_neighbors(): that index is built during the fault
        build, and the plots are drawn (and re-drawn on resume) in runs where the
        build never happened. Two definitions of "adjacent" would also mean two
-       different answers to "how many hops", which is the one thing a distance
+       different answers to "how many nodes", which is the one thing a distance
        label must not have."""
     global _DIST_ADJ
     if _DIST_ADJ is None:
@@ -26498,7 +26498,7 @@ _HOPS_CACHE = {}
 
 
 def hops_from(bus, max_hops=None):
-    """{bus: hops} out to max_hops. Cached per centre bus."""
+    """{bus: nodes} out to max_hops. Cached per centre bus."""
     bus = int(bus)
     lim = DIST_MAX_HOPS if max_hops is None else max_hops
     key = (bus, lim)
@@ -26533,12 +26533,12 @@ def sf_write_bus_distance(base):
         w.writerow(["bus_number", "bus_name", "base_kV", "hops_from_POI"])
         for b, d in rows:
             w.writerow([b, sf_nm(b), "%.2f" % sf_kv(b), d])
-    print("  [write] %s.csv  (%d bus(es) within %d hop(s) of the POI)"
+    print("  [write] %s.csv  (%d bus(es) within %d node(s) of the POI)"
           % (base, len(rows), DIST_MAX_HOPS))
 
 
 def sf_write_fault_distance(faults, base):
-    """faults\\FAULT_DISTANCE.csv -- hops from EACH FAULT BUS to nearby buses.
+    """faults\\FAULT_DISTANCE.csv -- nodes from EACH FAULT BUS to nearby buses.
 
        Bounded at FAULT_DIST_MAX_HOPS: one map per fault over the whole case
        would be 138 x 35,748 rows, which is a file nobody opens twice."""
@@ -26554,12 +26554,12 @@ def sf_write_fault_distance(faults, base):
                                key=lambda kv: (kv[1], kv[0])):
                 w.writerow([f["id"], fb, b, d])
                 n += 1
-    print("  [write] %s.csv  (%d row(s), %d hop(s) around each fault bus)"
+    print("  [write] %s.csv  (%d row(s), %d node(s) around each fault bus)"
           % (base, n, FAULT_DIST_MAX_HOPS))
 
 
 def sf_write_radius_buses(poi_bus, hops, base):
-    """List every BUS within 'hops' of the POI: number, name, base kV, hop-distance."""
+    """List every BUS within 'nodes' of the POI: number, name, base kV, node-distance."""
     # hop distance of each bus from the POI (BFS layers)
     poi_bus = int(poi_bus)
     dist = {poi_bus: 0}
@@ -26579,20 +26579,20 @@ def sf_write_radius_buses(poi_bus, hops, base):
         for b, nm, kv, d in rows:
             w.writerow([b, nm, ("%.2f" % kv), d])
     with open(base + ".txt", "w") as fout:
-        fout.write("BUSES WITHIN %d HOP(S) OF POI %d (%s)   kV>=%g (all shown)\n"
+        fout.write("BUSES WITHIN %d NODE(S) OF POI %d (%s)   kV>=%g (all shown)\n"
                    % (hops, poi_bus, sf_nm(poi_bus), 0.0))
         fout.write("Generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
         fout.write("=" * 60 + "\n")
-        fout.write("%-10s %-14s %9s  %s\n" % ("Bus", "Name", "kV", "hops"))
+        fout.write("%-10s %-14s %9s  %s\n" % ("Bus", "Name", "kV", "nodes"))
         fout.write("-" * 60 + "\n")
         for b, nm, kv, d in rows:
             fout.write("%-10d %-14s %9.2f  %d\n" % (b, nm, kv, d))
         fout.write("=" * 60 + "\n%d bus(es)\n" % len(rows))
-    print("  [write] %s.txt / .csv  (%d bus(es) within %d hop(s))" % (base, len(rows), hops))
+    print("  [write] %s.txt / .csv  (%d bus(es) within %d node(s))" % (base, len(rows), hops))
 
 
 def sf_write_radius_lines(poi_bus, hops, kv_min, base):
-    """List every BRANCH within 'hops' of the POI: LINE or TRANSFORMER, with kV + ckt."""
+    """List every BRANCH within 'nodes' of the POI: LINE or TRANSFORMER, with kV + ckt."""
     lines = sf_lines_around(poi_bus, hops, kv_min)
     xfmrs = sf_transformers_around(poi_bus, hops, kv_min)
     with open(base + ".csv", "w", newline="") as fh:
@@ -26604,7 +26604,7 @@ def sf_write_radius_lines(poi_bus, hops, kv_min, base):
         for (hi, lo, hikv, lokv, ck) in xfmrs:
             w.writerow(["XFMR", hi, sf_nm(hi), lo, sf_nm(lo), "%.1f" % hikv, ck, "%.1f" % lokv])
     with open(base + ".txt", "w") as fout:
-        fout.write("BRANCHES WITHIN %d HOP(S) OF POI %d (%s)   kV>=%g\n"
+        fout.write("BRANCHES WITHIN %d NODE(S) OF POI %d (%s)   kV>=%g\n"
                    % (hops, int(poi_bus), sf_nm(poi_bus), kv_min))
         fout.write("Generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
         fout.write("=" * 72 + "\n")
@@ -26617,7 +26617,7 @@ def sf_write_radius_lines(poi_bus, hops, kv_min, base):
             fout.write("   %-8s %-14s - %-8s %-14s  %6.1f/%.1f kV  ckt %s\n"
                        % (hi, sf_nm(hi), lo, sf_nm(lo), hikv, lokv, ck))
         fout.write("=" * 72 + "\n%d line(s), %d transformer(s)\n" % (len(lines), len(xfmrs)))
-    print("  [write] %s.txt / .csv  (%d line(s), %d transformer(s) within %d hop(s))"
+    print("  [write] %s.txt / .csv  (%d line(s), %d transformer(s) within %d node(s))"
           % (base, len(lines), len(xfmrs), hops))
 
 # ---------------------------------------------------------------------------
@@ -27102,7 +27102,7 @@ def sf_make_custom_fault_list():
        the plant rides through a disturbance rather than whether it meets a
        specific planning standard.
 
-       Buses come from the same hop map the SPP set uses, so "near the POI"
+       Buses come from the same node map the SPP set uses, so "near the POI"
        means the same thing in both. The kV floor keeps it on the transmission
        system, and the cap keeps a densely connected POI from producing several
        hundred runs without anyone asking for them."""
@@ -27136,7 +27136,7 @@ def sf_make_custom_fault_list():
     try:
         hop = sf_hop_map(poi, int(CUSTOM_HOPS))
     except Exception as e:
-        print("[faults] *** could not build the hop map around POI %d: %s ***" % (poi, e))
+        print("[faults] *** could not build the node map around POI %d: %s ***" % (poi, e))
         return []
     kv = {}
     try:
@@ -27180,7 +27180,7 @@ def sf_make_custom_fault_list():
                             "trip_lines": []})
 
     print("")
-    print("[faults] CUSTOM set: %s at %d bus(es) within %d hop(s) of POI %d, "
+    print("[faults] CUSTOM set: %s at %d bus(es) within %d node(s) of POI %d, "
           "kV >= %.1f" % ("/".join(CUSTOM_TYPES), len(buses), CUSTOM_HOPS, poi,
                           CUSTOM_KV_MIN))
     print("[faults]   %d type(s) -> %d scenario(s); clearing time per type:"
@@ -27229,7 +27229,7 @@ def sf_make_custom_fault_list():
                 fh.write("CUSTOM fault set -- project %s, POI %d (%s)\n"
                          % (RUN_PROJECT, poi, sf_nm(poi)))
                 fh.write("Generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
-                fh.write("within %d hop(s) of the POI, base kV >= %.1f, cap %d bus(es)\n"
+                fh.write("within %d node(s) of the POI, base kV >= %.1f, cap %d bus(es)\n"
                          % (CUSTOM_HOPS, CUSTOM_KV_MIN, CUSTOM_MAX_BUSES))
                 fh.write("types %s   clearing %s cycle(s)   no line tripping, no pre-outage\n"
                          % ("/".join(CUSTOM_TYPES),
@@ -27239,7 +27239,7 @@ def sf_make_custom_fault_list():
                              % (n_all, n_all - len(buses)))
                 fh.write("=" * 78 + "\n")
                 fh.write("%-24s %-9s %-14s %-5s %-8s %s\n"
-                         % ("fault id", "bus", "name", "hops", "kV", "type / clearing"))
+                         % ("fault id", "bus", "name", "nodes", "kV", "type / clearing"))
                 fh.write("-" * 78 + "\n")
                 for f in out:
                     fh.write("%-24s %-9d %-14s %-5d %-8.1f %s %d cycles\n"
@@ -27502,7 +27502,7 @@ def sf_con_to_faults(cons, poi_bus):
             _drop("nothing tripped")
             continue
         if not any(hopmap.get(int(b), 10 ** 6) <= lim for b in touched):
-            _drop("further than %d hop(s) from the POI" % lim)
+            _drop("further than %d node(s) from the POI" % lim)
             continue
 
         if c["unsupported"]:
@@ -27523,7 +27523,7 @@ def sf_con_to_faults(cons, poi_bus):
                 and hopmap.get(int(fb), 10 ** 6) > lim:
             # CON_NEAR_BY = "fault_bus": the event has to be AT the plant, not
             # merely touch something near it.
-            _drop("faulted bus further than %d hop(s) from the POI" % lim)
+            _drop("faulted bus further than %d node(s) from the POI" % lim)
             continue
 
         kv = sf_kv(fb)
@@ -27898,11 +27898,11 @@ def sf_table_to_faults(rows, poi_bus):
         for m in p["machines"]:
             touched.add(int(m[0]))
         if not any(hopmap.get(int(b), 10 ** 6) <= lim for b in touched):
-            _drop("further than %d hop(s) from the POI" % lim)
+            _drop("further than %d node(s) from the POI" % lim)
             continue
         if (TABLE_NEAR_BY or "").lower() != "any_element" \
                 and hopmap.get(int(p["fault_bus"]), 10 ** 6) > lim:
-            _drop("faulted bus further than %d hop(s) from the POI" % lim)
+            _drop("faulted bus further than %d node(s) from the POI" % lim)
             continue
         if p["unsupported"]:
             # Load shedding is part of the event as SPP wrote it and is not
@@ -28017,7 +28017,7 @@ def _imported_or_shared(make_list):
     """Import SPP's file, or read the shared list that was imported from it.
 
        BOTH CASES MUST RUN THE SAME EVENTS, and importing independently does not
-       guarantee that. The import filters on hops from the POI, walked over the
+       guarantee that. The import filters on nodes from the POI, walked over the
        case's own topology -- and the two cases differ: the project buses
        765910/765920/765930 exist with the projects and may not exist at all in
        the base case. An event naming one of them would be imported on one side
@@ -28192,7 +28192,7 @@ def finalize_report(produced, part=None, claim=False):
     except Exception as e:
         print("  radius check failed: %s" % e)
     if MONITOR_SYNC_IN_RADIUS:
-        print("  detected synchronous gens (%d) within %d hops of %d: %s"
+        print("  detected synchronous gens (%d) within %d nodes of %d: %s"
               % (len(_DETECTED_SYNC), SYNC_RADIUS_HOPS, SYNC_CENTER_BUS,
                  ["%d:%s" % (b, m) for b, m in _DETECTED_SYNC[:20]]))
     if EXPORT_CSV:
@@ -29344,7 +29344,7 @@ def write_all_results():
                         "\n"
                         " EVERY violation for ONE fault, in full,    -> VIOLATIONS  (%s)\n"
                         "   grouped by criterion, with bus, value,      one block per fault,\n"
-                        "   time, area and hops from the fault?         nothing truncated.\n"
+                        "   time, area and nodes from the fault?         nothing truncated.\n"
                         "                                               THIS is the per-fault view.\n"
                         "\n"
                         " What broke across the whole study, worst   -> WHAT FAILED\n"
@@ -29634,7 +29634,7 @@ def main():
     print("=" * 64); print(" SPP DYNAMIC STABILITY STUDY (DIS2201)"); print("=" * 64)
     print("[%s] RUN START" % _ts())
     print(" POI=%s  project_gens=%s" % (_poi_text(), PROJECT_GENS))
-    print(" study areas=%d areas  POI radius=%d hops  area kV>=%.0f"
+    print(" study areas=%d areas  POI radius=%d nodes  area kV>=%.0f"
           % (len(STUDY_AREAS), POI_RADIUS_HOPS, AREA_KV_MIN))
 
     # ---- PARALLEL role dispatch -------------------------------------------------------

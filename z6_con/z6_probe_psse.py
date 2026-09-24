@@ -110,7 +110,7 @@ def main():
             for b, h, z in reach:
                 for d in net["dev"].get(b, []):
                     if n < 40:
-                        P("  hops %d |Z| %.4f  %s" % (h, z, dict((k, d[k]) for k in d if k != "models")))
+                        P("  nodes %d |Z| %.4f  %s" % (h, z, dict((k, d[k]) for k in d if k != "models")))
                         if d.get("models"):
                             P("        models %s" % d["models"])
                     n += 1

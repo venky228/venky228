@@ -2454,7 +2454,7 @@ def _side_key(rdir):
 
 
 def where_of(fid, element):
-    """'area 534 SPP-NORTH, 2 hops from fault' for one element, or ''."""
+    """'area 534 SPP-NORTH, 2 nodes from fault' for one element, or ''."""
     got = (_WHERE.get(fid) or {}).get(str(element).strip())
     if not got:
         return ""
@@ -2466,7 +2466,7 @@ def where_of(fid, element):
         try:
             h = int(float(hp))
             bits.append("at the fault bus" if h == 0 else
-                        "%d hop%s from fault%s" % (h, "" if h == 1 else "s",
+                        "%d node%s from fault%s" % (h, "" if h == 1 else "s",
                                                    (" bus %s" % fb) if fb else ""))
         except (TypeError, ValueError):
             pass
@@ -3225,7 +3225,7 @@ _POI_BUS_CACHE = {}
 
 def _poi_bus_of(bus_map):
     """The POI bus number, or None -- it is the bus BUS_DISTANCE.csv records at
-       0 hops from the POI. Lets hops-from-POI be walked over the whole case
+       0 nodes from the POI. Lets nodes-from-POI be walked over the whole case
        instead of stopping at the edge of that file's radius."""
     if not bus_map:
         return None
@@ -3292,7 +3292,7 @@ def _why_no_base(base_scored, meas_b, bus=None, fid=None, fam=None):
         # Monitored by the area_volt spec in both studies, so this should not
         # happen: the base scored the fault but its measurements have no row.
         return "base scored but bus missing from its measurements -- re-score base"
-    return "below 100 kV -- monitored only within 5 hops of the POI"
+    return "below 100 kV -- monitored only within 5 nodes of the POI"
 
 
 def measured_value(meas, fam, fid, element):
@@ -6305,7 +6305,7 @@ def _cmp_bus_map():
         except Exception as e:
             print("[compare] could not read %s (%s)" % (p, e))
     if not _nread:
-        print("[compare] no BUS_MAP.csv in any results folder -- area and hop columns "
+        print("[compare] no BUS_MAP.csv in any results folder -- area and node columns "
               "will read 'no path'")
     return _CMP_BMAP
 
@@ -6327,7 +6327,7 @@ def _bmap_area_text(bus):
 
 
 def _bmap_hops_from(src, max_hops=60):
-    """{bus: hops} from one bus, over the whole case. Cached per source."""
+    """{bus: nodes} from one bus, over the whole case. Cached per source."""
     try:
         src = int(src)
     except (TypeError, ValueError):
@@ -8026,7 +8026,7 @@ def write_one_report(results, only_base, only_test):
                             # element -- it is FAR from the fault, and that is
                             # exactly what a reader is looking for here.
                             (("at fault" if min(_e["hops"]) == 0 else
-                              "%d hop%s" % (min(_e["hops"]),
+                              "%d node%s" % (min(_e["hops"]),
                                             "" if min(_e["hops"]) == 1 else "s"))
                              if _e["hops"] else "no path"),
                             _FAM_LABEL.get(fam2, fam2)[:22],
@@ -8035,14 +8035,14 @@ def write_one_report(results, only_base, only_test):
                             len(_e["faults"]),
                             "YES" if _e["new"] else ""))
         L.append("")
-        L.append(" Nearest = the FEWEST hops from a faulted bus, over the faults this")
+        L.append(" Nearest = the FEWEST nodes from a faulted bus, over the faults this")
         L.append("           element fails in -- how close it ever is to a fault.")
         L.append("           \"no path\" = the element is not connected to any faulted bus of")
         L.append("           this report in the case topology (BUS_MAP.csv).")
         L.append(" Faults  = how many of the faults in this report it fails in.")
         L.append("")
 
-    L.append(" Flt = how many levels (hops) the element is from the FAULTED BUS of")
+    L.append(" Flt = how many levels (nodes) the element is from the FAULTED BUS of")
     L.append(" that event. 0 = the faulted bus itself, - = no path in the case or")
     L.append(" not in the distance file. Measured on the topology of the case that was")
     L.append(" run (faults\\FAULT_DISTANCE.csv) -- the same measure the plots carry.")
@@ -13581,7 +13581,7 @@ def _push_settings(env, case):
        its own bare environment. So every fault-creation setting in this panel
        was applied to the RUNS and ignored by the BUILD that decides what the
        runs are: CUSTOM_CYCLES = [10] produced a list of 9-cycle faults, and
-       CUSTOM_HOPS = 2 produced one hop, because the build never saw either.
+       CUSTOM_HOPS = 2 produced one node, because the build never saw either.
 
        `case` decides which side of COLLECTOR_APPLY_TO this process is on."""
     # THE FAULT-CREATION SETTINGS, when this file sets them. Same rule: a None
@@ -17720,8 +17720,8 @@ def _gt_net():
 
 
 def _gt_cap_list(hops):
-    """[(bus, id, "F"|"S", Mvar, hops)]: GEN_TEST_CAPS_LIST, or every in-service
-       capacitor bank within `hops` of the POI -- fixed shunts with +Mvar and
+    """[(bus, id, "F"|"S", Mvar, nodes)]: GEN_TEST_CAPS_LIST, or every in-service
+       capacitor bank within `nodes` of the POI -- fixed shunts with +Mvar and
        switched shunts capacitive now. None when the network cannot be read."""
     if GEN_TEST_CAPS_LIST:
         return [(int(c[0]), str(c[1]).strip() if len(c) > 1 else "",
@@ -18250,11 +18250,11 @@ def _gt_add_hops_group(gens):
             seen.add(k)
             mem.append(k)
     if len(mem) < 2:
-        print("[gen-test] HOPS group skipped: %d machine(s) within %s buses -- the one-at-a-time "
+        print("[gen-test] NODES group skipped: %d machine(s) within %s buses -- the one-at-a-time "
               "runs already cover it" % (len(mem), GEN_TEST_HOPS))
         return gens
     if any(g.get("group") and set(g["group"]) == seen for g in gens):
-        print("[gen-test] HOPS group skipped: same machines as the POI group")
+        print("[gen-test] NODES group skipped: same machines as the POI group")
         return gens
     one = [g for g in gens if not g.get("group")]
     known = all(g["mw"] is not None for g in one)
@@ -18264,7 +18264,7 @@ def _gt_add_hops_group(gens):
            "mvar": sum(g["mvar"] or 0.0 for g in one) if known else None,
            "kind": "GROUP of %d" % len(mem), "name": "ALL IN %s BUSES" % GEN_TEST_HOPS,
            "models": ["%d:%s" % k for k in mem]}
-    print("[gen-test] HOPS group: %d machine(s) within %s buses of POI %s switched off TOGETHER: %s"
+    print("[gen-test] NODES group: %d machine(s) within %s buses of POI %s switched off TOGETHER: %s"
           % (len(mem), GEN_TEST_HOPS, GEN_TEST_POI, ", ".join("%d '%s'" % k for k in mem)))
     return [grp] + list(gens)
 
@@ -18946,7 +18946,7 @@ def _gt_write(runs, faults, gens):
         with csv_open(csvp, "w") as fh:
             w = csv.writer(fh)
             w.writerow(["scenario", "delt_cycles", "maxiter", "accel", "tol", "off_bus", "off_id",
-                        "off_name", "off_kind", "off_mw", "hops", "zdist_pu", "fault", "verdict",
+                        "off_name", "off_kind", "off_mw", "nodes", "zdist_pu", "fault", "verdict",
                         "noconv_steps", "buses_over_1p2", "max_pu", "folder", "note"])
             for r in runs:
                 sc, g, m = r["sc"], r["gen"], r.get("m") or {}
@@ -19450,7 +19450,7 @@ def run_gen_test():
         fh.write("machines within %s buses of POI %s (in service, |MW| >= %s), closest first\n\n"
                  % (GEN_TEST_HOPS, GEN_TEST_POI, GEN_TEST_MIN_MW))
         fh.write("%-8s %-4s %-14s %-18s %8s %8s %5s %8s  %s\n"
-                 % ("bus", "id", "name", "kind", "MW", "Mvar", "hops", "|Z| pu", "models"))
+                 % ("bus", "id", "name", "kind", "MW", "Mvar", "nodes", "|Z| pu", "models"))
         for g in gens:
             fh.write("%-8s %-4s %-14s %-18s %8s %8s %5s %8s  %s\n" % (
                 g["bus"], g["id"], g["name"][:14], g["kind"][:18],
@@ -19460,7 +19460,7 @@ def run_gen_test():
         fh.write("\nlines OPENED one at a time (GEN_TEST_LINES_EACH, scenario(s) %s)\n\n"
                  % ", ".join(GEN_TEST_LINES_SCENARIOS))
         fh.write("%-8s %-8s %-8s %-4s %-26s %-6s %8s %5s  %s\n"
-                 % ("from", "to", "3rd", "ckt", "names", "kind", "MW", "hops", "kV"))
+                 % ("from", "to", "3rd", "ckt", "names", "kind", "MW", "nodes", "kV"))
         for g in lines:
             br = g["branches"][0]
             fh.write("%-8s %-8s %-8s %-4s %-26s %-6s %8s %5s  %s\n" % (
@@ -20037,11 +20037,11 @@ def main():
         # study scripts' own value, and is not listed -- so this says exactly
         # what was overridden and nothing else.
         _forced = [(n, v) for n, v in (
-            ("auto-generate faults", AUTO_SPP_FAULTS), ("hops from POI", SPP_FAULT_HOPS),
+            ("auto-generate faults", AUTO_SPP_FAULTS), ("nodes from POI", SPP_FAULT_HOPS),
             ("kV floor", SPP_FAULT_KV_MIN), ("max faults", SPP_MAX_FAULTS),
-            ("planning events", SPP_EVENTS_ON), ("event hops", SPP_EVENT_HOPS),
+            ("planning events", SPP_EVENTS_ON), ("event nodes", SPP_EVENT_HOPS),
             ("custom types", CUSTOM_TYPES), ("custom cycles", CUSTOM_CYCLES),
-            ("custom hops", CUSTOM_HOPS),
+            ("custom nodes", CUSTOM_HOPS),
             ("POI P target MW", POI_P_TARGET_MW), ("POI P levels", POI_P_LEVELS),
             ("POI P levels %", POI_P_LEVELS_PCT),
             ("POI area held", POI_HOLD_AREA_MW), ("POI P share", POI_P_SHARE),

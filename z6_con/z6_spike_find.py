@@ -12,7 +12,7 @@ PART A  (no PSS/E needed, seconds)
     ranks the overvoltage buses:
       * how many faults each bus fails on, worst pu, worst fault
       * SPIKE (<= 2 cycles above the limit, at the clearing instant) vs SWING
-      * near the fault (0-1 hops) or remote
+      * near the fault (0-1 nodes) or remote
       * GROUPS of buses that fail on the same faults -- one group, one source
       * a likely-cause hint per bus
 
@@ -906,7 +906,7 @@ def run_folder(kind, proj, res_dir, vcsv):
           "    single-sample spike = the solution, not the network; 'clean' = a real model response.\n")
         W("\n 1. BUSES, most faults first (all of them in %s)\n" % os.path.basename(bcsv))
         W(" %-22s %-6s %6s %6s %-10s %-6s %8s %5s  %s\n"
-          % ("bus", "area", "faults", "worst", "in", "shape", "abv_s", "hops", "likely cause"))
+          % ("bus", "area", "faults", "worst", "in", "shape", "abv_s", "nodes", "likely cause"))
         W(" " + "-" * 98 + "\n")
         for b in buses[:TOP_BUSES]:
             W(" %-22s %-6s %6d %6.3f %-10s %-6s %8s %5s  %s\n"
@@ -944,7 +944,7 @@ def run_folder(kind, proj, res_dir, vcsv):
             wide = len(fr["buses"]) >= 20 and nsp >= 0.8 * len(fr_rows)
             W(" %-12s %4d bus(es)  worst %.3f at %s  (fault bus %s)%s\n"
               % (fr["fault"], len(fr["buses"]), fr["worst"], fr["worst_bus"], fr["fault_bus"],
-                 ("  <- WIDE-AREA CLEARING SPIKE (%d spikes, up to %d hops): the reactive current "
+                 ("  <- WIDE-AREA CLEARING SPIKE (%d spikes, up to %d nodes): the reactive current "
                   "injected DURING the fault is still flowing when it clears -- Part B/C name the plants"
                   % (nsp, hmax)) if wide else ""))
             _st = _solver_txt(fr["fault"])
@@ -1263,7 +1263,7 @@ def load_network(psspy, sav, dyr):
 
 
 def nearby(net, bus, max_hops=None):
-    """[(bus, hops, zdist)] within max_hops (NEAR_HOPS), Dijkstra on |Z| (pu)."""
+    """[(bus, nodes, zdist)] within max_hops (NEAR_HOPS), Dijkstra on |Z| (pu)."""
     max_hops = NEAR_HOPS if max_hops is None else max_hops
     import heapq
     best = {bus: (0.0, 0)}
@@ -1442,7 +1442,7 @@ def run_nearby(kind, combined, traced_all, res_dirs=None):
                 if not sel:
                     continue
                 W("   %-15s %-8s %-18s %4s %6s %8s %8s  %s\n"
-                  % ("device", "bus", "name", "hops", "|Z|pu", "MW", "Mvar", "what to check"))
+                  % ("device", "bus", "name", "nodes", "|Z|pu", "MW", "Mvar", "what to check"))
                 nshow = 0
                 for z, h, n, d, _g in sel:
                     key = (d["kind"], d["bus"], d.get("id"), d.get("to"))
@@ -1480,13 +1480,13 @@ def run_nearby(kind, combined, traced_all, res_dirs=None):
     with open(ncsv, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["case", "bad_bus", "faults_failed", "worst_pu", "device", "device_bus", "name", "id",
-                    "hops", "zdist_pu", "mw", "mvar", "status", "models", "confirmed_by_out", "what_to_check"])
+                    "nodes", "zdist_pu", "mw", "mvar", "status", "models", "confirmed_by_out", "what_to_check"])
         w.writerows(rows)
     if cause_rows:
         ccsv = os.path.join(_root(), "SPIKE_CAUSE_%s.csv" % tag)
         with open(ccsv, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["case", "bad_bus", "fault", "rank", "machine", "type", "gen_bus", "id", "hops",
+            w.writerow(["case", "bad_bus", "fault", "rank", "machine", "type", "gen_bus", "id", "nodes",
                         "zdist_pu", "q_prefault_mvar", "q_during_fault_avg", "q_during_fault_max",
                         "dq_at_bus_peak_mvar", "dq_max_after_clear_mvar", "t_qmax_after_clear_s",
                         "q_back_to_prefault_s", "eterm_max", "score", "reason"])
@@ -1560,7 +1560,7 @@ def _q_review(W, cb, gens, net, traces, cause_rows, tag, others=()):
         cand.append((score, dq, z, h, d, m))
     cand.sort(key=lambda c: -c[0])
     W("     %-24s %-6s %4s %6s %7s %8s %8s %8s %8s %7s %7s\n"
-      % ("generator", "type", "hops", "|Z|pu", "Q0", "Qfault", "dQ@peak", "dQmax", "t_qmax", "Q back", "Et max"))
+      % ("generator", "type", "nodes", "|Z|pu", "Q0", "Qfault", "dQ@peak", "dQmax", "t_qmax", "Q back", "Et max"))
     for score, dq, z, h, d, m in cand[:GEN_TOP]:
         W("     %-24s %-6s %4d %6.3f %7.0f %8s %8.0f %8.0f %8.3f %7s %7s\n"
           % (m["machine"][:24], d["kind"][:6], h, z, m["q0"],
