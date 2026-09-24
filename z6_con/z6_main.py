@@ -18347,18 +18347,34 @@ def _gt_scen_desc(sc):
 
 
 def _gt_score(m, faults):
-    """(passes, nc, over, max_pu, known, n_faults) for one run; None when
-       nothing scored. SKIP faults (left out of a line run) do not count."""
+    """(passes, nc, over, max_pu, known, n_scored, n_needed) for one run; None
+       when nothing scored.
+
+       ONLY SCORED FAULTS COUNT. A fault the study gave up on (it crashed on
+       every attempt) has no verdict and no bus list -- only the 'not
+       converged' steps it logged before it died. Adding those faults in as
+       '0 buses above 1.2 pu' made a run with ONE of four faults scored read
+       as '8 buses, peak 1.231' and top the ranking. n_scored < n_needed marks
+       such a run; it is compared only on the faults it did score.
+       SKIP faults (left out of a line run) are not needed at all."""
     if m:
         faults = [f for f in faults if f in m and m[f]["verdict"] != "SKIP"]
-    if not m or not any(m[f]["verdict"] in ("PASS", "FAIL") for f in faults):
+    if not m:
         return None
-    ps = sum(1 for f in faults if m[f]["verdict"] == "PASS")
-    nc = sum(m[f]["noconv"] or 0 for f in faults)
-    known = all(m[f]["noconv"] is not None for f in faults)
-    ov = sum(m[f]["n_over"] for f in faults)
-    mx = max([m[f]["max_pu"] or 0.0 for f in faults] or [0.0])
-    return ps, nc, ov, mx, known, len(faults)
+    sc = [f for f in faults if m[f]["verdict"] in ("PASS", "FAIL")]
+    if not sc:
+        return None
+    ps = sum(1 for f in sc if m[f]["verdict"] == "PASS")
+    nc = sum(m[f]["noconv"] or 0 for f in sc)
+    known = all(m[f]["noconv"] is not None for f in sc)
+    ov = sum(m[f]["n_over"] for f in sc)
+    mx = max([m[f]["max_pu"] or 0.0 for f in sc] or [0.0])
+    return ps, nc, ov, mx, known, len(sc), len(faults)
+
+
+def _gt_scored(m, faults):
+    """The faults this run has a verdict for (PASS / FAIL)."""
+    return [f for f in faults if m and f in m and m[f]["verdict"] in ("PASS", "FAIL")]
 
 
 def _gt_label(g):
@@ -18419,11 +18435,15 @@ def _gt_best(runs, faults, ref):
     for x, r in sc_all + part:
         g = r["gen"]
         b = ref.get(r["sc"][0])
-        # against the SAME faults: a line run that left F02 out is held to the
-        # all-in-service run's other faults, not to its total
-        fs = [f for f in faults if (r.get("m") or {}).get(f, {}).get("verdict") != "SKIP"]
-        bx = _gt_score(b.get("m") if b else None, fs)
-        if not g or not bx:
+        # against the SAME faults: only those BOTH runs scored -- a line run
+        # that left F02 out, or a run that gave up on F01-F03, is held to the
+        # all-in-service run's matching faults, not to its total
+        fs = [f for f in _gt_scored(r.get("m"), faults) if f in _gt_scored(b.get("m") if b else None, faults)]
+        if not g or not fs:
+            continue
+        x = _gt_score(r.get("m"), fs)
+        bx = _gt_score(b.get("m"), fs)
+        if not x or not bx:
             continue
         k = (g["bus"], g["id"])
         e = per.setdefault(k, {"g": g, "n": 0, "better": 0, "dnc": 0, "dov": 0, "dmx": 0.0,
@@ -18436,9 +18456,19 @@ def _gt_best(runs, faults, ref):
         if _gt_spike_key(x) < _gt_spike_key(bx):
             e["better"] += 1
         if e["best"] is None or _gt_spike_key(x) < _gt_spike_key(e["best"][0]):
-            e["best"] = (x, r["sc"][0])
+            e["best"] = (x, r["sc"][0], fs)
+    if part:
+        L += ["", "   NOT RANKED above -- %d run(s) with a fault that has NO VERDICT (the study gave up on it, it is still running,"
+                  % len(part),
+              "   or a line run left it out); section C compares them on the faults they did score:"]
+        for x, r in sorted(part, key=lambda t: _gt_key(t[0])):
+            nov = [f for f in faults if (r.get("m") or {}).get(f, {}).get("verdict") not in
+                   ("PASS", "FAIL", "SKIP")]
+            L.append("     %-22s %-34s scored %d/%d%s" % (
+                r["sc"][0], lab(r), x[5], nf,
+                ("   NO VERDICT: " + ", ".join(nov)) if nov else "   (line run: rest left out)"))
     L += ["", "C. EACH MACHINE / CAP OFF OR LINE / TRANSFORMER OPENED (id BR<to>[T<3rd>]C<ckt>), over every scenario it ran in "
-          "(vs the same scenario, all in service) -- ranked by the SPIKES: buses > 1.2 pu cleared,",
+          "(vs the same scenario, all in service, on the faults BOTH scored) -- ranked by the SPIKES: buses > 1.2 pu cleared,",
           "  then peak pu drop; 'better' = fewer buses > 1.2 pu (or the same and a lower peak);",
           "  a negative drop = WORSE with it out",
           "  %-8s %-10s %-14s %-16s %6s %8s %11s %11s %11s %9s  %s" % (
@@ -18449,10 +18479,11 @@ def _gt_best(runs, faults, ref):
     for e in pl:
         g = e["g"]
         bxx = e["best"][0]
-        L.append("  %-8s %-10s %-14s %-16s %6d %5d/%-2d %11.1f %11.3f %11.0f %9d  %s (%d / %s)" % (
+        L.append("  %-8s %-10s %-14s %-16s %6d %5d/%-2d %11.1f %11.3f %11.0f %9d  %s (%d / %s%s)" % (
             g["bus"], g["id"], g["name"][:14], (g["kind"] or "")[:16], e["n"], e["better"], e["n"],
             e["dov"] / float(e["n"]), e["dmx"] / float(e["n"]), e["dnc"] / float(e["n"]), e["fix"],
-            e["best"][1], bxx[2], "%.3f" % bxx[3] if bxx[3] else "-"))
+            e["best"][1], bxx[2], "%.3f" % bxx[3] if bxx[3] else "-",
+            "" if len(e["best"][2]) == nf else " -- %s ONLY" % ",".join(e["best"][2])))
     if not pl:
         L.append("  (no machine-off run has finished yet)")
     # D -- what it says
@@ -18483,8 +18514,10 @@ def _gt_best(runs, faults, ref):
                      "avg peak drop %.3f pu, avg nc drop %.0f" % (
                          _gt_label(e["g"]), e["better"], e["n"], e["dov"] / float(e["n"]),
                          e["dmx"] / float(e["n"]), e["dnc"] / float(e["n"])))
-            L.append("                best with it out: %s -- %d bus(es) > 1.2 pu, peak %s, nc %d"
-                     % (e["best"][1], bxx[2], "%.3f" % bxx[3] if bxx[3] else "-", bxx[1]))
+            L.append("                best with it out: %s -- %d bus(es) > 1.2 pu, peak %s, nc %d%s"
+                     % (e["best"][1], bxx[2], "%.3f" % bxx[3] if bxx[3] else "-", bxx[1],
+                        "" if len(e["best"][2]) == nf else
+                        "  (on %s ONLY -- the rest have no verdict)" % ",".join(e["best"][2])))
             if e["g"].get("branches") and e["better"] * 2 >= e["n"]:
                 L.append("  -> opening this line helps: the problem comes THROUGH it -- look at what")
                 L.append("     sits at its far end (machines, caps, controls) and its loading.")
@@ -18635,6 +18668,9 @@ def _gt_write(runs, faults, gens):
             return "%-26s" % "not run"
         nc = "-" if m["noconv"] is None else str(m["noconv"])
         mx = "-" if m["max_pu"] is None else "%.3f" % m["max_pu"]
+        if m["verdict"] not in ("PASS", "FAIL", "SKIP"):
+            # simulated (nc logged) but never scored: the study gave up on it
+            return "%-26s" % ("NO VERDICT nc %s" % nc)
         return "%-4s nc %-4s >1.2 %-3d %-5s" % (m["verdict"][:4], nc, m["n_over"], mx)
 
     L = ["GEN-OFF / SOLVER TEST -- %s, %s case  (%s)" % (proj, GEN_TEST_CASE,
@@ -18690,19 +18726,23 @@ def _gt_write(runs, faults, gens):
         b = ref.get(r["sc"][0])
         if not g or not m or not b:
             continue
-        fs = [f for f in faults if m[f]["verdict"] != "SKIP"]
+        # only the faults BOTH runs scored (see _gt_score)
+        fs = [f for f in _gt_scored(m, faults) if f in _gt_scored(b["m"], faults)]
+        if not fs:
+            continue
         dnc = sum((b["m"][f]["noconv"] or 0) - (m[f]["noconv"] or 0) for f in fs)
         dov = sum(b["m"][f]["n_over"] - m[f]["n_over"] for f in fs)
         fixed = [f for f in fs if b["m"][f]["verdict"] == "FAIL" and m[f]["verdict"] == "PASS"]
-        eff.append((dnc, dov, r["sc"][0], g, fixed))
-    eff.sort(key=lambda x: (-x[0], -x[1]))
+        eff.append((dnc, dov, r["sc"][0], g, fixed, len(fs)))
+    eff.sort(key=lambda x: (-x[1], -x[0]))
     if eff:
-        L.append("  %-22s %7s %9s  %s" % ("scenario", "nc drop", ">1.2 drop", "machine OFF / line OPEN"))
+        L.append("  %-22s %7s %9s %6s  %s" % ("scenario", "nc drop", ">1.2 drop", "faults",
+                                              "machine OFF / line OPEN"))
     else:
         L.append("  (nothing to compare yet)")
-    for dnc, dov, sc, g, fixed in eff[:40]:
-        L.append("  %-22s %7d %9d  %-44s %s%s" % (
-            sc, dnc, dov, _gt_label(g)[:44], g["kind"],
+    for dnc, dov, sc, g, fixed, nfs in eff[:40]:
+        L.append("  %-22s %7d %9d %6s  %-44s %s%s" % (
+            sc, dnc, dov, "%d/%d" % (nfs, len(faults)), _gt_label(g)[:44], g["kind"],
             ("  FIXES " + ",".join(fixed)) if fixed else ""))
     with open(txt, "w") as fh:
         fh.write("\n".join(L) + "\n")
@@ -18852,8 +18892,10 @@ def _gt_status_write(runs, faults, npar, t_start):
         x = _gt_score(m, faults) if m else None
         if not x:
             return ""
-        return "%d/%d PASS  nc %d%s  >1.2 %d  max %s" % (
-            x[0], x[5], x[1], "" if x[4] else "?", x[2], "%.3f" % x[3] if x[3] else "-")
+        return "%d/%d PASS  nc %d%s  >1.2 %d  max %s%s" % (
+            x[0], x[5], x[1], "" if x[4] else "?", x[2], "%.3f" % x[3] if x[3] else "-",
+            ("   ** scored %d of %d faults -- the rest NO VERDICT **" % (x[5], x[6]))
+            if x[5] < x[6] else "")
 
     L = ["GEN-OFF / SOLVER TEST STATUS -- %s  (updated %s, started %s)"
          % (GEN_TEST_PROJECT, time.strftime("%Y-%m-%d %H:%M:%S"),
