@@ -287,13 +287,14 @@ GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = True                   # all machines within GEN_TEST_HOPS off together
 GEN_TEST_POI_OFF_BASE = True                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
                                              #   compared with the POIALL run; same reports, rows "POI OFF + ..."
-GEN_TEST_HOPS = 5                            # "near" = within this many buses of the POI
+GEN_TEST_HOPS = 7                            # gens: "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
 GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus, id)]
 # -- 3d. cap and line runs (solver scenario s0_asis only)
 GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together
 GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own
 GEN_TEST_LINES_EACH = True                    # each nearby line / transformer opened on its own
+GEN_TEST_LINES_HOPS = 4                      # lines: both ends within this many buses of the POI
 # -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
@@ -17667,7 +17668,6 @@ GEN_TEST_CAPS_HOPS = 5                       # radius for the all-caps-off run
 GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]
 GEN_TEST_CAPS_LIST = []                      # [] = auto | [(763674, "1", "F"), (539715, "", "S")]
 GEN_TEST_CAPS_EACH_HOPS = None               # None = GEN_TEST_HOPS
-GEN_TEST_LINES_HOPS = 2                      # both ends within this many buses of the POI
 GEN_TEST_LINES_MIN_KV = 100.0                # skip lines below this kV
 GEN_TEST_LINES_XFMR = True                   # 2- and 3-winding transformers too (kV test on the HV side)
 GEN_TEST_LINES_LIST = []                     # [] = auto | [(765911, 531603, "1"), (w1, w2, "1", w3)]
