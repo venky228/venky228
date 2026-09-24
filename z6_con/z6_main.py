@@ -18463,6 +18463,7 @@ def run_gen_test():
     if gens is None:
         return 2
     gens = gens + _gt_each_caps()
+    lines = _gt_each_lines()
     gp = os.path.join(COMPARE_DIR, "GEN_TEST_GENS_%s.txt" % GEN_TEST_PROJECT)
     with open(gp, "w") as fh:
         fh.write("machines within %s buses of POI %s (in service, |MW| >= %s), closest first\n\n"
@@ -18475,6 +18476,18 @@ def run_gen_test():
                 "" if g["mw"] is None else "%.1f" % g["mw"],
                 "" if g["mvar"] is None else "%.1f" % g["mvar"], g["hops"],
                 "" if g["z"] is None else "%.4f" % g["z"], " ".join(g["models"])))
+        fh.write("\nlines OPENED one at a time (GEN_TEST_LINES_EACH, scenario(s) %s)\n\n"
+                 % ", ".join(GEN_TEST_LINES_SCENARIOS))
+        fh.write("%-8s %-8s %-4s %-18s %-5s %8s %5s %8s  %s\n"
+                 % ("from", "to", "ckt", "names", "kind", "MW", "hops", "|Z| pu", "kV"))
+        for g in lines:
+            a_, b_, ck_ = g["branches"][0]
+            fh.write("%-8s %-8s %-4s %-18s %-5s %8s %5s %8s  %s\n" % (
+                a_, b_, ck_, g["name"][:18], g["kind"],
+                "" if g["mw"] is None else "%.1f" % g["mw"], g["hops"],
+                "" if g["z"] is None else "%.4f" % g["z"], g["models"][0].split(" ")[-1]))
+        if not lines:
+            fh.write("  (none)\n")
     print("[gen-test] %d machine(s) within %s buses of %s -> %s"
           % (len(gens), GEN_TEST_HOPS, GEN_TEST_POI, gp))
     runs = []
@@ -18502,7 +18515,7 @@ def run_gen_test():
             if sc[0] in GEN_TEST_CAPS_SCENARIOS:
                 add(sc, caps)
     # 1c) every line near the POI opened on its own, default solver setting
-    for bl in _gt_each_lines():
+    for bl in lines:
         for sc in GEN_TEST_SCENARIOS:
             if sc[0] in GEN_TEST_LINES_SCENARIOS:
                 add(sc, bl)
