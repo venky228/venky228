@@ -241,15 +241,19 @@ SIM_END_S = 10                               # s per fault
 RUN_NPLT = 2                                 # write every N steps (1 = every step, huge)
 
 # ---- 3. GEN / CAP / LINE TEST --------------------------------------------------
-# GEN_TEST = True runs ONLY this test (normal study skipped). Results: comparison_scenarios\<project>\BASE_CASE\gen_test\GEN_TEST_*.txt
+# GEN_TEST = True runs ONLY this test (normal study skipped).
+# Results: comparison_scenarios\<project>\BASE_CASE\gen_test\  (all projects: comparison_scenarios\GEN_TEST_ALL_PROJECTS.txt)
+# Preview the plan without simulating:  python z6_gt_report.py
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
-GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
-GEN_TEST_CASE = "base"                       # "base" | "proj" -- case the test runs on
-GEN_TEST_PROJECT = "SantaFe"
-GEN_TEST_PROJECTS = []                       # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"] one after another
-# per project: any GEN_TEST_<NAME> setting, written without the GEN_TEST_ prefix. A
-# project not listed, or a name it does not give, uses the value set above.
+GEN_TEST_PROJECTS = []                       # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
+GEN_TEST_PROJECT = "SantaFe"                 # the one project run when GEN_TEST_PROJECTS = []
+GEN_TEST_CASE = "base"                       # "base" | "proj"
+GEN_TEST_FAULTS = ["F01-F04"]                # same syntax as ONLY_FAULTS
+# per project: POI bus, machines always tested however far (EXTRA_GENS), and the
+# .dyr changes tried on the EXISTING gens at its feeders, BESS untouched (EGF_EDITS,
+# {} = none; each entry = one run). REGCA1 Khv only acts above Volim -- change both.
+# Any other GEN_TEST_ setting may be given here too, without the GEN_TEST_ prefix.
 GEN_TEST_BY_PROJECT = {
     "SantaFe":       {"POI": 765911, "EXTRA_GENS": [(763676, "1")],
                       "EGF_EDITS": {"KHV": [("REGCA1", {"Volim": 1.2, "Khv": 1.0, "Accel": 0.7})]}},
@@ -257,51 +261,28 @@ GEN_TEST_BY_PROJECT = {
     "EastFork":      {"POI": 531623, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCAU1 already Volim 1.2 / Khv 0.2 / Accel 0.7
     "EmpirePrairie": {"POI": 761383, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCA1 already Volim 1.2 / Khv 0.2 / Accel 0.7
 }
-GEN_TEST_MODE = "spp"
-GEN_TEST_FAULTS = ["F01-F04"]                # same syntax as ONLY_FAULTS
-GEN_TEST_POI = 765911                        # bus the radius is measured from
-GEN_TEST_HOPS = 5                            # machines within this many buses of the POI
+# which runs (each machine / group / EGF_EDITS run is done in every GEN_TEST_GEN_SCENARIOS)
+GEN_TEST_REFERENCE_RUNS = True               # all in service (needed to compare; finished ones are reused)
+GEN_TEST_EACH_GEN = True                     # each machine within GEN_TEST_HOPS off on its own
+GEN_TEST_EXCLUDE_POI_GENS = False            # True = POI plants left out of the one-at-a-time runs and the HOPS group
+GEN_TEST_POI_GROUP = True                    # all POI plants off together
+GEN_TEST_HOPS_GROUP = False                  # all machines within GEN_TEST_HOPS off together
+GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together (s0_asis)
+GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own (s0_asis)
+GEN_TEST_LINES_EACH = True                   # each nearby line / transformer opened on its own (s0_asis)
+GEN_TEST_HOPS = 5                            # "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
-GEN_TEST_MAX_GENS = 0                        # 0 = all found | N = N closest
-GEN_TEST_GENS = []                           # [] = find automatically | [(765912, "1"), ...]
 GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus, id)]
-GEN_TEST_EXTRA_GENS = [(763676, "1")]        # machines always tested, however far [(bus, id)]
-GEN_TEST_POI_GROUP = True                    # True = also all machines at the POI off together
-GEN_TEST_POI_GROUP_GENS = []                 # [] = found automatically | [(bus, id), ...]
-GEN_TEST_EXCLUDE_POI_GENS = False            # True = the POI plants are NOT switched off one at a time (nor in the HOPS group); the POI group still does
-GEN_TEST_HOPS_GROUP = False                  # True = also one run with ALL machines within GEN_TEST_HOPS (+ EXTRA_GENS) off together
-GEN_TEST_POI_GROUP_ONLY = False              # True = of the machine runs, ONLY the group run(s) (POI group / HOPS group)
-GEN_TEST_REFERENCE_RUNS = True               # False = do not RUN the all-in-service runs (finished ones are still used)
-# the EXISTING machines at GEN_TEST_PROJECT's feeders (not the BESS) with their model
-# constants changed -- each entry is one more element run, in the machine-run scenarios.
-# REGCA1 Khv only acts above Volim; this deck has Volim 0, so change them together.
-GEN_TEST_EGF_EDITS = {"KHV": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}   # {} = none
-GEN_TEST_CAPS_OFF = True                     # True = also one run with all caps near the POI off
-GEN_TEST_CAPS_HOPS = 5                       # radius for that run
-GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]        # solver scenario(s) for it
-GEN_TEST_CAPS_LIST = []                      # [] = auto | [(763674, "1", "F"), (539715, "", "S")]
-GEN_TEST_CAPS_EACH = False                   # True = also each cap bank off on its own
-GEN_TEST_CAPS_EACH_HOPS = None               # None = GEN_TEST_HOPS
-GEN_TEST_LINES_EACH = True                   # True = also each nearby line opened on its own (radial skipped)
-GEN_TEST_LINES_HOPS = 2                      # both ends within this many buses of the POI
-GEN_TEST_LINES_MIN_KV = 100.0                # skip lines below this kV
-GEN_TEST_LINES_XFMR = True                   # True = 2- and 3-winding transformers too (kV test on the HV side)
-GEN_TEST_LINES_LIST = []                     # [] = auto | [(765911, 531603, "1"), (w1, w2, "1", w3) for 3-winding]
-GEN_TEST_LINES_SCENARIOS = ["s0_asis"]       # solver scenario(s) for the line runs
-GEN_TEST_LINES_SKIP_FAULTED = True           # True = skip a line a fault trips, or that islands buses with a fault's trips
-# GEN_TEST_SCENARIOS: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
+# solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
     ("s3_it400_a020",        None, 400,  0.20, None),     # reference: finished with everything in service and the POI plants off
     ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10 -- fewest non-converged steps
     ("s8_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
-# dropped (their finished folders stay on disk): s1_delt8 and s4_tol1em4 changed nothing
-# against s0; s2_it200_a030, s5_delt8_it400_a020 and s7_delt8_it400_a010 gave up on
-# F01-F03 when a machine was off
-GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s6_it400_a010", "s8_it100_a080"]  # "all" | "best2" | [...] -- machine-off runs
-GEN_TEST_CLEAN_BUILD = True                  # True = delete each finished run's .sav/.cnv/.snp (disk)
-GEN_TEST_START_GAP_MIN = 20                  # max minutes between run starts
+GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s6_it400_a010", "s8_it100_a080"]  # "all" | "best2" | [...] -- scenarios for the runs above
+GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
+# rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
 # FIXED_SOLVER = True runs the WHOLE study (all faults, both cases) on the FIXED_* values
@@ -17652,6 +17633,30 @@ def _gt_expand(ids):
     return out
 
 
+# ---- GEN TEST -- advanced defaults ----------------------------------------------
+# Rarely changed, so kept out of the panel. Any of them can still be set per
+# project in GEN_TEST_BY_PROJECT (name without the GEN_TEST_ prefix).
+GEN_TEST_POI = None                          # POI bus: from GEN_TEST_BY_PROJECT
+GEN_TEST_EXTRA_GENS = []                     # from GEN_TEST_BY_PROJECT
+GEN_TEST_EGF_EDITS = {}                      # from GEN_TEST_BY_PROJECT
+GEN_TEST_MODE = "spp"
+GEN_TEST_MAX_GENS = 0                        # 0 = all found | N = N closest
+GEN_TEST_GENS = []                           # [] = find automatically | [(bus, id), ...]
+GEN_TEST_POI_GROUP_GENS = []                 # [] = found automatically | [(bus, id), ...]
+GEN_TEST_CAPS_HOPS = 5                       # radius for the all-caps-off run
+GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]
+GEN_TEST_CAPS_LIST = []                      # [] = auto | [(763674, "1", "F"), (539715, "", "S")]
+GEN_TEST_CAPS_EACH_HOPS = None               # None = GEN_TEST_HOPS
+GEN_TEST_LINES_HOPS = 2                      # both ends within this many buses of the POI
+GEN_TEST_LINES_MIN_KV = 100.0                # skip lines below this kV
+GEN_TEST_LINES_XFMR = True                   # 2- and 3-winding transformers too (kV test on the HV side)
+GEN_TEST_LINES_LIST = []                     # [] = auto | [(765911, 531603, "1"), (w1, w2, "1", w3)]
+GEN_TEST_LINES_SCENARIOS = ["s0_asis"]
+GEN_TEST_LINES_SKIP_FAULTED = True           # skip a line a fault trips, or that islands buses with a fault's trips
+GEN_TEST_CLEAN_BUILD = True                  # delete each finished run's .sav/.cnv/.snp (disk)
+GEN_TEST_START_GAP_MIN = 20                  # max minutes between run starts
+
+
 def _gt_case():
     return CASE_BASE if str(GEN_TEST_CASE).lower().startswith("b") else CASE_TEST
 
@@ -19294,6 +19299,9 @@ def run_gen_tests():
 
 def run_gen_test():
     _banner("GEN-OFF / SOLVER TEST -- %s (%s case)" % (GEN_TEST_PROJECT, GEN_TEST_CASE))
+    if GEN_TEST_POI is None:
+        print("[gen-test] *** %s: no POI -- add it to GEN_TEST_BY_PROJECT ***" % GEN_TEST_PROJECT)
+        return 2
     faults = _gt_expand(GEN_TEST_FAULTS)
     if not faults:
         print("[gen-test] *** GEN_TEST_FAULTS is empty ***")
@@ -19321,16 +19329,16 @@ def run_gen_test():
     gens = _gt_add_hops_group(_gt_find_gens())
     if gens is None:
         return 2
-    if GEN_TEST_POI_GROUP_ONLY:
+    if not GEN_TEST_EACH_GEN:
         # the one-at-a-time machines (and GEN_TEST_EXTRA_GENS) are left out;
         # the all-in-service reference runs, caps and lines follow their own switches
         grp = [g for g in gens if g.get("group")]
         if not grp:
-            print("[gen-test] *** GEN_TEST_POI_GROUP_ONLY: no group was formed -- set "
+            print("[gen-test] *** GEN_TEST_EACH_GEN = False: no group was formed -- set "
                   "GEN_TEST_POI_GROUP = True (and GEN_TEST_POI_GROUP_GENS if the POI "
                   "machines are not found) or GEN_TEST_HOPS_GROUP = True ***")
             return 2
-        print("[gen-test] GEN_TEST_POI_GROUP_ONLY: machine runs = the group(s) off together "
+        print("[gen-test] GEN_TEST_EACH_GEN = False: machine runs = the group(s) off together "
               "only (%d one-at-a-time machine(s) left out)" % (len(gens) - len(grp)))
         gens = grp
     gens = gens + _gt_egf_entries() + _gt_each_caps()
