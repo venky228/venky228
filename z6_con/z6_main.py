@@ -662,6 +662,10 @@ GEN_TEST_SCENARIOS = [
 GEN_TEST_GEN_SCENARIOS = "all"     # "all" | ["s0_asis", "s1_delt8"] -- scenarios each machine-off run uses
 GEN_TEST_CLEAN_BUILD = True        # True = delete each finished run's own .sav/.cnv/.snp/.cnl (disk space);
                                    # the results folder (.out, reports, logs) is always kept
+GEN_TEST_PARALLEL = "auto"         # runs AT ONCE: "auto" = (cores - CORES_SPARE, max CORES_MAX) // faults
+                                   # (3 faults on 24 cores -> 7 runs = 21 PSS/E) | N | 1 = one after another
+GEN_TEST_START_GAP_MIN = 20        # next run starts when the previous one has built its snapshot,
+                                   # or after this many minutes at most (keeps dyre_new builds apart)
 
 
 # ---- THE SPP CRITERIA --------------------------------------------------------
@@ -13806,7 +13810,7 @@ def _push_settings(env, case):
 
 
 @_timed("simulation + scoring")
-def run_study(case, projects=None, modes=None, extra_env=None, background=False):
+def run_study(case, projects=None, modes=None, extra_env=None, background=False, log_path=None):
     """Launch one study's launcher and wait. Returns its exit code.
 
        background=True returns the Popen immediately instead of waiting, and
@@ -13926,12 +13930,21 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False)
         if os.name == "nt":
             _kw["creationflags"] = 0x08000000          # CREATE_NO_WINDOW
         return subprocess.Popen([PYTHON, "-u", script], **_kw)
-    p = subprocess.Popen([PYTHON, "-u", script], cwd=case["dir"], env=env,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         universal_newlines=True, bufsize=1)
-    th = threading.Thread(target=_pump, args=("[%s]" % case["key"], p))
-    th.daemon = True
-    th.start()
+    _lfh = None
+    if log_path:
+        # ITS OWN LOG FILE, waited on like any other run: GEN_TEST_PARALLEL has
+        # several of these at once and one console could not be read.
+        _lfh = open(log_path, "a")
+        p = subprocess.Popen([PYTHON, "-u", script], cwd=case["dir"], env=env,
+                             stdout=_lfh, stderr=subprocess.STDOUT)
+        th = None
+    else:
+        p = subprocess.Popen([PYTHON, "-u", script], cwd=case["dir"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             universal_newlines=True, bufsize=1)
+        th = threading.Thread(target=_pump, args=("[%s]" % case["key"], p))
+        th.daemon = True
+        th.start()
     t0 = time.time()
     while True:
         rc = p.poll()
@@ -13947,7 +13960,14 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False)
             rc = -1
             break
         time.sleep(2)
-    th.join(timeout=5)
+    if th is not None:
+        th.join(timeout=5)
+    if _lfh is not None:
+        try:
+            _lfh.close()
+        except Exception:
+            pass
+        return rc
     print("[compare] %s finished rc=%s after %s"
           % (case["key"], rc, _fmt_hms(time.time() - t0)))
     return rc
@@ -17816,6 +17836,122 @@ def _gt_write(runs, faults, gens):
     print("[gen-test] -> %s" % txt)
 
 
+def _gt_parallel(nf):
+    """How many runs at once: GEN_TEST_PARALLEL, "auto" = the cores a lone
+       case may use (cores - CORES_SPARE, at most CORES_MAX) // faults per run."""
+    v = GEN_TEST_PARALLEL
+    if isinstance(v, str) and v.strip().lower() == "auto":
+        usable = _cpu_count() - max(0, int(CORES_SPARE))
+        if CORES_MAX:
+            usable = min(usable, int(CORES_MAX))
+        return max(1, usable // max(1, int(nf)))
+    try:
+        return max(1, int(v))
+    except Exception:
+        return 1
+
+
+def _gt_built(tag, rdir, t0):
+    """True once a run started at t0 has its snapshot (or its first .out):
+       its dyre_new is over, so the next run's build cannot collide with it on
+       the shared conec.flx / conet.flx in the case folder."""
+    d = _gt_case()["dir"]
+    for fp in (glob.glob(os.path.join(d, "*_%s.snp.built" % tag)) +
+               glob.glob(os.path.join(rdir, "outs", "*.out"))):
+        try:
+            if os.path.getmtime(fp) >= t0 - 5.0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _gt_finish(r, rc, t0):
+    tag = _gt_tag(r["sc"], r["gen"])
+    done, r["m"] = _gt_done(r["rdir"], r["faults"])
+    r["note"] = ("%.0f min" % ((time.time() - t0) / 60.0)) + ("" if done else "  INCOMPLETE rc=%s" % rc)
+    if done:
+        _gt_clean_build(tag)
+    else:
+        print("[gen-test] *** %s did not score every fault (rc=%s) -- see %s\\logs ***"
+              % (tag, rc, r["rdir"]))
+    return done
+
+
+def _gt_run_parallel(todo, runs, faults, gens, npar):
+    """GEN_TEST_PARALLEL: up to npar runs at once, each a separate launcher
+       with len(faults) PSS/E sessions, each logging to its own file.
+
+       Starts are spaced: a run starts only once the one started before it has
+       built its snapshot (or GEN_TEST_START_GAP_MIN has passed), so no two
+       dyre_new builds write the case folder's conec/conet at the same time."""
+    ldir = os.path.join(COMPARE_DIR, "gen_test_logs")
+    try:
+        os.makedirs(ldir)
+    except Exception:
+        pass
+    nf = len(faults)
+    print("[gen-test] PARALLEL: %d run(s) at once x %d PSS/E each = %d sessions; "
+          "each run's console -> %s\\<run>.log" % (npar, nf, npar * nf, ldir))
+    queue = list(todo)
+    live = {}                       # tag -> (thread, run, t0, box)
+    last = None                     # (tag, rdir, t0) of the newest start
+    k = 0
+    t_say = 0.0
+    gap_s = float(GEN_TEST_START_GAP_MIN or 0) * 60.0
+    while queue or live:
+        for tag in list(live):
+            th, r, t0, box = live[tag]
+            if th.is_alive():
+                continue
+            del live[tag]
+            r["faults"] = faults
+            ok = _gt_finish(r, box.get("rc"), t0)
+            print("[gen-test] FINISHED %s -- %s (%.0f min) | %d running, %d waiting"
+                  % (tag, "done" if ok else "INCOMPLETE", (time.time() - t0) / 60.0,
+                     len(live), len(queue)))
+            _gt_write(runs, faults, gens)
+        spaced = (last is None or last[0] not in live or _gt_built(*last)
+                  or (time.time() - last[2]) >= gap_s)
+        if queue and len(live) < npar and spaced:
+            r = queue.pop(0)
+            k += 1
+            sc, g = r["sc"], r["gen"]
+            tag = _gt_tag(sc, g)
+            lp = os.path.join(ldir, tag + ".log")
+            print("[gen-test] START %d/%d  %s -- %s | %s | log %s"
+                  % (k, len(todo), sc[0],
+                     ("machine %d '%s' %s OFF" % (g["bus"], g["id"], g["name"])) if g
+                     else "all machines in service", _gt_scen_desc(sc), lp))
+            env = _gt_env(sc, g, faults)
+            # THIS RUN'S SHARE, NOT THE MACHINE: nf sessions each, no handover
+            # file to grow on, and no shared live-status file to fight over.
+            env["SPP_LAUNCH_WORKERS"] = str(nf)
+            env["SPP_LAUNCH_REPORT_WORKERS"] = str(nf)
+            env["SPP_SLOTS_FILE"] = os.path.join(ldir, ".slots_%s.txt" % tag)
+            env["SPP_LIVE_STATUS_ALL"] = ""
+            box = {}
+
+            def _go(r=r, env=env, lp=lp, box=box):
+                try:
+                    box["rc"] = run_study(_gt_case(), projects=[GEN_TEST_PROJECT],
+                                          modes=[GEN_TEST_MODE], extra_env=env, log_path=lp)
+                except Exception as e:
+                    box["rc"] = "raised %s" % e
+            th = threading.Thread(target=_go)
+            th.daemon = True
+            t0 = time.time()
+            th.start()
+            live[tag] = (th, r, t0, box)
+            last = (tag, r["rdir"], t0)
+            continue
+        if time.time() - t_say >= 300.0 and live:
+            t_say = time.time()
+            print("[gen-test] %s  running (%d): %s | waiting %d"
+                  % (time.strftime("%H:%M"), len(live), ", ".join(sorted(live)), len(queue)))
+        time.sleep(5)
+
+
 def run_gen_test():
     _banner("GEN-OFF / SOLVER TEST -- %s (%s case)" % (GEN_TEST_PROJECT, GEN_TEST_CASE))
     faults = _gt_expand(GEN_TEST_FAULTS)
@@ -17873,6 +18009,12 @@ def run_gen_test():
         return 0
     todo = [r for r in runs if not r["note"]]
     print("[gen-test] %d run(s) to simulate, %d already done" % (len(todo), len(runs) - len(todo)))
+    npar = min(_gt_parallel(len(faults)), max(1, len(todo)))
+    if npar > 1:
+        _gt_run_parallel(todo, runs, faults, gens, npar)
+        _gt_write(runs, faults, gens)
+        print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, COMPARE_DIR))
+        return 0
     for k, r in enumerate(todo, 1):
         sc, g = r["sc"], r["gen"]
         tag = _gt_tag(sc, g)
