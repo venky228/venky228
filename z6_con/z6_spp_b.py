@@ -1103,6 +1103,13 @@ GROUP3_GEN_BUSES = []    # <-- add the other Group 3 queued-project buses here
 # overflow the .out writer, and this study has hit the 32-bit 2 GB ceiling
 # before. Turn it on deliberately, and watch the first .out size.
 GROUP3_AREA_IBR_PQV = True
+# GROUP 3 WITHOUT A LIST: every machine in STUDY_AREAS whose bus name is a queue
+# project name (G21-070-GEN2, GEN-2017-...) is a current/prior queued project.
+# The inverter ones already get P/Q/ETERM above; this adds P/Q/ETERM for the
+# SYNCHRONOUS ones (they otherwise record rotor angle only). The list found is
+# written to GROUP3_MACHINES.csv in the results folder.
+GROUP3_SYNC_PQV = True
+GROUP3_NAME_RE = (os.environ.get("SPP_GROUP3_NAME_RE") or "").strip() or r"^\s*(G\d{2}-\d{3}|GEN-?\d{4}-)"
 # >>> Monitored study areas (SPP disturbance set). Your gen is in 534; SPP monitors the
 #     whole neighbourhood: 520 (AEPW), 524 (OKGE), 526 (SPS), 534 (SUNC), 652 (WAPA).
 # The PQ Run3 idv's "CHSB,AR" subsystem is the FULL MMWG area list:
@@ -6541,6 +6548,57 @@ def _poi_power_channels():
         print("  monitor [poi-pow ]   %s -> %s ck %s   (%s)" % (b, a, ck, _how.get((a, b, ck), "")))
 
 
+def _group3_named(areas):
+    """{bus: (name, extra_pqv)} for every bus in `areas` whose name matches
+       GROUP3_NAME_RE. extra_pqv is False in the central area, where cent_mach
+       already records P/Q/ETERM for every machine."""
+    out = {}
+    try:
+        rx = re.compile(GROUP3_NAME_RE, re.I)
+    except Exception as e:
+        print("  [group3] GROUP3_NAME_RE %r is not a valid pattern (%s)" % (GROUP3_NAME_RE, e))
+        return out
+    try:
+        cen = set(int(a) for a in (_central_areas() or []))
+    except Exception:
+        cen = set()
+    want = set(int(a) for a in (areas or []))
+    try:
+        ie, ai = psspy.abusint(-1, 2, ["NUMBER", "AREA"])
+        je, ac = psspy.abuschar(-1, 2, ["NAME"])
+        if ie in (0, None) and je in (0, None):
+            for b, a, nm in zip(ai[0], ai[1], ac[0]):
+                if int(a) in want and rx.match(str(nm)):
+                    out[int(b)] = (str(nm).strip(), int(a) not in cen)
+    except Exception as e:
+        print("  [group3] bus names could not be read (%s)" % e)
+    return out
+
+
+def _group3_write(g3, sync, async_):
+    """GROUP3_MACHINES.csv: the queued-project machines found, and what each records."""
+    if not g3:
+        return
+    rows = []
+    for kind, lst, what in (("SYNC", sync, "ANGL + PELEC/QELEC/ETERM"),
+                            ("ASYNC", async_, "SPD + PELEC/QELEC/ETERM" if GROUP3_AREA_IBR_PQV else "SPD")):
+        for b, mid in lst:
+            if b in g3:
+                nm, extra = g3[b]
+                rows.append([b, mid, nm, kind,
+                             what if (kind == "ASYNC" or extra) else "ANGL + P/Q/ETERM (central area)"])
+    try:
+        with open(os.path.join(RESULTS_DIR, "GROUP3_MACHINES.csv"), "w") as fh:
+            fh.write("bus,id,name,kind,recorded\n")
+            for r in sorted(rows):
+                fh.write("%d,%s,%s,%s,%s\n" % tuple(r))
+        print("  [group3] %d queued-project machine(s) in the study areas (%d sync, %d async) "
+              "-> GROUP3_MACHINES.csv" % (len(rows), sum(1 for r in rows if r[3] == "SYNC"),
+                                          sum(1 for r in rows if r[3] == "ASYNC")))
+    except Exception as e:
+        print("  [group3] could not write GROUP3_MACHINES.csv (%s)" % e)
+
+
 def add_channels():
     """CHSB AN (6 basic) + MONITOR_SPECS (mirrors Run3 CHSB,AR machine channels) +
        named PROJ* channels + detected SYNC* + POI V/ANG/FREQ."""
@@ -6580,9 +6638,11 @@ def add_channels():
             # SPEED only (bounded) -- which is exactly the SPP asynchronous-machine quantity.
             gens = find_area_sync_gens(spec["areas"], spec.get("kv_min", 0.0), AREA_SYNC_MAX)
             codes = [c for c in spec["codes"] if c in _CODE_SUFFIX]
+            _g3 = _group3_named(spec["areas"]) if GROUP3_SYNC_PQV else {}
             n = 0
             for bus, mid in gens:
-                for code in codes:
+                _extra = [2, 3, 4] if _g3.get(bus, (None, False))[1] else []
+                for code in codes + [c for c in _extra if c not in codes]:
                     rc = psspy.machine_array_channel([-1, code, bus], mid,
                                                      "GEN%d_%s" % (bus, _CODE_SUFFIX[code]))
                     if (rc[0] if isinstance(rc, (list, tuple)) else rc) in (0, None):
@@ -6623,6 +6683,7 @@ def add_channels():
                             "AGEN%d_%s" % (bus, _CODE_SUFFIX[_ac]))
                         if (rc[0] if isinstance(rc, (list, tuple)) else rc) in (0, None):
                             na += 1
+                _group3_write(_g3, gens, agens)
                 print("  monitor [%-9s] SYNC: %d machine(s) (ANGL/P/Q/ETRM) + ASYNC: %d "
                       "machine(s) (%s) in areas %s -> %d channels"
                       % (spec["name"], len(gens), len(agens),
