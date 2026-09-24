@@ -614,6 +614,7 @@ SOLVER_RETRY_RECIPES = [("iterations 200, accel 0.50", 200, 0.50), ("iterations 
 DELT_CYCLES = 4                             # None = the study's own step (1/4 cycle). 8 = 1/8 cycle: try it when a case
                                             # runs its flat run cleanly but the FAULT runs go NaN (the network solution
                                             # loses itself at the switching); the run takes about twice as long
+DYN_TOL = None                              # None = the study's own network tolerance (0.0000095) | e.g. 0.0001
 ADJUSTMENTS_REPORT = True                   # collect every non-project change into SYSTEM_ADJUSTMENTS.txt and the report
 PSSE_FAULT_LOG = True                     # True = keep PSS/E's own messages for each fault run ("Network not
                                             # converged at TIME = ...") in results\<proj>_spp\logs\psse\<fault>.txt
@@ -13707,6 +13708,7 @@ def _push_settings(env, case):
         env["SPP_DELT_CYCLES"] = str(float(DELT_CYCLES))
     else:
         env.pop("SPP_DELT_CYCLES", None)
+    env["SPP_DYN_TOL"] = repr(float(DYN_TOL)) if DYN_TOL else "0"
     if SOLVER_RETRY_MAX_NONCONV is not None:
         env["SPP_SOLVER_RETRY_MAX"] = str(int(SOLVER_RETRY_MAX_NONCONV))
     if SOLVER_RETRY_RECIPES is not None:
