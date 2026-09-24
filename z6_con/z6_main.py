@@ -18492,7 +18492,10 @@ def _gt_label(g):
     if not g:
         return "all in service"
     if g.get("egf"):
-        return "EDIT existing gens: %s" % _gt_egf_text(g["egf"])
+        # THE ENTRY'S NAME FIRST: the tables cut labels at 34-46 characters, and
+        # "EDIT existing gens: REGCA1 Accel=0.7,Khv=..." left every edit run
+        # looking the same once cut
+        return "EDIT %s: %s" % (str(g.get("id") or "EGF")[3:] or "EGF", _gt_egf_text(g["egf"]))
     if g.get("branches"):
         return "OPEN %s %s %s" % (g.get("kind") or "LINE", _gt_brname(g["branches"][0]), g["name"])
     return "OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])
