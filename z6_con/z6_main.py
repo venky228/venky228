@@ -534,6 +534,8 @@ POI_P_AREA       = None                     # None = the project's own area
 POI_P_SHARE      = "capacity"               # how the REMAINDER splits between the existing machines ...
 COMPARE_REQUIRE_COMPLETE = False            # True = after SIMULATING, stop before the comparison if a project did not finish (it would otherwise be compared on partial results)
 POI_P_STRICT         = True                 # True = STOP the build when the POI total is not within tolerance of POI_P_TARGET_MW (no study runs on a case that is not at its interconnection)
+POI_P_EGF_OFF_WHEN_SGF_ONLY = True        # True = a POI target equal to the BESS (SGF) rating takes the existing
+                                           # machines at that POI OUT OF SERVICE (not in service at 0 MW); stops if it cannot
 POI_P_STRICT_TOL_MW  = 2.0                  # how close it must be: this many MW, or 1 % of the target, whichever is larger
 POI_P_METER          = "delivered"          # "delivered" = MW arriving into the POI from the plant (SPP's "MW at the POI") | "export" = net MW leaving the POI to the system
 POI_P_MEASURE        = None                 # "metered" (default) = the number the one-line shows at the POI ...
@@ -13498,6 +13500,7 @@ def _push_settings(env, case):
                         ("SPP_POI_P_MEASURE", POI_P_MEASURE),
                         ("SPP_POI_P_METER", POI_P_METER),
                         ("SPP_POI_P_STRICT", "1" if POI_P_STRICT else "0"),
+                        ("SPP_EGF_OFF_SGF_ONLY", "1" if POI_P_EGF_OFF_WHEN_SGF_ONLY else "0"),
                         ("SPP_POI_P_STRICT_TOL", POI_P_STRICT_TOL_MW),
                         ("SPP_POI_METER_ITERS", POI_P_METER_ITERS),
                         ("SPP_POI_METER_TOL", POI_P_METER_TOL_MW),
@@ -18257,7 +18260,7 @@ def _gt_built(tag, rdir, t0, faults=()):
     return False
 
 
-_GT_NOSWITCH = re.compile(r"((?:SPP_(?:MACHINES|SHUNTS|BRANCHES)_OFF: |SPP_SOLVER: |POI_P_TARGET_MW (?:not met|could not be checked|has no entry))[^\r\n]*)")
+_GT_NOSWITCH = re.compile(r"((?:SPP_(?:MACHINES|SHUNTS|BRANCHES|EGF)_OFF: |SPP_SOLVER: |POI_P_TARGET_MW (?:not met|could not be checked|has no entry))[^\r\n]*)")
 
 
 def _gt_switch_failure(r):

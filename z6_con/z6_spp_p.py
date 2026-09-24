@@ -2947,6 +2947,10 @@ if _pta:
         pass
 POI_HOLD_AREA_MW = _env_bool("SPP_POI_HOLD_AREA", POI_HOLD_AREA_MW)
 POI_P_SHARE      = (os.environ.get("SPP_POI_P_SHARE") or POI_P_SHARE).strip()
+# SGF ONLY: a POI target no larger than the surplus facility's own rating means
+# the SGF carries the POI alone -- the existing machines are then taken OUT OF
+# SERVICE (not left in service at 0 MW, still regulating voltage).
+POI_P_EGF_OFF_WHEN_SGF_ONLY = _env_bool("SPP_EGF_OFF_SGF_ONLY", True)
 _egfoff = (os.environ.get("SPP_EGF_OFF") or "").strip().lower()
 if _egfoff in ("1", "true", "yes", "on"):
     POI_P_EXISTING_OFF = True
@@ -12974,7 +12978,22 @@ def apply_poi_p_target(project, target_mw):
     # zero is not the same thing: a machine at 0 MW is still a voltage source
     # with its reactive capability and its dynamic models in service, and SPP's
     # scenario has it off.
-    if POI_P_EXISTING_OFF:
+    egf_off = POI_P_EXISTING_OFF
+    if not egf_off and POI_P_EGF_OFF_WHEN_SGF_ONLY and exist and _pm_pairs and _pm_rate is not None:
+        _sr = float(_pm_rate) * (float(CAP_SCALE) if CAP_SCALE is not None else 1.0)
+        _tl = max(float(POI_P_STRICT_TOL_MW), 0.01 * abs(float(target_mw)))
+        if float(target_mw) <= _sr + _tl:
+            print("  [poi-p] SGF ONLY: POI target %.1f MW is within the surplus facility's rating "
+                  "(%.1f MW) -- the %d existing machine(s) go OUT OF SERVICE"
+                  % (float(target_mw), _sr, len(exist)))
+            if not _pm_new:
+                raise RuntimeError("SPP_EGF_OFF: SGF-only POI target %.1f MW, but the surplus "
+                                   "machines are not in the %s* block, so the existing machines "
+                                   "cannot be told apart and switched off. Set "
+                                   "POI_P_EGF_OFF_WHEN_SGF_ONLY = False to leave them in service"
+                                   % (float(target_mw), NEW_GEN_BUS_PREFIX))
+            egf_off = True
+    if egf_off:
         # ---- WHICH MACHINES ARE THE SGF, AND WHICH ARE THE EGF -----------
         #
         # SGF = the SURPLUS facility = the new machines in the NEW_GEN_BUS_PREFIX
@@ -13016,18 +13035,30 @@ def apply_poi_p_target(project, target_mw):
             print("  [poi-p] *** EGF OFF: there are no existing machines at this "
                   "plant to switch off. The POI already carries the surplus "
                   "facility alone. ***")
-    if POI_P_EXISTING_OFF and exist and _pm_new:
+    if egf_off and exist and _pm_new:
         print("  [poi-p] EGF OFF (BP-7250 7.6, first scenario): taking the "
               "plant's %d existing machine(s) OUT OF SERVICE" % len(exist))
-        _off = 0
+        _off, _left = 0, []
         for (b, mid, p0, _pmax, _pmin) in exist:
-            if _set_machine_status(b, mid, 0):
+            _ok = _set_machine_status(b, mid, 0)
+            try:
+                _ie, _st = psspy.macint(int(b), str(mid), "STATUS")
+                if _ie == 0 and _st != 0:
+                    _ok = False
+            except Exception:
+                pass
+            if _ok:
                 _off += 1
                 print("  [poi-p]   %-8d '%s'  %8.1f MW -> OUT OF SERVICE"
                       % (b, mid, p0))
             else:
+                _left.append("%d '%s'" % (b, mid))
                 print("  [poi-p]   *** %-8d '%s' could NOT be switched off -- "
                       "this run is not the EGF-off scenario ***" % (b, mid))
+        if _left:
+            raise RuntimeError("SPP_EGF_OFF: %d existing machine(s) could not be taken out of "
+                               "service (%s), so this run is not the SGF-only / EGF-off scenario"
+                               % (len(_left), ", ".join(_left)))
         print("  [poi-p] POI now carries the surplus machines alone: %.1f MW"
               % proj_mw)
         exist = []
