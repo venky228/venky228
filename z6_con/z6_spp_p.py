@@ -9182,13 +9182,40 @@ _DYR_USR = re.compile(r"^\s*'([A-Za-z0-9_]+)'\s+"
                       re.S)
 
 
+# STANDARD LIBRARY IBR MODELS HAVE ICONs TOO. REGCA1 opens with Lvplsw,
+# REECA1 with six flags, REPCA1 with seven -- written in the record before the
+# CONs just as a user model's are, but with no header to say how many. Counting
+# "con 6" from the first value made it Lvpl1 on REGCA1 instead of Volim. The
+# shape is (ICONs, CONs) as the PSS/E library defines them; it is used only when
+# the record holds exactly that many values, so a deck that differs falls back
+# to plain counting and says so.
+_STD_SHAPE = {"REGCA1": (1, 14), "REECA1": (6, 45), "REPCA1": (7, 27), "REPCTA1": (7, 27)}
+_STD_LABELS = {
+    "REGCA1": ["Lvplsw", "Tg", "Rrpwr", "Brkpt", "Zerox", "Lvpl1", "Volim", "Lvpnt1",
+               "Lvpnt0", "Iolim", "Tfltr", "Khv", "Iqrmax", "Iqrmin", "Accel"],
+    "REECA1": ["ICON1", "ICON2", "ICON3", "ICON4", "ICON5", "ICON6",
+               "Vdip", "Vup", "Trv", "dbd1", "dbd2", "Kqv", "Iqh1", "Iql1", "Vref0",
+               "Iqfrz", "Thld", "Thld2", "Tp", "QMax", "QMin", "VMAX", "VMIN", "Kqp",
+               "Kqi", "Kvp", "Kvi", "Vref1", "Tiq", "dPmax", "dPmin", "PMAX", "PMIN",
+               "Imax", "Tpord", "Vq1", "Iq1", "Vq2", "Iq2", "Vq3", "Iq3", "Vq4", "Iq4",
+               "Vp1", "Ip1", "Vp2", "Ip2", "Vp3", "Ip3", "Vp4", "Ip4"],
+    "REPCA1": ["ICON1", "ICON2", "ICON3", "ICON4", "ICON5", "ICON6", "ICON7",
+               "Tfltr", "Kp", "Ki", "Tft", "Tfv", "Vfrz", "Rc", "Xc", "Kc", "emax",
+               "emin", "dbd1", "dbd2", "Qmax", "Qmin", "Kpg", "Kig", "Tp", "fdbd1",
+               "fdbd2", "femax", "femin", "Pmax", "Pmin", "Tg", "Ddn", "Dup"]}
+
+
 def _dyr_split(model, rest):
     """(real model name, tokens, first CON index) for one record.
 
        first CON index is 0-based into `tokens`: 0 for an ordinary model, and
-       past the ICONs for a user model."""
+       past the ICONs for a user model or a standard IBR model (_STD_SHAPE)."""
     if model.upper() not in ("USRMDL", "USRLOD"):
-        return model, _dyr_tokens(rest.rstrip().rstrip("/")), 0
+        toks = _dyr_tokens(rest.rstrip().rstrip("/"))
+        shp = _STD_SHAPE.get(model.upper())
+        if shp and len(toks) == shp[0] + shp[1]:
+            return model, toks, shp[0]
+        return model, toks, 0
     m = _DYR_USR.match(rest.strip())
     if not m:
         return model, _dyr_tokens(rest.rstrip().rstrip("/")), 0
@@ -9261,7 +9288,8 @@ def _dyr_template_labels(model):
                     _DYR_TMPL_LABELS[nm.upper()] = names
         except Exception as e:
             print("  [dyr] could not read the names out of BESS_MODEL_TEMPLATE (%s)" % e)
-    return _DYR_TMPL_LABELS.get(str(model).upper(), [])
+    return (_DYR_TMPL_LABELS.get(str(model).upper())
+            or _STD_LABELS.get(str(model).upper(), []))
 
 
 def _dyr_apply_one(rec, edits, hits, labels=None):
@@ -9296,10 +9324,18 @@ def _dyr_apply_one(rec, edits, hits, labels=None):
                 return False
         return spec == str(bus).strip()
 
+    def _id_matches(spec):
+        spec = str(spec).strip().strip("'")
+        if spec == "*":
+            return True
+        if spec.startswith("!"):            # "!B" = every machine but the BESS
+            return mid.strip() != spec[1:].strip()
+        return spec == mid
+
     want = [e for e in edits
             if str(e[2]).strip().upper() == model.upper()
             and _bus_matches(e[0])
-            and (str(e[1]) == "*" or str(e[1]).strip().strip("'") == mid)]
+            and _id_matches(e[1])]
     if not want:
         return rec
 
@@ -9309,6 +9345,9 @@ def _dyr_apply_one(rec, edits, hits, labels=None):
                   and _DYR_USR.match(rest.strip()))
     spans = _dyr_spans(rec, 3 + (7 if is_usr else 0))
     names = labels or _dyr_template_labels(model)
+    if (not labels and not is_usr and model.upper() in _STD_LABELS
+            and len(names) != len(toks)):
+        names = []          # this deck's record is not the library shape
     out = rec
     for (_b, _i, _m, n, val) in want:
         k, kind = _dyr_pos(n, n_icon, names)
@@ -11238,6 +11277,177 @@ def _dyr_disable_stamp():
     return (" | disabled: " + " ; ".join(_d)) if _d else ""
 
 
+# ============================================================================
+# EXISTING MACHINES (EGF) AT THE PROJECT'S FEEDERS -- .dyr edits and OFF
+# ============================================================================
+# The spikes seen right after clearing in the BASE case come from the existing
+# plants at the POI (SantaFe: the four wind machines at 765912/922/932/935),
+# not from the project. These let their model constants be changed -- or the
+# machines be taken out -- in a run of their own:
+#
+#   SPP_EGF_DYR_EDITS = [["REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7}]]
+#   SPP_EGF_OFF       = "1"
+#
+# THE MACHINES are every record at this project's feeder buses whose id is not
+# the BESS id -- the same buses in the base case and the project case, so both
+# sides of a comparison get the same change. A constant is named, or numbered
+# as the model documentation numbers its CONs (REGCA1 con 6 = Volim).
+EGF_DYR_EDITS = []
+EGF_OFF = _env_bool("SPP_EGF_OFF", False)
+_egfj = (os.environ.get("SPP_EGF_DYR_EDITS") or "").strip()
+if _egfj:
+    try:
+        import json as _json
+        EGF_DYR_EDITS = [(str(m), dict(d)) for m, d in _json.loads(_egfj)]
+    except Exception as _e:
+        raise RuntimeError("SPP_EGF_DYR_EDITS could not be read (%s) -- a run named for "
+                           "edited existing machines must not run them unedited" % _e)
+    print("[egf] .dyr edits on the existing machines at %s's feeders: %s"
+          % (RUN_PROJECT, "; ".join("%s %s" % (m, ", ".join(
+              "%s=%s" % kv for kv in sorted(d.items(), key=lambda kv: str(kv[0]))))
+              for m, d in EGF_DYR_EDITS)))
+
+
+def _egf_buses():
+    return [int(b) for b in ((_RUN_PROJ or {}).get("feeders") or [])]
+
+
+def egf_dyr_with_edits(src):
+    """Write a copy of `src` with EGF_DYR_EDITS applied to the existing machines
+       at this project's feeder buses. Returns the path to use.
+
+       EVERY (model, constant) MUST CHANGE SOMETHING in the base case -- a run
+       filed under "existing machines edited" with the deck values in it is a
+       false study, so that stops the run. In the project case the existing
+       machines may have been purged from the deck (disable_existing), so a
+       miss there is reported and the run carries on."""
+    if not EGF_DYR_EDITS:
+        return src
+    buses = _egf_buses()
+    if not buses:
+        raise RuntimeError("EGF .dyr edits: project %s has no feeder buses" % RUN_PROJECT)
+    edits = []
+    for m, d in EGF_DYR_EDITS:
+        for c, v in sorted(d.items(), key=lambda kv: str(kv[0])):
+            for b in buses:
+                edits.append((str(b), "!" + str(BESS_ID), str(m).strip().strip("'\""), c, v))
+    with open(src, "r", errors="ignore") as fh:
+        text = fh.read()
+    hits = []
+    out = []
+    for r, l in zip(*_dyr_records(text)):
+        out.append(_dyr_apply_one(r, edits, hits, _dyr_labels(l)))
+    for h in hits:
+        print("  [egf] %s '%s' %s %s: %s -> %s" % h)
+    missed = []
+    for m, d in EGF_DYR_EDITS:
+        for c in d:
+            if not any(str(h[2]).upper() == str(m).upper() and str(h[3]) == str(c)
+                       for h in hits):
+                missed.append("%s %s" % (m, c))
+    if missed:
+        held = []
+        for r in _dyr_records(text)[0]:
+            mh = _DYR_HEAD.match(_dyr_data_text(r).strip())
+            try:
+                if mh and int(mh.group(1)) in buses:
+                    held.append("%s %s '%s'" % (mh.group(1), _dyr_split(
+                        mh.group(2).strip(), mh.group(4))[0], mh.group(3)))
+            except ValueError:
+                pass
+        print("  [egf] *** matched NO existing machine: %s ***" % ", ".join(missed))
+        print("  [egf]   records at the feeders %s: %s"
+              % (buses, ", ".join(held) or "(none)"))
+        # A MODEL THE FEEDERS DO HOLD but a constant that matched nothing is a
+        # typo on either side. Only in the project case, and only when the
+        # model is not at the feeders at all (existing machines purged by
+        # disable_existing), is a miss expected.
+        held_models = set(h.split()[1].upper() for h in held
+                          if h.split()[2].strip("'") != str(BESS_ID))
+        typo = [x for x in missed if x.split()[0].upper() in held_models]
+        if typo or not ENABLE_BESS:
+            raise RuntimeError("EGF .dyr edits: %s matched no existing machine at %s's "
+                               "feeders (listed above) -- fix the model or constant name "
+                               "(nothing was run)" % (", ".join(typo or missed), RUN_PROJECT))
+        print("  [egf]   project case: that model is not at the feeders here (existing "
+              "machines purged, disable_existing) -- nothing to edit on this side")
+        if not hits:
+            return src
+    dst = os.path.join(STUDY_DIR, "%s_EGF_%s%s.dyr"
+                       % (os.path.splitext(os.path.basename(src))[0],
+                          (RUN_PROJECT or "study").replace(" ", "_"),
+                          ("_" + _RUN_TAG_DIR) if _RUN_TAG_DIR else ""))
+    new = "\n".join(out) + "\n"
+    try:
+        with open(dst, "r", errors="ignore") as fh:
+            same = fh.read() == new
+    except Exception:
+        same = False
+    if not same:
+        tmp = "%s.tmp%d" % (dst, os.getpid())
+        with open(tmp, "w") as fh:
+            fh.write(new)
+        try:
+            os.replace(tmp, dst)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            with open(dst, "r", errors="ignore") as fh:
+                if fh.read() != new:
+                    raise
+    print("  [egf] %d constant(s) changed -> %s" % (len(hits), os.path.basename(dst)))
+    _dyr_verify_file(dst, hits)             # read the written deck back
+    try:
+        _ensure_results_dirs()
+        with open(os.path.join(RESULTS_DIR, "EGF_DYR_EDITS.txt"), "w") as fh:
+            fh.write("existing machines at %s's feeders %s -- .dyr edits of this run\n"
+                     % (RUN_PROJECT, buses))
+            fh.write("deck: %s\n\n" % dst)
+            for h in hits:
+                fh.write("%s '%s' %s %s: %s -> %s\n" % h)
+            for x in missed:
+                fh.write("NOT FOUND: %s\n" % x)
+    except Exception as e:
+        print("  [egf] EGF_DYR_EDITS.txt not written (%s)" % e)
+    return dst
+
+
+def _egf_stamp():
+    if not (EGF_DYR_EDITS or EGF_OFF):
+        return ""
+    return " | egf: %s%s" % ("; ".join("%s %s" % (m, sorted((str(k), v) for k, v in d.items()))
+                                      for m, d in EGF_DYR_EDITS),
+                            " OFF" if EGF_OFF else "")
+
+
+def _egf_switch_off():
+    """Every in-service machine at this project's feeders, but the BESS, OFF."""
+    buses = set(_egf_buses())
+    found = []
+    try:
+        ie, nums = psspy.amachint(-1, 1, ["NUMBER"])
+        ie2, ids = psspy.amachchar(-1, 1, ["ID"])
+        for b, i in zip(nums[0], ids[0]):
+            if int(b) in buses and str(i).strip() != str(BESS_ID):
+                found.append((int(b), str(i).strip()))
+    except Exception as e:
+        raise RuntimeError("SPP_EGF_OFF: could not list the machines (%s)" % e)
+    if not found:
+        if ENABLE_BESS:
+            print("  [egf-off] no existing machine in service at %s -- already out in the "
+                  "project case" % sorted(buses))
+            return
+        raise RuntimeError("SPP_EGF_OFF: no existing machine in service at %s's feeders %s"
+                           % (RUN_PROJECT, sorted(buses)))
+    print("  [egf-off] existing machines OUT OF SERVICE: %s"
+          % ", ".join("%d '%s'" % x for x in found))
+    for x in found:
+        if x not in MACHINES_OFF:
+            MACHINES_OFF.append(x)
+
+
 def _dyr_stamp():
     """One line describing the edits, for the snapshot-reuse guard.
 
@@ -11252,7 +11462,7 @@ def _dyr_stamp():
        worker decided the snapshot was stale, so all of them rebuilt it at once,
        in one folder, over each other's files."""
     if not DYR_EDITS:
-        return "dyr: unedited" + _dyr_disable_stamp()
+        return "dyr: unedited" + _dyr_disable_stamp() + _egf_stamp()
     # QUIETLY. The stamp is computed several times a run -- before the build,
     # after it, and again by every worker -- and normalising prints a line for
     # each row it skips. Printed once during the build those lines are the
@@ -11278,9 +11488,10 @@ def _dyr_stamp():
         # Nothing normalised -- all of it out of scope, or a form not
         # recognised. The RAW rows still belong in the stamp, because changing
         # them must still invalidate a snapshot, so they go in as text.
-        return "dyr: " + " ; ".join(repr(e) for e in DYR_EDITS) + _dyr_disable_stamp()
+        return ("dyr: " + " ; ".join(repr(e) for e in DYR_EDITS) + _dyr_disable_stamp()
+                + _egf_stamp())
     return ("dyr: " + " ; ".join("%s/%s/%s con%s=%s" % (e[0], e[1], e[2], e[3], e[4])
-                                 for e in rows) + _dyr_disable_stamp())
+                                 for e in rows) + _dyr_disable_stamp() + _egf_stamp())
 
 
 def bess_combined_dyr(project, base_dyr):
@@ -15605,6 +15816,8 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # would hold a dispatch that never happened.
         if PROJECT_OFF:
             _switch_project_off()
+        if EGF_OFF:
+            _egf_switch_off()
         if MACHINES_OFF:
             _switch_machines_off()
         if SHUNTS_OFF:
@@ -15783,6 +15996,7 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # it -- instead of quietly tuning something that is about to go.
         _dyr_used = dyr_drop_models(_dyr_used)
         _dyr_used = dyr_with_edits(_dyr_used)
+        _dyr_used = egf_dyr_with_edits(_dyr_used)
         chk(psspy.dyre_new([101, 101, 101, 101], _dyr_used,
                            _abspath(CONEC_FLX), _abspath(CONET_FLX), _abspath(COMPILE_BAT)),
             "dyre_new (%s)" % os.path.basename(_dyr_used))

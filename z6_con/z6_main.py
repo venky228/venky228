@@ -435,6 +435,15 @@ DYR_SCOPE = "project"                        # "project" machines only | "deck" 
 DYR_COMPILE_WHEN = None                      # when to run the compile .bat files
 DYR_COMPILE_BATS = ["MyCompile34.bat", "MyCload41.bat"]
 DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is saved
+# EGF = the EXISTING machines at each project's feeder buses (not the BESS). Each run
+# below goes into its own <proj>_<mode>_egf / _egfoff folders in BOTH cases; the main
+# results are never touched. Set the RUN switch False to turn a variant off -- the
+# edits stay written here, and its folders and comparisons stay on disk.
+EGF_DYR_EDITS_BY_PROJECT = {}                # {"SantaFe": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}
+EGF_DYR_RUN = False                          # True = run BOTH cases with those edits (_egf) and compare
+EGF_OFF_RUN = False                          # True = run BOTH cases with every existing machine OFF (_egfoff) and compare
+EGF_PROJECTS = []                            # [] = every project of the launch (EGF_DYR_RUN: those with edits)
+EGF_FAULTS = "same"                          # "same" = ONLY_FAULTS | "all" | ["F01-F04"]
 ABORT_ON_MODEL_NOT_ACCESSIBLE = True         # stop on 'MODEL NOT ACCESSIBLE'
 INIT_NAN_ABORT = False                       # stop on NaN after init
 ADJUSTMENTS_REPORT = True                    # list every non-project change in SYSTEM_ADJUSTMENTS.txt
@@ -4107,7 +4116,8 @@ def _planned_fault_ids(proj, rb, rt):
 
 
 @_timed("comparison")
-def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
+def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix="",
+                    test_case=None):
     """Everything about one project, both cases, ready to be written out.
 
        test_suffix names a capacity level's results folder ("_cap50") on the
@@ -4120,10 +4130,15 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
        project case, one at ..._ _run1 and one at the run just finished. Every
        classification then reads relative to THAT reference -- "NEW" means "this
        run broke it and the other did not" -- which is the same machinery and a
-       different question."""
+       different question.
+
+       test_case points the JUDGED side at another case -- the EGF runs compare
+       the base case with its existing machines edited against the base case
+       as it is."""
     base_case = base_case or CASE_BASE
+    test_case = test_case or CASE_TEST
     rb = results_dir(base_case, proj, mode) + (base_suffix or "")
-    rt = results_dir(CASE_TEST, proj, mode) + (test_suffix or "")
+    rt = results_dir(test_case, proj, mode) + (test_suffix or "")
     cb, src_cb = read_criteria(rb, proj)
     ct, src_ct = read_criteria(rt, proj)
     vb, src_vb = read_violations(rb, proj)
@@ -4156,7 +4171,7 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
     # the study ran, not this script's idea of what it would have been.
     descs = read_descriptions(rt, proj) or read_descriptions(rb, proj)
     fb, ft = (read_fault_defs(base_case, proj, mode),
-              read_fault_defs(CASE_TEST, proj, mode))
+              read_fault_defs(test_case, proj, mode))
 
     # ---- are these two studies even comparable? ----------------------------
     # Checked BEFORE anything is compared, and reported at the top of the
@@ -4485,7 +4500,12 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix=""):
     # THE CHANNEL NUMBERS, both studies in one file, for checking by hand.
     # CHANNELS_<proj>.txt is ~900 kB of .out channel numbers, for checking a
     # reading by hand. Useful once; noise in the folder every other time.
-    if not SIMPLE_OUTPUT:
+    # ONLY FOR THE MAIN PAIR. The file has one fixed name per project, so a
+    # variant pair (a capacity level, an EGF run, run against run) written
+    # after the main comparison replaced its channel numbers with its own.
+    _main_pair = (os.path.normpath(rb) == os.path.normpath(results_dir(CASE_BASE, proj, mode))
+                  and os.path.normpath(rt) == os.path.normpath(results_dir(CASE_TEST, proj, mode)))
+    if not SIMPLE_OUTPUT and _main_pair:
         try:
             _chp = write_channel_file(proj, rb, rt)
             print("[compare] %s %s: channel numbers -> %s" % (proj, mode, _chp))
@@ -7671,6 +7691,26 @@ def write_one_report(results, only_base, only_test):
     L.append(" Project case   %-14s %s" % ("(projects in)", CASE_TEST["dir"]))
     L.append(" Projects       %s" % ", ".join(sorted(set(res["project"] for res, _r in rows_all))
                                               or ["-"]))
+    # A PAIR THAT IS NOT "PROJECT vs BASE". The EGF and run-against-run
+    # comparisons point either side at another folder -- the base case edited
+    # against the base case as it is, say -- and the columns below still say
+    # Base / Projects. Name the two folders, and what the words mean here.
+    _odd = []
+    for res in dict((id(x), x) for x, _r in rows_all).values():
+        _d = res.get("dirs") or {}
+        if (_d.get("base") and _d.get("test")
+                and (os.path.normpath(_d["base"]) != os.path.normpath(
+                        results_dir(CASE_BASE, res["project"], res["mode"]))
+                     or os.path.normpath(_d["test"]) != os.path.normpath(
+                        results_dir(CASE_TEST, res["project"], res["mode"])))):
+            _odd.append(_d)
+    if _odd:
+        if _RUN_OUTPUT[0]:
+            L.append(" THIS REPORT    %s" % _RUN_OUTPUT[0])
+        for _d in _odd:
+            L.append(" 'Base' cols =  %s" % _d["base"])
+            L.append(" 'Proj' cols =  %s" % _d["test"])
+        L.append(" In this report 'the projects' means the change between those two folders.")
     # WHICH CONSTANTS THIS ONE WAS RUN WITH. One line, not a column: in a
     # fixed-width table every row would carry the same text, and the thing it
     # distinguishes is this REPORT from the other values' reports.
@@ -8600,6 +8640,225 @@ def compare_surplus_scenarios(proj, mode):
                       % (sc["tag"], e))
             finally:
                 _RUN_OUTPUT[0] = ""
+
+
+# ============================================================================
+# EXISTING MACHINES (EGF) AT THE FEEDERS -- edited, or switched off
+# ============================================================================
+# The base-case spikes right after clearing come from the plants already at
+# the POI, so the question "is it them, and does fixing their data fix it" is
+# answered by running BOTH cases again with those machines changed -- the same
+# change on both sides -- and comparing every pair:
+#
+#   1  project vs base, both with the change   <- the study as it would be
+#   2  base with the change vs base as it is    <- what the change does
+#   3  project with the change vs project       <- the same, project side
+#
+# plus one table of every fault's verdict in all the cases side by side.
+EGF_TAG = "egf"
+EGF_OFF_TAG = "egfoff"
+
+
+def _egf_edits_for(proj):
+    """[[model, {con: value}], ...] for one project, checked. [] = none."""
+    out = []
+    for i, e in enumerate((EGF_DYR_EDITS_BY_PROJECT or {}).get(proj) or []):
+        try:
+            model, d = e
+            if not isinstance(d, dict) or not d:
+                raise ValueError("no {constant: value}")
+            out.append([str(model).strip().strip("'\""),
+                        dict((str(c).strip(), v) for c, v in d.items())])
+        except Exception as ex:
+            raise RuntimeError("EGF_DYR_EDITS_BY_PROJECT[%r] row %d is not "
+                               "(model, {constant: value}): %r (%s)" % (proj, i + 1, e, ex))
+    return out
+
+
+def _egf_variants(proj):
+    """[(tag, label, env)] the panel asks for, for one project."""
+    if EGF_PROJECTS and proj not in EGF_PROJECTS:
+        return []
+    out = []
+    if EGF_DYR_RUN:
+        ed = _egf_edits_for(proj)
+        if ed:
+            out.append((EGF_TAG, "existing machines EDITED: " + "; ".join(
+                "%s %s" % (m, ", ".join("%s=%s" % kv for kv in sorted(d.items())))
+                for m, d in ed), {"SPP_EGF_DYR_EDITS": json.dumps(ed)}))
+        elif not EGF_PROJECTS or proj in EGF_PROJECTS:
+            print("[egf] %s: EGF_DYR_RUN is on but EGF_DYR_EDITS_BY_PROJECT has no "
+                  "entry for it -- no edited run" % proj)
+    if EGF_OFF_RUN:
+        out.append((EGF_OFF_TAG, "existing machines OFF", {"SPP_EGF_OFF": "1"}))
+    return out
+
+
+def _egf_fault_env():
+    """SPP_ONLY_FAULTS for an EGF run: what EGF_FAULTS asks for, as plain ids."""
+    spec = EGF_FAULTS
+    if isinstance(spec, str) and spec.strip().lower() == "all":
+        return {"SPP_ONLY_FAULTS": "", "SPP_REPORT_FAULTS": ""}
+    if isinstance(spec, str) and spec.strip().lower() == "same":
+        spec = ONLY_FAULTS
+    if not spec:
+        return {"SPP_ONLY_FAULTS": "", "SPP_REPORT_FAULTS": ""}
+    ids, words = _expand_only(list(spec) if isinstance(spec, (list, tuple)) else [spec])
+    if words or not ids:
+        # A keyword (CRASHED, FAILING ...) cannot resolve in a fresh folder --
+        # the launcher would stop with "resolved to NOTHING".
+        print("[egf] fault selection %r holds a keyword -- the EGF runs take every "
+              "fault" % (spec,))
+        return {"SPP_ONLY_FAULTS": "", "SPP_REPORT_FAULTS": ""}
+    txt = ",".join(sorted(ids))
+    return {"SPP_ONLY_FAULTS": txt, "SPP_REPORT_FAULTS": txt}
+
+
+def run_egf_variants(proj, mode):
+    """Both cases once per EGF variant, each into its own tagged folder."""
+    for tag, label, venv in _egf_variants(proj):
+        for case in (CASE_BASE, CASE_TEST):
+            _banner("EXISTING MACHINES -- %s -- %s case -- %s"
+                    % (proj, case["key"].upper(), label))
+            env = {"SPP_RUN_TAG": tag}
+            env.update(venv)
+            env.update(_egf_fault_env())
+            env.update(_sweep_resume_env())
+            rc = run_study(case, projects=[proj], modes=[mode], extra_env=env)
+            if rc not in (0, None):
+                print("[egf] %s %s %s: the run ended with code %s -- its comparison "
+                      "uses what finished" % (proj, case["key"], tag, rc))
+
+
+def _egf_write(res, proj, sub, label, runtimes_suffix=None):
+    with _cmp_into(proj if COMPARE_BY_PROJECT else "", sub):
+        _RUN_OUTPUT[0] = label
+        try:
+            if ONE_REPORT:
+                write_one_report([res], [], [])
+            else:
+                write_summary([res], [], [])
+                write_project_report(res)
+                write_project_csv(res)
+                write_elements(res)
+            write_spp_event_tables([res])
+            if runtimes_suffix is not None and not SIMPLE_OUTPUT:
+                write_runtime_comparison(proj, res["mode"], test_suffix=runtimes_suffix)
+        finally:
+            _RUN_OUTPUT[0] = ""
+
+
+def compare_egf_variants(proj, mode):
+    """The three comparisons per EGF variant on disk, and the one table.
+
+       Built from whatever folders exist, so a PIPELINE = "compare" launch -- or
+       a variant switched off after it ran -- still gets its comparisons."""
+    done = []
+    for tag, what in ((EGF_TAG, "existing machines EDITED"),
+                      (EGF_OFF_TAG, "existing machines OFF")):
+        sfx = "_" + tag
+        db = results_dir(CASE_BASE, proj, mode) + sfx
+        dt = results_dir(CASE_TEST, proj, mode) + sfx
+        if not (os.path.isdir(db) or os.path.isdir(dt)):
+            continue
+        done.append(tag)
+        pairs = [
+            ("%s_vs_base_%s" % (tag, tag),
+             "%s -- PROJECT vs BASE, both with the change" % what,
+             dict(test_suffix=sfx, base_suffix=sfx), (db, dt)),
+            ("%s_base_vs_asis" % tag,
+             "%s -- BASE with the change vs BASE as it is" % what,
+             dict(test_case=CASE_BASE, test_suffix=sfx, base_case=CASE_BASE, base_suffix=""),
+             (results_dir(CASE_BASE, proj, mode), db)),
+            ("%s_proj_vs_asis" % tag,
+             "%s -- PROJECT with the change vs PROJECT as it is" % what,
+             dict(test_suffix=sfx, base_case=CASE_TEST, base_suffix=""),
+             (results_dir(CASE_TEST, proj, mode), dt))]
+        for sub, label, kw, dirs in pairs:
+            miss = [d for d in dirs if not os.path.isdir(d)]
+            if miss:
+                print("[egf] %s: %s not written -- no results at %s"
+                      % (proj, sub, ", ".join(miss)))
+                continue
+            try:
+                res = compare_project(proj, mode, **kw)
+            except Exception as e:
+                print("[egf] %s: could not compare %s (%s)" % (proj, sub, e))
+                continue
+            if not res or not res.get("rows"):
+                print("[egf] %s: %s -- nothing scored on one side yet" % (proj, sub))
+                continue
+            _banner("EGF COMPARISON -- %s (%s) -- %s" % (proj, mode, label))
+            try:
+                # no runtime table: it times the project side against the base
+                # AS IT IS, which is the wrong reference for two of these pairs
+                _egf_write(res, proj, sub, label)
+            except Exception as e:
+                print("[egf] %s: the %s comparison could not be written (%s)"
+                      % (proj, sub, e))
+    if done:
+        try:
+            with _cmp_into(proj if COMPARE_BY_PROJECT else ""):
+                write_egf_table(proj, mode, done)
+        except Exception as e:
+            print("[egf] %s: the all-cases table could not be written (%s)" % (proj, e))
+
+
+def write_egf_table(proj, mode, tags):
+    """EGF_CASES_<proj>_<mode>.txt/.csv -- every fault's verdict in every case."""
+    cols = [("BASE as is", results_dir(CASE_BASE, proj, mode)),
+            ("PROJECT as is", results_dir(CASE_TEST, proj, mode))]
+    for tag in tags:
+        nm = "EDITED" if tag == EGF_TAG else "EGF OFF"
+        cols += [("BASE %s" % nm, results_dir(CASE_BASE, proj, mode) + "_" + tag),
+                 ("PROJECT %s" % nm, results_dir(CASE_TEST, proj, mode) + "_" + tag)]
+    data = []
+    for nm, d in cols:
+        crit = {}
+        if os.path.isdir(d):
+            try:
+                crit = read_criteria(d, proj)[0] or {}
+            except Exception as e:
+                print("[egf] %s: %s not read (%s)" % (proj, d, e))
+        data.append((nm, d, crit))
+    faults = set()
+    for _nm, _d, crit in data:
+        faults |= set(f for f in crit if _id_selected(f) and f != "FLAT_RUN")
+    faults = sorted(faults, key=_fault_key)
+
+    def verdict(crit, f, d):
+        if not os.path.isdir(d):
+            return "no run"
+        v = norm_verdict((crit.get(f) or {}).get("verdict"))
+        return v or "not scored"
+    L = ["EXISTING MACHINES (EGF) -- %s %s -- every fault in every case" % (proj, mode),
+         "  existing machines = every machine at the project's feeder buses except the BESS",
+         "  (the machines and constants each run changed: EGF_DYR_EDITS.txt / the run log"
+         " in its folder)", ""]
+    ed = (EGF_DYR_EDITS_BY_PROJECT or {}).get(proj)
+    if EGF_TAG in tags:
+        L.append("  EDITED = %s" % ("; ".join("%s %s" % (m, d) for m, d in ed)
+                                    if ed else "(edits no longer in the panel -- see "
+                                               "EGF_DYR_EDITS.txt in the _egf folders)"))
+    L += ["  folders:"] + ["    %-16s %s" % (nm, d) for nm, d, _c in data] + [""]
+    w = 17
+    L.append("  %-10s " % "fault" + "".join("%-*s" % (w, nm) for nm, _d, _c in data))
+    for f in faults:
+        L.append("  %-10s " % f + "".join("%-*s" % (w, verdict(c, f, d)) for _n, d, c in data))
+    L += ["", "  PASS count: " + "   ".join(
+        "%s %d/%d" % (nm, sum(1 for f in faults if verdict(c, f, d) == "PASS"), len(faults))
+        for nm, d, c in data)]
+    if not faults:
+        L.append("  (no case has scored a fault yet)")
+    name = "EGF_CASES_%s_%s" % (proj, mode)
+    with open(name + ".txt", "w") as fh:
+        fh.write("\n".join(L) + "\n")
+    with csv_open(name + ".csv", "w") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(["fault"] + [nm for nm, _d, _c in data])
+        for f in faults:
+            wr.writerow([f] + [verdict(c, f, d) for _n, d, c in data])
+    print("[egf] %s: all cases side by side -> %s.txt / .csv" % (proj, name))
 
 
 def run_capacity_sweep(proj, mode):
@@ -11205,7 +11464,8 @@ def _run_suffixes(proj, mode):
                         or re.match(r"^_dyr_\w+$", sfx)
                         or re.match(r"^_cap\d+_dyr_\w+$", sfx)
                         or sfx == "_" + NEW_PLANT_TAG
-                        or sfx == "_" + PROJECT_OFF_TAG):
+                        or sfx == "_" + PROJECT_OFF_TAG
+                        or sfx in ("_" + EGF_TAG, "_" + EGF_OFF_TAG)):
             continue
         out.append(sfx)
 
@@ -11266,6 +11526,10 @@ def _run_label(sfx):
         return "project OFF"
     if sfx == "_" + NEW_PLANT_TAG:
         return "NEW plant built"
+    if sfx == "_" + EGF_TAG:
+        return "existing machines EDITED"
+    if sfx == "_" + EGF_OFF_TAG:
+        return "existing machines OFF"
     # BOTH AXES IN ONE HEADING. "Kqv=2.0" over a column that was run at half
     # output is the one label that could be read as the opposite of what it is,
     # so the level is named before anything else in the cell.
@@ -13766,6 +14030,9 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False,
     # may take a scenario whose owner is still alive. The second is never yes.
     # A worker the watchdog kills is dead, so its claim frees itself.
     env["SPP_NEVER_STEAL_LIVE"] = "1"
+    # EGF variants only when a variant run asks for one (extra_env below)
+    env.pop("SPP_EGF_DYR_EDITS", None)
+    env.pop("SPP_EGF_OFF", None)
     if extra_env:
         env.update(extra_env)
     print("[compare] launching %s : %s%s" % (case["key"], script,
@@ -19976,6 +20243,24 @@ def main():
                 compare_surplus_scenarios(res["project"], res["mode"])
             except Exception as e:
                 print("[surplus] the scenario comparisons failed (%s)" % e)
+
+    # ---- THE EXISTING MACHINES AT THE FEEDERS, edited or off ---------------
+    # Both cases again, into their own _egf / _egfoff folders; then every pair
+    # compared. The comparisons are rebuilt from disk on any launch, so a
+    # variant already run (or since switched off) keeps its workbooks.
+    if results and (EGF_DYR_RUN or EGF_OFF_RUN) and pipeline != "compare":
+        for res in results:
+            try:
+                run_egf_variants(res["project"], res["mode"])
+            except Exception as e:
+                print("[egf] the existing-machine runs failed (%s) -- the comparison "
+                      "above is unaffected" % e)
+    if results:
+        for res in results:
+            try:
+                compare_egf_variants(res["project"], res["mode"])
+            except Exception as e:
+                print("[egf] the existing-machine comparisons failed (%s)" % e)
 
     if results and CAPACITY_LEVELS and pipeline != "compare":
         for res in results:
