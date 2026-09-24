@@ -2950,7 +2950,25 @@ POI_P_SHARE      = (os.environ.get("SPP_POI_P_SHARE") or POI_P_SHARE).strip()
 # SGF ONLY: a POI target no larger than the surplus facility's own rating means
 # the SGF carries the POI alone -- the existing machines are then taken OUT OF
 # SERVICE (not left in service at 0 MW, still regulating voltage).
-POI_P_EGF_OFF_WHEN_SGF_ONLY = _env_bool("SPP_EGF_OFF_SGF_ONLY", True)
+POI_P_SPLIT_SGF_EGF = _env_bool("SPP_POI_SPLIT_SGF_EGF", False)
+# POI target <= the SGF (BESS) rating:
+#   POI_P_SPLIT_SGF_EGF False = SGF alone, the EGF (existing machines) OUT OF SERVICE
+#   POI_P_SPLIT_SGF_EGF True  = half from the SGF, half from the EGF (EGF in service)
+
+
+def _sgf_only_mode(target_mw, rate):
+    """None = POI target above the SGF rating (the EGF makes up the rest);
+       "sgf" = at/below it, SGF alone; "split" = at/below it, half each."""
+    if target_mw is None or rate is None:
+        return None
+    try:
+        r = float(rate) * (float(CAP_SCALE) if CAP_SCALE is not None else 1.0)
+        tol = max(float(POI_P_STRICT_TOL_MW), 0.01 * abs(float(target_mw)))
+    except (TypeError, ValueError):
+        return None
+    if float(target_mw) > r + tol:
+        return None
+    return "split" if POI_P_SPLIT_SGF_EGF else "sgf"
 _egfoff = (os.environ.get("SPP_EGF_OFF") or "").strip().lower()
 if _egfoff in ("1", "true", "yes", "on"):
     POI_P_EXISTING_OFF = True
@@ -12598,6 +12616,8 @@ def apply_poi_p_metered(project, target_mw):
                 print("  [poi-p]     This study is of the CURTAILED plant. Raise "
                       "POI_P_TARGET_MW to study it at full output.")
             _rate = float(target_mw)
+        if _rate is not None and _sgf_only_mode(target_mw, _poi_rate) == "split":
+            _rate = float(target_mw) / 2.0      # SGF delivers half, the EGF the rest
         # CAN THE BESS's OWN SHARE ACTUALLY BE MEASURED?
         #
         # THIS IS WHAT PUT A BESS AT -124 MW. bess_mw is what crosses _bess_cut
@@ -12896,6 +12916,11 @@ def apply_poi_p_target(project, target_mw):
                 print("  [poi-p]   This study is of the CURTAILED plant. Raise "
                       "POI_P_TARGET_MW to study it at full output.")
                 _rate = float(target_mw)
+            if _sgf_only_mode(target_mw, _pm_rate) == "split":
+                _rate = float(target_mw) / 2.0
+                print("  [poi-p] SGF + EGF SPLIT: POI target %.1f MW is within the SGF rating -- "
+                      "SGF %.1f MW, EGF %.1f MW (POI_P_SPLIT_SGF_EGF)"
+                      % (float(target_mw), _rate, float(target_mw) - _rate))
             _per = _rate / max(1, len(_pm_pairs))
             print("  [poi-p] project machines set to their rating: %d x %.1f MW = %.1f MW"
                   % (len(_pm_pairs), _per, _rate))
@@ -12979,20 +13004,23 @@ def apply_poi_p_target(project, target_mw):
     # with its reactive capability and its dynamic models in service, and SPP's
     # scenario has it off.
     egf_off = POI_P_EXISTING_OFF
-    if not egf_off and POI_P_EGF_OFF_WHEN_SGF_ONLY and exist and _pm_pairs and _pm_rate is not None:
+    _mode = _sgf_only_mode(target_mw, _pm_rate) if _pm_pairs else None
+    if _mode == "split" and not egf_off and not exist:
+        raise RuntimeError("POI_P_TARGET_MW not met for %s: POI_P_SPLIT_SGF_EGF puts half of "
+                           "%.1f MW on the existing machines (EGF), and none were found behind "
+                           "the POI" % (project.get("name"), float(target_mw)))
+    if not egf_off and _mode == "sgf" and exist:
         _sr = float(_pm_rate) * (float(CAP_SCALE) if CAP_SCALE is not None else 1.0)
-        _tl = max(float(POI_P_STRICT_TOL_MW), 0.01 * abs(float(target_mw)))
-        if float(target_mw) <= _sr + _tl:
-            print("  [poi-p] SGF ONLY: POI target %.1f MW is within the surplus facility's rating "
-                  "(%.1f MW) -- the %d existing machine(s) go OUT OF SERVICE"
-                  % (float(target_mw), _sr, len(exist)))
-            if not _pm_new:
-                raise RuntimeError("SPP_EGF_OFF: SGF-only POI target %.1f MW, but the surplus "
-                                   "machines are not in the %s* block, so the existing machines "
-                                   "cannot be told apart and switched off. Set "
-                                   "POI_P_EGF_OFF_WHEN_SGF_ONLY = False to leave them in service"
-                                   % (float(target_mw), NEW_GEN_BUS_PREFIX))
-            egf_off = True
+        print("  [poi-p] SGF ONLY: POI target %.1f MW is within the surplus facility's rating "
+              "(%.1f MW) -- the %d existing machine(s) go OUT OF SERVICE"
+              % (float(target_mw), _sr, len(exist)))
+        if not _pm_new:
+            raise RuntimeError("SPP_EGF_OFF: SGF-only POI target %.1f MW, but the surplus "
+                               "machines are not in the %s* block, so the existing machines "
+                               "cannot be told apart and switched off. Set "
+                               "POI_P_SPLIT_SGF_EGF = True to keep them in service (half each)"
+                               % (float(target_mw), NEW_GEN_BUS_PREFIX))
+        egf_off = True
     if egf_off:
         # ---- WHICH MACHINES ARE THE SGF, AND WHICH ARE THE EGF -----------
         #

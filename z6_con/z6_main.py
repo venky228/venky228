@@ -186,508 +186,69 @@ def _print_phase_times(total):
              time.strftime("%Y-%m-%d %H:%M:%S")))
     print("=" * 72)
 
-# ==========================================================================
-#                       QUICK SETTINGS -- EDIT HERE
-# ==========================================================================
-# Every setting you normally change, in one screenful, in the order you
-# normally think about them. The explanation of each one is still below,
-# under the same heading -- this is the panel, that is the manual.
-#
-# None almost always means "leave the study scripts' own value alone".
-# A value here is sent to BOTH cases, which is the point: a setting
-# applied to one case only is not a comparison.
-# ==========================================================================
-# ---- THE SETTINGS FOR THIS STUDY, AND WHERE THEY ARE ------------------------
-# An index, not a second copy: everything named here is DEFINED once, below.
-# A duplicated setting is a setting that drifts, so there is nothing to keep in
-# step -- follow the name down the panel to change it.
-#
-#   WHICH DECK
-#     BASE_SAV / PROJ_SAV         one deck per case, each in its OWN folder --
-#                                 no shared files. Both are the BASE case; the
-#                                 project case builds its plant into its copy.
-#     BASE_FOLDER / PROJ_FOLDER   the two case folders (separate results\)
-#     SHARED_DECK / _SAV / _DYR   set it to point BOTH cases at ONE file again;
-#                                 while it is set, BASE_SAV / PROJ_SAV are ignored
-#
-#   WHICH PROJECTS, AND HOW BIG
-#     PROJECTS                    all four, each a complete study, one at a time
-#     PROJECT_MW                  which rated size, where a project lists two
-#     MODES                       the fault set: spp | con | table | custom
-#
-#   HOW MUCH EACH PLANT PUTS ON THE SYSTEM
-#     POI_P_TARGET_MW             <-- THE NUMBER YOU ENTER, one per project:
-#                                 total P leaving the plant at its POI, new BESS
-#                                 and existing generation together
-#     POI_P_PROJECT_AT            where the project machines sit ("rated")
-#     POI_P_SHARE                 how the remainder splits between the existing
-#                                 machines ("capacity")
-#     POI_HOLD_AREA_MW            put the area back to its pre-project total
-#     POI_P_LEVELS                [] = one study; a list = one study per level
-#
-#   WHAT THIS RUN DOES
-#     PIPELINE                    all = simulate then compare | missing | compare
-#     RUN_CASES                   both | base | proj
-#     FRESH_START / SKIP_DONE     start over, or resume
-#
-#   FURTHER DOWN, AND RARELY CHANGED
-#     COLLECTOR_*                 collector impedances applied per project
-#     NEW_PLANT / NEW_PLANT_*     build a facility rather than adopt one
-#     DYR_* / DYR_SWEEP_*         dynamic-model edits and sweeps
-#     SURPLUS_SCENARIOS           BP-7250 7.6 SGF/EGF pair
-#     PLOT_* / REPORT_*           plotting and reporting behaviour
-#
-# ---- WHERE, WHAT, AND HOW MUCH ---------------------------------------------------
 # ============================================================================
-# CONTROL PANEL -- EVERY SETTING FOR THIS STUDY, ONE LINE EACH
+#   SETTINGS -- everything you change is in this block (details: NOTES ON THE
+#   SETTINGS at the bottom of this file). Most-used groups first:
 #
-# Change values here and nowhere else. The reasoning behind each one is in
-# NOTES ON THE SETTINGS at the BOTTOM of this file, under the same headings.
+#   1. WHAT TO RUN             2. GEN / CAP / LINE TEST   3. SOLVER
+#   4. POI POWER               5. CASES AND FOLDERS       6. PROJECTS TOGETHER
+#   7. SPP CRITERIA            8. SIMULATION LENGTH       9. FAULT LIST
+#   10. CLEARING / RECLOSE     11. DYNAMIC MODELS         12. .dyr SWEEP
+#   13. COLLECTOR SYSTEM       14. NEW FACILITY           15. EXTRA STUDIES
+#   16. CORES AND SPEED        17. RESUME RULES           18. SCORING
+#   19. PLOTS                  20. REPORTS                21. WATCHDOG / LICENCE
+#
+#   None = leave the study scripts' own value. Values go to BOTH cases.
 # ============================================================================
 
-# ============================================================================
-# THE STUDY YOU ARE RUNNING -- ALL THE KNOBS FOR ONE Kqv (.dyr) SWEEP, HERE
-# ============================================================================
-# Everything needed to run "base vs the project with several .dyr changes, does
-# the overvoltage come down" is on this one screen. Set these; the rest of the
-# panel below is machine/output defaults you rarely touch. Each name is defined
-# ONCE -- here -- and the old scattered spots now just point back to this block.
-#
-#   1. PROJECTS / MODES : which case, which fault set.
-#   2. PIPELINE         : "all" to SIMULATE the sweep (must NOT be "compare",
-#                         which only re-reads folders already on disk).
-#   3. DYR_SWEEP        : the model, the constant, and the values to try.
-#   4. the rest         : leave as-is unless noted.
-#
-# Result lands in comparison\<project>\ :
-#   DYR_SWEEP_OVERVOLTAGE_<proj>_<mode>.xlsx  <- base | project | value1 | value2
-#                                                peak pu per bus, MITIGATED/... verdict
-#   DYR_SWEEP_<proj>_<mode>.xlsx              <- the PASS/FAIL matrix
-#   dyr_<value>\                              <- a full comparison per value
+# ---- 1. WHAT TO RUN ----------------------------------------------------------
+PROJECTS = ["SantaFe"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
+PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
+MODES = ["spp"]                              # fault set: spp | con | table | custom | manual
+PIPELINE = "all"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
+RUN_CASES = "both"                           # "both" | "base" | "proj" -- which case to simulate
+ONLY_FAULTS = ["F01-F04"]                    # [] = every fault | e.g. ["F01-F04"]
+ONLY_EVENTS = []                             # [] = every event
+FRESH_START = False                          # True = start over (clears .done markers) -- set back to False after
+SKIP_DONE = True                             # True = skip scenarios that already have .done + .out
+FORCE_REBUILD = None                         # True = rebuild the snapshot even if the flat run is done
+RUN_FLAT = None                              # no-fault initial-condition run (None = on)
+RUN_FAULTS = None                            # False = build and score only, simulate no fault
+MERGE_ONLY = False                           # True = only rebuild the reports from parts, then compare
+COMPARE_REQUIRE_COMPLETE = False             # True = no comparison if a project did not finish
+RUN_STUDIES = False                          # old setting -- PIPELINE wins
+RUN_MISSING = False                          # old setting -- same as PIPELINE = "missing"
 
-PROJECTS   = ["SantaFe"]            # one project at a time for a sweep
-                                            # others: ["SantaFe","IronStar","EmpirePrairie","EastFork"]
-# -- ONE AT A TIME, OR ALL AT ONCE ------------------------------------------
-# "each"      one study per project in PROJECTS, each alone in the case (as before)
-# "together"  ONE study with EVERY project in PROJECTS built into the case at
-#             once -- every plant at its MW, every POI held to its POI_P_TARGET_MW,
-#             each area's total kept at its pre-project value with all the plants
-#             excluded from the scaling. Faults, monitored radius, protect set and
-#             plots are the union around every POI. It is compared against the
-#             base like any project: results\<TOGETHER_NAME>_spp.
-# "both"      the single-project studies AND the together study.
-PROJECTS_RUN  = "each"
-TOGETHER_NAME = "AllProjects"               # its name: the results folder and the comparison label
-TOGETHER_SPLIT = True                       # True  = ONE comparison PER MEMBER on the cluster case: every plant is built
-                                            #         once (area MW held), then each member gets its OWN fault list around
-                                            #         its POI, its own run set and its own comparison against the base --
-                                            #         results\<TOGETHER_NAME>-<member>_spp, e.g. Cluster-SantaFe_spp
-                                            # False = one study and one comparison for the whole cluster (one merged
-                                            #         fault list around every POI)
-TOGETHER_PROJECTS = []                      # the projects IN the together study; [] = PROJECTS. Name them here
-                                            # to run, say, SantaFe alone AND the whole cluster in one launch:
-                                            #   PROJECTS = ["SantaFe"]; PROJECTS_RUN = "both";
-                                            #   TOGETHER_PROJECTS = ["SantaFe","IronStar","EastFork","EmpirePrairie"]
-TOGETHER_MW   = {}                          # MW per project IN THE TOGETHER STUDY, e.g. {"EmpirePrairie": 769};
-                                            # a project not named here uses PROJECT_MW, else its rating
-TOGETHER_STEP_MISMATCH_MVA = 0.1            # after EACH plant goes into the cluster case, solve until the total
-                                            # system mismatch is below this before adding the next one
-                                            # (the final save still iterates to MISMATCH_MVA)
-
-
-def _panel_projects():
-    """PROJECTS as this run actually uses it -- the together names added or
-       substituted per PROJECTS_RUN. EVERY place that used to read PROJECTS
-       reads this: the launch, the fault-list build, the comparison filter
-       and the file names, so the cluster studies cannot be built by phase 0
-       and then not run, or run and then not compared."""
-    _one = (os.environ.get("SPP_CMP_ONE_PROJECT") or "").strip()
-    if _one:
-        return [_one]                 # a FAST_COMPARE child: this project only
-    if not PROJECTS:
-        return []
-    _how = str(PROJECTS_RUN or "each").strip().lower()
-    _tg = ([("%s-%s" % (TOGETHER_NAME, _m)) for _m in (TOGETHER_PROJECTS or PROJECTS)]
-           if TOGETHER_SPLIT else [TOGETHER_NAME])
-    if _how == "together":
-        return _tg
-    if _how == "both":
-        return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
-    return list(PROJECTS)
-MODES      = ["spp"]                        # spp | con | table | custom | manual
-PIPELINE   ="all"                          # ***SET TO "all" TO RUN THE SWEEP*** | "compare" = rescore + report only | "missing" = finish what is not done
-                                            #   "all"     simulate each value, then compare
-                                            #   "compare" only reads disk -- SKIPS the sweep
-
-# -- THE Kqv SWEEP ITSELF ----------------------------------------------------
-# model -> constant -> list of values. One study per value, each vs the base.
-# Replace REECCU1 with the model in YOUR .dyr that carries Kqv.
-DYR_SWEEP            = {}#{"REECCU1": {"Kqv": [0.0, 2.0]},}#{"REECCU1": {"Kqv": [2.0, 4.0]}, "REPCAU1": {"Ki": [10.0, 25.0 ]}}   # ONE key per model, values as a LIST: {"REECCU1": {"Kqv": [2.0, 4.0]}}. Two keys with the same model name keep only the last one (Python). Model names bare -- REPCAU1, not 'REPCAU1'. Every combination of the lists is one run.
-DYR_SWEEP_BY_PROJECT = {}                    # per-project override, e.g.
-                                            #   {"SantaFe": {"REECCU1": {"Kqv": [0.5, 1.5]}}}
-DYR_SWEEP_PROJECTS   = []                    # [] = every project in PROJECTS
-DYR_SWEEP_FAULTS     = "all"                # "all" every fault per value | "failing" only failures | "crashed" only the scenarios the as-studied project run CRASHED on / gave up (re-run those at each value, in their own folders; everything finished stays as it is)
-DYR_SWEEP_COMPARE    = True                 # also write a full comparison folder per value
-
-# -- DON'T RE-RUN A VALUE THE DECK ALREADY HAS -------------------------------
-# The sweep forces every listed value onto the project's machines regardless of
-# what the .dyr already carries. If a variant would force EXACTLY the values the
-# deck already has -- every swept constant, no other change -- that run is an
-# identical copy of "baseline (as studied)": same simulation, same numbers, a
-# wasted day of compute. Such variants are skipped; the comparison already
-# carries as-studied as its "project" column, so nothing is lost.
-#
-# THE DECK VALUES ARE READ AUTOMATICALLY from BESS_MODEL_TEMPLATE in z6_spp_p.py
-# (they are already there: Kqv 2.0, Khv 0.0, Volim 1.2, ...), overlaid by the
-# panel .dyr edits the as-studied run applies. You need declare nothing.
-#
-# DYR_DECK_VALUES is only for a PRODUCTION .dyr whose values differ from that
-# template -- what you put here WINS over the template read:
-#   e.g. {"REECCU1": {"Kqv": 1.0}, "REGCAU1": {"Khv": 0.0}}
-#
-# The POI and capacity sweeps already skip their own baseline level; this is the
-# same idea for the .dyr axis.
-DYR_SWEEP_SKIP_DECK  = True                 # False = run even a deck-identical variant
-DYR_DECK_VALUES      = {}                   # override the auto-read template values
-
-# -- the panel edit stays EMPTY so the sweep alone controls Kqv --------------
-DYR_EDITS            = []
-DYR_EDITS_BY_PROJECT = {}                    # e.g. {"SantaFe": [("REECCU1", {"Kqv": 0.0})]}
-DYR_APPLY_TO         = "project"            # edit the Project case only
-
-# -- the overvoltage criterion the table measures against --------------------
-V_OVERSHOOT_PU    = 1.20                     # no swing above this (pu)
-OVERSHOOT_SPIKE_S = 2.0 / 60.0             # over the limit for <= this = SPIKE, more = SWING
-
-# -- run it faster (already tuned for your 64 GB / many-core PC) -------------
-# CORES_MAX / CORES_FOR_REPORTS / SCORE_NO_CASE / FORCE_RESCORE keep their own
-# section below (they are machine settings, not this study's). See "HOW MANY
-# CORES" and "SCORING AND WHEN TO RE-SCORE".
-# ============================================================================
-# ============================================================================
-#  SPEED / RESOURCES -- everything that decides how fast a launch runs, in one place
-# ============================================================================
-# -- TIMINGS: size of every .out (drives sim time AND scoring time) --
-FLAT_RUN_S  = 5                # s, the no-fault initial-condition run
-PRE_FAULT_S = 5                 # s, steady state before the fault
-SIM_END_S   = 10              # s per fault; SPP needs ~2.5 s recovery + ~10 s damping; longer = bigger .out
-RUN_NPLT    = 2                 # write every N steps: 1 = every step (huge) | 2 = half-cycle | 4 = per cycle
-KILL_GRACE_MIN = 30             # minutes of worker silence before any watchdog may act (slowest scenario ever measured: 24 min)
-# -- CORES / SESSIONS: how many PSS/E runs at once --
-RUN_IN_PARALLEL = True          # True = base and project at once, BOTH in PROJECTS order | False = one after the other
-ONE_PROJECT_AT_A_TIME = True    # with RUN_IN_PARALLEL = False: base THEN project for ONE project, then the next project
-                                # (False = the base study for every project, then the project study for every project)
-N_WORKERS       = "auto"        # "auto" = cores - CORES_SPARE split between cases | N = sessions per case
-CORES_SPARE     = 2             # cores kept free for Windows / Excel / you (0-4)
-CORES_MAX       = 22            # ceiling on PSS/E sessions across BOTH cases; 0 = none; auto-clamped to the PC
-CORES_FOR_REPORTS = 6         # of CORES_MAX, cores for scoring s-*hards + plotters (0 = hold none back)
-CORES_MAX_INCLUDES_REPORTS = True  # True = scoring shares the ceiling | False = adds to it
-# -- SCORING: when and how results are scored --
-REPORT_WORKERS  = "auto"        # scoring shards per case: "auto" | 1..8
-FAST_COMPARE    = False          # PIPELINE = "compare" only: compare what is ON DISK NOW, fast -- no re-scoring,
-                             # no report rebuilds, no sweep/extra tables. Faults missing from a merged report are
-                             # read from parts\ as always; a fault with NO verdict at all reads "not compared"
-                             # (listed at the end). False = the full, slow compare (scores and rebuilds first)
-FAST_COMPARE_PARALLEL = 4    # FAST_COMPARE: projects compared at once, each in its own process (1 = one at a time)
-FORCE_RESCORE   = False      # True = re-score every folder every launch (only after a criterion change)
-REPORTS_AFTER_ALL_PROJECTS = True  # True = the launchers simulate every project first; scoring runs once at the end for both cases (a relaunch no longer re-reads a finished project before the next one simulates) | False = each project is scored right after it simulates
-RESCORE_STALE_REPORTS = True    # True = re-score a report older than its .out files
-SCORE_NO_CASE   = True          # True = shards score without loading the case (32-bit memory fix) -- keep
-# -- PLOTS: PDFs --
-MAKE_PLOTS      = None          # None = engine default (draw) | False = no PDFs (much faster)
-PLOT_MISSING_OUTS = False       # compare/missing run: draw PDFs for .out files that have none (slower)
-_LAUNCH_T0 = __import__("time").time()          # when this launch started (FORCE_REPLOT)
-FORCE_REPLOT    = False        # True = REDRAW every PDF from the .out files on this launch (PIPELINE = "compare" redraws without simulating)
-PLOT_SCOPE      = "compact"     # "compact" = SPP set + every violation (~5x fewer panels) | "full" = every kept channel
-PLOT_INRUN      = 1             # plotters trailing each running folder (1 = the old single plotter)
-PLOT_WORKERS    = 2             # plotters per case in the catch-up pass (0/1 = one)
-PLOT_TOTAL_MAX  = 4             # hard cap on plotters at once, all folders (0 = PLOT_WORKERS x 2)
-PLOT_ONE_PROJECT_AT_A_TIME = True   # True = finish one project's PDFs (base, then project case) before starting the next project's
-PLOT_SKIP_INCOMPLETE = True         # True = do NOT draw a scenario whose .out stops before the end of the simulation (it did not run); False = draw it for diagnosis
-# ============================================================================
-
-# ---- WHERE THE STUDY LIVES ---------------------------------------------------
-ROOT = ""                                   # "" = the folder this file is in; everything else follows it
-BASE_FOLDER = "Base"                        # the folder holding the BASE case (projects NOT modelled)
-PROJ_FOLDER = "Projects"                    # the folder holding the case WITH the projects
-CMP_FOLDER  = "comparison"                  # where the comparison output goes (created if absent)
-# PROJECTS -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
-# ---- THE DECK EACH CASE READS ------------------------------------------------
-SHARED_DECK     = ""                        # "" = NO SHARED FILES: each case reads its own deck, in its own ...
-SHARED_DECK_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav" # only read while SHARED_DECK is set
-SHARED_DECK_DYR = "2020MDWG-25S-DIS2201.dyr"
-BASE_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"      # a bare name = this file, in BASE_FOLDER
-BASE_DYR = "2020MDWG-25S-DIS2201.dyr"    #"2020MDWG-25S-DIS2201.dyr"     # run z4_split_cases.py --copy to put them there
-PROJ_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"      # a bare name = this file, in PROJ_FOLDER
-PROJ_DYR = "2020MDWG-25S-DIS2201.dyr"
-# -- A DIFFERENT DECK FOR ONE PROJECT'S RUNS -------------------------------------
-
-#     BASE_SAV_BY_PROJECT = {"EastFork": "DIS2201-25SP-G03-CQ_F_EastFork.sav"}
-BASE_SAV_BY_PROJECT = {}#{"EastFork": "DIS2201-25SP-G03-CQ_F_EF.sav"}   # EastFork base deck, in Base\ -- comment out to use the shared base
-BASE_DYR_BY_PROJECT = {}#{"EastFork": "DIS2201-25SP-G03-CQ_EF.dyr"} 
-PROJ_SAV_BY_PROJECT = {}
-PROJ_DYR_BY_PROJECT = {}
-ADD_PROJECTS = []                           # A project lived only in BESS_PROJECTS inside BOTH study scripts ...
-
-
-# fleet sized by PLOT_TOTAL_MAX on top of them.
-PLOT_ROUNDS_MAX   = 3                       # retry the plot pass this many times, halving the fleet each round
-PLOT_RESTART_MAX  = 20                      # how many times one plotter slot may be restarted
-PLOT_STALL_MIN    = 30                      # give the whole plot pass up after this many minutes with NOTHING drawn (0 = never)
-PLOT_PASS_MAX_MIN = 0                       # hard wall-clock cap on the plot pass, minutes (0 = no cap)
-DYNAMIC_WORK = True                         # True = one shared queue; workers take the next free scenario
-LIVE_STATUS_ALL = "LIVE_STATUS.txt"         # both cases' live table in one file here ("" = off)
-CLAIM_STALE_S = 3600                        # backstop age for a stale claim; liveness decides first
-NEVER_KILL_WORKERS = False                  # True = no watchdog ever kills a running process. FALSE NOW: on 2026-09-16 F166 held a worker 18h 33m behind a CodeMeter dialog and nothing was allowed to end it
-SCENARIO_MAX_MIN = 75                       # a scenario RUNNING longer than this is killed and requeued, printing or not -- 3x the slowest ever measured (24 min); 0 = off
-LICENCE_COOLDOWN_MIN = 10                   # a worker that hit MAX_LICENCE_FAILS is PARKED this long and relaunched, not retired -- six of seven slots retired for good on 2026-09-16 during a licence outage
-LICENCE_STARTS_PER_MIN = 6                  # PSS/E process starts per minute across BOTH cases (shared gate beside the cases); ~170/h flooded CodeMeter into "Error 100". 0 = off
-LAUNCH_STAGGER_S = 20                       # worker i starts PSS/E i x this many s after launch, so N licence requests do not hit CodeMeter at once
-CLOSE_PSSE_DIALOGS = True                   # True = close modal PSS/E boxes ("CodeMeter runtime system is currently busy") shown by this launch's own processes
-LICENCE_BACKOFF_S = 60                      # pause before relaunching a worker whose PSS/E could not take a licence (doubles each time, max 15 min)
-STARTUP_SILENT_MIN = 15                     # a worker silent this long that holds NO scenario is killed and relaunched (nothing is lost)
-RETRY_GAVE_UP_ROUNDS = 0                    # after the workers finish, re-run the scenarios that GAVE UP this many more times with a fresh attempt budget (0 = off)
-STUDY_TIMEOUT_S = 0                         # kill a study that has run this long (0 = wait for ever)
-COMPILE_LOCK = True                         # True = one dsusr.dll build at a time, across both cases
-COMPILE_LOCK_WAIT_S = 900                   # seconds to wait for the compile lock before giving up
-
-
-MERGE_ONLY = False
-
-
-AUTO_REMERGE_STALE_PARTS = True
-
-
-VERIFY_SCORING_COVERAGE = True
-
-# PIPELINE, MODES -- set in "THE STUDY YOU ARE RUNNING" panel at the top of this file.
-RUN_CASES  = "both"                         # "both" | "base" | "proj" -- which case to SIMULATE
-RUN_STUDIES = False                         # kept for the older settings; PIPELINE wins
-RUN_MISSING = False                         # same as PIPELINE = "missing"
-RUN_FLAT   = None                           # the no-fault initial-condition check (leave it on)
-RUN_FAULTS = None                           # False = build and score only, simulate no fault
-# ---- HOW MUCH IS DRAWN (the throttle, when there is no matplotlib) -----------
-INDIVIDUAL_KEYWORDS = ["PROJ", "POI", "FLT", "GEN"]   # the SPP set. [] = a panel for EVERY signal -- see below
-PLOT_MAX_PANELS = 0                         # 0 = no cap. A number = at most that many panels per scenario
-PLOT_MAX_POINTS = 1500                      # samples per trace; lower draws faster
-PER_PAGE        = 3                         # panels per PDF page
-EXPORT_PDF_PUREPY = True                    # the pure-Python PDF writer -- what draws when matplotlib is absent
-EXPORT_CSV      = False                     # one CSV per run beside the plots: time, then a column per channel
-EXPORT_SVG      = False                     # one SVG per run; open in a browser, print to PDF if you want one
-PLOT_CLEAR_STALE_CLAIMS = True              # before a plot pass, free every claim whose plotter is no longer running
-FRESH_START    = False                     # True = START OVER: clears every .done/.attempts marker so all 1,100 faults simulate again with the 20-area monitoring. SET BACK TO False ONCE THE RUN IS GOING, or a relaunch starts over again
-SKIP_DONE      = True                       # skip scenarios that already have a .done and a .out
-FORCE_REBUILD = None                        # True = rebuild the snapshot even if the flat run is done
-MAX_SCENARIO_ATTEMPTS = 3                   # give up on a scenario after this many crashes
-RETIRE_STALE_PDFS = False                   # True = rename PDFs whose project-machine labels differ from the newest group to *.oldbuild (guesswork; a PDF older than its .out is redrawn anyway)
-RETIRE_TRUNCATED_DONE = True                # before scoring, take back the .done markers of scenarios whose ...
-TRUNCATED_FRAC = 0.80                       # NO LONGER USED: a run's completeness is read from its .done marker (tend=), never from the .out size
-RESTORE_TRUNCATED_DONE = True               # give back every .done.truncated the old size rule took, unless its marker itself records a short run (tend=)
-SCORE_PARTIAL_RUNS = True                   # a run that stopped early but reached PARTIAL_MIN_FRAC of SIM_END_S is drawn and scored, and marked PARTIAL in the PDF, the criteria report and every comparison sheet
-PARTIAL_MIN_FRAC   = 0.80                   # of SIM_END_S; shorter runs stay CRASHED (no post-clearing record worth judging)
-KEEP_PARTIAL_RUNS  = True                   # PIPELINE = "all": do NOT simulate over a scenario that already holds a scorable PARTIAL run -- re-running overwrites its .out, and an attempt that dies at init replaces a 23.7 s record with nothing. False = try it again and accept that
-RUN_ONLY_MISSING_OUT = True                 # PIPELINE = "all": simulate ONLY the faults with NO .out file at all. Anything with a result on disk -- complete, partial or short -- is left exactly as it is and scored from what is there
-OUT_EMPTY_BYTES = 1048576                   # an .out under this holds no samples at all (a header at most) -- its .done is retired; this is 'the file is empty', not a size rule
-ONLY_EVENTS = []                            # [] = every event
-ONLY_FAULTS   =  ["F01-F04"]                            # [] = every fault -- see the ONLY_FAULTS warning in the comparison
-SEARCH_DEPTH = 4                            # how many folder levels below SEARCH_ROOT to look
-
-# ---- HOW MUCH EACH PLANT PUTS ON THE SYSTEM ----------------------------------
-PROJECT_MW = {                              # a LIST = one complete study per size, each in its own folder
-   # "EmpirePrairie": [604, 769],            # 604 MW, and the full 769 MW that fills the POI on its own
-}
-
-
-
-
-POI_P_TARGET_MW  = {
-    "SantaFe":        984.2,      # 984.2, 502 MW BESS + the rest from 765912/765922/765932/765935
-    "IronStar":       290.5,      # 290.5, 214 MW BESS + the rest from 587313/587317
-    "EastFork":       193.5,      # 193.5, 112 MW BESS + the rest from 531620/531607
-    "EmpirePrairie":  769,      # 769, 604, BESS + the rest from 761379/761382/761400/761403
-}
-POI_P_LEVELS     = []                       # [] = off. [1000, 1200] = one COMPLETE study per level, each in ...
-POI_P_LEVELS_PCT = []                       # [] = off. [100, 80, 60, 40, 20] = the SAME sweep as
-#                                           # POI_P_LEVELS, entered as a PERCENTAGE of each project's
-#                                           # own POI_P_TARGET_MW instead of in MW.
-# WHY A PERCENTAGE LIST AS WELL AS AN MW ONE.
-#
-# POI_P_LEVELS is absolute, and one list of MW cannot serve four projects whose
-# POI totals are 983, 769, 290 and 193: 600 MW is 61 % of SantaFe and more than
-# three times EastFork. "every project at 20, 40, 60, 80 and 100 % of its own
-# interconnection" is one line here and would otherwise be four separate runs
-# with four hand-computed lists.
-#
-#     POI_P_LEVELS_PCT = [100, 80, 60, 40, 20]
-#
-# Each project's levels are that percentage of ITS OWN POI_P_TARGET_MW, so
-# SantaFe runs 983 / 786 / 590 / 393 / 197 and EastFork runs 193 / 154 / 116 /
-# 77 / 39, each into its own results folder named for the MW it actually ran.
-# Values above 1 are read as percent; 0.2 and 20 both mean 20 %.
-#
-# POI_HOLD_AREA_MW stays in force at every level, so the area total is put back
-# to its pre-project value each time and what moves between levels is the split
-# at the POI, not the area's generation.
-#
-# Both lists can be set; the totals are merged and de-duplicated.
-POI_P_AREA       = None                     # None = the project's own area
-POI_P_SHARE      = "capacity"               # how the REMAINDER splits between the existing machines ...
-COMPARE_REQUIRE_COMPLETE = False            # True = after SIMULATING, stop before the comparison if a project did not finish (it would otherwise be compared on partial results)
-POI_P_STRICT         = True                 # True = STOP the build when the POI total is not within tolerance of POI_P_TARGET_MW (no study runs on a case that is not at its interconnection)
-POI_P_EGF_OFF_WHEN_SGF_ONLY = True        # True = a POI target equal to the BESS (SGF) rating takes the existing
-                                           # machines at that POI OUT OF SERVICE (not in service at 0 MW); stops if it cannot
-POI_P_STRICT_TOL_MW  = 2.0                  # how close it must be: this many MW, or 1 % of the target, whichever is larger
-POI_P_METER          = "delivered"          # "delivered" = MW arriving into the POI from the plant (SPP's "MW at the POI") | "export" = net MW leaving the POI to the system
-POI_P_MEASURE        = None                 # "metered" (default) = the number the one-line shows at the POI ...
-POI_P_PROJECT_AT = "rated"                  # where the PROJECT machines sit while that happens: "rated" ...
-POI_P_EXISTING_BUSES = []                   # a list for every project, or {"SantaFe": [765910, ...]} per project
-POI_P_COMPARE    = True                     # a FULL comparison per level, each in its own folder
-POI_P_FAULTS     = "all"                    # "all" every fault at each level | "failing" only the failures
-POI_P_METER_ITERS    = 8                    # solve/measure passes allowed (default 8)
-POI_P_METER_TOL_MW   = None                 # how close the POI meter must come (default 0.5 MW)
-POI_HOLD_AREA_MW = True                     # False = raise the POI and let the area total rise
-POI_HOLD_AREA_TOL_MW = None                 # how close the area must come back (default 0.5 MW)
-POI_HOLD_AREA_PASSES = None                 # solve/correct passes allowed to get there (default 4)
-POI_RADIUS_HOPS = None                      # how many bus-hops from the POI to MONITOR voltage
-STUDY_AREAS     = [327, 330, 356, 515, 520, 523, 524, 525, 526, 531, 534, 536, 541, 542,
-                   544, 545, 546, 635, 640, 645]   # the 20 areas named in the SPP report text; None = the engine's own list
-AREA_KV_MIN     = None                      # None = the study script's 100.0 kV -- MISO monitors from 100 kV
-
-# ---- THE FAULT SET -----------------------------------------------------------
-AUTO_SPP_FAULTS = False                     # THE _con SET READS ITS LIST, NEVER BUILDS ONE -- z4_disis_con.py writes SPP_FAULTS_<project>.csv from the DISIS workbook, filtered by distance from the POI. True here would build a list from the topology and throw SPP's own contingencies away
-REGEN_FAULTS = None                         # "if-missing" | "always" | "never" -- when to rewrite the files
-NEW_FAULT_LIST = False                      # True = build a BRAND-NEW fault list (renumbers, retires old ...
-MAKE_FAULT_LIST  = False                    # THE _con SET NEVER BUILDS OR COPIES A LIST. z4_disis_con.py
-                                            # already wrote SPP_FAULTS_CON_<project>.csv beside the cases from
-                                            # the DISIS workbook. True here made phase 0 walk the BASE case
-                                            # topology and write its own list over that path -- which is what
-                                            # "it keeps moving files from Base to the root folder" was. If the
-                                            # DISIS list is missing, phase 0 now STOPS and says to run
-                                            # z4_disis_con.py, instead of silently substituting a generated one.
-FAULT_LIST_FROM  = "BASE"                   # "BASE" | "TEST" -- whose topology defines it
-SHARED_FAULTS_CSV = r"{root}\SPP_FAULTS_CON_{project}.csv"   # THE _con SET HAS ITS OWN LIST. It shared SPP_FAULTS_{project}.csv with the _f set, which writes that file too -- so whichever ran last decided what BOTH of them simulated, and nothing in either said which # {root} = the folder the cases sit in, {project} = its name
-SPP_FAULT_HOPS   = None                     # how many levels out from the POI to build events
-SPP_FAULT_KV_MIN = None                     # ignore anything below this kV
-SPP_MAX_FAULTS   = None                     # keep only the N nearest the POI (0 = keep all)
-SPP_EVENTS_ON    = None                     # ["P1.2","P1.3","P4.2"] -- which planning events to build
-SPP_EVENT_HOPS = None                       # {"P1.2": 4, "P4.2": 2} -- per event; only what you name
-SPP_P4_MODE         = None                  # "spp-proxy" (SPP's own, the default) | "group" | "both"
-SPP_P4_GROUP        = None                  # mode "group"/"both" only: -1 all but one | 2 every pair | 1 one | ...
-SPP_P4_TAP_SEGMENTS = None                  # True = a tapped line goes out in all its segments
-SPP_SLG_RETAIN_VPU  = None                  # 0.6 -- the SLG fault is tuned to this bus voltage
-FAULTS_CON   = None                         # r"C:\ENGIE\con2022_DIS2201.con" (MODES = ["con"])
-FAULTS_TABLE = None                         # r"C:\ENGIE\SPP_GROPU3_FAULTS.xlsx" (MODES = ["table"])
-CON_NEAR_BY  = None                         # "fault_bus" = the faulted bus is within the event's hop
-TABLE_GROUPS = None                         # [] = every Group in the table
-CON_EVENTS   = None                         # [] = every event the parser understands
-CON_MAX_ELEMENTS = None                     # skip a contingency removing more than N elements (0 = no cap)
-CUSTOM_TYPES     = ["3PH"]                  # ["3PH"] | ["SLG"] | ["3PH","SLG"] -- one run per type
-# None -> 6 cy at 345 kV+, 7 cy below
-CUSTOM_CYCLES    = {"3PH": None,
-                    "SLG": 16}     # SPP's stuck-breaker clearing
-CUSTOM_HOPS      = 3                        # how far from the POI to place them
-CUSTOM_KV_MIN    = 100                      # only at or above this bus base kV
-CUSTOM_MAX_BUSES = 4                        # cap, so a dense POI cannot produce hundreds
-CUSTOM_INCLUDE_POI = True                   # True = fault the POI bus itself as well
-
-# ---- CLEARING TIMES AND RECLOSING --------------------------------------------
-NORMAL_CLEAR_CYCLES = None                  # a number = that many cycles at EVERY kV (overrides the 6/7 table ...
-SPP_STUCK_CYCLES    = None                  # P4 stuck-breaker clearing -- SPP say 16
-RECLOSE_WAIT_CYCLES = None                  # SPP say 20
-ENABLE_RECLOSE      = None                  # False = no reclose on any event, whatever SPP say
-SIMULATE_RECLOSE    = True            # False = describe the reclose but do not simulate it
-#   >>> SET False DELIBERATELY. With it on, the study clears the fault, waits
-#   RECLOSE_WAIT_CYCLES (20 = 0.333 s) and RECLOSES INTO THE FAULT, then clears
-#   again -- an UNSUCCESSFUL-RECLOSE duty. That is a far more severe event than
-#   a single clearing, and it produces a SECOND transient at ~0.43 s after the
-#   first, which is where the second cluster of >1.20 pu readings came from.
-#   Turn it back on only for events where SPP asks for the reclose duty.
-RECLOSE_SKIP_IF_ISLANDS = None              # True = apply SPP's rule and drop a reclose that would strand a ...
-
-# ---- SYSTEM ADJUSTMENTS (SPP's "pre-existing issues") ------------------------
-DYR_DISABLE = []                            # dynamic models REMOVED from the deck: ("WTDTA1", 51565) | "@OV_RELAYS"
-DYR_DISABLE_APPLY_TO = "both"               # "both" | "project" | "base" -- a pre-existing fix belongs in BOTH cases
-DYR_DISABLE_STRICT = True                   # True = a disable that matched no record STOPS instead of running on
-FAULT_LINE_MIN_X_PU = 0.0                   # 0 = off. Raise a faulted line's |X| to this floor before the fault
-FAULT_LINE_X_WARN_PU = 0.0001               # name every faulted line whose |X| is under this, changed or not
-SOLVER_RETRY_ON_NONCONV = False             # False = a non-converged event is reported, never re-solved on other settings
-SOLVER_RETRY_MAX_NONCONV = 6                # non-converged steps tolerated before a retry is triggered
-SOLVER_RETRY_RECIPES = [("iterations 200, accel 0.50", 200, 0.50), ("iterations 400, accel 0.30", 400, 0.30), ("iterations 600, accel 0.10", 600, 0.10)]                # None = the study's own ladder; [("label", MAXITER, ACCEL), ...] replaces it
-DELT_CYCLES = 4                             # None = the study's own step (1/4 cycle). 8 = 1/8 cycle: try it when a case
-                                            # runs its flat run cleanly but the FAULT runs go NaN (the network solution
-                                            # loses itself at the switching); the run takes about twice as long
-DYN_TOL = None                              # None = the study's own network tolerance (0.0000095) | e.g. 0.0001
-ADJUSTMENTS_REPORT = True                   # collect every non-project change into SYSTEM_ADJUSTMENTS.txt and the report
-PSSE_FAULT_LOG = True                     # True = keep PSS/E's own messages for each fault run ("Network not
-                                            # converged at TIME = ...") in results\<proj>_spp\logs\psse\<fault>.txt
-                                            # instead of discarding them -- nothing extra on the terminal.
-                                            # z6_spike_find.py then writes SOLVER_LOG_<KIND>_<proj>.txt per project
-
-
-# ---- RUN THE WHOLE STUDY WITH THE SOLVER PARAMETERS BELOW ----------------------
-# FIXED_SOLVER = True: the gen test is switched off and every fault in both cases
-# is simulated with exactly these values. Results that were NOT made with them
-# are moved aside first (<folder>_before_fixed_<time>), so nothing old is reused;
-# a stopped run started again with the same values carries on where it stopped.
-FIXED_SOLVER      = False          # True = use the values below for the whole study
-FIXED_DELT_CYCLES = 8              # time step: 4 = 1/4 cycle (as SPP), 8 = 1/8 cycle
-FIXED_MAXITER     = 400            # network iterations      (SPP: 60)
-FIXED_ACCEL       = 0.10           # acceleration factor     (SPP: 0.60)
-FIXED_TOL         = 0.0000095      # network tolerance       (SPP: 0.0000095)
-
-
-# ---- GEN-OFF / SOLVER TEST ------------------------------------------------------
-# Finds out whether the >1.2 pu spikes and "Network not converged" come from the
-# SOLVER or from a nearby GENERATOR. With GEN_TEST = True this panel runs ONLY
-# the test below and stops (the normal pipeline and comparison are skipped):
-#   1. the faults under every solver scenario, all machines in service
-#   2. each machine within GEN_TEST_HOPS buses of the POI switched OFF, one at a
-#      time, under the scenarios in GEN_TEST_GEN_SCENARIOS
-# Every run has its own folder: <case>\results_base\<proj>_spp_gt_<scenario>[_off<bus>_<id>]
-# The as-studied results (<proj>_spp) are never touched. A run whose folder already
-# scored every fault is NOT re-run.
-# Output: <comparison folder>\GEN_TEST_<proj>.txt / .csv (rewritten after each run)
-#         GEN_TEST_BEST_<proj>.txt = the "best of all" summary on its own
-#         GEN_TEST_GENS_<proj>.txt = the machines found and their distance
-GEN_TEST          = True           # True = run this test ONLY | False = normal panel
-GEN_TEST_DRY_RUN  = False          # True = list the machines and the run plan, simulate nothing
-GEN_TEST_CASE     = "base"         # "base" | "proj" -- which case the test runs on
-GEN_TEST_PROJECT  = "SantaFe"
-GEN_TEST_MODE     = "spp"
-GEN_TEST_FAULTS   = ["F01-F04"]    # same syntax as ONLY_FAULTS
-GEN_TEST_POI      = 765911         # the bus the radius is measured from
-GEN_TEST_HOPS     = 5              # machines within this many buses of the POI
-GEN_TEST_MIN_MW   = 5.0            # skip machines below this |MW| (SVC/STATCOM always kept)
-GEN_TEST_MAX_GENS = 0              # 0 = every machine found | N = the N electrically closest
-GEN_TEST_GENS     = []             # [] = find them automatically | or fixed: [(765912, "1"), (539670, "1")]
-GEN_TEST_EXCLUDE  = []             # machines never switched off: [(bus, "id"), ...]
-GEN_TEST_EXTRA_GENS = [(763676, "1")]  # machines ALWAYS tested, however far from the POI: [(bus, "id"), ...]
-GEN_TEST_POI_GROUP = True          # True = ALSO run with EVERY machine connected at the POI off together
-                                   # (one extra "machine" in the plan, run under the same scenarios)
-GEN_TEST_POI_GROUP_GENS = []       # [] = found automatically: the machines behind the POI, reached from it
-                                   # through buses BELOW the POI kV only (their own GSU / collector) |
-                                   # or fixed: [(765912, "1"), (765922, "1"), ...]
-GEN_TEST_CAPS_OFF = True           # True = ALSO one run with EVERY capacitor bank within GEN_TEST_CAPS_HOPS
-                                   # of the POI out of service (fixed caps + switched shunts capacitive now)
-GEN_TEST_CAPS_HOPS = 5             # buses from the POI
-GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]   # solver scenario(s) for it -- default settings only
-GEN_TEST_CAPS_LIST = []            # [] = found automatically: fixed caps (+Mvar) and switched shunts
-                                   # CAPACITIVE NOW, within GEN_TEST_CAPS_HOPS | or fixed:
-                                   # [(763674, "1", "F"), (539715, "", "S")]  F = fixed, S = switched
-GEN_TEST_CAPS_EACH = True          # True = ALSO every capacitor bank near the POI off ON ITS OWN, as one more
-                                   # "machine" of the list -- run under the same scenarios as the machines
-GEN_TEST_CAPS_EACH_HOPS = None     # None = GEN_TEST_HOPS (the machines' radius) | N buses from the POI
-GEN_TEST_LINES_EACH = True         # True = ALSO every line near the POI OPENED ON ITS OWN before the
-                                   # simulation (one run each) -- shows which path the problem comes through.
-                                   # A line whose opening would cut buses off the grid (radial) is skipped.
-GEN_TEST_LINES_HOPS = 2            # lines with BOTH ends within this many buses of the POI
-GEN_TEST_LINES_MIN_KV = 100.0      # skip lines below this kV (both ends)
-GEN_TEST_LINES_XFMR = False        # True = transformers (2-winding) too
-GEN_TEST_LINES_LIST = []           # [] = found automatically | or fixed: [(765911, 531603, "1"), ...]
-GEN_TEST_LINES_SCENARIOS = ["s0_asis"]  # solver scenario(s) for the line-off runs
-# Solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL). None = the study's own value
-# (DELT 1/4 cycle from DELT_CYCLES above, MAXITER 60, ACCEL 0.60, TOL 0.0000095).
-# Tags: letters, digits and _ only (they become folder names).
+# ---- 2. GEN / CAP / LINE TEST ------------------------------------------------
+# GEN_TEST = True runs ONLY this test (normal study skipped). Results: comparison\GEN_TEST_*.txt
+GEN_TEST = True                              # True = run this test only | False = normal study
+GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
+GEN_TEST_CASE = "base"                       # "base" | "proj" -- case the test runs on
+GEN_TEST_PROJECT = "SantaFe"
+GEN_TEST_MODE = "spp"
+GEN_TEST_FAULTS = ["F01-F04"]                # same syntax as ONLY_FAULTS
+GEN_TEST_POI = 765911                        # bus the radius is measured from
+GEN_TEST_HOPS = 5                            # machines within this many buses of the POI
+GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
+GEN_TEST_MAX_GENS = 0                        # 0 = all found | N = N closest
+GEN_TEST_GENS = []                           # [] = find automatically | [(765912, "1"), ...]
+GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus, id)]
+GEN_TEST_EXTRA_GENS = [(763676, "1")]        # machines always tested, however far [(bus, id)]
+GEN_TEST_POI_GROUP = True                    # True = also all machines at the POI off together
+GEN_TEST_POI_GROUP_GENS = []                 # [] = found automatically | [(bus, id), ...]
+GEN_TEST_CAPS_OFF = True                     # True = also one run with all caps near the POI off
+GEN_TEST_CAPS_HOPS = 5                       # radius for that run
+GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]        # solver scenario(s) for it
+GEN_TEST_CAPS_LIST = []                      # [] = auto | [(763674, "1", "F"), (539715, "", "S")]
+GEN_TEST_CAPS_EACH = True                    # True = also each cap bank off on its own
+GEN_TEST_CAPS_EACH_HOPS = None               # None = GEN_TEST_HOPS
+GEN_TEST_LINES_EACH = True                   # True = also each nearby line opened on its own (radial skipped)
+GEN_TEST_LINES_HOPS = 2                      # both ends within this many buses of the POI
+GEN_TEST_LINES_MIN_KV = 100.0                # skip lines below this kV
+GEN_TEST_LINES_XFMR = False                  # True = 2-winding transformers too
+GEN_TEST_LINES_LIST = []                     # [] = auto | [(765911, 531603, "1"), ...]
+GEN_TEST_LINES_SCENARIOS = ["s0_asis"]       # solver scenario(s) for the line runs
+# GEN_TEST_SCENARIOS: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
     ("s1_delt8",             8,    None, None, None),     # 1/8-cycle time step
@@ -698,62 +259,183 @@ GEN_TEST_SCENARIOS = [
     ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10
     ("s7_delt8_it400_a010",  8,    400,  0.10, None),     # same, 1/8-cycle time step
 ]
-GEN_TEST_GEN_SCENARIOS = "all"     # scenarios each machine-off run uses:
-                                   #   "all"   = every scenario
-                                   #   "best2" = s0_asis + the BEST solver scenario (picked automatically
-                                   #             from the all-in-service runs, section B) -- ~4x fewer runs
-                                   #   ["s0_asis", "s1_delt8"] = these
-GEN_TEST_CLEAN_BUILD = True        # True = delete each finished run's own .sav/.cnv/.snp/.cnl (disk space);
-                                   # the results folder (.out, reports, logs) is always kept
-GEN_TEST_PARALLEL = "auto"         # runs AT ONCE: "auto" = (cores - CORES_SPARE, max CORES_MAX) // faults
-                                   # (3 faults on 24 cores -> 7 runs = 21 PSS/E) | N | 1 = one after another
-GEN_TEST_START_GAP_MIN = 20        # next run starts when the previous one has built its snapshot,
-                                   # or after this many minutes at most (keeps dyre_new builds apart)
+GEN_TEST_GEN_SCENARIOS = "all"               # "all" | "best2" (s0 + best solver) | ["s0_asis", ...]
+GEN_TEST_CLEAN_BUILD = True                  # True = delete each finished run's .sav/.cnv/.snp (disk)
+GEN_TEST_PARALLEL = "auto"                   # "auto" | N runs at once | 1
+GEN_TEST_START_GAP_MIN = 20                  # max minutes between run starts
 
+# ---- 3. SOLVER ---------------------------------------------------------------
+# FIXED_SOLVER = True runs the WHOLE study (all faults, both cases) on the FIXED_* values
+FIXED_SOLVER = False                         # True = use the FIXED_* values below for everything
+FIXED_DELT_CYCLES = 8                        # time step: 4 = 1/4 cycle (SPP) | 8 = 1/8 cycle
+FIXED_MAXITER = 400                          # network iterations (SPP 60)
+FIXED_ACCEL = 0.10                           # acceleration (SPP 0.60)
+FIXED_TOL = 0.0000095                        # network tolerance (SPP 0.0000095)
+DELT_CYCLES = 4                              # normal study time step (None = 1/4 cycle)
+DYN_TOL = None                               # normal study tolerance (None = 0.0000095)
+SOLVER_RETRY_ON_NONCONV = False              # True = re-run a non-converged fault on the recipes below
+SOLVER_RETRY_MAX_NONCONV = 6                 # non-converged steps allowed before a retry
+SOLVER_RETRY_RECIPES = [("iterations 200, accel 0.50", 200, 0.50), ("iterations 400, accel 0.30", 400, 0.30), ("iterations 600, accel 0.10", 600, 0.10)]  # [("label", MAXITER, ACCEL), ...]
+PSSE_FAULT_LOG = True                        # True = keep PSS/E messages per fault (logs\psse)
 
-# ---- THE SPP CRITERIA --------------------------------------------------------
-V_RECOVERY_PU  = 0.70                       # must recover above this after clearing
-V_RECOVERY_S   = 2.5                        # ...within this many seconds
-# V_OVERSHOOT_PU, OVERSHOOT_SPIKE_S -- set in "THE STUDY YOU ARE RUNNING" panel at the top.
-V_SS_LOW       = 0.90                       # post-fault steady-state band
-V_SS_HIGH      = 1.10                       # ...and high
-TRIP_PGEN_DEAD_MW = 10.0                    # a machine that ENDS below this many MW (and below half its pre-fault MW) has TRIPPED
-ANGLE_DEV_DEG  = 16.0                       # rotor-angle deviation judged individually above this
+# ---- 4. POI POWER ------------------------------------------------------------
+# POI_P_TARGET_MW: MW at the POI per project (BESS + existing together)
+POI_P_TARGET_MW = {
+    "SantaFe":        984.2,      # 984.2, 502 MW BESS + the rest from 765912/765922/765932/765935
+    "IronStar":       290.5,      # 290.5, 214 MW BESS + the rest from 587313/587317
+    "EastFork":       193.5,      # 193.5, 112 MW BESS + the rest from 531620/531607
+    "EmpirePrairie":  769,      # 769, 604, BESS + the rest from 761379/761382/761400/761403
+}
+POI_P_SPLIT_SGF_EGF = False                  # POI <= BESS rating: False = BESS only, existing OUT OF SERVICE | True = half BESS, half existing
+# PROJECT_MW: {project: MW} or a list = one study per size
+PROJECT_MW = {                              # a LIST = one complete study per size, each in its own folder
+   # "EmpirePrairie": [604, 769],            # 604 MW, and the full 769 MW that fills the POI on its own
+}
+POI_P_PROJECT_AT = "rated"                   # "rated" = BESS at its rating, existing take the rest
+POI_P_SHARE = "capacity"                     # "capacity" | "equal" | "present" -- how existing machines share
+POI_P_EXISTING_BUSES = []                    # extra existing-machine buses, list or {project: [...]}
+POI_P_STRICT = True                          # True = STOP when the POI MW is not met
+POI_P_STRICT_TOL_MW = 2.0                    # tolerance: this MW or 1 % of target
+POI_P_METER = "delivered"                    # "delivered" into the POI | "export" to the system
+POI_P_MEASURE = None                         # "metered" (default) | "machines"
+POI_P_METER_ITERS = 8                        # solve/measure passes (default 8)
+POI_P_METER_TOL_MW = None                    # meter tolerance (default 0.5 MW)
+POI_P_AREA = None                            # None = the project's own area
+POI_HOLD_AREA_MW = True                      # True = area total put back to its pre-project MW
+POI_HOLD_AREA_TOL_MW = None                  # default 0.5 MW
+POI_HOLD_AREA_PASSES = None                  # default 4
+POI_P_LEVELS = []                            # [] = off | [MW, ...] one study per level
+POI_P_LEVELS_PCT = []                        # [] = off | [100, 80, ...] % of POI_P_TARGET_MW
+POI_P_COMPARE = True                         # full comparison per level
+POI_P_FAULTS = "all"                         # "all" | "failing" at each level
+
+# ---- 5. CASES AND FOLDERS ----------------------------------------------------
+ROOT = ""                                    # "" = this file's folder
+BASE_FOLDER = "Base"                         # base case folder (no projects)
+PROJ_FOLDER = "Projects"                     # case folder with the projects
+CMP_FOLDER = "comparison"                    # comparison output folder
+BASE_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"  # base .sav (in BASE_FOLDER)
+BASE_DYR = "2020MDWG-25S-DIS2201.dyr"
+PROJ_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"  # project .sav (in PROJ_FOLDER)
+PROJ_DYR = "2020MDWG-25S-DIS2201.dyr"
+SHARED_DECK = ""                             # "" = each case its own deck | set = both use SHARED_DECK_*
+SHARED_DECK_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"
+SHARED_DECK_DYR = "2020MDWG-25S-DIS2201.dyr"
+BASE_SAV_BY_PROJECT = {}                     # e.g. {"EastFork": "DIS2201-25SP-G03-CQ_F_EF.sav"}
+BASE_DYR_BY_PROJECT = {}                     # e.g. {"EastFork": "DIS2201-25SP-G03-CQ_EF.dyr"}
+PROJ_SAV_BY_PROJECT = {}
+PROJ_DYR_BY_PROJECT = {}
+ADD_PROJECTS = []                            # extra project rows (see NOTES)
+SEARCH_DEPTH = 4                             # folder levels searched for files
+
+# ---- 6. PROJECTS TOGETHER ----------------------------------------------------
+# used when PROJECTS_RUN = together / both
+TOGETHER_NAME = "AllProjects"                # results folder / label
+TOGETHER_SPLIT = True                        # True = one comparison per member | False = one for all
+TOGETHER_PROJECTS = []                       # [] = PROJECTS
+TOGETHER_MW = {}                             # {project: MW} in the together study
+TOGETHER_STEP_MISMATCH_MVA = 0.1             # solve to this after each plant is added
+
+# ---- 7. SPP CRITERIA ---------------------------------------------------------
+V_RECOVERY_PU = 0.70                         # recover above this after clearing
+V_RECOVERY_S = 2.5                           # within this many s
+V_OVERSHOOT_PU = 1.20                        # no swing above this
+OVERSHOOT_SPIKE_S = 2.0 / 60.0               # above the limit <= this = SPIKE, longer = SWING
+V_SS_LOW = 0.90                              # post-fault steady-state band, low
+V_SS_HIGH = 1.10                             # and high
+TRIP_PGEN_DEAD_MW = 10.0                     # machine ending below this MW = tripped
+ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
+# FLAT_TOL_BY_KIND: flat-run tolerance per quantity
 FLAT_TOL_BY_KIND = {"VOLT": 0.005, "ETERM": 0.005, "ANGLE": 1.0,
-                    "PELEC": 1.0, "QELEC": 2.0, "SPEED": 0.0002}   # flat run: per QUANTITY, own units ({} = one number)
-FLAT_REL       = 0.02                       # ...or this share of the channel's own initial value, whichever is larger
-WORSE_PU_DELTA  = 0.02                      # e.g. overshoot 1.150 -> 1.175 with a 1.20 limit
-WORSE_DEG_DELTA = 2.0                       # e.g. largest swing 12.0 -> 15.0 deg
-ELEMENT_LIST_MAX = 40                       # elements printed per violation before it summarises
-MISMATCH_MVA = 0.04                         # both cases are solved to this total system mismatch
-MISMATCH_PASSES = 20                        # solve passes spent trying; it stops early once it plateaus
-MISMATCH_ABORT = True                       # True = a build that cannot reach it STOPS rather than saving
+                    "PELEC": 1.0, "QELEC": 2.0, "SPEED": 0.0002}
+FLAT_REL = 0.02                              # or this share of the initial value
+WORSE_PU_DELTA = 0.02                        # PASS both sides but this much worse = WORSENED
+WORSE_DEG_DELTA = 2.0                        # same, degrees
+POI_RADIUS_HOPS = None                       # buses from the POI monitored (None = study value)
+# STUDY_AREAS: areas monitored (None = engine list)
+STUDY_AREAS = [327, 330, 356, 515, 520, 523, 524, 525, 526, 531, 534, 536, 541, 542,
+                   544, 545, 546, 635, 640, 645]
+AREA_KV_MIN = None                           # None = 100 kV
+MISMATCH_MVA = 0.04                          # both cases solved to this mismatch
+MISMATCH_PASSES = 20                         # solve passes allowed
+MISMATCH_ABORT = True                        # True = stop if not reached
 
-# ---- SCORING AND WHEN TO RE-SCORE --------------------------------------------
-# OFF, because True re-reads and re-scores every .out in every folder on EVERY
-# launch -- a campaign's worth of scoring repeated to reproduce results already
-# on disk, which is the single largest avoidable cost in a re-run. Nothing is
-# missed by turning it off: RESCORE_STALE_REPORTS above still re-scores a report
-# older than its .out files, auto_remerge_stale_reports() picks up parts that
-# landed after the report, and verify_scoring_coverage() names any .out with no
-# verdict before the comparison runs. Set it True only to deliberately rebuild a
-# folder whose report you have reason to distrust.
-                                           #   fix). The heavy diverged .out files are ~341 MB of floats; with
-                                           #   the 35,785-bus case ALSO in the shard they blow past a 32-bit
-                                           #   process's 2 GB ceiling and the read crashes every launch. Scoring
-                                           #   needs no live case -- bus kV, names, areas, hop distances and the
-                                           #   monitoring radius all come from flags\BUS_MAP.csv, which an earlier
-                                           #   run wrote. So the shard skips psseinit + the case load and the
-                                           #   .out read has the full address space. Honoured only when
-                                           #   BUS_MAP.csv is on disk; otherwise the case is loaded as before.
-                                           #   Set False to go back to loading the case in the scoring shards.
-REPORT_COVERAGE_MIN = 0.90                  # ...and re-score one that scored less than this share of them A ...
-EMPTY_CELL = "n/a"                          # what a cell of the detail sheets shows when there is nothing to put in it. Never a blank: a blank reads as zero, or as fine, or as forgotten, and it is none of those
-STALE_REPORT_TOL_S = 120                    # how much younger the newest .out may be before that fires
+# ---- 8. SIMULATION LENGTH ----------------------------------------------------
+FLAT_RUN_S = 5                               # s, no-fault run
+PRE_FAULT_S = 5                              # s before the fault
+SIM_END_S = 10                               # s per fault
+RUN_NPLT = 2                                 # write every N steps (1 = every step, huge)
 
-# ---- THE COLLECTOR SYSTEM ----------------------------------------------------
-COLLECTOR_ON = True                         # False = leave every collector alone, table or no table
-# the collector branch per project gen -- R, X, B per row
+# ---- 9. FAULT LIST -----------------------------------------------------------
+AUTO_SPP_FAULTS = False                      # False: the _con set reads SPP_FAULTS_CON_<project>.csv (z4_disis_con.py)
+MAKE_FAULT_LIST = False                      # False: never build/copy a list here
+REGEN_FAULTS = None                          # "if-missing" | "always" | "never"
+NEW_FAULT_LIST = False                       # True = brand-new list (renumbers, retires old results)
+FAULT_LIST_FROM = "BASE"                     # "BASE" | "TEST" topology
+SHARED_FAULTS_CSV = r"{root}\SPP_FAULTS_CON_{project}.csv"  # {root} = case folder, {project} = name
+SPP_FAULT_HOPS = None                        # levels out from the POI
+SPP_FAULT_KV_MIN = None                      # ignore below this kV
+SPP_MAX_FAULTS = None                        # keep N nearest (0 = all)
+SPP_EVENTS_ON = None                         # ["P1.2","P1.3","P4.2"]
+SPP_EVENT_HOPS = None                        # {"P1.2": 4, ...}
+SPP_P4_MODE = None                           # "spp-proxy" | "group" | "both"
+SPP_P4_GROUP = None
+SPP_P4_TAP_SEGMENTS = None                   # True = tapped line out in all segments
+SPP_SLG_RETAIN_VPU = None                    # SLG tuned to this retained voltage
+FAULTS_CON = None                            # MODES = ["con"]: .con file
+FAULTS_TABLE = None                          # MODES = ["table"]: .xlsx
+CON_NEAR_BY = None
+TABLE_GROUPS = None                          # [] = every group
+CON_EVENTS = None                            # [] = every event
+CON_MAX_ELEMENTS = None                      # skip contingencies removing more (0 = no cap)
+CUSTOM_TYPES = ["3PH"]                       # MODES = ["custom"]: ["3PH"] | ["SLG"] | both
+# CUSTOM_CYCLES: None = 6 cy at 345 kV+, 7 below
+CUSTOM_CYCLES = {"3PH": None,
+                    "SLG": 16}
+CUSTOM_HOPS = 3
+CUSTOM_KV_MIN = 100
+CUSTOM_MAX_BUSES = 4
+CUSTOM_INCLUDE_POI = True
+
+# ---- 10. CLEARING / RECLOSE --------------------------------------------------
+NORMAL_CLEAR_CYCLES = None                   # a number = that many cycles at every kV
+SPP_STUCK_CYCLES = None                      # P4 stuck breaker (SPP 16)
+RECLOSE_WAIT_CYCLES = None                   # SPP 20
+ENABLE_RECLOSE = None                        # False = no reclose on any event
+SIMULATE_RECLOSE = True                      # False = describe the reclose, do not simulate it
+RECLOSE_SKIP_IF_ISLANDS = None               # True = drop a reclose that would island
+FAULT_LINE_MIN_X_PU = 0.0                    # 0 = off | raise a faulted line's |X| to this
+FAULT_LINE_X_WARN_PU = 0.0001                # name faulted lines with |X| below this
+
+# ---- 11. DYNAMIC MODELS ------------------------------------------------------
+DYR_EDITS = []                               # [("REECCU1", {"Kqv": 0.0}), ...]
+DYR_EDITS_BY_PROJECT = {}                    # {"SantaFe": [("REECCU1", {"Kqv": 0.0})]}
+DYR_APPLY_TO = "project"                     # "project" | "base" | "both"
+DYR_DISABLE = []                             # models removed: ("WTDTA1", 51565) | "@OV_RELAYS"
+DYR_DISABLE_APPLY_TO = "both"                # "both" | "project" | "base"
+DYR_DISABLE_STRICT = True                    # True = stop if a disable matches nothing
+DYR_SHOW = []                                # print these models from the deck, e.g. ["REECAU1"]
+DYR_SCOPE = "project"                        # "project" machines only | "deck" everywhere
+DYR_COMPILE_WHEN = None                      # when to run the compile .bat files
+DYR_COMPILE_BATS = ["MyCompile34.bat", "MyCload41.bat"]
+DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is saved
+ABORT_ON_MODEL_NOT_ACCESSIBLE = True         # stop on 'MODEL NOT ACCESSIBLE'
+INIT_NAN_ABORT = False                       # stop on NaN after init
+ADJUSTMENTS_REPORT = True                    # list every non-project change in SYSTEM_ADJUSTMENTS.txt
+
+# ---- 12. .dyr SWEEP ----------------------------------------------------------
+# one study per value, each compared with the base
+DYR_SWEEP = {}                               # e.g. {"REECCU1": {"Kqv": [0.0, 2.0]}}
+DYR_SWEEP_BY_PROJECT = {}                    # {"SantaFe": {"REECCU1": {"Kqv": [0.5, 1.5]}}}
+DYR_SWEEP_PROJECTS = []                      # [] = every project
+DYR_SWEEP_FAULTS = "all"                     # "all" | "failing" | "crashed"
+DYR_SWEEP_COMPARE = True                     # full comparison per value
+DYR_SWEEP_SKIP_DECK = True                   # skip a value the deck already has
+DYR_DECK_VALUES = {}                         # override the deck values read from the template
+
+# ---- 13. COLLECTOR SYSTEM ----------------------------------------------------
+COLLECTOR_ON = True                          # False = leave every collector alone
+# COLLECTOR_BRANCHES: per project: (gen bus, from, to, ckt, R, X, B); None = keep
 COLLECTOR_BRANCHES = {
     "SantaFe": [
         # gen bus, collector branch,           R,      X,      B
@@ -780,71 +462,20 @@ COLLECTOR_BRANCHES = {
         (761403, 761402, 761401, "1",      None,   None,   None),
     ]
 }
-COLLECTOR_SCALE = {}
-COLLECTOR_ALL = None                        # row in the table above, whatever that row says -- so four ...
-COLLECTOR_BY_PROJECT = {}                   # that project is set to it, and a project not named here is left to its own rows
-COLLECTOR_Z_BASE_MVA = None                 # MVA base the R/X/B are on
-COLLECTOR_APPLY_TO = "project"              # "project" | "both" | "base" -- which case gets the change
+COLLECTOR_SCALE = {}                         # {"SantaFe": (0.5, 0.5, 1.0)} or 0.2
+COLLECTOR_ALL = None                         # (R, X, B) for every collector
+COLLECTOR_BY_PROJECT = {}                    # (R, X, B) per project
+COLLECTOR_Z_BASE_MVA = None                  # MVA base of R/X/B
+COLLECTOR_APPLY_TO = "project"               # "project" | "both" | "base"
 
-# ---- BUILDING A NEW FACILITY -------------------------------------------------
-NEW_PLANT_RUN      = False                  # True = one extra study per project, new plant built
-NEW_PLANT_PROJECTS = []                     # [] = every project compared
-NEW_PLANT_COMPARE  = True                   # a FULL comparison of that run too, in its own folder
-# {} = leave the study script's own NEW_PLANT alone
+# ---- 14. NEW FACILITY --------------------------------------------------------
+# BESS built as its own plant, buses 999001+
+NEW_PLANT_RUN = False                        # True = extra study with the new plant built
+NEW_PLANT_PROJECTS = []                      # [] = every project
+NEW_PLANT_COMPARE = True                     # full comparison of it
+# NEW_PLANT: "enabled" True = build the BESS as its own facility in the normal run
 NEW_PLANT = {
-    # >>> BUILD IT IN THE ORDINARY RUN? This is the switch most people are
-    #     looking for, and it is NOT NEW_PLANT_RUN above.
-    #
-    #       "enabled": True    the plant is built in the NORMAL project run --
-    #                          results\<proj>_<mode>\ -- so the study, the POI
-    #                          dispatch and the comparison are all about the case
-    #                          WITH the new facility in it.
-    #       NEW_PLANT_RUN      an EXTRA study on top of that, into
-    #                          results\<proj>_<mode>_newplant\, for comparing the
-    #                          new-plant case against the ordinary one. It forces
-    #                          "enabled" on for its own run only.
-    #
-    #     Leave "enabled" out and the study script's own NEW_PLANT["enabled"]
-    #     decides (it ships False).
     "enabled":      True,
-    # >>> WHY THIS IS TRUE. THE PREMISE CHANGED WITH THE DECK.
-    #
-    # False was right while PROJ_SAV was a deck that ALREADY HELD THE PLANT
-    # (DIS2201-25SP-G03-CQ_EP.sav). build_new_plant() would have found every bus
-    # present and adopted it, and switching it on bought nothing but a duplicate
-    # set of dynamic models appended to a .dyr that already had them.
-    #
-    # THAT IS NO LONGER THE DECK EITHER CASE READS -- whether the two share one
-    # file or each has its own copy, it is the BASE case: it holds none of the
-    # new BESS. Nothing is there to adopt, so with
-    # "enabled": False NO FACILITY IS BUILT. What you get is ENABLE_BESS on its
-    # own, which is a DIFFERENT model of the project:
-    #
-    #   "enabled": False   BESS machines (id 'B') are added AT THE EXISTING
-    #                      FEEDER BUSES -- 761379/761382/761400/761403 for
-    #                      EmpirePrairie. No new buses, no new collector, no GSU,
-    #                      no MPT, no tie. The BESS shares the existing plant's
-    #                      collector system and its interconnection. Correct if
-    #                      the battery is co-located behind the existing POI.
-    #
-    #   "enabled": True    build_new_plant() CREATES the facility in the
-    #                      999xxx block -- unit buses, GSUs, a collector bus,
-    #                      the MPT and the tie to the POI -- with the impedances
-    #                      below. The project's ORIGINAL feeder buses are kept as
-    #                      "feeders_original" and become the EGF that makes up
-    #                      the remainder to POI_P_TARGET_MW, and
-    #                      disable_existing is forced OFF because a new facility
-    #                      ADDS capacity rather than replacing what is there.
-    #                      That is the SGF + EGF split of BP-7250 7.6.
-    #
-    # The duplicate-.dyr objection does not apply here either: the 999xxx buses
-    # are not in the base .dyr, so there is nothing for bess_combined_dyr() to
-    # duplicate. It applied only to the pre-built deck.
-    #
-    # So this is a question about the PROJECT, not about the script: is the BESS
-    # its own facility with its own collector and transformer, or is it behind
-    # the existing one? Set it accordingly. See NEW_GEN_BUS_PREFIX and
-    # POI_P_PROJECT_MW in z6_spp_p.py.
     "units":        None,                   # None = project MW / 200 MW cap, divided EQUALLY
     "mw_per_unit":  None,                   # None = follows from the above
     "unit_kv":      0.69,
@@ -857,88 +488,143 @@ NEW_PLANT = {
     "tie":       {"r": 0.0000, "x": 0.0005, "b": 0.0},
 }
 
-# ---- THE SURPLUS / EXISTING PAIR AND CAPACITY LEVELS -------------------------
-# SPP's answer to "how is the 600 MW allocated between the existing ...
+# ---- 15. EXTRA STUDIES -------------------------------------------------------
+# SURPLUS_SCENARIOS: BP-7250 7.6 SGF/EGF runs (see NOTES)
 SURPLUS_SCENARIOS = [
     # {"tag": "s1_egfoff", "label": "SGF 100 %, EGF off",
     #  "egf_off": True,  "poi_mw": None},
     # {"tag": "s2_poi_is", "label": "SGF 100 %, EGF set so POI = IS (600 MW)",
     #  "egf_off": False, "poi_mw": 600.0},
 ]
-CAPACITY_LEVELS = []                        # [] = off. [0.75, 0.5] = re-run at 75 % and 50 % output
-CAPACITY_FAULTS = "all"                     # "all" every fault at each level | "failing" only the failures
-CAPACITY_COMPARE = True                     # a FULL comparison per level, each in its own folder
-SWEEP_AT_CAPACITY_LEVELS = True             # True = repeat the .dyr sweep AND project-off at EVERY level
-SWEEP_SKIP_DONE = True                      # True = a swept run RESUMES; False = re-simulate it every launch
+CAPACITY_LEVELS = []                         # [] = off | [0.75, 0.5] re-run at that output
+CAPACITY_FAULTS = "all"                      # "all" | "failing"
+CAPACITY_COMPARE = True
+SWEEP_AT_CAPACITY_LEVELS = True              # repeat sweeps at every level
+SWEEP_SKIP_DONE = True                       # True = swept runs resume
+PROJECT_OFF_RUN = False                      # True = extra study with the project machines off
+PROJECT_OFF_PROJECTS = []                    # [] = every project
+PROJECT_OFF_COMPARE = False
 
-# ---- DYNAMIC MODEL EDITS AND SWEEPS ------------------------------------------
-# DYR_EDITS, DYR_EDITS_BY_PROJECT, DYR_APPLY_TO and the whole DYR_SWEEP* set are
-# now in "THE STUDY YOU ARE RUNNING" panel at the top of this file. Only the
-# show/compile knobs stay here.
-DYR_SHOW = []                               # Change a dynamic model constant and see what it does
-DYR_SCOPE = "project"                       # machines, and a dict changes several constants of one model at once
-DYR_COMPILE_WHEN = None                     # dyre_new rewrites conec.flx and conet.flx for the model set it just read
-DYR_COMPILE_BATS = ["MyCompile34.bat", "MyCload41.bat"]
-DYR_COMPILE_AFTER_SNAP = True               # Run them again after the .snp is saved, so dsusr.dll on disk ...
-ABORT_ON_MODEL_NOT_ACCESSIBLE = True        # In the init output, among several hundred harmless FLOW1 ...
-INIT_NAN_ABORT = False                      # strt_2 returns ierr=0 and still leaves NaN in a model that ...
+# ---- 16. CORES AND SPEED -----------------------------------------------------
+RUN_IN_PARALLEL = True                       # True = base and project at once
+ONE_PROJECT_AT_A_TIME = True                 # with RUN_IN_PARALLEL False: base then project per project
+N_WORKERS = "auto"                           # "auto" | PSS/E sessions per case
+CORES_SPARE = 2                              # cores kept free
+CORES_MAX = 22                               # max PSS/E sessions, both cases (0 = none)
+CORES_FOR_REPORTS = 6                        # of CORES_MAX, for scoring + plots
+CORES_MAX_INCLUDES_REPORTS = True            # True = scoring shares the ceiling
+REPORT_WORKERS = "auto"                      # scoring shards per case: "auto" | 1..8
+DYNAMIC_WORK = True                          # True = shared queue of scenarios
 
-# ---- TURNING A PROJECT OFF ---------------------------------------------------
-PROJECT_OFF_RUN = False                     # True = one extra study per project with its machines OFF
-PROJECT_OFF_PROJECTS = []                   # [] = every project compared
-PROJECT_OFF_COMPARE = False                 # a FULL comparison of that run too, in its own folder
+# ---- 17. RESUME RULES --------------------------------------------------------
+RUN_ONLY_MISSING_OUT = True                  # True = simulate only faults with no .out
+MAX_SCENARIO_ATTEMPTS = 3                    # give up after this many crashes
+RETRY_GAVE_UP_ROUNDS = 0                     # extra rounds for scenarios that gave up
+KEEP_PARTIAL_RUNS = True                     # True = keep a scorable partial run
+SCORE_PARTIAL_RUNS = True                    # score runs that reached PARTIAL_MIN_FRAC
+PARTIAL_MIN_FRAC = 0.80                      # of SIM_END_S
+RETIRE_TRUNCATED_DONE = True
+TRUNCATED_FRAC = 0.80                        # no longer used
+RESTORE_TRUNCATED_DONE = True
+OUT_EMPTY_BYTES = 1048576                    # .out under this = empty
 
-# ---- WHAT GETS WRITTEN -------------------------------------------------------
-# WRITE_CSV = False -- the comparison writes .txt and .xlsx only. The .csv
-# companions duplicated what the workbook already holds, sheet for sheet, and
-# doubled the file count in every comparison folder.
-#
-# WHAT THIS DOES NOT TOUCH. The STUDY's data files -- SPP_MEASURE_VOLTS.csv,
-# SPP_MEASURE_ANGLES.csv, SPP_CRITERIA_REPORT.csv and the rest -- are written by
-# the engine, which has its own WRITE_CSV, and the measurement files are written
-# unconditionally because they are DATA, not a report companion: the comparison
-# reads them for every base and project value. Turning this off cannot empty a
-# base column.
-#
-# The one file that was .csv only, 01_PROJECT_CAUSED_ELEMENTS.csv, is now the
-# workbook's "2 Project introduces" sheet -- same rows, fewer columns, area and
-# hop distances beside each -- so nothing is lost by switching this off.
-WRITE_CSV       = False                     # False = .txt + .xlsx only (see above)
-WRITE_XLSX      = True                      # .xlsx with a coloured header + filters
-ONE_REPORT      = True                      # one COMPARISON_REPORT instead of 8 files
+# ---- 18. SCORING -------------------------------------------------------------
+FORCE_RESCORE = False                        # True = re-score everything every launch
+RESCORE_STALE_REPORTS = True                 # re-score a report older than its .out
+STALE_REPORT_TOL_S = 120
+REPORT_COVERAGE_MIN = 0.90                   # re-score a report covering less than this
+REPORTS_AFTER_ALL_PROJECTS = True            # True = score once at the end
+SCORE_NO_CASE = True                         # True = score without loading the case (keep)
+AUTO_REMERGE_STALE_PARTS = True
+VERIFY_SCORING_COVERAGE = True
+FAST_COMPARE = False                         # PIPELINE "compare": compare disk as is, fast
+FAST_COMPARE_PARALLEL = 4                    # projects at once
 
-# ---- HOW MUCH TO WRITE -------------------------------------------------------
-# The comparison had grown to about twenty files per project, most of them
-# written for a question nobody was asking that day, and finding the one that
-# answers "what did the project break" meant knowing which of the twenty it was.
-#
-# True = write only what a reader opens:
-#
-#     00_COMPARISON_REPORT.xlsx / .txt     the comparison -- 5 tabs
-#     detail\DYR_SWEEP_MEASURED*           base | project | each swept value
-#     detail\POI_P_MEASURED*               base | project | each POI level
-#     detail\ALL_VARIANTS_MEASURED*        base | project | every variant
-#     detail\DYR_SWEEP_*                   the PASS/FAIL matrix per value
-#     comparison\<proj>\<variant>\           a full comparison per swept value
-#
-# and skip the rest: CHANNELS (a 900 kB list of .out channel numbers, for
-# checking a reading by hand), COMPARISON_RUNTIMES, BEST_CASE, MATRIX and
-# ALL_RUNS. None of them is an input to anything -- they are all reports -- so
-# turning them off costs nothing but the report itself, and any one of them can
-# be had again by setting this False.
-SIMPLE_OUTPUT   = False
+# ---- 19. PLOTS ---------------------------------------------------------------
+MAKE_PLOTS = None                            # None = draw | False = no PDFs (faster)
+PLOT_MISSING_OUTS = False                    # draw PDFs for .out files without one
+FORCE_REPLOT = False                         # True = redraw every PDF
+PLOT_SCOPE = "compact"                       # "compact" | "full"
+PLOT_INRUN = 1                               # plotters per running folder
+PLOT_WORKERS = 2                             # plotters per case
+PLOT_TOTAL_MAX = 4                           # cap on plotters
+PLOT_ONE_PROJECT_AT_A_TIME = True
+PLOT_SKIP_INCOMPLETE = True                  # True = do not draw a run that stopped early
+INDIVIDUAL_KEYWORDS = ["PROJ", "POI", "FLT", "GEN"]  # the SPP channel set ([] = every signal)
+PLOT_MAX_PANELS = 0                          # 0 = no cap
+PLOT_MAX_POINTS = 1500                       # samples per trace
+PER_PAGE = 3                                 # panels per page
+EXPORT_PDF_PUREPY = True
+EXPORT_CSV = False                           # CSV per run
+EXPORT_SVG = False                           # SVG per run
+PLOT_CLEAR_STALE_CLAIMS = True
+RETIRE_STALE_PDFS = False
+PLOT_ROUNDS_MAX = 3
+PLOT_RESTART_MAX = 20
+PLOT_STALL_MIN = 30                          # give up after this many min with nothing drawn
+PLOT_PASS_MAX_MIN = 0                        # 0 = no cap
+PLOT_RISKY_ISOLATED = True                   # retry a refused .out in its own process
+PLOT_ISOLATED_S = 1800
 
-PLOT_RISKY_ISOLATED = True                  # a .out the plot pass refuses is retried in its OWN process
-PLOT_ISOLATED_S = 1800                      # seconds one such isolated plot may take (0 = no limit)
-ELEM_LINES      = 0                         # buses/machines listed per violation (0 = every one)
-CAUSE_BUSES_MAX = 0                         # buses named in the Summary/Action cause column (0 = every one)
-COMPARE_BY_PROJECT = True                   # comparison\<project>\ instead of one folder for all
-KEEP_PREVIOUS_RUNS = True                   # rename the last run aside instead of writing over it
-COMPARE_ALL_RUNS = True                     # one table over every run still on disk, same base case
-COMPARE_RUNS = None                         # Not project-against-base -- run-against-run
-SWEEP_PLAN_FILE  = "SWEEP_PLAN.txt"         # every run of the campaign, done and to-do ("" = off)
-SWEEP_PLAN_EVERY = 60                       # seconds between refreshes of it (0 = only at the phase boundaries)
-LIVE_COMPARE_EVERY = 300                    # seconds between live comparison refreshes (0 = only at the end)
+# ---- 20. REPORTS -------------------------------------------------------------
+WRITE_CSV = False                            # False = .txt + .xlsx only
+WRITE_XLSX = True
+ONE_REPORT = True                            # one COMPARISON_REPORT instead of 8 files
+SIMPLE_OUTPUT = False                        # True = only the files a reader opens
+ELEMENT_LIST_MAX = 40                        # elements listed per violation
+ELEM_LINES = 0                               # 0 = every one
+CAUSE_BUSES_MAX = 0                          # 0 = every one
+EMPTY_CELL = "n/a"
+COMPARE_BY_PROJECT = True                    # comparison\<project>\
+KEEP_PREVIOUS_RUNS = True                    # rename the last run aside
+COMPARE_ALL_RUNS = True
+COMPARE_RUNS = None                          # run against run, e.g. ("__run1", "")
+SWEEP_PLAN_FILE = "SWEEP_PLAN.txt"           # "" = off
+SWEEP_PLAN_EVERY = 60                        # s
+LIVE_COMPARE_EVERY = 300                     # s (0 = end only)
+LIVE_STATUS_ALL = "LIVE_STATUS.txt"          # "" = off
+
+# ---- 21. WATCHDOG / LICENCE --------------------------------------------------
+KILL_GRACE_MIN = 30                          # min of silence before a watchdog acts
+SCENARIO_MAX_MIN = 75                        # kill + requeue a scenario running longer (0 = off)
+STARTUP_SILENT_MIN = 15
+NEVER_KILL_WORKERS = False
+CLAIM_STALE_S = 3600
+STUDY_TIMEOUT_S = 0                          # 0 = wait for ever
+LICENCE_COOLDOWN_MIN = 10
+LICENCE_STARTS_PER_MIN = 6                   # 0 = off
+LAUNCH_STAGGER_S = 20
+LICENCE_BACKOFF_S = 60
+CLOSE_PSSE_DIALOGS = True
+COMPILE_LOCK = True                          # one dsusr.dll build at a time
+COMPILE_LOCK_WAIT_S = 900
+
+# ============================================================================
+#   END OF SETTINGS
+# ============================================================================
+
+_LAUNCH_T0 = __import__("time").time()
+
+
+def _panel_projects():
+    """PROJECTS as this run actually uses it -- the together names added or
+       substituted per PROJECTS_RUN. EVERY place that used to read PROJECTS
+       reads this: the launch, the fault-list build, the comparison filter
+       and the file names, so the cluster studies cannot be built by phase 0
+       and then not run, or run and then not compared."""
+    _one = (os.environ.get("SPP_CMP_ONE_PROJECT") or "").strip()
+    if _one:
+        return [_one]                 # a FAST_COMPARE child: this project only
+    if not PROJECTS:
+        return []
+    _how = str(PROJECTS_RUN or "each").strip().lower()
+    _tg = ([("%s-%s" % (TOGETHER_NAME, _m)) for _m in (TOGETHER_PROJECTS or PROJECTS)]
+           if TOGETHER_SPLIT else [TOGETHER_NAME])
+    if _how == "together":
+        return _tg
+    if _how == "both":
+        return list(PROJECTS) + [x for x in _tg if x not in PROJECTS]
+    return list(PROJECTS)
 
 
 def _script_dir():
@@ -13500,7 +13186,7 @@ def _push_settings(env, case):
                         ("SPP_POI_P_MEASURE", POI_P_MEASURE),
                         ("SPP_POI_P_METER", POI_P_METER),
                         ("SPP_POI_P_STRICT", "1" if POI_P_STRICT else "0"),
-                        ("SPP_EGF_OFF_SGF_ONLY", "1" if POI_P_EGF_OFF_WHEN_SGF_ONLY else "0"),
+                        ("SPP_POI_SPLIT_SGF_EGF", "1" if POI_P_SPLIT_SGF_EGF else "0"),
                         ("SPP_POI_P_STRICT_TOL", POI_P_STRICT_TOL_MW),
                         ("SPP_POI_METER_ITERS", POI_P_METER_ITERS),
                         ("SPP_POI_METER_TOL", POI_P_METER_TOL_MW),
