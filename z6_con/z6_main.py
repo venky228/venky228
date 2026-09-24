@@ -252,7 +252,7 @@ GEN_TEST_PROJECTS = []                       # [] = GEN_TEST_PROJECT only | ["Sa
 # project not listed, or a name it does not give, uses the value set above.
 GEN_TEST_BY_PROJECT = {
     "SantaFe":       {"POI": 765911, "EXTRA_GENS": [(763676, "1")],
-                      "EGF_EDITS": {"KHV": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}},
+                      "EGF_EDITS": {"KHV": [("REGCA1", {"Volim": 1.2, "Khv": 1.0, "Accel": 0.7})]}},
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
     "EastFork":      {"POI": 531623, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCAU1 already Volim 1.2 / Khv 0.2 / Accel 0.7
     "EmpirePrairie": {"POI": 761383, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCA1 already Volim 1.2 / Khv 0.2 / Accel 0.7
@@ -268,7 +268,9 @@ GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus
 GEN_TEST_EXTRA_GENS = [(763676, "1")]        # machines always tested, however far [(bus, id)]
 GEN_TEST_POI_GROUP = True                    # True = also all machines at the POI off together
 GEN_TEST_POI_GROUP_GENS = []                 # [] = found automatically | [(bus, id), ...]
-GEN_TEST_POI_GROUP_ONLY = False              # True = of the machine runs, ONLY all POI machines off together
+GEN_TEST_EXCLUDE_POI_GENS = False            # True = the POI plants are NOT switched off one at a time (nor in the HOPS group); the POI group still does
+GEN_TEST_HOPS_GROUP = False                  # True = also one run with ALL machines within GEN_TEST_HOPS (+ EXTRA_GENS) off together
+GEN_TEST_POI_GROUP_ONLY = False              # True = of the machine runs, ONLY the group run(s) (POI group / HOPS group)
 GEN_TEST_REFERENCE_RUNS = True               # False = do not RUN the all-in-service runs (finished ones are still used)
 # the EXISTING machines at GEN_TEST_PROJECT's feeders (not the BESS) with their model
 # constants changed -- each entry is one more element run, in the machine-run scenarios.
@@ -18066,6 +18068,9 @@ def _gt_find_gens():
         gens = [{"bus": int(b), "id": str(i).strip(), "hops": "", "z": None, "mw": None,
                  "mvar": None, "kind": "", "name": "", "models": []}
                 for b, i in GEN_TEST_GENS if (int(b), str(i).strip()) not in excl]
+        if GEN_TEST_EXCLUDE_POI_GENS:
+            pk = set((int(b), str(i).strip()) for b, i in GEN_TEST_POI_GROUP_GENS)
+            gens = [g for g in gens if (g["bus"], g["id"]) not in pk]
         if GEN_TEST_POI_GROUP and not GEN_TEST_POI_GROUP_GENS:
             print("[gen-test] POI group skipped: with GEN_TEST_GENS set by hand, list the POI's")
             print("[gen-test]   machines in GEN_TEST_POI_GROUP_GENS as well")
@@ -18093,6 +18098,17 @@ def _gt_find_gens():
                          "mvar": d.get("mvar"), "kind": d.get("kind", ""),
                          "name": net["bus"].get(b, {}).get("name", ""),
                          "models": d.get("models") or []})
+    poi = None
+    if GEN_TEST_EXCLUDE_POI_GENS:
+        # the POI plants stay in service in the one-at-a-time runs (and the
+        # HOPS group); the POI group still switches them off together
+        poi = (_gt_poi_members(net, excl) if not GEN_TEST_POI_GROUP_GENS else
+               [(int(b), str(i).strip(), None, None) for b, i in GEN_TEST_POI_GROUP_GENS])
+        pk = set((b, i) for b, i, _p, _q in poi)
+        n0 = len(gens)
+        gens = [g for g in gens if (g["bus"], g["id"]) not in pk]
+        print("[gen-test] GEN_TEST_EXCLUDE_POI_GENS: %d POI machine(s) left out of the "
+              "one-at-a-time runs" % (n0 - len(gens)))
     if GEN_TEST_MAX_GENS:
         gens = gens[:int(GEN_TEST_MAX_GENS)]
     have = set((g["bus"], g["id"]) for g in gens)
@@ -18116,7 +18132,7 @@ def _gt_find_gens():
         have.add((b, i))
         print("[gen-test] GEN_TEST_EXTRA_GENS: %d '%s' %s added (outside GEN_TEST_HOPS)"
               % (b, i, gens[-1]["name"]))
-    return _gt_add_group(gens, net, excl)
+    return _gt_add_group(gens, net, excl, poi)
 
 
 def _gt_poi_members(net, excl):
@@ -18164,7 +18180,7 @@ def _gt_poi_members(net, excl):
     return out
 
 
-def _gt_add_group(gens, net, excl):
+def _gt_add_group(gens, net, excl, found=None):
     """GEN_TEST_POI_GROUP: one more entry, every POI machine off at once, put
        FIRST among the machines so it runs before the one-at-a-time list."""
     if not GEN_TEST_POI_GROUP:
@@ -18172,6 +18188,8 @@ def _gt_add_group(gens, net, excl):
     if GEN_TEST_POI_GROUP_GENS:
         mem = [(int(b), str(i).strip(), None, None) for b, i in GEN_TEST_POI_GROUP_GENS
                if (int(b), str(i).strip()) not in excl]
+    elif found is not None:
+        mem = found
     elif net is not None:
         mem = _gt_poi_members(net, excl)
     else:
@@ -18188,6 +18206,39 @@ def _gt_add_group(gens, net, excl):
            "models": ["%d:%s" % (b, i) for b, i, _p, _q in mem]}
     print("[gen-test] POI group: %d machine(s) at POI %s switched off TOGETHER: %s"
           % (len(mem), GEN_TEST_POI, ", ".join("%d '%s'" % (b, i) for b, i, _p, _q in mem)))
+    return [grp] + list(gens)
+
+
+def _gt_add_hops_group(gens):
+    """GEN_TEST_HOPS_GROUP: one more entry, EVERY machine of the one-at-a-time
+       list (within GEN_TEST_HOPS, plus GEN_TEST_EXTRA_GENS) off at once."""
+    if not GEN_TEST_HOPS_GROUP or gens is None:
+        return gens
+    mem, seen = [], set()
+    for g in gens:
+        if g.get("group"):
+            continue
+        k = (int(g["bus"]), str(g["id"]).strip())
+        if k not in seen:
+            seen.add(k)
+            mem.append(k)
+    if len(mem) < 2:
+        print("[gen-test] HOPS group skipped: %d machine(s) within %s buses -- the one-at-a-time "
+              "runs already cover it" % (len(mem), GEN_TEST_HOPS))
+        return gens
+    if any(g.get("group") and set(g["group"]) == seen for g in gens):
+        print("[gen-test] HOPS group skipped: same machines as the POI group")
+        return gens
+    one = [g for g in gens if not g.get("group")]
+    known = all(g["mw"] is not None for g in one)
+    grp = {"bus": int(GEN_TEST_POI), "id": "ALL%dBUS" % int(GEN_TEST_HOPS), "group": mem,
+           "hops": "", "z": None,
+           "mw": sum(g["mw"] for g in one) if known else None,
+           "mvar": sum(g["mvar"] or 0.0 for g in one) if known else None,
+           "kind": "GROUP of %d" % len(mem), "name": "ALL IN %s BUSES" % GEN_TEST_HOPS,
+           "models": ["%d:%s" % k for k in mem]}
+    print("[gen-test] HOPS group: %d machine(s) within %s buses of POI %s switched off TOGETHER: %s"
+          % (len(mem), GEN_TEST_HOPS, GEN_TEST_POI, ", ".join("%d '%s'" % k for k in mem)))
     return [grp] + list(gens)
 
 
@@ -19267,7 +19318,7 @@ def run_gen_test():
     if miss:
         print("[gen-test] *** GEN_TEST_GEN_SCENARIOS names %s, not in GEN_TEST_SCENARIOS ***" % miss)
         return 2
-    gens = _gt_find_gens()
+    gens = _gt_add_hops_group(_gt_find_gens())
     if gens is None:
         return 2
     if GEN_TEST_POI_GROUP_ONLY:
@@ -19275,11 +19326,11 @@ def run_gen_test():
         # the all-in-service reference runs, caps and lines follow their own switches
         grp = [g for g in gens if g.get("group")]
         if not grp:
-            print("[gen-test] *** GEN_TEST_POI_GROUP_ONLY: no POI group was formed -- set "
+            print("[gen-test] *** GEN_TEST_POI_GROUP_ONLY: no group was formed -- set "
                   "GEN_TEST_POI_GROUP = True (and GEN_TEST_POI_GROUP_GENS if the POI "
-                  "machines are not found) ***")
+                  "machines are not found) or GEN_TEST_HOPS_GROUP = True ***")
             return 2
-        print("[gen-test] GEN_TEST_POI_GROUP_ONLY: machine runs = all POI machines off together "
+        print("[gen-test] GEN_TEST_POI_GROUP_ONLY: machine runs = the group(s) off together "
               "only (%d one-at-a-time machine(s) left out)" % (len(gens) - len(grp)))
         gens = grp
     gens = gens + _gt_egf_entries() + _gt_each_caps()
