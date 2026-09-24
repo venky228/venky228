@@ -245,8 +245,8 @@ GEN_TEST_CAPS_EACH_HOPS = None               # None = GEN_TEST_HOPS
 GEN_TEST_LINES_EACH = True                   # True = also each nearby line opened on its own (radial skipped)
 GEN_TEST_LINES_HOPS = 2                      # both ends within this many buses of the POI
 GEN_TEST_LINES_MIN_KV = 100.0                # skip lines below this kV
-GEN_TEST_LINES_XFMR = False                  # True = 2-winding transformers too
-GEN_TEST_LINES_LIST = []                     # [] = auto | [(765911, 531603, "1"), ...]
+GEN_TEST_LINES_XFMR = True                   # True = 2- and 3-winding transformers too (kV test on the HV side)
+GEN_TEST_LINES_LIST = []                     # [] = auto | [(765911, 531603, "1"), (w1, w2, "1", w3) for 3-winding]
 GEN_TEST_LINES_SCENARIOS = ["s0_asis"]       # solver scenario(s) for the line runs
 # GEN_TEST_SCENARIOS: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
@@ -17297,28 +17297,56 @@ def _gt_each_caps():
     return out
 
 
-def _gt_radial(net, a, b):
-    """True when opening the a-b branch cuts buses off the grid: a single
-       a-b connection and b no longer reachable from a without it."""
-    if sum(1 for m, _z, _w in net["adj"].get(a, []) if m == b) > 1:
-        return False                    # a parallel circuit keeps them tied
-    seen, todo = set([a]), [a]
-    while todo:
-        n = todo.pop()
+def _gt_brname(br):
+    """765911-531603 '1', or 765911-531603-13801 '1' for a 3-winding transformer."""
+    a, b, ck = br[0], br[1], br[2]
+    c = br[3] if len(br) > 3 else 0
+    return ("%d-%d-%d '%s'" % (a, b, c, ck)) if c else ("%d-%d '%s'" % (a, b, ck))
+
+
+def _gt_islands(net, edges):
+    """Opening the element whose network links are `edges` (each removed ONCE,
+       so a parallel circuit still ties its buses): the pieces of the network
+       the element's buses end up in that are cut off from the grid."""
+    rm = {}
+    for x, y in edges:
+        k = frozenset((x, y))
+        rm[k] = rm.get(k, 0) + 1
+    grid = min(500, max(3, len(net["bus"]) // 2))
+
+    def nbrs(n):
+        cnt = {}
         for m, _z, _w in net["adj"].get(n, []):
-            if m in seen or (n == a and m == b) or (n == b and m == a):
-                continue
-            if m == b:
-                return False
-            seen.add(m)
-            todo.append(m)
-    return True
+            cnt[m] = cnt.get(m, 0) + 1
+        return [m for m, c in cnt.items() if c - rm.get(frozenset((n, m)), 0) > 0]
+    out = []
+    for st in sorted(set(b for e in edges for b in e)):
+        if any(st in x for x in out):
+            continue
+        seen, todo = set([st]), [st]
+        while todo and len(seen) <= grid:
+            n = todo.pop()
+            for m in nbrs(n):
+                if m not in seen:
+                    seen.add(m)
+                    todo.append(m)
+        if len(seen) <= grid:
+            out.append(seen)
+    return out
+
+
+def _gt_has_machine(net, b):
+    skip = ("LINE CHARGING", "SWITCHED SHUNT", "FIXED CAP", "FIXED REACTOR", "FACTS")
+    return any(d.get("kind") not in skip and d.get("status", 1) == 1 for d in net["dev"].get(b, []))
 
 
 def _gt_each_lines():
-    """GEN_TEST_LINES_EACH: one plan entry per line near the POI, opened on its
-       own before the simulation. Radial lines (their opening islands buses) are
-       skipped -- that would switch off whatever hangs behind them instead."""
+    """GEN_TEST_LINES_EACH: one plan entry per line (and, with
+       GEN_TEST_LINES_XFMR, 2- and 3-winding transformer) near the POI, opened on
+       its own before the simulation. One whose opening cuts buses off the grid
+       is skipped -- it would switch off whatever hangs behind it instead --
+       except a transformer winding to a dead-end bus with no machine (a
+       tertiary): that bus is disconnected with it."""
     if not GEN_TEST_LINES_EACH:
         return []
     net = _gt_net()
@@ -17330,48 +17358,63 @@ def _gt_each_lines():
     near = dict((b, (h, z)) for b, h, z in S.nearby(net, GEN_TEST_POI, GEN_TEST_LINES_HOPS))
     want = None
     if GEN_TEST_LINES_LIST:
-        want = set()
+        want = {}
         for x in GEN_TEST_LINES_LIST:
-            a, b, ck = int(x[0]), int(x[1]), (str(x[2]).strip() if len(x) > 2 else "1") or "1"
-            want.add((a, b, ck))
-            want.add((b, a, ck))
+            bs = [int(v) for v in (list(x[:2]) + ([x[3]] if len(x) > 3 and x[3] else []))]
+            ck = (str(x[2]).strip() if len(x) > 2 else "1") or "1"
+            want[(frozenset(bs), ck)] = x
     kv = lambda n: net["bus"].get(n, {}).get("kv") or 0.0
     nm = lambda n: (net["bus"].get(n, {}).get("name") or "").strip()
     out, radial, found = [], [], set()
-    for a, b, ck, z, typ, p in net["brn"]:
+    for r in net["brn"]:
+        a, b, ck, z, typ, p = r[:6]
+        c = r[6] if len(r) > 6 else 0
+        typ = "XFMR2W" if typ == "XFMR" else typ
+        bs = [a, b] + ([c] if c else [])
+        key = (frozenset(bs), ck)
         if want is not None:
-            if (a, b, ck) not in want:
+            if key not in want:
                 continue
-            found.add((a, b, ck))
+            found.add(key)
         else:
             if a not in near or b not in near:
                 continue
-            if typ == "XFMR" and not GEN_TEST_LINES_XFMR:
+            if typ != "LINE" and not GEN_TEST_LINES_XFMR:
                 continue
-            if min(kv(a), kv(b)) < GEN_TEST_LINES_MIN_KV:
+            if (min if typ == "LINE" else max)(kv(x) for x in bs) < GEN_TEST_LINES_MIN_KV:
                 continue
-        if _gt_radial(net, a, b):
-            radial.append("%d-%d '%s'" % (a, b, ck))
-            continue
-        h = max(near.get(a, ("", 0))[0], near.get(b, ("", 0))[0]) if a in near and b in near else ""
-        out.append({"bus": a, "id": "BR%dC%s" % (b, ck), "branches": [(a, b, ck)],
+        br = (a, b, ck, c) if c else (a, b, ck)
+        edges = [(a, b), (a, c)] if c else [(a, b)]
+        isl = _gt_islands(net, edges)
+        dscn = []
+        if isl:
+            dead = [x for x in isl if len(x) == 1 and typ != "LINE"
+                    and not _gt_has_machine(net, list(x)[0])]
+            if len(dead) != len(isl):
+                radial.append(_gt_brname(br))
+                continue
+            dscn = sorted(list(x)[0] for x in dead)
+        h = max(near.get(x, (0, 0))[0] for x in (a, b)) if a in near and b in near else ""
+        out.append({"bus": a, "id": ("BR%dT%dC%s" % (b, c, ck)) if c else ("BR%dC%s" % (b, ck)),
+                    "branches": [br], "dscn": dscn,
                     "hops": h, "z": z, "mw": p, "mvar": None, "kind": typ,
-                    "name": "%s-%s" % (nm(a)[:8], nm(b)[:8]),
-                    "models": ["%d-%d:%s %.0fkV" % (a, b, ck, min(kv(a), kv(b)))]})
+                    "name": "-".join(nm(x)[:8] for x in bs),
+                    "models": ["%s %s kV%s" % (_gt_brname(br), "/".join("%.0f" % kv(x) for x in bs),
+                                              (" (bus %s disconnected)" % ",".join(str(d) for d in dscn))
+                                              if dscn else "")]})
     if want is not None:
-        for x in GEN_TEST_LINES_LIST:
-            a, b, ck = int(x[0]), int(x[1]), (str(x[2]).strip() if len(x) > 2 else "1") or "1"
-            if (a, b, ck) not in found and (b, a, ck) not in found:
-                print("[gen-test] *** GEN_TEST_LINES_LIST: %d-%d '%s' is not an in-service branch "
-                      "of the case -- skipped ***" % (a, b, ck))
+        for key, x in sorted(want.items(), key=lambda t: str(t[1])):
+            if key not in found:
+                print("[gen-test] *** GEN_TEST_LINES_LIST: %s is not an in-service branch or "
+                      "transformer of the case -- skipped ***" % (x,))
     if radial:
-        print("[gen-test] %d radial line(s) skipped (opening them cuts buses off the grid): %s"
-              % (len(radial), ", ".join(radial)))
-    print("[gen-test] %d line(s) %s, each OPENED on its own: %s"
+        print("[gen-test] %d radial line(s)/transformer(s) skipped (opening them cuts buses off "
+              "the grid): %s" % (len(radial), ", ".join(radial)))
+    print("[gen-test] %d line(s)/transformer(s) %s, each OPENED on its own: %s"
           % (len(out), "from GEN_TEST_LINES_LIST" if want is not None else
              "within %s buses of POI %s (>= %.0f kV)" % (GEN_TEST_LINES_HOPS, GEN_TEST_POI,
                                                          GEN_TEST_LINES_MIN_KV),
-             ", ".join("%d-%d '%s'" % g["branches"][0] for g in out) or "none"))
+             ", ".join("%s %s" % (g["kind"], _gt_brname(g["branches"][0])) for g in out) or "none"))
     return out
 
 
@@ -17613,7 +17656,9 @@ def _gt_env(sc, g, faults):
                                 ";".join("%d:%s" % m for m in g["group"]) if g.get("group")
                                 else "%d:%s" % (g["bus"], g["id"])) if g else "",
            "SPP_SHUNTS_OFF": ";".join("%d:%s:%s" % c for c in g["caps"]) if g and g.get("caps") else "",
-           "SPP_BRANCHES_OFF": ";".join("%d:%d:%s" % c for c in g["branches"]) if g and g.get("branches") else ""}
+           "SPP_BRANCHES_OFF": ";".join(":".join(str(v) for v in c) for c in g["branches"])
+                               if g and g.get("branches") else "",
+           "SPP_BUSES_DSCN": ";".join(str(b) for b in g.get("dscn") or []) if g else ""}
     if it or acc:
         env["SPP_SOLVER_RETRY"] = "1"
         env["SPP_SOLVER_RETRY_RECIPES"] = json.dumps([[tag, it, acc]])
@@ -17700,8 +17745,7 @@ def _gt_label(g):
     if not g:
         return "all in service"
     if g.get("branches"):
-        a, b, ck = g["branches"][0]
-        return "OPEN %s %d-%d '%s' %s" % (g.get("kind") or "LINE", a, b, ck, g["name"])
+        return "OPEN %s %s %s" % (g.get("kind") or "LINE", _gt_brname(g["branches"][0]), g["name"])
     return "OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])
 
 
@@ -17760,7 +17804,7 @@ def _gt_best(runs, faults, ref):
             e["better"] += 1
         if e["best"] is None or _gt_key(x) < _gt_key(e["best"][0]):
             e["best"] = (x, r["sc"][0])
-    L += ["", "C. EACH MACHINE / CAP OFF OR LINE OPENED (id BR<to>C<ckt>), over every scenario it ran in "
+    L += ["", "C. EACH MACHINE / CAP OFF OR LINE / TRANSFORMER OPENED (id BR<to>[T<3rd>]C<ckt>), over every scenario it ran in "
           "(vs the same scenario, all in service)",
           "  %-8s %-10s %-14s %-16s %6s %8s %11s %11s %9s  %s" % (
               "bus", "id", "name", "kind", "runs", "better", "avg nc drop", "avg >1.2 dr",
@@ -18234,14 +18278,14 @@ def run_gen_test():
                 "" if g["z"] is None else "%.4f" % g["z"], " ".join(g["models"])))
         fh.write("\nlines OPENED one at a time (GEN_TEST_LINES_EACH, scenario(s) %s)\n\n"
                  % ", ".join(GEN_TEST_LINES_SCENARIOS))
-        fh.write("%-8s %-8s %-4s %-18s %-5s %8s %5s %8s  %s\n"
-                 % ("from", "to", "ckt", "names", "kind", "MW", "hops", "|Z| pu", "kV"))
+        fh.write("%-8s %-8s %-8s %-4s %-26s %-6s %8s %5s  %s\n"
+                 % ("from", "to", "3rd", "ckt", "names", "kind", "MW", "hops", "kV"))
         for g in lines:
-            a_, b_, ck_ = g["branches"][0]
-            fh.write("%-8s %-8s %-4s %-18s %-5s %8s %5s %8s  %s\n" % (
-                a_, b_, ck_, g["name"][:18], g["kind"],
+            br = g["branches"][0]
+            fh.write("%-8s %-8s %-8s %-4s %-26s %-6s %8s %5s  %s\n" % (
+                br[0], br[1], br[3] if len(br) > 3 else "", br[2], g["name"][:26], g["kind"],
                 "" if g["mw"] is None else "%.1f" % g["mw"], g["hops"],
-                "" if g["z"] is None else "%.4f" % g["z"], g["models"][0].split(" ")[-1]))
+                g["models"][0].split(" ", 2)[-1]))
         if not lines:
             fh.write("  (none)\n")
     print("[gen-test] %d machine(s) within %s buses of %s -> %s"

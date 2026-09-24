@@ -1187,8 +1187,8 @@ def load_network(psspy, sav, dyr):
         link(fr[i], to[i], max(z, 1e-4), "branch")
         ck = (bid[i] if i < len(bid) else "").strip()
         net["brn"].append([fr[i], to[i], ck, max(z, 1e-4),
-                           "LINE" if (fr[i], to[i], ck) in lines else "XFMR",
-                           bp[i] if i < len(bp) else None])
+                           "LINE" if (fr[i], to[i], ck) in lines else "XFMR2W",
+                           bp[i] if i < len(bp) else None, 0])
         if i < len(bch) and bch[i] * 100.0 >= LINE_CHG_MVAR:
             d = {"kind": "LINE CHARGING", "bus": fr[i], "to": to[i],
                  "id": (bid[i] if i < len(bid) else "").strip(),
@@ -1198,10 +1198,14 @@ def load_network(psspy, sav, dyr):
     # 3-winding transformers: star them through winding 1
     t3 = _arr(psspy.atr3int, -1, 1, ["WIND1NUMBER", "WIND2NUMBER", "WIND3NUMBER"], 1, 1, 1)
     w1, w2, w3 = t3.get("WIND1NUMBER", []), t3.get("WIND2NUMBER", []), t3.get("WIND3NUMBER", [])
+    t3id = _arr(psspy.atr3char, -1, 1, ["ID"], 1, 1, 1).get("ID", [])
     for i in range(len(w1)):
         for w in ((w2[i] if i < len(w2) else 0), (w3[i] if i < len(w3) else 0)):
             if w:
                 link(w1[i], w, 0.1, "3w-xfmr")
+        if i < len(w2) and i < len(w3) and w2[i] and w3[i]:
+            net["brn"].append([w1[i], w2[i], (t3id[i] if i < len(t3id) else "1").strip() or "1",
+                               0.1, "XFMR3W", None, w3[i]])
     # machines
     models = read_dyr_models(dyr)
     mi = _arr(psspy.amachint, -1, 4, ["NUMBER", "STATUS", "WMOD"])
@@ -1366,7 +1370,8 @@ def _load_net_via_child(kind):
     net = {"bus": dict((int(k), v) for k, v in js["bus"].items()),
            "adj": dict((int(k), [(int(m), z, w) for m, z, w in v]) for k, v in js["adj"].items()),
            "dev": dict((int(k), v) for k, v in js["dev"].items()),
-           "brn": [(int(a), int(c), k, z, t, p) for a, c, k, z, t, p in js.get("brn", [])]}
+           "brn": [tuple([int(r[0]), int(r[1])] + list(r[2:6]) + [int(r[6]) if len(r) > 6 and r[6] else 0])
+                   for r in js.get("brn", [])]}
     print("[near] case: %d buses, %d with devices" % (len(net["bus"]), len(net["dev"])))
     return net
 

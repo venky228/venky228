@@ -11745,8 +11745,10 @@ def _switch_shunts_off():
                            % (len(left), len(SHUNTS_OFF), ", ".join(left)))
 
 
-# SPP_BRANCHES_OFF = "765911:531603:1;531447:531469:2" -- lines / 2-winding
-# transformers opened before the power flow, like SPP_MACHINES_OFF (from:to:ckt).
+# SPP_BRANCHES_OFF = "765911:531603:1;531447:531469:2;w1:w2:1:w3" -- lines,
+# 2-winding and (4th field = third winding) 3-winding transformers opened before
+# the power flow, like SPP_MACHINES_OFF. SPP_BUSES_DSCN = buses left with no
+# connection by that (a dead-end tertiary) -- disconnected with it.
 BRANCHES_OFF = []
 for _bo in (os.environ.get("SPP_BRANCHES_OFF") or "").split(";"):
     _bo = _bo.strip()
@@ -11755,16 +11757,39 @@ for _bo in (os.environ.get("SPP_BRANCHES_OFF") or "").split(";"):
     _bp = _bo.split(":")
     try:
         BRANCHES_OFF.append((int(_bp[0]), int(_bp[1]),
-                             ((_bp[2] if len(_bp) > 2 else "").strip() or "1")))
+                             ((_bp[2] if len(_bp) > 2 else "").strip() or "1"),
+                             int(_bp[3]) if len(_bp) > 3 and _bp[3].strip() else 0))
     except (ValueError, IndexError):
-        print("[line-off] SPP_BRANCHES_OFF entry %r ignored (use from:to:ckt)" % _bo)
+        print("[line-off] SPP_BRANCHES_OFF entry %r ignored (use from:to:ckt[:3rd])" % _bo)
+BUSES_DSCN = []
+for _bd in (os.environ.get("SPP_BUSES_DSCN") or "").split(";"):
+    try:
+        if _bd.strip():
+            BUSES_DSCN.append(int(_bd))
+    except ValueError:
+        print("[line-off] SPP_BUSES_DSCN entry %r ignored" % _bd)
+
+
+def _brn_txt(a, b, ck, c):
+    return ("%d-%d-%d '%s'" % (a, b, c, ck)) if c else ("%d-%d '%s'" % (a, b, ck))
+
+
 if BRANCHES_OFF:
     print("[line-off] branches to OPEN: %s"
-          % ", ".join("%d-%d '%s'" % b_ for b_ in BRANCHES_OFF))
+          % ", ".join(_brn_txt(*b_) for b_ in BRANCHES_OFF))
 
 
-def _brn_status(a, b, ck):
-    """STATUS of branch / 2-winding transformer a-b ck, or None if not readable."""
+def _brn_status(a, b, ck, c=0):
+    """STATUS of a branch / 2-winding transformer (or, with c, the 3-winding
+       transformer a-b-c), or None if not readable."""
+    if c:
+        try:
+            ie, v = psspy.tr3int(int(a), int(b), int(c), str(ck), "STATUS")
+            if ie == 0:
+                return int(v)
+        except Exception:
+            pass
+        return None
     for nm in ("brnint", "xfrint"):
         f3 = getattr(psspy, nm, None)
         if f3 is None:
@@ -11783,14 +11808,18 @@ def _switch_branches_off():
        branch_chng_3, a transformer with two_winding_chng_6), then its STATUS
        read back. Any that stays in service stops the run."""
     done, left = 0, []
-    for a, b, ck in BRANCHES_OFF:
-        tries = (("branch_chng_3", lambda f2: f2(a, b, ck, [0, _i, _i, _i, _i, _i],
+    for a, b, ck, c in BRANCHES_OFF:
+        tries = ((("three_wnd_imped_chng_4", lambda f2: f2(a, b, c, ck, [0] + [_i] * 11, [_f] * 30,
+                                                           [_f] * 3, "")),
+                  ("three_wnd_imped_chng_3", lambda f2: f2(a, b, c, ck, [0] + [_i] * 11, [_f] * 28,
+                                                           [_f] * 3, ""))) if c else
+                 (("branch_chng_3", lambda f2: f2(a, b, ck, [0, _i, _i, _i, _i, _i],
                                                  [_f] * 12, [_f] * 12, "")),
                  ("branch_chng", lambda f2: f2(a, b, ck, [0, _i, _i, _i, _i, _i], [_f] * 12)),
                  ("two_winding_chng_6", lambda f2: f2(a, b, ck, [0] + [_i] * 15, [_f] * 26,
                                                       [_f] * 3, "", "")),
                  ("two_winding_chng_5", lambda f2: f2(a, b, ck, [0] + [_i] * 15, [_f] * 24,
-                                                      [_f] * 3, "", "")))
+                                                      [_f] * 3, "", ""))))
         ok, why = False, "no branch API in this build"
         for nm, call in tries:
             f2 = getattr(psspy, nm, None)
@@ -11807,23 +11836,40 @@ def _switch_branches_off():
                 break
             why = "%s ierr=%s" % (nm, ie)
         if ok:
-            st = _brn_status(a, b, ck)
+            st = _brn_status(a, b, ck, c)
             if st is None:
                 why += ", status not read back"
             elif st != 0:
                 ok, why = False, why + " answered 0 but STATUS is still %d" % st
             else:
                 why += ", STATUS read back 0"
-        print("  [line-off]   %d-%d '%s': %s" % (a, b, ck, why))
+        print("  [line-off]   %s: %s" % (_brn_txt(a, b, ck, c), why))
         if ok:
             done += 1
         else:
-            left.append("%d-%d '%s' (%s)" % (a, b, ck, why))
+            left.append("%s (%s)" % (_brn_txt(a, b, ck, c), why))
     print("  [line-off] %d of %d branch(es) OPENED" % (done, len(BRANCHES_OFF)))
+    # A DEAD-END BUS the opening left with nothing (a tertiary): disconnected,
+    # or the power flow has an island with no swing bus
+    for bus in BUSES_DSCN:
+        try:
+            ie = psspy.dscn(int(bus))
+            ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+        except Exception as e:
+            ie = e
+        tp = None
+        try:
+            _ie, tp = psspy.busint(int(bus), "TYPE")
+        except Exception:
+            pass
+        if ie in (0, None) and tp in (4, None):
+            print("  [line-off]   bus %d disconnected (dead end left by the opening)" % bus)
+        else:
+            left.append("bus %d not disconnected (dscn: %s, TYPE %s)" % (bus, ie, tp))
     if left:
-        raise RuntimeError("SPP_BRANCHES_OFF: %d of %d branch(es) could not be opened, so this "
-                           "run would not test what it is named for: %s"
-                           % (len(left), len(BRANCHES_OFF), ", ".join(left)))
+        raise RuntimeError("SPP_BRANCHES_OFF: not all of the %d branch(es) could be opened, so "
+                           "this run would not test what it is named for: %s"
+                           % (len(BRANCHES_OFF), ", ".join(left)))
 
 
 def _switch_machines_off():
