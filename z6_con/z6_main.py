@@ -662,6 +662,14 @@ GEN_TEST_CAPS_LIST = []            # [] = found automatically: fixed caps (+Mvar
 GEN_TEST_CAPS_EACH = True          # True = ALSO every capacitor bank near the POI off ON ITS OWN, as one more
                                    # "machine" of the list -- run under the same scenarios as the machines
 GEN_TEST_CAPS_EACH_HOPS = None     # None = GEN_TEST_HOPS (the machines' radius) | N buses from the POI
+GEN_TEST_LINES_EACH = True         # True = ALSO every line near the POI OPENED ON ITS OWN before the
+                                   # simulation (one run each) -- shows which path the problem comes through.
+                                   # A line whose opening would cut buses off the grid (radial) is skipped.
+GEN_TEST_LINES_HOPS = 2            # lines with BOTH ends within this many buses of the POI
+GEN_TEST_LINES_MIN_KV = 100.0      # skip lines below this kV (both ends)
+GEN_TEST_LINES_XFMR = False        # True = transformers (2-winding) too
+GEN_TEST_LINES_LIST = []           # [] = found automatically | or fixed: [(765911, 531603, "1"), ...]
+GEN_TEST_LINES_SCENARIOS = ["s0_asis"]  # solver scenario(s) for the line-off runs
 # Solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL). None = the study's own value
 # (DELT 1/4 cycle from DELT_CYCLES above, MAXITER 60, ACCEL 0.60, TOL 0.0000095).
 # Tags: letters, digits and _ only (they become folder names).
@@ -17586,6 +17594,84 @@ def _gt_each_caps():
     return out
 
 
+def _gt_radial(net, a, b):
+    """True when opening the a-b branch cuts buses off the grid: a single
+       a-b connection and b no longer reachable from a without it."""
+    if sum(1 for m, _z, _w in net["adj"].get(a, []) if m == b) > 1:
+        return False                    # a parallel circuit keeps them tied
+    seen, todo = set([a]), [a]
+    while todo:
+        n = todo.pop()
+        for m, _z, _w in net["adj"].get(n, []):
+            if m in seen or (n == a and m == b) or (n == b and m == a):
+                continue
+            if m == b:
+                return False
+            seen.add(m)
+            todo.append(m)
+    return True
+
+
+def _gt_each_lines():
+    """GEN_TEST_LINES_EACH: one plan entry per line near the POI, opened on its
+       own before the simulation. Radial lines (their opening islands buses) are
+       skipped -- that would switch off whatever hangs behind them instead."""
+    if not GEN_TEST_LINES_EACH:
+        return []
+    net = _gt_net()
+    if net is None or "brn" not in net:
+        print("[gen-test] line-off runs skipped: the network (with its branch list) could not "
+              "be read -- is z6_spike_find.py the new one?")
+        return []
+    import z6_spike_find as S
+    near = dict((b, (h, z)) for b, h, z in S.nearby(net, GEN_TEST_POI, GEN_TEST_LINES_HOPS))
+    want = None
+    if GEN_TEST_LINES_LIST:
+        want = set()
+        for x in GEN_TEST_LINES_LIST:
+            a, b, ck = int(x[0]), int(x[1]), (str(x[2]).strip() if len(x) > 2 else "1") or "1"
+            want.add((a, b, ck))
+            want.add((b, a, ck))
+    kv = lambda n: net["bus"].get(n, {}).get("kv") or 0.0
+    nm = lambda n: (net["bus"].get(n, {}).get("name") or "").strip()
+    out, radial, found = [], [], set()
+    for a, b, ck, z, typ, p in net["brn"]:
+        if want is not None:
+            if (a, b, ck) not in want:
+                continue
+            found.add((a, b, ck))
+        else:
+            if a not in near or b not in near:
+                continue
+            if typ == "XFMR" and not GEN_TEST_LINES_XFMR:
+                continue
+            if min(kv(a), kv(b)) < GEN_TEST_LINES_MIN_KV:
+                continue
+        if _gt_radial(net, a, b):
+            radial.append("%d-%d '%s'" % (a, b, ck))
+            continue
+        h = max(near.get(a, ("", 0))[0], near.get(b, ("", 0))[0]) if a in near and b in near else ""
+        out.append({"bus": a, "id": "BR%dC%s" % (b, ck), "branches": [(a, b, ck)],
+                    "hops": h, "z": z, "mw": p, "mvar": None, "kind": typ,
+                    "name": "%s-%s" % (nm(a)[:8], nm(b)[:8]),
+                    "models": ["%d-%d:%s %.0fkV" % (a, b, ck, min(kv(a), kv(b)))]})
+    if want is not None:
+        for x in GEN_TEST_LINES_LIST:
+            a, b, ck = int(x[0]), int(x[1]), (str(x[2]).strip() if len(x) > 2 else "1") or "1"
+            if (a, b, ck) not in found and (b, a, ck) not in found:
+                print("[gen-test] *** GEN_TEST_LINES_LIST: %d-%d '%s' is not an in-service branch "
+                      "of the case -- skipped ***" % (a, b, ck))
+    if radial:
+        print("[gen-test] %d radial line(s) skipped (opening them cuts buses off the grid): %s"
+              % (len(radial), ", ".join(radial)))
+    print("[gen-test] %d line(s) %s, each OPENED on its own: %s"
+          % (len(out), "from GEN_TEST_LINES_LIST" if want is not None else
+             "within %s buses of POI %s (>= %.0f kV)" % (GEN_TEST_LINES_HOPS, GEN_TEST_POI,
+                                                         GEN_TEST_LINES_MIN_KV),
+             ", ".join("%d-%d '%s'" % g["branches"][0] for g in out) or "none"))
+    return out
+
+
 def _gt_find_gens():
     """Machines within GEN_TEST_HOPS of GEN_TEST_POI, closest (|Z|) first."""
     excl = set((int(b), str(i).strip()) for b, i in GEN_TEST_EXCLUDE)
@@ -17820,10 +17906,11 @@ def _gt_env(sc, g, faults):
            "SPP_PSSE_FAULT_LOG": "1",
            "SPP_DELT_CYCLES": str(float(dc or DELT_CYCLES or 4)),
            "SPP_DYN_TOL": repr(float(tol)) if tol else "0",
-           "SPP_MACHINES_OFF": ("" if g.get("caps") else
+           "SPP_MACHINES_OFF": ("" if g.get("caps") or g.get("branches") else
                                 ";".join("%d:%s" % m for m in g["group"]) if g.get("group")
                                 else "%d:%s" % (g["bus"], g["id"])) if g else "",
-           "SPP_SHUNTS_OFF": ";".join("%d:%s:%s" % c for c in g["caps"]) if g and g.get("caps") else ""}
+           "SPP_SHUNTS_OFF": ";".join("%d:%s:%s" % c for c in g["caps"]) if g and g.get("caps") else "",
+           "SPP_BRANCHES_OFF": ";".join("%d:%d:%s" % c for c in g["branches"]) if g and g.get("branches") else ""}
     if it or acc:
         env["SPP_SOLVER_RETRY"] = "1"
         env["SPP_SOLVER_RETRY_RECIPES"] = json.dumps([[tag, it, acc]])
@@ -17894,6 +17981,16 @@ def _gt_score(m, faults):
     return ps, nc, ov, mx, known
 
 
+def _gt_label(g):
+    """What a plan entry takes out, as the reports name it."""
+    if not g:
+        return "all in service"
+    if g.get("branches"):
+        a, b, ck = g["branches"][0]
+        return "OPEN %s %d-%d '%s' %s" % (g.get("kind") or "LINE", a, b, ck, g["name"])
+    return "OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])
+
+
 def _gt_key(sc):
     return (-sc[0], sc[1], sc[2], sc[3])
 
@@ -17913,7 +18010,7 @@ def _gt_best(runs, faults, ref):
 
     def lab(r):
         g = r["gen"]
-        return ("OFF %d '%s' %s" % (g["bus"], g["id"], g["name"]))[:34] if g else "all in service"
+        return _gt_label(g)[:34]
 
     def row(i, x, r):
         return "  %3s  %-22s %-34s %3d/%-3d %8d%s %6d %7s" % (
@@ -17949,15 +18046,16 @@ def _gt_best(runs, faults, ref):
             e["better"] += 1
         if e["best"] is None or _gt_key(x) < _gt_key(e["best"][0]):
             e["best"] = (x, r["sc"][0])
-    L += ["", "C. EACH MACHINE OFF, over every scenario it ran in (vs the same scenario, all in service)",
-          "  %-8s %-4s %-14s %-16s %6s %8s %11s %11s %9s  %s" % (
+    L += ["", "C. EACH MACHINE / CAP OFF OR LINE OPENED (id BR<to>C<ckt>), over every scenario it ran in "
+          "(vs the same scenario, all in service)",
+          "  %-8s %-10s %-14s %-16s %6s %8s %11s %11s %9s  %s" % (
               "bus", "id", "name", "kind", "runs", "better", "avg nc drop", "avg >1.2 dr",
               "faults+", "its best scenario")]
     pl = sorted(per.values(), key=lambda e: (-(e["dnc"] / float(e["n"])), -(e["dov"] / float(e["n"])),
                                              -e["fix"]))
     for e in pl:
         g = e["g"]
-        L.append("  %-8s %-4s %-14s %-16s %6d %5d/%-2d %11.0f %11.1f %9d  %s" % (
+        L.append("  %-8s %-10s %-14s %-16s %6d %5d/%-2d %11.0f %11.1f %9d  %s" % (
             g["bus"], g["id"], g["name"][:14], (g["kind"] or "")[:16], e["n"], e["better"], e["n"],
             e["dnc"] / float(e["n"]), e["dov"] / float(e["n"]), e["fix"], e["best"][1]))
     if not pl:
@@ -17985,10 +18083,13 @@ def _gt_best(runs, faults, ref):
     if pl:
         e = pl[0]
         if e["dnc"] > 0 or e["dov"] > 0:
-            L.append("  top machine : %d '%s' %s -- better in %d of %d scenarios, avg nc drop %.0f, "
-                     "avg >1.2 drop %.1f" % (e["g"]["bus"], e["g"]["id"], e["g"]["name"], e["better"],
+            L.append("  top element : %s -- better in %d of %d scenarios, avg nc drop %.0f, "
+                     "avg >1.2 drop %.1f" % (_gt_label(e["g"]), e["better"],
                                              e["n"], e["dnc"] / float(e["n"]), e["dov"] / float(e["n"])))
-            if e["better"] * 2 >= e["n"]:
+            if e["g"].get("branches") and e["better"] * 2 >= e["n"]:
+                L.append("  -> opening this line helps: the problem comes THROUGH it -- look at what")
+                L.append("     sits at its far end (machines, caps, controls) and its loading.")
+            elif e["better"] * 2 >= e["n"]:
                 L.append("  -> switching it off helps in most scenarios: its dynamic model / settings are")
                 L.append("     the prime suspect (check its REEC/REGC or exciter data, or ask its owner).")
         else:
@@ -18026,11 +18127,11 @@ def _gt_write(runs, faults, gens):
             fh.write("\n".join(L[:3] + _best) + "\n")
     except Exception as e:
         print("[gen-test] GEN_TEST_BEST not written (%s)" % e)
-    L += ["", "%-22s %-40s " % ("scenario", "machine OFF") +
+    L += ["", "%-22s %-40s " % ("scenario", "machine OFF / line OPEN") +
           " | ".join("%-26s" % f for f in faults), "-" * 150]
     for r in runs:
         g = r["gen"]
-        gl = ("%d '%s' %s" % (g["bus"], g["id"], g["name"]))[:40] if g else "(none -- all in service)"
+        gl = _gt_label(g)[:40] if g else "(none -- all in service)"
         L.append("%-22s %-40s " % (r["sc"][0], gl) +
                  " | ".join(cell((r.get("m") or {}).get(f)) for f in faults) +
                  ("   " + r["note"] if r.get("note") else ""))
@@ -18049,12 +18150,12 @@ def _gt_write(runs, faults, gens):
         eff.append((dnc, dov, r["sc"][0], g, fixed))
     eff.sort(key=lambda x: (-x[0], -x[1]))
     if eff:
-        L.append("  %-22s %7s %9s  %s" % ("scenario", "nc drop", ">1.2 drop", "machine OFF"))
+        L.append("  %-22s %7s %9s  %s" % ("scenario", "nc drop", ">1.2 drop", "machine OFF / line OPEN"))
     else:
         L.append("  (nothing to compare yet)")
     for dnc, dov, sc, g, fixed in eff[:40]:
-        L.append("  %-22s %7d %9d  %d '%s' %-14s %s%s" % (
-            sc, dnc, dov, g["bus"], g["id"], g["name"][:14], g["kind"],
+        L.append("  %-22s %7d %9d  %-44s %s%s" % (
+            sc, dnc, dov, _gt_label(g)[:44], g["kind"],
             ("  FIXES " + ",".join(fixed)) if fixed else ""))
     with open(txt, "w") as fh:
         fh.write("\n".join(L) + "\n")
@@ -18154,7 +18255,7 @@ def _gt_status_write(runs, faults, npar, t_start):
             (n_wait + n_run) * avg / max(1, npar) / 3600.0, avg / 60.0, npar)
 
     def mach(g):
-        return ("OFF %d '%s' %s" % (g["bus"], g["id"], g["name"]))[:34] if g else "all in service"
+        return _gt_label(g)[:34]
 
     def outs(r):
         # THIS RUN'S FAULTS ONLY: the build's FLAT.out sits in the same folder
@@ -18290,7 +18391,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             lp = os.path.join(ldir, tag + ".log")
             print("[gen-test] START %d/%d  %s -- %s | %s | log %s"
                   % (k, len(todo), sc[0],
-                     ("machine %d '%s' %s OFF" % (g["bus"], g["id"], g["name"])) if g
+                     _gt_label(g) if g
                      else "all machines in service", _gt_scen_desc(sc), lp))
             _gt_reset(r)
             env = _gt_env(sc, g, faults)
@@ -18386,6 +18487,11 @@ def run_gen_test():
         for sc in GEN_TEST_SCENARIOS:
             if sc[0] in GEN_TEST_CAPS_SCENARIOS:
                 add(sc, caps)
+    # 1c) every line near the POI opened on its own, default solver setting
+    for bl in _gt_each_lines():
+        for sc in GEN_TEST_SCENARIOS:
+            if sc[0] in GEN_TEST_LINES_SCENARIOS:
+                add(sc, bl)
     # 2) machine-off runs. "best2" picks its two scenarios once step 1 is
     #    scored; until then only machine runs ALREADY FINISHED on disk are
     #    listed, so nothing an earlier "all" run produced drops out of the report.
@@ -18420,7 +18526,7 @@ def run_gen_test():
         for i, r in enumerate(runs, 1):
             g = r["gen"]
             print("  %3d  %-22s %-30s %s" % (i, r["sc"][0],
-                                             ("OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])) if g else "all in service",
+                                             _gt_label(g),
                                              "DONE" if r["note"] else ""))
         _gt_write(runs, faults, gens)
         print("[gen-test] DRY RUN -- nothing simulated. Set GEN_TEST_DRY_RUN = False to run.")
@@ -18474,7 +18580,7 @@ def _gt_execute(todo, runs, faults, gens, npar):
         sc, g = r["sc"], r["gen"]
         tag = _gt_tag(sc, g)
         _banner("GEN TEST %d/%d -- %s -- %s" % (k, len(todo), sc[0],
-                ("machine %d '%s' %s OFF" % (g["bus"], g["id"], g["name"])) if g else "all machines in service"))
+                _gt_label(g) if g else "all machines in service"))
         print("[gen-test] %s | folder %s" % (_gt_scen_desc(sc), r["rdir"]))
         _gt_reset(r)
         t0 = time.time()

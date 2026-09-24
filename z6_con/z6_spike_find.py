@@ -1148,7 +1148,7 @@ def load_network(psspy, sav, dyr):
     ierr = psspy.case(sav)
     if ierr:
         raise RuntimeError("psspy.case(%s) ierr=%s" % (sav, ierr))
-    net = {"bus": {}, "adj": {}, "dev": {}}
+    net = {"bus": {}, "adj": {}, "dev": {}, "brn": []}
     b = _arr(psspy.abusint, -1, 2, ["NUMBER", "AREA"])
     br = _arr(psspy.abusreal, -1, 2, ["BASE", "PU"])
     bc = _arr(psspy.abuschar, -1, 2, ["NAME"])
@@ -1175,9 +1175,20 @@ def load_network(psspy, sav, dyr):
     bch = _arr(psspy.abrnreal, -1, 3, ["CHARGING"], 1, 1, 1).get("CHARGING", [])
     bid = _arr(psspy.abrnchar, -1, 3, ["ID"], 1, 1, 1).get("ID", [])
     fr, to = bi.get("FROMNUMBER", []), bi.get("TONUMBER", [])
+    # every in-service line / 2-winding transformer with its circuit id (GEN_TEST
+    # line-off runs); flag 1 = lines only, so whatever flag 3 adds is a transformer
+    bp = _arr(psspy.abrnreal, -1, 3, ["P"], 1, 1, 1).get("P", [])
+    li = _arr(psspy.abrnint, -1, 1, ["FROMNUMBER", "TONUMBER"], 1, 1, 1)
+    lc = _arr(psspy.abrnchar, -1, 1, ["ID"], 1, 1, 1).get("ID", [])
+    lines = set((a_, c_, (k_ or "").strip()) for a_, c_, k_ in
+                zip(li.get("FROMNUMBER", []), li.get("TONUMBER", []), lc))
     for i in range(min(len(fr), len(to))):
         z = abs(bz[i]) if i < len(bz) else 0.05
         link(fr[i], to[i], max(z, 1e-4), "branch")
+        ck = (bid[i] if i < len(bid) else "").strip()
+        net["brn"].append([fr[i], to[i], ck, max(z, 1e-4),
+                           "LINE" if (fr[i], to[i], ck) in lines else "XFMR",
+                           bp[i] if i < len(bp) else None])
         if i < len(bch) and bch[i] * 100.0 >= LINE_CHG_MVAR:
             d = {"kind": "LINE CHARGING", "bus": fr[i], "to": to[i],
                  "id": (bid[i] if i < len(bid) else "").strip(),
@@ -1317,7 +1328,8 @@ def _net_child(kind, out_json):
     net = load_network(ps, sav, dyr)
     js = {"bus": dict((str(k), v) for k, v in net["bus"].items()),
           "adj": dict((str(k), [[m, z, w] for m, z, w in v]) for k, v in net["adj"].items()),
-          "dev": dict((str(k), v) for k, v in net["dev"].items())}
+          "dev": dict((str(k), v) for k, v in net["dev"].items()),
+          "brn": net.get("brn", [])}
     tmp = out_json + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(js, fh)
@@ -1353,7 +1365,8 @@ def _load_net_via_child(kind):
         pass
     net = {"bus": dict((int(k), v) for k, v in js["bus"].items()),
            "adj": dict((int(k), [(int(m), z, w) for m, z, w in v]) for k, v in js["adj"].items()),
-           "dev": dict((int(k), v) for k, v in js["dev"].items())}
+           "dev": dict((int(k), v) for k, v in js["dev"].items()),
+           "brn": [(int(a), int(c), k, z, t, p) for a, c, k, z, t, p in js.get("brn", [])]}
     print("[near] case: %d buses, %d with devices" % (len(net["bus"]), len(net["dev"])))
     return net
 

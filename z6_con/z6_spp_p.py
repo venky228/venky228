@@ -11714,6 +11714,87 @@ def _switch_shunts_off():
                            % (len(left), len(SHUNTS_OFF), ", ".join(left)))
 
 
+# SPP_BRANCHES_OFF = "765911:531603:1;531447:531469:2" -- lines / 2-winding
+# transformers opened before the power flow, like SPP_MACHINES_OFF (from:to:ckt).
+BRANCHES_OFF = []
+for _bo in (os.environ.get("SPP_BRANCHES_OFF") or "").split(";"):
+    _bo = _bo.strip()
+    if not _bo:
+        continue
+    _bp = _bo.split(":")
+    try:
+        BRANCHES_OFF.append((int(_bp[0]), int(_bp[1]),
+                             ((_bp[2] if len(_bp) > 2 else "").strip() or "1")))
+    except (ValueError, IndexError):
+        print("[line-off] SPP_BRANCHES_OFF entry %r ignored (use from:to:ckt)" % _bo)
+if BRANCHES_OFF:
+    print("[line-off] branches to OPEN: %s"
+          % ", ".join("%d-%d '%s'" % b_ for b_ in BRANCHES_OFF))
+
+
+def _brn_status(a, b, ck):
+    """STATUS of branch / 2-winding transformer a-b ck, or None if not readable."""
+    for nm in ("brnint", "xfrint"):
+        f3 = getattr(psspy, nm, None)
+        if f3 is None:
+            continue
+        try:
+            ie, v = f3(int(a), int(b), str(ck), "STATUS")
+            if ie == 0:
+                return int(v)
+        except Exception:
+            pass
+    return None
+
+
+def _switch_branches_off():
+    """Every BRANCHES_OFF entry opened with the load-flow calls (a line with
+       branch_chng_3, a transformer with two_winding_chng_6), then its STATUS
+       read back. Any that stays in service stops the run."""
+    done, left = 0, []
+    for a, b, ck in BRANCHES_OFF:
+        tries = (("branch_chng_3", lambda f2: f2(a, b, ck, [0, _i, _i, _i, _i, _i],
+                                                 [_f] * 12, [_f] * 12, "")),
+                 ("branch_chng", lambda f2: f2(a, b, ck, [0, _i, _i, _i, _i, _i], [_f] * 12)),
+                 ("two_winding_chng_6", lambda f2: f2(a, b, ck, [0] + [_i] * 15, [_f] * 26,
+                                                      [_f] * 3, "", "")),
+                 ("two_winding_chng_5", lambda f2: f2(a, b, ck, [0] + [_i] * 15, [_f] * 24,
+                                                      [_f] * 3, "", "")))
+        ok, why = False, "no branch API in this build"
+        for nm, call in tries:
+            f2 = getattr(psspy, nm, None)
+            if f2 is None:
+                continue
+            try:
+                ie = call(f2)
+                ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+            except Exception as e:
+                why = "%s: %s" % (nm, e)
+                continue
+            if ie in (0, None):
+                ok, why = True, nm
+                break
+            why = "%s ierr=%s" % (nm, ie)
+        if ok:
+            st = _brn_status(a, b, ck)
+            if st is None:
+                why += ", status not read back"
+            elif st != 0:
+                ok, why = False, why + " answered 0 but STATUS is still %d" % st
+            else:
+                why += ", STATUS read back 0"
+        print("  [line-off]   %d-%d '%s': %s" % (a, b, ck, why))
+        if ok:
+            done += 1
+        else:
+            left.append("%d-%d '%s' (%s)" % (a, b, ck, why))
+    print("  [line-off] %d of %d branch(es) OPENED" % (done, len(BRANCHES_OFF)))
+    if left:
+        raise RuntimeError("SPP_BRANCHES_OFF: %d of %d branch(es) could not be opened, so this "
+                           "run would not test what it is named for: %s"
+                           % (len(left), len(BRANCHES_OFF), ", ".join(left)))
+
+
 def _switch_machines_off():
     done, left = 0, []
     for b, mid in MACHINES_OFF:
@@ -15283,6 +15364,8 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
             _switch_machines_off()
         if SHUNTS_OFF:
             _switch_shunts_off()
+        if BRANCHES_OFF:
+            _switch_branches_off()
         # THE POI TOTAL, AND THE AREA PUT BACK. After the project machines exist
         # (they are what the existing ones make up the difference to) and before
         # the solve, so the converted case and the snapshot carry this dispatch.
