@@ -257,8 +257,17 @@ GEN_TEST_FAULTS = ["F01-F04"]                # same syntax as ONLY_FAULTS
 # {} = none; each entry = one run). REGCA1 Khv only acts above Volim -- change both.
 # Any other GEN_TEST_ setting may be given here too, without the GEN_TEST_ prefix.
 GEN_TEST_BY_PROJECT = {
-    "SantaFe":       {"POI": 765911, "EXTRA_GENS": [],
-                      "EGF_EDITS": {"KHV": [("REGCA1", {"Volim": 1.2, "Khv": 1.0, "Accel": 0.7})]}},
+    "SantaFe": {
+        "POI": 765911,
+        "EXTRA_GENS": [],
+        "EGF_EDITS": {
+            "KHV":          [("REGCA1", {"Volim": 1.20, "Khv": 1.0, "Accel": 0.7})],   # done
+            "V115_K1":      [("REGCA1", {"Volim": 1.15, "Khv": 1.0, "Accel": 0.7})],   # Volim effect alone
+            "V115_K2":      [("REGCA1", {"Volim": 1.15, "Khv": 2.0, "Accel": 0.7})],
+            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7})],
+            "V120_K1_A001": [("REGCA1", {"Volim": 1.20, "Khv": 1.0})],                # Accel left as in the deck
+        },
+    },
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
     "EastFork":      {"POI": 531623, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCAU1 already Volim 1.2 / Khv 0.2 / Accel 0.7
     "EmpirePrairie": {"POI": 761383, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCA1 already Volim 1.2 / Khv 0.2 / Accel 0.7
