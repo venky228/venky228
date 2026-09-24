@@ -302,7 +302,7 @@ GEN_TEST_EXCLUDE_POI_GENS = True             # True = POI plants left out of the
 GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = True                   # all machines within GEN_TEST_HOPS off together
 GEN_TEST_POI_OFF_BASE = True                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
-                                             #   compared with the POIALL run; same reports, rows "POI OFF + ..."
+                                             #   compared with the POIGENOFF run; same reports, rows "POI OFF + ..."
 GEN_TEST_HOPS = 7                            # gens: "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
 GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus, id)]
@@ -320,7 +320,7 @@ GEN_TEST_SCENARIOS = [
     ("s4_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
 GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s2_it300_a020"]  # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
-GEN_TEST_POIALL_SCENARIOS = "all"             # all POI plants off (POIALL): "all" | [...] | None = as GEN_TEST_GEN_SCENARIOS
+GEN_TEST_POIGENOFF_SCENARIOS = "all"          # all POI gens off (POIGENOFF): "all" | [...] | None = as GEN_TEST_GEN_SCENARIOS
 # rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
@@ -18251,7 +18251,7 @@ def _gt_add_group(gens, net, excl, found=None):
            "hops": "", "z": None,
            "mw": sum(p for _b, _i, p, _q in mem if p is not None) if mem[0][2] is not None else None,
            "mvar": sum(q for _b, _i, _p, q in mem if q is not None) if mem[0][3] is not None else None,
-           "kind": "GROUP of %d" % len(mem), "name": "ALL AT POI",
+           "kind": "GROUP of %d" % len(mem), "name": "POIGENOFF",
            "models": ["%d:%s" % (b, i) for b, i, _p, _q in mem]}
     print("[gen-test] POI group: %d machine(s) at POI %s switched off TOGETHER: %s"
           % (len(mem), GEN_TEST_POI, ", ".join("%d '%s'" % (b, i) for b, i, _p, _q in mem)))
@@ -18608,8 +18608,8 @@ def _gt_label(g):
         return "EDIT %s: %s" % (str(g.get("id") or "EGF")[3:] or "EGF", _gt_egf_text(g["egf"]))
     if g.get("branches"):
         return "OPEN %s %s %s" % (g.get("kind") or "LINE", _gt_brname(g["branches"][0]), g["name"])
-    if g.get("group") and str(g.get("id")) == "ALL%dBUS" % int(GEN_TEST_HOPS):
-        return g["name"]            # "ALL GENS OFF 7 BUSES" (id ALL7BUS stays the folder name)
+    if g.get("group") and str(g.get("id")) in ("ALL%dBUS" % int(GEN_TEST_HOPS), "POIALL"):
+        return g["name"]            # "ALL GENS OFF 7 BUSES" / "POIGENOFF" (ids ALL7BUS / POIALL stay the folder names)
     return "OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])
 
 
@@ -18831,12 +18831,12 @@ def _gt_impact(runs, faults, proj):
                             [x for x in k if x.endswith(_GT_POIOFF_SC)][:1])]
 
     def ref_txt(sc):
-        return ("POI plants off (the POIALL run)" if sc.endswith(_GT_POIOFF_SC)
+        return ("POI plants off (the POIGENOFF run)" if sc.endswith(_GT_POIOFF_SC)
                 else "everything in service")
     L = ["GEN TEST -- WHICH ELEMENT DRIVES THE SPIKE, PER FAULT -- %s  (%s)"
          % (proj, time.strftime("%Y-%m-%d %H:%M")),
          "Each run with one element out vs the SAME solver scenario with everything in service.",
-         "Blocks marked%s: the element taken out WITH the POI plants off, compared with the POIALL run"
+         "Blocks marked%s: the element taken out WITH the POI plants off, compared with the POIGENOFF run"
          % _GT_POIOFF_SC,
          "  (GEN_TEST_POI_OFF_BASE) -- what else drives the spike once the POI plants are gone.",
          "buses>1.2 = buses above 1.2 pu (in service -> element out), peak = highest pu, nc = 'not converged' steps.",
@@ -19505,7 +19505,7 @@ def run_gen_test():
         print("[gen-test] *** GEN_TEST_GEN_SCENARIOS names %s, not in GEN_TEST_SCENARIOS ***" % miss)
         return 2
     # the POIALL run (all POI plants off) in its own scenarios: "all" | [...] | None = as the 3c runs
-    _pspec = GEN_TEST_POIALL_SCENARIOS
+    _pspec = GEN_TEST_POIGENOFF_SCENARIOS
     if isinstance(_pspec, (list, tuple)) and len(_pspec) == 1 and str(_pspec[0]).strip().lower() == "all":
         _pspec = "all"
     if _pspec is None:
@@ -19516,11 +19516,11 @@ def run_gen_test():
         _poi_tags = [str(t).strip() for t in _pspec]
         miss = [t for t in _poi_tags if t not in tags]
         if miss:
-            print("[gen-test] *** GEN_TEST_POIALL_SCENARIOS names %s, not in GEN_TEST_SCENARIOS ***" % miss)
+            print("[gen-test] *** GEN_TEST_POIGENOFF_SCENARIOS names %s, not in GEN_TEST_SCENARIOS ***" % miss)
             return 2
     else:
-        print("[gen-test] *** GEN_TEST_POIALL_SCENARIOS = %r: use \"all\", a list or None ***"
-              % (GEN_TEST_POIALL_SCENARIOS,))
+        print("[gen-test] *** GEN_TEST_POIGENOFF_SCENARIOS = %r: use \"all\", a list or None ***"
+              % (GEN_TEST_POIGENOFF_SCENARIOS,))
         return 2
     gens = _gt_add_hops_group(_gt_find_gens())
     if gens is None:
@@ -19635,7 +19635,7 @@ def run_gen_test():
                 for sc in GEN_TEST_SCENARIOS:
                     if sc not in gsc and _gt_done(_gt_rdir(_gt_tag(sc, g)), faults, g)[0]:
                         add(sc, g)
-    # 2b) GEN_TEST_POIALL_SCENARIOS: the POIALL run also in its own scenarios
+    # 2b) GEN_TEST_POIGENOFF_SCENARIOS: the POIALL run also in its own scenarios
     #     (its POI-off runs below still follow GEN_TEST_GEN_SCENARIOS)
     if _poi_tags:
         for g in gens:
@@ -19687,7 +19687,7 @@ def run_gen_test():
                 if sc in psc or _gt_done(_gt_rdir(_gt_tag(sc, d)), faults, d)[0]:
                     add(sc, d)
         print("[gen-test] GEN_TEST_POI_OFF_BASE: %d run(s) with the %d POI machine(s) off as well, in %s%s"
-              % (len(runs) - n0, len(mem), ", ".join(sc[0] for sc in psc) or "(no POIALL run yet)",
+              % (len(runs) - n0, len(mem), ", ".join(sc[0] for sc in psc) or "(no POIGENOFF run yet)",
                  "" if psc else " -- set GEN_TEST_GEN_SCENARIOS to a list or \"all\""))
 
     def add_best2():
