@@ -652,9 +652,12 @@ GEN_TEST_POI_GROUP_GENS = []       # [] = found automatically: the machines behi
                                    # through buses BELOW the POI kV only (their own GSU / collector) |
                                    # or fixed: [(765912, "1"), (765922, "1"), ...]
 GEN_TEST_CAPS_OFF = True           # True = ALSO one run with EVERY capacitor bank within GEN_TEST_CAPS_HOPS
-                                   # of the POI out of service (fixed caps + switched shunts able to go capacitive)
+                                   # of the POI out of service (fixed caps + switched shunts capacitive now)
 GEN_TEST_CAPS_HOPS = 5             # buses from the POI
 GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]   # solver scenario(s) for it -- default settings only
+GEN_TEST_CAPS_LIST = []            # [] = found automatically: fixed caps (+Mvar) and switched shunts
+                                   # CAPACITIVE NOW, within GEN_TEST_CAPS_HOPS | or fixed:
+                                   # [(763674, "1", "F"), (539715, "", "S")]  F = fixed, S = switched
 # Solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL). None = the study's own value
 # (DELT 1/4 cycle from DELT_CYCLES above, MAXITER 60, ACCEL 0.60, TOL 0.0000095).
 # Tags: letters, digits and _ only (they become folder names).
@@ -17508,6 +17511,11 @@ def _gt_find_caps():
        switched shunts that can go capacitive (BMAX > 0) -- or None."""
     if not GEN_TEST_CAPS_OFF:
         return None
+    if GEN_TEST_CAPS_LIST:
+        caps = [(int(c[0]), str(c[1]).strip() if len(c) > 1 else "",
+                 (str(c[2]).strip().upper() if len(c) > 2 else ("F" if len(c) > 1 and str(c[1]).strip() else "S"))[:1],
+                 0.0, "") for c in GEN_TEST_CAPS_LIST]
+        return _gt_caps_entry(caps)
     net = _gt_net()
     if net is None:
         print("[gen-test] caps-off run skipped: the network could not be read")
@@ -17521,12 +17529,18 @@ def _gt_find_caps():
             k = d.get("kind")
             if k == "FIXED CAP" and (d.get("mvar") or 0) > 0:
                 caps.append((b, str(d.get("id") or "1").strip() or "1", "F", d.get("mvar") or 0.0, h))
-            elif k == "SWITCHED SHUNT" and ((d.get("bmax") or 0) > 0 or (d.get("mvar") or 0) > 0):
+            elif k == "SWITCHED SHUNT" and (d.get("mvar") or 0) > 0:
+                # CAPACITIVE NOW only: one sitting on a reactor step is absorbing,
+                # and switching it off would RAISE the voltage -- the opposite test
                 caps.append((b, "", "S", d.get("mvar") or 0.0, h))
     if not caps:
         print("[gen-test] caps-off run skipped: no capacitor bank within %s buses of %s"
               % (GEN_TEST_CAPS_HOPS, GEN_TEST_POI))
         return None
+    return _gt_caps_entry(caps)
+
+
+def _gt_caps_entry(caps):
     print("[gen-test] CAPS OFF: %d capacitor bank(s) within %s buses of POI %s switched off "
           "TOGETHER: %s" % (len(caps), GEN_TEST_CAPS_HOPS, GEN_TEST_POI,
                             ", ".join("%d%s(%s %.0f Mvar)" % (b, (" '%s' " % i) if i else " ", k, q)
@@ -17577,27 +17591,36 @@ def _gt_find_gens():
 
 
 def _gt_poi_members(net, excl):
-    """Machines connected at the POI: reached from it through buses BELOW the
-       POI kV only -- the plants' own transformers and collectors -- so a plant
-       on the wider grid (reached over a line at POI kV or above) is not one."""
+    """Machines connected at the POI: everything that is cut off from the
+       wider grid when the POI bus is removed -- the plants' own gen-ties,
+       transformers and collectors (the study's "project-side island").
+
+       A neighbour of the POI whose side reaches more than GRID buses is the
+       grid; anything smaller hangs off the POI alone. (Walking only through
+       lower-kV buses missed plants whose gen-tie is at the POI's own kV.)"""
+    GRID = 500
     skip = ("LINE CHARGING", "SWITCHED SHUNT", "FIXED CAP", "FIXED REACTOR", "FACTS")
-    kv0 = float(net["bus"].get(GEN_TEST_POI, {}).get("kv") or 0.0)
-    seen = {GEN_TEST_POI: 0}
-    todo = [GEN_TEST_POI]
-    while todo:
-        n = todo.pop(0)
-        if seen[n] >= int(GEN_TEST_HOPS):
+    island = set()
+    for nb, _z, _w in net["adj"].get(GEN_TEST_POI, []):
+        if nb in island or nb == GEN_TEST_POI:
             continue
-        for m, _z, _w in net["adj"].get(n, []):
-            if m in seen:
-                continue
-            kv = float(net["bus"].get(m, {}).get("kv") or 0.0)
-            if kv0 and kv >= kv0 - 0.01:
-                continue
-            seen[m] = seen[n] + 1
-            todo.append(m)
+        seen = set([nb])
+        todo = [nb]
+        big = False
+        while todo:
+            n = todo.pop()
+            for m, _z2, _w2 in net["adj"].get(n, []):
+                if m == GEN_TEST_POI or m in seen:
+                    continue
+                seen.add(m)
+                todo.append(m)
+            if len(seen) > GRID:
+                big = True
+                break
+        if not big:
+            island |= seen
     out = []
-    for b in sorted(seen, key=lambda x: (seen[x], x)):
+    for b in sorted(island):
         for d in net["dev"].get(b, []):
             if d.get("kind") in skip or d.get("status", 1) != 1:
                 continue
@@ -17607,6 +17630,8 @@ def _gt_poi_members(net, excl):
             mid = str(d.get("id") or "").strip()
             if (b, mid) not in excl:
                 out.append((b, mid, mw, d.get("mvar") or 0.0))
+    print("[gen-test] POI %s: %d bus(es) hang off it alone (cut off from the grid without it)"
+          % (GEN_TEST_POI, len(island)))
     return out
 
 
