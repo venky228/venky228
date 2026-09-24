@@ -14841,6 +14841,25 @@ def build_new_plant(cfg, poi):
        of something else."""
     lay = _np_layout(cfg, poi)
     n, mw_u, why = _np_units_for(cfg)
+    # THE MACHINES GO ON bus_start .. bus_start+8 (999001..999009) AND NOWHERE
+    # ELSE. A tenth unit would land on bus_start+9 and the next plant's block,
+    # and a unit outside NEW_GEN_BUS_PREFIX's block would be an anonymous area
+    # machine to both engines -- not channelled, not reported as the new plant.
+    _ub = [b for b, _kv, _nm in lay["units"]]
+    _b0 = int(cfg.get("bus_start") or 900001)
+    _lo, _hi = _new_block_range()
+    _bad = [b for b in _ub if b > _b0 + 8 or (_hi and not (_lo <= b <= _hi))]
+    if _bad:
+        raise RuntimeError(
+            "NEW_PLANT: the new machines must sit on %d..%d%s, but %d unit(s) would "
+            "use %s. Use fewer, larger units (NEW_PLANT['units'] <= 9, or raise "
+            "FEEDER_MAX_MW), or move NEW_PLANT['bus_start'] into that block."
+            % (_b0, _b0 + 8,
+               (" inside the new-generation block %d..%d (NEW_GEN_BUS_PREFIX %r)"
+                % (_lo, _hi, NEW_GEN_BUS_PREFIX)) if _hi else "",
+               n, ", ".join(str(b) for b in _ub)))
+    print("  [newplant] new machine bus(es): %s  (allowed %d..%d)"
+          % (", ".join(str(b) for b in _ub), _b0, _b0 + 8))
     print("")
     print("  [newplant] === BUILDING A NEW FACILITY AT POI %s ===" % poi)
     print("  [newplant] %s: %d feeder(s) x %.1f MW = %.1f MW   (%s)"
