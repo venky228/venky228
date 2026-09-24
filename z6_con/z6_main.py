@@ -366,6 +366,7 @@ V_SS_LOW = 0.90                              # post-fault steady-state band, low
 V_SS_HIGH = 1.10                             # and high
 TRIP_PGEN_DEAD_MW = 10.0                     # machine ending below this MW = tripped
 ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
+SPPR_MIN_AFTER_FIRST_PEAK = True             # True = SPPR "Minimum Value" as SPP Figure 2 (lowest trough after 1st peak) | False = lowest point after clearing
 # FLAT_TOL_BY_KIND: flat-run tolerance per quantity
 FLAT_TOL_BY_KIND = {"VOLT": 0.005, "ETERM": 0.005, "ANGLE": 1.0,
                     "PELEC": 1.0, "QELEC": 2.0, "SPEED": 0.0002}
@@ -13291,6 +13292,7 @@ def _push_settings(env, case):
                         ("SPP_V_SS_LOW", V_SS_LOW),
                         ("SPP_V_SS_HIGH", V_SS_HIGH),
                         ("SPP_ANGLE_DEV_DEG", ANGLE_DEV_DEG),
+                        ("SPP_SPPR_MIN_AFTER_PEAK", "1" if SPPR_MIN_AFTER_FIRST_PEAK else "0"),
                         ("SPP_TRIP_PGEN_DEAD_MW", TRIP_PGEN_DEAD_MW),
                         ("SPP_MISMATCH_MVA", MISMATCH_MVA),
                         ("SPP_MISMATCH_PASSES", MISMATCH_PASSES),

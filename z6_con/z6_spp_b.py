@@ -2683,6 +2683,12 @@ PEAK_MIN_PROMINENCE_FRAC = 0.02
 SPPR_FLOOR_LIMITED_AS_REVIEW = False
 SPPR_FLOOR_LIMITED_AS_REVIEW = _env_bool("SPP_SPPR_FLOOR_REVIEW", SPPR_FLOOR_LIMITED_AS_REVIEW)
 
+# SPPR "Minimum Value". True = as Rev 3.0 Figure 2 draws it, the lowest trough
+# AFTER the 1st positive peak. False = the lowest point after clearing (the
+# earlier, stricter reading). Set from the panel (SPPR_MIN_AFTER_FIRST_PEAK).
+SPPR_MIN_AFTER_FIRST_PEAK = True
+SPPR_MIN_AFTER_FIRST_PEAK = _env_bool("SPP_SPPR_MIN_AFTER_PEAK", SPPR_MIN_AFTER_FIRST_PEAK)
+
 # The smallest ring amplitude about the settling value that may serve as the
 # base of the about-settle ratios, as a fraction of the judged deviation. A
 # first peak that lands essentially ON the settling value gives a base near
@@ -18658,7 +18664,8 @@ def spp_damping(seg):
     # fails machines SPP's own method passes. The 16-deg gate is unchanged --
     # Rev 3.0 defines that one as absolute maximum to absolute minimum.
     info["vmin_all"] = vmin
-    vmin = min(seg[peaks[0][0]:])
+    if SPPR_MIN_AFTER_FIRST_PEAK:
+        vmin = min(seg[peaks[0][0]:])
     info["vmin"] = vmin
     base = peaks[0][1] - vmin
     info["p1"] = peaks[0][1]
