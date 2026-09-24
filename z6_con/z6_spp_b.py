@@ -10342,6 +10342,64 @@ if MACHINES_OFF:
           % ", ".join("%d '%s'" % m for m in MACHINES_OFF))
 
 
+# SPP_SHUNTS_OFF = "531469:1:F;765911::S" -- capacitor banks taken out of
+# service before the power flow, like SPP_MACHINES_OFF. F = fixed shunt (bus:id),
+# S = switched shunt (one per bus, no id).
+SHUNTS_OFF = []
+for _so in (os.environ.get("SPP_SHUNTS_OFF") or "").split(";"):
+    _so = _so.strip()
+    if not _so:
+        continue
+    _sp = _so.split(":")
+    try:
+        SHUNTS_OFF.append((int(_sp[0]), (_sp[1] if len(_sp) > 1 else "").strip() or "1",
+                           ((_sp[2] if len(_sp) > 2 else "F").strip().upper() or "F")[0]))
+    except ValueError:
+        print("[caps-off] SPP_SHUNTS_OFF entry %r ignored (use bus:id:F or bus::S)" % _so)
+if SHUNTS_OFF:
+    print("[caps-off] shunts to switch OFF: %s"
+          % ", ".join("%d '%s' %s" % s_ for s_ in SHUNTS_OFF))
+
+
+def _switch_shunts_off():
+    """Every SHUNTS_OFF entry STATUS 0, with the same calls the event switching
+       uses (fixed: shunt_chng; switched: switched_shunt_chng_3, STAT = [11])."""
+    done, left = 0, []
+    for b, sid, kind in SHUNTS_OFF:
+        if kind == "S":
+            calls = (("switched_shunt_chng_3",
+                      lambda f2: f2(int(b), [_i] * 11 + [0] + [_i] * 2, [_f] * 13, "")),
+                     ("switched_shunt_chng",
+                      lambda f2: f2(int(b), [_i] * 11 + [0], [_f] * 12, "")))
+        else:
+            calls = (("shunt_chng", lambda f2: f2(int(b), sid, 0, [_f, _f])),
+                     ("shunt_data", lambda f2: f2(int(b), sid, 0, [_f, _f])))
+        ok, why = False, "no API in this build"
+        for nm, call in calls:
+            f2 = getattr(psspy, nm, None)
+            if f2 is None:
+                continue
+            try:
+                ie = call(f2)
+                ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+            except Exception as e:
+                ie = e
+            if ie in (0, None):
+                ok = True
+                break
+            why = "%s ierr=%s" % (nm, ie)
+        if ok:
+            done += 1
+        else:
+            left.append("%d '%s' %s (%s)" % (b, sid, kind, why))
+    print("  [caps-off] %d of %d shunt(s) taken OUT OF SERVICE" % (done, len(SHUNTS_OFF)))
+    for x in left:
+        print("  [caps-off]   could not switch off %s" % x)
+    if done == 0:
+        raise RuntimeError("SPP_SHUNTS_OFF was set but no shunt could be taken out of "
+                           "service: %s" % ", ".join(left))
+
+
 def _switch_machines_off():
     done, left = 0, []
     for b, mid in MACHINES_OFF:
@@ -11841,6 +11899,8 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
             _switch_project_off()
         if MACHINES_OFF:
             _switch_machines_off()
+        if SHUNTS_OFF:
+            _switch_shunts_off()
         # 1a) remove broken machines (garbage dynamic states crash the swing-capture
         #     writer at the first disturbance -- see REMOVE_MACHINES comment)
         _rm_list = REMOVE_MACHINES if APPLY_REMOVE_MACHINES else []

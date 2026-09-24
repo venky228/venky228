@@ -651,6 +651,10 @@ GEN_TEST_POI_GROUP = True          # True = ALSO run with EVERY machine connecte
 GEN_TEST_POI_GROUP_GENS = []       # [] = found automatically: the machines behind the POI, reached from it
                                    # through buses BELOW the POI kV only (their own GSU / collector) |
                                    # or fixed: [(765912, "1"), (765922, "1"), ...]
+GEN_TEST_CAPS_OFF = True           # True = ALSO one run with EVERY capacitor bank within GEN_TEST_CAPS_HOPS
+                                   # of the POI out of service (fixed caps + switched shunts able to go capacitive)
+GEN_TEST_CAPS_HOPS = 5             # buses from the POI
+GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]   # solver scenario(s) for it -- default settings only
 # Solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL). None = the study's own value
 # (DELT 1/4 cycle from DELT_CYCLES above, MAXITER 60, ACCEL 0.60, TOL 0.0000095).
 # Tags: letters, digits and _ only (they become folder names).
@@ -17473,6 +17477,66 @@ def _gt_tag(sc, g):
     return t
 
 
+_GT_NET = [None, False]
+
+
+def _gt_net():
+    """The case's network, read once (z6_spike_find's child process)."""
+    if _GT_NET[1]:
+        return _GT_NET[0]
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (here, STUDY_ROOT):
+        if os.path.isfile(os.path.join(d, "z6_spike_find.py")):
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            break
+    else:
+        print("[gen-test] *** z6_spike_find.py not found beside this panel -- it is used to")
+        print("[gen-test]     read the network. Copy it here, or list GEN_TEST_GENS by hand ***")
+        _GT_NET[1] = True
+        return None
+    import z6_spike_find as S
+    kind = "base" if _gt_case() is CASE_BASE else "proj"
+    _GT_NET[0] = S._load_net_via_child(kind)
+    _GT_NET[1] = True
+    return _GT_NET[0]
+
+
+def _gt_find_caps():
+    """GEN_TEST_CAPS_OFF: one plan entry holding every in-service capacitor
+       bank within GEN_TEST_CAPS_HOPS of the POI -- fixed shunts with +Mvar and
+       switched shunts that can go capacitive (BMAX > 0) -- or None."""
+    if not GEN_TEST_CAPS_OFF:
+        return None
+    net = _gt_net()
+    if net is None:
+        print("[gen-test] caps-off run skipped: the network could not be read")
+        return None
+    import z6_spike_find as S
+    caps = []
+    for b, h, z in S.nearby(net, GEN_TEST_POI, GEN_TEST_CAPS_HOPS):
+        for d in net["dev"].get(b, []):
+            if d.get("status", 1) != 1:
+                continue
+            k = d.get("kind")
+            if k == "FIXED CAP" and (d.get("mvar") or 0) > 0:
+                caps.append((b, str(d.get("id") or "1").strip() or "1", "F", d.get("mvar") or 0.0, h))
+            elif k == "SWITCHED SHUNT" and ((d.get("bmax") or 0) > 0 or (d.get("mvar") or 0) > 0):
+                caps.append((b, "", "S", d.get("mvar") or 0.0, h))
+    if not caps:
+        print("[gen-test] caps-off run skipped: no capacitor bank within %s buses of %s"
+              % (GEN_TEST_CAPS_HOPS, GEN_TEST_POI))
+        return None
+    print("[gen-test] CAPS OFF: %d capacitor bank(s) within %s buses of POI %s switched off "
+          "TOGETHER: %s" % (len(caps), GEN_TEST_CAPS_HOPS, GEN_TEST_POI,
+                            ", ".join("%d%s(%s %.0f Mvar)" % (b, (" '%s' " % i) if i else " ", k, q)
+                                      for b, i, k, q, _h in caps)))
+    return {"bus": int(GEN_TEST_POI), "id": "CAPS", "caps": [(b, i, k) for b, i, k, _q, _h in caps],
+            "hops": "", "z": None, "mw": None, "mvar": sum(q for _b, _i, _k, q, _h in caps),
+            "kind": "%d CAP BANKS" % len(caps), "name": "ALL CAPS <=%s" % GEN_TEST_CAPS_HOPS,
+            "models": ["%d%s" % (b, (":" + i) if i else "") + ":" + k for b, i, k, _q, _h in caps]}
+
+
 def _gt_find_gens():
     """Machines within GEN_TEST_HOPS of GEN_TEST_POI, closest (|Z|) first."""
     excl = set((int(b), str(i).strip()) for b, i in GEN_TEST_EXCLUDE)
@@ -17484,21 +17548,10 @@ def _gt_find_gens():
             print("[gen-test] POI group skipped: with GEN_TEST_GENS set by hand, list the POI's")
             print("[gen-test]   machines in GEN_TEST_POI_GROUP_GENS as well")
         return _gt_add_group(gens, None, excl)
-    here = os.path.dirname(os.path.abspath(__file__))
-    for d in (here, STUDY_ROOT):
-        if os.path.isfile(os.path.join(d, "z6_spike_find.py")):
-            if d not in sys.path:
-                sys.path.insert(0, d)
-            break
-    else:
-        print("[gen-test] *** z6_spike_find.py not found beside this panel -- it is used to")
-        print("[gen-test]     read the network. Copy it here, or list GEN_TEST_GENS by hand ***")
-        return None
-    import z6_spike_find as S
-    kind = "base" if _gt_case() is CASE_BASE else "proj"
-    net = S._load_net_via_child(kind)
+    net = _gt_net()
     if net is None:
         return None
+    import z6_spike_find as S
     if GEN_TEST_POI not in net["bus"]:
         print("[gen-test] *** POI bus %s is not in the case ***" % GEN_TEST_POI)
         return None
@@ -17686,8 +17739,10 @@ def _gt_env(sc, g, faults):
            "SPP_PSSE_FAULT_LOG": "1",
            "SPP_DELT_CYCLES": str(float(dc or DELT_CYCLES or 4)),
            "SPP_DYN_TOL": repr(float(tol)) if tol else "0",
-           "SPP_MACHINES_OFF": (";".join("%d:%s" % m for m in g["group"]) if g.get("group")
-                                else "%d:%s" % (g["bus"], g["id"])) if g else ""}
+           "SPP_MACHINES_OFF": ("" if g.get("caps") else
+                                ";".join("%d:%s" % m for m in g["group"]) if g.get("group")
+                                else "%d:%s" % (g["bus"], g["id"])) if g else "",
+           "SPP_SHUNTS_OFF": ";".join("%d:%s:%s" % c for c in g["caps"]) if g and g.get("caps") else ""}
     if it or acc:
         env["SPP_SOLVER_RETRY"] = "1"
         env["SPP_SOLVER_RETRY_RECIPES"] = json.dumps([[tag, it, acc]])
@@ -18215,6 +18270,12 @@ def run_gen_test():
     # 1) every solver scenario, every machine in service
     for sc in GEN_TEST_SCENARIOS:
         add(sc, None)
+    # 1b) every capacitor bank near the POI off, default solver setting
+    caps = _gt_find_caps()
+    if caps:
+        for sc in GEN_TEST_SCENARIOS:
+            if sc[0] in GEN_TEST_CAPS_SCENARIOS:
+                add(sc, caps)
     # 2) machine-off runs. "best2" picks its two scenarios once step 1 is
     #    scored; until then only machine runs ALREADY FINISHED on disk are
     #    listed, so nothing an earlier "all" run produced drops out of the report.
