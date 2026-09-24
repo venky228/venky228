@@ -17849,6 +17849,33 @@ def _gt_clean_build(tag):
         print("[gen-test] %s: %d build file(s) removed (results kept)" % (tag, n))
 
 
+def _gt_reset(r):
+    """A run that is about to start is NOT finished, so whatever its folder
+       holds is from an earlier attempt that was stopped part-way -- and the
+       .out files of a simulation killed mid-run are half-written. The study
+       treats any .out as a result (RUN_ONLY_MISSING_OUT), simulates nothing,
+       and then cannot read them: the run ends INCOMPLETE in a minute, every
+       time. So the folder is cleared and the run starts clean."""
+    rdir = r.get("rdir")
+    if not rdir or not os.path.isdir(rdir):
+        return
+    import shutil
+    shutil.rmtree(rdir, ignore_errors=True)
+    if os.path.isdir(rdir):
+        old = rdir + "_stopped_%s" % time.strftime("%H%M%S")
+        try:
+            os.rename(rdir, old)
+            print("[gen-test] %s: leftover folder of a stopped attempt could not be deleted "
+                  "(a file is open) -- moved to %s" % (os.path.basename(rdir), old))
+        except Exception as e:
+            print("[gen-test] *** %s: leftover folder of a stopped attempt could not be "
+                  "cleared (%s) -- close anything using it and run again ***"
+                  % (os.path.basename(rdir), e))
+        return
+    print("[gen-test] %s: leftover results of a stopped attempt cleared -- runs from the start"
+          % os.path.basename(rdir))
+
+
 def _gt_scen_desc(sc):
     tag, dc, it, acc, tol = sc
     return "DELT 1/%g cyc, MAXITER %s, ACCEL %s, TOL %s" % (
@@ -18265,6 +18292,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
                   % (k, len(todo), sc[0],
                      ("machine %d '%s' %s OFF" % (g["bus"], g["id"], g["name"])) if g
                      else "all machines in service", _gt_scen_desc(sc), lp))
+            _gt_reset(r)
             env = _gt_env(sc, g, faults)
             # THIS RUN'S SHARE, NOT THE MACHINE: nf sessions each, no handover
             # file to grow on, and no shared live-status file to fight over.
@@ -18448,6 +18476,7 @@ def _gt_execute(todo, runs, faults, gens, npar):
         _banner("GEN TEST %d/%d -- %s -- %s" % (k, len(todo), sc[0],
                 ("machine %d '%s' %s OFF" % (g["bus"], g["id"], g["name"])) if g else "all machines in service"))
         print("[gen-test] %s | folder %s" % (_gt_scen_desc(sc), r["rdir"]))
+        _gt_reset(r)
         t0 = time.time()
         r["state"], r["t0"] = "RUNNING", t0
         try:
