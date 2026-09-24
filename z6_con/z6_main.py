@@ -17878,6 +17878,130 @@ def _gt_finish(r, rc, t0):
     return done
 
 
+def _gt_tail(path):
+    """The last non-empty line of a run's console log, or ""."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            n = fh.tell()
+            fh.seek(max(0, n - 4096))
+            lines = [x.strip() for x in fh.read().decode("latin-1").splitlines() if x.strip()]
+        return lines[-1][:110] if lines else ""
+    except Exception:
+        return ""
+
+
+def _gt_status_write(runs, faults, npar, t_start):
+    """GEN_TEST_STATUS_<proj>.txt: every run of the plan, what has finished,
+       what is running now (with its progress) and what is still to come."""
+    now = time.time()
+    nf = len(faults)
+    st = [r.get("state") or "WAITING" for r in runs]
+    n_done = sum(1 for x in st if x.startswith("DONE"))
+    n_run = st.count("RUNNING")
+    n_inc = st.count("INCOMPLETE")
+    n_wait = st.count("WAITING")
+    fin = [r for r in runs if r.get("state") in ("DONE", "INCOMPLETE") and r.get("t0") and r.get("t1")]
+    avg = (sum(r["t1"] - r["t0"] for r in fin) / float(len(fin))) if fin else 0.0
+    eta = ""
+    if avg and (n_wait + n_run):
+        eta = "  |  ~%.1f h left (avg %.0f min/run, %d at once)" % (
+            (n_wait + n_run) * avg / max(1, npar) / 3600.0, avg / 60.0, npar)
+
+    def mach(g):
+        return ("OFF %d '%s' %s" % (g["bus"], g["id"], g["name"]))[:34] if g else "all in service"
+
+    def outs(r):
+        try:
+            return len(glob.glob(os.path.join(r["rdir"], "outs", "*.out")))
+        except Exception:
+            return 0
+
+    def res(r):
+        m = r.get("m")
+        x = _gt_score(m, faults) if m else None
+        if not x:
+            return ""
+        return "%d/%d PASS  nc %d%s  >1.2 %d  max %s" % (
+            x[0], nf, x[1], "" if x[4] else "?", x[2], "%.3f" % x[3] if x[3] else "-")
+
+    L = ["GEN-OFF / SOLVER TEST STATUS -- %s  (updated %s, started %s)"
+         % (GEN_TEST_PROJECT, time.strftime("%Y-%m-%d %H:%M:%S"),
+            time.strftime("%H:%M", time.localtime(t_start))),
+         "runs %d : DONE %d | RUNNING %d | WAITING %d | INCOMPLETE %d%s"
+         % (len(runs), n_done, n_run, n_wait, n_inc, eta),
+         "=" * 150, "", "RUNNING NOW"]
+    live = [r for r in runs if r.get("state") == "RUNNING"]
+    for r in live:
+        L.append("  #%-4d %-22s %-34s %5.0f min  outs %d/%d  %s"
+                 % (r["k"], r["sc"][0], mach(r["gen"]), (now - r["t0"]) / 60.0, outs(r), nf,
+                    r["rdir"]))
+        if r.get("log"):
+            L.append("         last: %s" % _gt_tail(r["log"]))
+    if not live:
+        L.append("  (nothing)")
+    L += ["", "ALL RUNS (plan order)",
+          "  %-5s %-22s %-34s %-12s %8s  %s" % ("#", "scenario", "machine", "state", "min", "result")]
+    for r in runs:
+        s_ = r.get("state") or "WAITING"
+        mins = ""
+        if r.get("t0"):
+            mins = "%.0f" % (((r.get("t1") or now) - r["t0"]) / 60.0)
+        L.append("  %-5d %-22s %-34s %-12s %8s  %s"
+                 % (r["k"], r["sc"][0], mach(r["gen"]), s_, mins, res(r)))
+    p = os.path.join(COMPARE_DIR, "GEN_TEST_STATUS_%s.txt" % GEN_TEST_PROJECT)
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write("\n".join(L) + "\n")
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+        os.rename(tmp, p)
+    except Exception:
+        # Open in an editor that locks it: write straight over it next time.
+        try:
+            with open(p, "w") as fh:
+                fh.write("\n".join(L) + "\n")
+        except Exception:
+            pass
+    return p
+
+
+def _gt_status_start(runs, faults, npar):
+    """Rewrite the status file every 30 s from a background thread, until
+       _gt_status_stop(): the sequential loop blocks inside run_study."""
+    stat = {"stop": False, "t": time.time()}
+    stat["path"] = _gt_status_write(runs, faults, npar, stat["t"])
+
+    def _loop():
+        while not stat["stop"]:
+            for _ in range(30):
+                if stat["stop"]:
+                    return
+                time.sleep(1)
+            try:
+                _gt_status_write(runs, faults, npar, stat["t"])
+            except Exception:
+                pass
+    th = threading.Thread(target=_loop)
+    th.daemon = True
+    th.start()
+    stat["th"] = th
+    stat["runs"], stat["faults"], stat["npar"] = runs, faults, npar
+    return stat
+
+
+def _gt_status_stop(stat):
+    stat["stop"] = True
+    try:
+        _gt_status_write(stat["runs"], stat["faults"], stat["npar"], stat["t"])
+    except Exception:
+        pass
+
+
 def _gt_run_parallel(todo, runs, faults, gens, npar):
     """GEN_TEST_PARALLEL: up to npar runs at once, each a separate launcher
        with len(faults) PSS/E sessions, each logging to its own file.
@@ -17907,6 +18031,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             del live[tag]
             r["faults"] = faults
             ok = _gt_finish(r, box.get("rc"), t0)
+            r["state"], r["t1"] = ("DONE" if ok else "INCOMPLETE"), time.time()
             print("[gen-test] FINISHED %s -- %s (%.0f min) | %d running, %d waiting"
                   % (tag, "done" if ok else "INCOMPLETE", (time.time() - t0) / 60.0,
                      len(live), len(queue)))
@@ -17943,6 +18068,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             t0 = time.time()
             th.start()
             live[tag] = (th, r, t0, box)
+            r["state"], r["t0"], r["log"] = "RUNNING", t0, lp
             last = (tag, r["rdir"], t0)
             continue
         if time.time() - t_say >= 300.0 and live:
@@ -17997,7 +18123,8 @@ def run_gen_test():
         rdir = _gt_rdir(_gt_tag(sc, g))
         done, m = _gt_done(rdir, faults)
         runs.append({"sc": sc, "gen": g, "rdir": rdir, "m": m if (done or os.path.isdir(rdir)) else None,
-                     "note": "done earlier -- not re-run" if done else ""})
+                     "note": "done earlier -- not re-run" if done else "",
+                     "state": "DONE earlier" if done else "WAITING", "k": len(runs) + 1})
     if GEN_TEST_DRY_RUN:
         for i, r in enumerate(runs, 1):
             g = r["gen"]
@@ -18010,8 +18137,13 @@ def run_gen_test():
     todo = [r for r in runs if not r["note"]]
     print("[gen-test] %d run(s) to simulate, %d already done" % (len(todo), len(runs) - len(todo)))
     npar = min(_gt_parallel(len(faults)), max(1, len(todo)))
+    _stat = _gt_status_start(runs, faults, npar)
+    print("[gen-test] live status of every run -> %s" % _stat["path"])
     if npar > 1:
-        _gt_run_parallel(todo, runs, faults, gens, npar)
+        try:
+            _gt_run_parallel(todo, runs, faults, gens, npar)
+        finally:
+            _gt_status_stop(_stat)
         _gt_write(runs, faults, gens)
         print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, COMPARE_DIR))
         return 0
@@ -18022,12 +18154,14 @@ def run_gen_test():
                 ("machine %d '%s' %s OFF" % (g["bus"], g["id"], g["name"])) if g else "all machines in service"))
         print("[gen-test] %s | folder %s" % (_gt_scen_desc(sc), r["rdir"]))
         t0 = time.time()
+        r["state"], r["t0"] = "RUNNING", t0
         try:
             rc = run_study(_gt_case(), projects=[GEN_TEST_PROJECT], modes=[GEN_TEST_MODE],
                            extra_env=_gt_env(sc, g, faults))
         except Exception as e:
             rc = "raised %s" % e
         done, r["m"] = _gt_done(r["rdir"], faults)
+        r["state"], r["t1"] = ("DONE" if done else "INCOMPLETE"), time.time()
         r["note"] = ("%.0f min" % ((time.time() - t0) / 60.0)) + ("" if done else "  INCOMPLETE rc=%s" % rc)
         if done:
             _gt_clean_build(tag)
@@ -18035,6 +18169,7 @@ def run_gen_test():
             print("[gen-test] *** %s did not score every fault (rc=%s) -- see %s\\logs ***"
                   % (tag, rc, r["rdir"]))
         _gt_write(runs, faults, gens)
+    _gt_status_stop(_stat)
     _gt_write(runs, faults, gens)
     print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, COMPARE_DIR))
     return 0
