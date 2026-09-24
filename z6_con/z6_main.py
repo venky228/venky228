@@ -641,11 +641,12 @@ GEN_TEST_PROJECT  = "SantaFe"
 GEN_TEST_MODE     = "spp"
 GEN_TEST_FAULTS   = ["F01-F04"]    # same syntax as ONLY_FAULTS
 GEN_TEST_POI      = 765911         # the bus the radius is measured from
-GEN_TEST_HOPS     = 7              # machines within this many buses of the POI
+GEN_TEST_HOPS     = 5              # machines within this many buses of the POI
 GEN_TEST_MIN_MW   = 5.0            # skip machines below this |MW| (SVC/STATCOM always kept)
 GEN_TEST_MAX_GENS = 0              # 0 = every machine found | N = the N electrically closest
 GEN_TEST_GENS     = []             # [] = find them automatically | or fixed: [(765912, "1"), (539670, "1")]
 GEN_TEST_EXCLUDE  = []             # machines never switched off: [(bus, "id"), ...]
+GEN_TEST_EXTRA_GENS = [(763676, "1")]  # machines ALWAYS tested, however far from the POI: [(bus, "id"), ...]
 GEN_TEST_POI_GROUP = True          # True = ALSO run with EVERY machine connected at the POI off together
                                    # (one extra "machine" in the plan, run under the same scenarios)
 GEN_TEST_POI_GROUP_GENS = []       # [] = found automatically: the machines behind the POI, reached from it
@@ -17621,6 +17622,27 @@ def _gt_find_gens():
                          "models": d.get("models") or []})
     if GEN_TEST_MAX_GENS:
         gens = gens[:int(GEN_TEST_MAX_GENS)]
+    have = set((g["bus"], g["id"]) for g in gens)
+    for b, i in GEN_TEST_EXTRA_GENS:
+        b, i = int(b), str(i).strip()
+        if (b, i) in have or (b, i) in excl:
+            continue
+        d = [x for x in net["dev"].get(b, []) if str(x.get("id") or "").strip() == i
+             and x.get("kind") not in skip]
+        if not d:
+            print("[gen-test] *** GEN_TEST_EXTRA_GENS: no machine %d '%s' in the case -- skipped ***" % (b, i))
+            continue
+        d = d[0]
+        if d.get("status", 1) != 1:
+            print("[gen-test] GEN_TEST_EXTRA_GENS: %d '%s' is already out of service -- skipped" % (b, i))
+            continue
+        gens.append({"bus": b, "id": i, "hops": "extra", "z": None, "mw": d.get("mw") or 0.0,
+                     "mvar": d.get("mvar"), "kind": d.get("kind", ""),
+                     "name": net["bus"].get(b, {}).get("name", ""),
+                     "models": d.get("models") or []})
+        have.add((b, i))
+        print("[gen-test] GEN_TEST_EXTRA_GENS: %d '%s' %s added (outside GEN_TEST_HOPS)"
+              % (b, i, gens[-1]["name"]))
     return _gt_add_group(gens, net, excl)
 
 
