@@ -17926,13 +17926,13 @@ def _gt_parallel(nf):
         return 1
 
 
-def _gt_built(tag, rdir, t0):
+def _gt_built(tag, rdir, t0, faults=()):
     """True once a run started at t0 has its snapshot (or its first .out):
        its dyre_new is over, so the next run's build cannot collide with it on
        the shared conec.flx / conet.flx in the case folder."""
     d = _gt_case()["dir"]
     for fp in (glob.glob(os.path.join(d, "*_%s.snp.built" % tag)) +
-               glob.glob(os.path.join(rdir, "outs", "*.out"))):
+               [os.path.join(rdir, "outs", "%s.out" % f) for f in faults]):
         try:
             if os.path.getmtime(fp) >= t0 - 5.0:
                 return True
@@ -17987,10 +17987,9 @@ def _gt_status_write(runs, faults, npar, t_start):
         return ("OFF %d '%s' %s" % (g["bus"], g["id"], g["name"]))[:34] if g else "all in service"
 
     def outs(r):
-        try:
-            return len(glob.glob(os.path.join(r["rdir"], "outs", "*.out")))
-        except Exception:
-            return 0
+        # THIS RUN'S FAULTS ONLY: the build's FLAT.out sits in the same folder
+        return sum(1 for f in faults
+                   if os.path.isfile(os.path.join(r["rdir"], "outs", "%s.out" % f)))
 
     def res(r):
         m = r.get("m")
@@ -18144,7 +18143,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             th.start()
             live[tag] = (th, r, t0, box)
             r["state"], r["t0"], r["log"] = "RUNNING", t0, lp
-            last = (tag, r["rdir"], t0)
+            last = (tag, r["rdir"], t0, faults)
             continue
         if time.time() - t_say >= 300.0 and live:
             t_say = time.time()
