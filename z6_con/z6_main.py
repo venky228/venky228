@@ -278,6 +278,8 @@ GEN_TEST_EACH_GEN = False                     # each machine within GEN_TEST_HOP
 GEN_TEST_EXCLUDE_POI_GENS = False            # True = POI plants left out of the one-at-a-time runs and the HOPS group
 GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = False                  # all machines within GEN_TEST_HOPS off together
+GEN_TEST_POI_OFF_BASE = False                # True = ALSO every cap / line / gen run again with the POI plants OFF,
+                                             #   compared with the POIALL run; same reports, rows "POI OFF + ..."
 GEN_TEST_HOPS = 5                            # "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
 GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus, id)]
@@ -17679,6 +17681,8 @@ def _gt_safe(x):
 def _gt_tag(sc, g):
     t = "gt_%s" % sc[0]
     if g:
+        if g.get("base_off"):
+            t += "_poioff"
         t += "_off%d_%s" % (g["bus"], _gt_safe(g["id"]))
     return t
 
@@ -18364,6 +18368,21 @@ def _gt_done(rdir, faults, g=None):
     return ok, m
 
 
+def _gt_machines_off(g):
+    """The machines a run switches off: its own (a machine or a group; none
+       for a cap / line / .dyr-edit run) plus, for a GEN_TEST_POI_OFF_BASE
+       run, the POI plants. Each once, in order."""
+    if not g:
+        return []
+    own = [] if g.get("caps") or g.get("branches") or g.get("egf") else \
+        list(g["group"]) if g.get("group") else [(g["bus"], g["id"])]
+    out = []
+    for k in list(g.get("base_off") or []) + own:
+        if k not in out:
+            out.append(k)
+    return out
+
+
 def _gt_env(sc, g, faults):
     tag, dc, it, acc, tol = sc
     fl = ",".join(_gt_run_faults(g, faults)) if g and g.get("skip") else ",".join(GEN_TEST_FAULTS)
@@ -18373,9 +18392,7 @@ def _gt_env(sc, g, faults):
            "SPP_PSSE_FAULT_LOG": "1",
            "SPP_DELT_CYCLES": str(float(dc or DELT_CYCLES or 4)),
            "SPP_DYN_TOL": repr(float(tol)) if tol else "0",
-           "SPP_MACHINES_OFF": ("" if g.get("caps") or g.get("branches") or g.get("egf") else
-                                ";".join("%d:%s" % m for m in g["group"]) if g.get("group")
-                                else "%d:%s" % (g["bus"], g["id"])) if g else "",
+           "SPP_MACHINES_OFF": ";".join("%d:%s" % m for m in _gt_machines_off(g)),
            "SPP_SHUNTS_OFF": ";".join("%d:%s:%s" % c for c in g["caps"]) if g and g.get("caps") else "",
            "SPP_BRANCHES_OFF": ";".join(":".join(str(v) for v in c) for c in g["branches"])
                                if g and g.get("branches") else "",
@@ -18500,6 +18517,9 @@ def _gt_label(g):
     """What a plan entry takes out, as the reports name it."""
     if not g:
         return "all in service"
+    if g.get("base_of"):
+        # GEN_TEST_POI_OFF_BASE: the same element, taken out with the POI plants off
+        return "POI OFF + " + _gt_label(g["base_of"])
     if g.get("egf"):
         # THE ENTRY'S NAME FIRST: the tables cut labels at 34-46 characters, and
         # "EDIT existing gens: REGCA1 Accel=0.7,Khv=..." left every edit run
@@ -18508,6 +18528,29 @@ def _gt_label(g):
     if g.get("branches"):
         return "OPEN %s %s %s" % (g.get("kind") or "LINE", _gt_brname(g["branches"][0]), g["name"])
     return "OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])
+
+
+_GT_POIOFF_SC = " [POI OFF]"     # impact-report block name suffix, GEN_TEST_POI_OFF_BASE runs
+
+
+def _gt_refs(runs):
+    """(scenario, poi_off) -> the run an element run is compared with: the
+       same scenario all in service, or -- for a GEN_TEST_POI_OFF_BASE run --
+       the same scenario with the POI plants off (the POIALL run)."""
+    out = {}
+    for r in runs:
+        g = r["gen"]
+        if not r.get("m"):
+            continue
+        if not g:
+            out[(r["sc"][0], False)] = r
+        elif g.get("id") == "POIALL" and not g.get("base_off"):
+            out[(r["sc"][0], True)] = r
+    return out
+
+
+def _gt_ref(refs, r):
+    return refs.get((r["sc"][0], bool(r["gen"] and r["gen"].get("base_off"))))
 
 
 def _gt_key(sc):
@@ -18558,7 +18601,7 @@ def _gt_best(runs, faults, ref):
     per = {}
     for x, r in sc_all + part:
         g = r["gen"]
-        b = ref.get(r["sc"][0])
+        b = _gt_ref(ref, r)
         # against the SAME faults: only those BOTH runs scored -- a line run
         # that left F02 out, or a run that gave up on F01-F03, is held to the
         # all-in-service run's matching faults, not to its total
@@ -18569,7 +18612,7 @@ def _gt_best(runs, faults, ref):
         bx = _gt_score(b.get("m"), fs)
         if not x or not bx:
             continue
-        k = (g["bus"], g["id"])
+        k = (g["bus"], g["id"], bool(g.get("base_off")))
         e = per.setdefault(k, {"g": g, "n": 0, "better": 0, "dnc": 0, "dov": 0, "dmx": 0.0,
                                "fix": 0, "best": None})
         e["n"] += 1
@@ -18612,7 +18655,7 @@ def _gt_best(runs, faults, ref):
         L.append("  (no machine-off run has finished yet)")
     # D -- what it says
     L += ["", "D. WHAT IT SAYS"]
-    s0 = ref.get(GEN_TEST_SCENARIOS[0][0])
+    s0 = ref.get((GEN_TEST_SCENARIOS[0][0], False))
     s0x = _gt_score(s0.get("m") if s0 else None, faults)
     L.append("  best of all : %s, %s -- %d/%d PASS, nc %d, %d bus(es) > 1.2 pu, peak %s"
              % (best_r["sc"][0], lab(best_r), best_x[0], nf, best_x[1], best_x[2],
@@ -18663,11 +18706,11 @@ def _gt_impact(runs, faults, proj):
             (buses over 1.2 pu cleared, peak pu drop, 'not converged' drop)
          B. per fault, each bus that spikes in the all-in-service run and the
             element whose removal brings THAT bus down the most."""
-    ref = dict((r["sc"][0], r) for r in runs if not r["gen"] and r.get("m"))
+    ref = _gt_refs(runs)
     rows = []
     for r in runs:
         g, m = r["gen"], r.get("m")
-        b = ref.get(r["sc"][0])
+        b = _gt_ref(ref, r)
         if not g or not m or not b:
             continue
         for f in faults:
@@ -18675,7 +18718,7 @@ def _gt_impact(runs, faults, proj):
             if mo.get("verdict") not in ("PASS", "FAIL") or mb.get("verdict") not in ("PASS", "FAIL"):
                 continue
             bb, bo = mb.get("bus_pu") or {}, mo.get("bus_pu") or {}
-            rows.append({"f": f, "sc": r["sc"][0], "g": g,
+            rows.append({"f": f, "sc": r["sc"][0] + (_GT_POIOFF_SC if g.get("base_off") else ""), "g": g,
                          "cleared": len([x for x in bb if x not in bo]),
                          "new": len([x for x in bo if x not in bb]),
                          "over_b": len(bb), "over_o": len(bo),
@@ -18691,9 +18734,28 @@ def _gt_impact(runs, faults, proj):
         x["eff"] = ("CONTRIBUTES" if up and not down else "HOLDS DOWN" if down and not up
                     else "MIXED" if up else "no effect")
     key = lambda x: (-(x["over_b"] - x["over_o"]), -x["dpk"], -x["dnc"])
+
+    def scs(fr):
+        """The scenario blocks with rows, in panel order: each scenario, then
+           the same scenario with the POI plants off (GEN_TEST_POI_OFF_BASE)."""
+        have = set(x["sc"] for x in fr)
+        return [k for t in GEN_TEST_SCENARIOS for k in (t[0], t[0] + _GT_POIOFF_SC) if k in have]
+
+    def firsts(fr):
+        """The first plain block and the first POI-off block (each if any)."""
+        k = scs(fr)
+        return [c for c in ([x for x in k if not x.endswith(_GT_POIOFF_SC)][:1] +
+                            [x for x in k if x.endswith(_GT_POIOFF_SC)][:1])]
+
+    def ref_txt(sc):
+        return ("POI plants off (the POIALL run)" if sc.endswith(_GT_POIOFF_SC)
+                else "everything in service")
     L = ["GEN TEST -- WHICH ELEMENT DRIVES THE SPIKE, PER FAULT -- %s  (%s)"
          % (proj, time.strftime("%Y-%m-%d %H:%M")),
          "Each run with one element out vs the SAME solver scenario with everything in service.",
+         "Blocks marked%s: the element taken out WITH the POI plants off, compared with the POIALL run"
+         % _GT_POIOFF_SC,
+         "  (GEN_TEST_POI_OFF_BASE) -- what else drives the spike once the POI plants are gone.",
          "buses>1.2 = buses above 1.2 pu (in service -> element out), peak = highest pu, nc = 'not converged' steps.",
          "Top of each list = taking it out helps most = it CONTRIBUTES most to the spike.",
          "impact: CONTRIBUTES = better with it out (it drives the spike / non-convergence)",
@@ -18705,25 +18767,26 @@ def _gt_impact(runs, faults, proj):
         if not fr:
             L.append("  %-8s (no element-off run finished yet)" % f)
             continue
-        sc = [t[0] for t in GEN_TEST_SCENARIOS if any(x["sc"] == t[0] for x in fr)][0]
-        sr = sorted([x for x in fr if x["sc"] == sc], key=key)
-        con = [x for x in sr if x["eff"] in ("CONTRIBUTES", "MIXED")]
-        hol = [x for x in sr if x["eff"] == "HOLDS DOWN"]
-        L.append("  %-8s [%s] in service: %s, %d bus(es) > 1.2, peak %s, nc %s"
-                 % (f, sc, sr[0]["v_b"], sr[0]["over_b"], "%.3f" % sr[0]["pk_b"] if sr[0]["pk_b"] else "-",
-                    "-" if sr[0]["nc_b"] is None else sr[0]["nc_b"]))
-        for x in con[:6]:
-            L.append("      contributes : %-50s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s"
-                     % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
-                        "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-",
-                        "-" if x["nc_b"] is None else x["nc_b"], "-" if x["nc_o"] is None else x["nc_o"],
-                        x["v_b"], x["v_o"]))
-        for x in hol[:3]:
-            L.append("      holds down  : %-50s buses %d -> %d, peak %s -> %s"
-                     % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
-                        "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-"))
-        if not con and not hol:
-            L.append("      no single element changes this fault")
+        for sc in firsts(fr):
+            sr = sorted([x for x in fr if x["sc"] == sc], key=key)
+            con = [x for x in sr if x["eff"] in ("CONTRIBUTES", "MIXED")]
+            hol = [x for x in sr if x["eff"] == "HOLDS DOWN"]
+            L.append("  %-8s [%s] %s: %s, %d bus(es) > 1.2, peak %s, nc %s"
+                     % (f, sc, ref_txt(sc), sr[0]["v_b"], sr[0]["over_b"],
+                        "%.3f" % sr[0]["pk_b"] if sr[0]["pk_b"] else "-",
+                        "-" if sr[0]["nc_b"] is None else sr[0]["nc_b"]))
+            for x in con[:6]:
+                L.append("      contributes : %-50s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s"
+                         % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
+                            "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-",
+                            "-" if x["nc_b"] is None else x["nc_b"], "-" if x["nc_o"] is None else x["nc_o"],
+                            x["v_b"], x["v_o"]))
+            for x in hol[:3]:
+                L.append("      holds down  : %-50s buses %d -> %d, peak %s -> %s"
+                         % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
+                            "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-"))
+            if not con and not hol:
+                L.append("      no single element changes this fault")
     L.append("")
     for f in faults:
         fr = [x for x in rows if x["f"] == f]
@@ -18731,11 +18794,11 @@ def _gt_impact(runs, faults, proj):
         if not fr:
             L += ["  (no element-off run finished for this fault yet)", ""]
             continue
-        for sc in [t[0] for t in GEN_TEST_SCENARIOS if any(x["sc"] == t[0] for x in fr)]:
+        for sc in scs(fr):
             sr = sorted([x for x in fr if x["sc"] == sc], key=key)
             b0 = sr[0]
-            L += ["", "  scenario %s -- everything in service: %s, %d bus(es) > 1.2 pu, peak %s, nc %s"
-                  % (sc, b0["v_b"], b0["over_b"], "%.3f" % b0["pk_b"] if b0["pk_b"] else "-",
+            L += ["", "  scenario %s -- %s: %s, %d bus(es) > 1.2 pu, peak %s, nc %s"
+                  % (sc, ref_txt(sc), b0["v_b"], b0["over_b"], "%.3f" % b0["pk_b"] if b0["pk_b"] else "-",
                      "-" if b0["nc_b"] is None else b0["nc_b"]),
                   "  %-3s %-12s %-50s %-14s %-12s %-15s %-11s %s"
                   % ("#", "impact", "element taken out", "kind", "buses>1.2", "peak pu", "nc", "verdict")]
@@ -18748,19 +18811,21 @@ def _gt_impact(runs, faults, proj):
                     "%s -> %s" % ("-" if x["nc_b"] is None else x["nc_b"],
                                   "-" if x["nc_o"] is None else x["nc_o"]),
                     "%s -> %s" % (x["v_b"], x["v_o"])))
-        # B -- per spiking bus, the element that lowers it most (first scenario with runs)
-        sc = [t[0] for t in GEN_TEST_SCENARIOS if any(x["sc"] == t[0] for x in fr)][0]
-        sr = [x for x in fr if x["sc"] == sc]
-        bb = sr[0]["bb"]
-        L += ["", "%s  B. EACH BUS ABOVE 1.2 pu (scenario %s) -- the element whose removal lowers it most" % (f, sc)]
-        if not bb:
-            L.append("  (no bus above 1.2 pu with everything in service)")
-        for bus, pk in sorted(bb.items(), key=lambda t: -t[1]):
-            best = sorted(sr, key=lambda x: x["bo"].get(bus, 0.0))[:3]
-            L.append("  %-28s %.3f pu  -> %s" % (bus[:28], pk, "  |  ".join(
-                "%s: %s" % (_gt_label(x["g"])[4:].strip(),
-                            ("%.3f" % x["bo"][bus]) if bus in x["bo"] else "below 1.2")
-                for x in best)))
+        # B -- per spiking bus, the element that lowers it most (first scenario
+        # with runs, and the first POI-off block when there is one)
+        for sc in firsts(fr):
+            sr = [x for x in fr if x["sc"] == sc]
+            bb = sr[0]["bb"]
+            L += ["", "%s  B. EACH BUS ABOVE 1.2 pu (scenario %s, %s) -- the element whose removal lowers it most"
+                  % (f, sc, ref_txt(sc))]
+            if not bb:
+                L.append("  (no bus above 1.2 pu in the reference run)")
+            for bus, pk in sorted(bb.items(), key=lambda t: -t[1]):
+                best = sorted(sr, key=lambda x: x["bo"].get(bus, 0.0))[:3]
+                L.append("  %-28s %.3f pu  -> %s" % (bus[:28], pk, "  |  ".join(
+                    "%s: %s" % (re.sub(r"^(OFF|EDIT|OPEN) ", "", _gt_label(x["g"])),
+                                ("%.3f" % x["bo"][bus]) if bus in x["bo"] else "below 1.2")
+                    for x in best)))
         L.append("")
     if not rows:
         L.append("(no element-off run has finished yet)")
@@ -18785,7 +18850,7 @@ def _gt_write(runs, faults, gens):
     proj = GEN_TEST_PROJECT
     txt = os.path.join(_gt_dir(), "GEN_TEST_%s.txt" % proj)
     csvp = os.path.join(_gt_dir(), "GEN_TEST_%s.csv" % proj)
-    ref = dict((r["sc"][0], r) for r in runs if not r["gen"] and r.get("m"))
+    ref = _gt_refs(runs)
 
     def cell(m):
         if not m:
@@ -18847,7 +18912,7 @@ def _gt_write(runs, faults, gens):
     eff = []
     for r in runs:
         g, m = r["gen"], r.get("m")
-        b = ref.get(r["sc"][0])
+        b = _gt_ref(ref, r)
         if not g or not m or not b:
             continue
         # only the faults BOTH runs scored (see _gt_score)
@@ -19211,7 +19276,7 @@ def _gt_write_all(projs):
             L += ["=" * 130, "%s -- not run in this launch" % pj, ""]
             continue
         runs, faults = _GT_LAST[pj]
-        ref = dict((r["sc"][0], r) for r in runs if not r["gen"] and r.get("m"))
+        ref = _gt_refs(runs)
         L += ["=" * 130, "%s  (faults %s)" % (pj, ", ".join(faults)), "=" * 130,
               "  %-18s %-52s %6s %13s %15s %12s %9s" % (
                   "scenario", "element run", "faults", ">1.2 in->out", "peak in->out",
@@ -19219,7 +19284,7 @@ def _gt_write_all(projs):
         cand = []
         for r in runs:
             g, m = r["gen"], r.get("m")
-            b = ref.get(r["sc"][0])
+            b = _gt_ref(ref, r)
             if not g or not m or not b:
                 continue
             fs = [f for f in _gt_scored(m, faults) if f in _gt_scored(b["m"], faults)]
@@ -19233,6 +19298,10 @@ def _gt_write_all(projs):
             rows_csv.append([pj, r["sc"][0], lab, len(fs), len(faults), bx[2], x[2],
                              "%.3f" % (bx[3] or 0.0), "%.3f" % (x[3] or 0.0), bx[1], x[1],
                              bx[0], x[0]])
+            if g.get("base_off"):
+                # measured against the POI-off run, not against all in service:
+                # listed above, but not a candidate for the project's BEST
+                continue
             cand.append((x[0] - bx[0], bx[2] - x[2], (bx[3] or 0.0) - (x[3] or 0.0),
                          len(fs) == len(faults), r["sc"][0], lab, x, bx, fs))
         if not cand:
@@ -19463,6 +19532,43 @@ def run_gen_test():
                 for sc in GEN_TEST_SCENARIOS:
                     if sc not in gsc and _gt_done(_gt_rdir(_gt_tag(sc, g)), faults, g)[0]:
                         add(sc, g)
+    # 3) GEN_TEST_POI_OFF_BASE: each cap / line / machine run AGAIN with the POI
+    #    plants off too, in the scenarios the POIALL run is in (caps and lines
+    #    also only in their own scenarios), each compared with that POIALL run.
+    #    Own folders (..._poioff_off...), so the runs above are all kept.
+    if GEN_TEST_POI_OFF_BASE:
+        poi = [g for g in gens if g.get("id") == "POIALL" and g.get("group")]
+        if not poi:
+            print("[gen-test] *** GEN_TEST_POI_OFF_BASE = True needs the POI group: set GEN_TEST_POI_GROUP "
+                  "= True (and GEN_TEST_POI_GROUP_GENS if the POI machines are not found) ***")
+            return 2
+        poi = poi[0]
+        mem = list(poi["group"])
+        memk = set((int(b), str(i).strip()) for b, i in mem)
+        psc = [r["sc"] for r in runs if r["gen"] is poi]
+        n0 = len(runs)
+        for g in ([caps] if caps else []) + list(lines) + list(gens):
+            if g is poi or g.get("egf"):
+                # a .dyr edit acts on the existing machines at the feeders --
+                # the POI plants, which are off here
+                continue
+            d = dict(g)
+            if g.get("group"):
+                d["group"] = [k for k in g["group"] if (int(k[0]), str(k[1]).strip()) not in memk]
+                if not d["group"]:
+                    continue
+            elif not (g.get("caps") or g.get("branches")) and \
+                    (int(g["bus"]), str(g["id"]).strip()) in memk:
+                continue
+            d["base_off"], d["base_of"], d["name"] = mem, g, "POIOFF+" + g["name"]
+            ok = GEN_TEST_CAPS_SCENARIOS if g is caps else \
+                GEN_TEST_LINES_SCENARIOS if g.get("branches") else None
+            for sc in psc:
+                if ok is None or sc[0] in ok:
+                    add(sc, d)
+        print("[gen-test] GEN_TEST_POI_OFF_BASE: %d run(s) with the %d POI machine(s) off as well, in %s%s"
+              % (len(runs) - n0, len(mem), ", ".join(sc[0] for sc in psc) or "(no POIALL run yet)",
+                 "" if psc else " -- set GEN_TEST_GEN_SCENARIOS to a list or \"all\""))
 
     def add_best2():
         """s0 (as-is) + the best solver scenario of step 1, for every machine."""
