@@ -17662,11 +17662,18 @@ def _gt_measure(rdir, faults):
 
 
 def _gt_done(rdir, faults):
-    """Finished = every fault scored, or the study wrote ALL_DONE (a fault it gave
-       up on has no verdict but is not run again either)."""
+    """Finished = every fault scored, or the study wrote ALL_DONE AND its
+       criteria report (a fault it gave up on has no verdict but is not run
+       again either).
+
+       NOT the flag alone: each worker writes ALL_DONE_w<N>.flag when IT has
+       nothing left, while the other workers are still simulating -- a run
+       stopped then was skipped on the next launch with no results."""
     m = _gt_measure(rdir, faults)
     ok = all(m[f]["verdict"] in ("PASS", "FAIL") for f in faults)
-    if not ok and glob.glob(os.path.join(rdir, "flags", "ALL_DONE*.flag")):
+    if (not ok and glob.glob(os.path.join(rdir, "flags", "ALL_DONE*.flag"))
+            and _gt_find(rdir, "SPP_CRITERIA_REPORT", "csv")
+            and any(m[f]["verdict"] in ("PASS", "FAIL") for f in faults)):
         ok = True
     return ok, m
 
