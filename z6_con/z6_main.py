@@ -274,7 +274,7 @@ GEN_TEST_BY_PROJECT = {
 }
 # -- 3c. machine runs (each one, and each EGF_EDITS run, is done in every GEN_TEST_GEN_SCENARIOS)
 GEN_TEST_REFERENCE_RUNS = True               # all in service (needed to compare; finished ones are reused)
-GEN_TEST_EACH_GEN = False                     # each machine within GEN_TEST_HOPS off on its own
+GEN_TEST_EACH_GEN = True                      # each machine within GEN_TEST_HOPS off on its own
 GEN_TEST_EXCLUDE_POI_GENS = False            # True = POI plants left out of the one-at-a-time runs and the HOPS group
 GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = False                  # all machines within GEN_TEST_HOPS off together
@@ -286,7 +286,7 @@ GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus
 # -- 3d. cap and line runs (solver scenario s0_asis only)
 GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together
 GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own
-GEN_TEST_LINES_EACH = False                   # each nearby line / transformer opened on its own
+GEN_TEST_LINES_EACH = True                    # each nearby line / transformer opened on its own
 # -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
