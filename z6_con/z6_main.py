@@ -18576,7 +18576,14 @@ def _fixed_solver_apply():
         print("[fixed] GEN_TEST is ignored while FIXED_SOLVER = True")
     ok = True
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    for case in (CASE_BASE, CASE_TEST):
+    # ONLY THE CASES THIS LAUNCH SIMULATES: a case RUN_CASES leaves out keeps its
+    # results (moving them aside would leave it empty and nothing to re-run it)
+    _run = _cases_to_run()
+    if len(_run) < 2:
+        print("[fixed] RUN_CASES = %r: only %s is re-run on these values -- the other case "
+              "keeps its results; run it with the same FIXED_* values before trusting the "
+              "comparison" % (RUN_CASES, " / ".join(c.get("key", "?") for c in _run)))
+    for case in _run:
         for proj in (_panel_projects() or []):
             for mode in MODES:
                 rdir = results_dir(case, proj, mode)
