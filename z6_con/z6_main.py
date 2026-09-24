@@ -321,6 +321,8 @@ GEN_TEST_SCENARIOS = [
 ]
 GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s2_it300_a020"]  # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
 GEN_TEST_POIGENOFF_SCENARIOS = "all"          # all POI gens off (POIGENOFF): "all" | [...] | None = as GEN_TEST_GEN_SCENARIOS
+GEN_TEST_LINES_SCENARIOS = ["s0_asis", "s2_it300_a020"]  # each line / transformer opened (and its POI-off run)
+GEN_TEST_CAPS_SCENARIOS = ["s0_asis", "s2_it300_a020"]   # caps off (and its POI-off run)
 # rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
@@ -17683,13 +17685,11 @@ GEN_TEST_MAX_GENS = 0                        # 0 = all found | N = N closest
 GEN_TEST_GENS = []                           # [] = find automatically | [(bus, id), ...]
 GEN_TEST_POI_GROUP_GENS = []                 # [] = found automatically | [(bus, id), ...]
 GEN_TEST_CAPS_HOPS = 5                       # radius for the all-caps-off run
-GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]
 GEN_TEST_CAPS_LIST = []                      # [] = auto | [(763674, "1", "F"), (539715, "", "S")]
 GEN_TEST_CAPS_EACH_HOPS = None               # None = GEN_TEST_HOPS
 GEN_TEST_LINES_MIN_KV = 100.0                # skip lines below this kV
 GEN_TEST_LINES_XFMR = True                   # 2- and 3-winding transformers too (kV test on the HV side)
 GEN_TEST_LINES_LIST = []                     # [] = auto | [(765911, 531603, "1"), (w1, w2, "1", w3)]
-GEN_TEST_LINES_SCENARIOS = ["s0_asis"]
 GEN_TEST_LINES_SKIP_FAULTED = True           # skip a line a fault trips, or that islands buses with a fault's trips
 GEN_TEST_CLEAN_BUILD = True                  # delete each finished run's .sav/.cnv/.snp (disk)
 GEN_TEST_START_GAP_MIN = 20                  # max minutes between run starts
@@ -19504,6 +19504,12 @@ def run_gen_test():
     if miss:
         print("[gen-test] *** GEN_TEST_GEN_SCENARIOS names %s, not in GEN_TEST_SCENARIOS ***" % miss)
         return 2
+    for _nm, _lst in (("GEN_TEST_LINES_SCENARIOS", GEN_TEST_LINES_SCENARIOS),
+                      ("GEN_TEST_CAPS_SCENARIOS", GEN_TEST_CAPS_SCENARIOS)):
+        miss = [t for t in (_lst or []) if t not in tags]
+        if isinstance(_lst, str) or miss:
+            print("[gen-test] *** %s = %r: list tags from GEN_TEST_SCENARIOS ***" % (_nm, _lst))
+            return 2
     # the POIALL run (all POI plants off) in its own scenarios: "all" | [...] | None = as the 3c runs
     _pspec = GEN_TEST_POIGENOFF_SCENARIOS
     if isinstance(_pspec, (list, tuple)) and len(_pspec) == 1 and str(_pspec[0]).strip().lower() == "all":
