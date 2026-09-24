@@ -5083,6 +5083,19 @@ def _noconv_since(mark):
             worst, wbus = mm, int(m.group(4))
     return n, worst, wbus
 
+def _dsp_or_stop(ints, reals, what):
+    """dynamics_solution_param_2, and STOP when PSS/E does not take it: a run
+       on solver values other than the ones it is named for is not that run."""
+    try:
+        ie = psspy.dynamics_solution_param_2(ints, reals)
+        ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+    except Exception as e:
+        ie = e
+    if ie not in (0, None):
+        raise RuntimeError("SPP_SOLVER: %s not applied (dynamics_solution_param_2: %s), so this "
+                           "run would not use the solver values it is named for" % (what, ie))
+
+
 def _apply_solver_recipe(niter, accel):
     """Push one recipe into PSS/E. Only MAXITER and ACCEL are ever written -- every other
        slot is passed as the 'unchanged' sentinel, so tolerance, time step and frequency
@@ -5092,12 +5105,8 @@ def _apply_solver_recipe(niter, accel):
              _f,                      # TOL   -- never changed
              _f,                      # DELT  -- never changed
              _f, _f, _f, _f, _f]      # FILTERTIME and the large-step group -- never changed
-    try:
-        psspy.dynamics_solution_param_2(ints, reals)
-        return True
-    except Exception as e:
-        print("  [solver-retry] could not apply recipe: %s" % e)
-        return False
+    _dsp_or_stop(ints, reals, "MAXITER %s / ACCEL %s" % (niter, accel))
+    return True
 
 def _run_with_solver_retry(scen_id, runner):
     """Run one scenario; if the network does not converge, re-run it with each recipe in
@@ -10556,12 +10565,22 @@ def _switch_machines_off():
                 left.append("%s '%s' (ierr=%s)" % (b, mid, ie))
         except Exception as e:
             left.append("%s '%s' (%s)" % (b, mid, e))
-    print("  [gen-off] %d machine(s) taken OUT OF SERVICE" % done)
+    # READ BACK: a call that answered 0 but left the machine running is caught
+    for b, mid in MACHINES_OFF:
+        try:
+            ie, st = psspy.macint(int(b), str(mid), "STATUS")
+        except Exception:
+            continue
+        if ie == 0 and st != 0 and not any(x.startswith("%s '%s'" % (b, mid)) for x in left):
+            done -= 1
+            left.append("%s '%s' (answered 0 but STATUS is still %s)" % (b, mid, st))
+    print("  [gen-off] %d of %d machine(s) taken OUT OF SERVICE" % (done, len(MACHINES_OFF)))
     for x in left:
         print("  [gen-off]   could not switch off %s" % x)
-    if done == 0:
-        raise RuntimeError("SPP_MACHINES_OFF was set but no machine could be taken "
-                           "out of service: %s" % ", ".join(left))
+    if left:
+        raise RuntimeError("SPP_MACHINES_OFF: %d of %d machine(s) could not be taken out of "
+                           "service, so this run would not test what it is named for: %s"
+                           % (len(left), len(MACHINES_OFF), ", ".join(left)))
 
 
 def _switch_project_off():
@@ -12168,9 +12187,9 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # 9) dynadcfx + Dyna_fix
         for d in DYNADCFX_IDVS: _apply_deck(d, required=False)
         # 10) dynamics solution parameters (quarter cycle, BUILD tol 0.0001)
-        psspy.dynamics_solution_param_2([SOLV_NITER, _i, _i, _i, _i, _i, _i, _i],
-                                        [SOLV_ACCEL, SOLV_TOL, SOLV_DELT, SOLV_FREQFILTER,
-                                         _f, _f, _f, _f])
+        _dsp_or_stop([SOLV_NITER, _i, _i, _i, _i, _i, _i, _i],
+                     [SOLV_ACCEL, SOLV_TOL, SOLV_DELT, SOLV_FREQFILTER, _f, _f, _f, _f],
+                     "build values (DELT %.6f s)" % SOLV_DELT)
         # 11) DyreChanges + AECI_dyr_TRate_changes
         for d in DYRECHANGE_IDV: _apply_deck(d, required=False)
         # 11a) DISABLES THE DECK TEXT COULD NOT REACH -- models the decks above
@@ -12313,14 +12332,11 @@ def _snap_solver_params():
                 accel = float(_a)
         except Exception:
             pass
-    try:
-        psspy.dynamics_solution_param_2([niter, _i, _i, _i, _i, _i, _i, _i],
-                                        [accel, SOLV_TOL_INIT, SOLV_DELT, SOLV_FREQFILTER,
-                                         _f, _f, _f, _f])
-        print("  [snap] saved with MAXITER %d, ACCEL %g, TOL %g, DELT %.6f s"
-              % (niter, accel, SOLV_TOL_INIT, SOLV_DELT))
-    except Exception as e:
-        print("  [snap] solver values not written into the snapshot (%s)" % e)
+    _dsp_or_stop([niter, _i, _i, _i, _i, _i, _i, _i],
+                 [accel, SOLV_TOL_INIT, SOLV_DELT, SOLV_FREQFILTER, _f, _f, _f, _f],
+                 "snapshot values MAXITER %d / ACCEL %g / TOL %g" % (niter, accel, SOLV_TOL_INIT))
+    print("  [snap] saved with MAXITER %d, ACCEL %g, TOL %g, DELT %.6f s"
+          % (niter, accel, SOLV_TOL_INIT, SOLV_DELT))
 
 
 def restore_and_init(snp=SNP_FILE, cnv=CNV_CASE):
@@ -12334,9 +12350,9 @@ def restore_and_init(snp=SNP_FILE, cnv=CNV_CASE):
         else: load_user_dlls()
         load_bess_dlls()          # the BESS model library must be loaded before strt_2
         # INIT dynamics params -- Run3 uses ACCEL 0.60, TOL 0.0000095 (build TOL 0.0001)
-        psspy.dynamics_solution_param_2([SOLV_NITER, _i, _i, _i, _i, _i, _i, _i],
-                                        [SOLV_ACCEL_INIT, SOLV_TOL_INIT, SOLV_DELT, SOLV_FREQFILTER,
-                                         _f, _f, _f, _f])
+        _dsp_or_stop([SOLV_NITER, _i, _i, _i, _i, _i, _i, _i],
+                     [SOLV_ACCEL_INIT, SOLV_TOL_INIT, SOLV_DELT, SOLV_FREQFILTER, _f, _f, _f, _f],
+                     "TOL %g / DELT %.6f s" % (SOLV_TOL_INIT, SOLV_DELT))
         psspy.fact(); psspy.tysl(0)
         # THE PROJECT MACHINE IDS MUST BE RIGHT BEFORE THE CHANNELS ARE ADDED.
         #

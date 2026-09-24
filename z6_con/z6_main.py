@@ -17957,6 +17957,17 @@ def _gt_reset(r):
        treats any .out as a result (RUN_ONLY_MISSING_OUT), simulates nothing,
        and then cannot read them: the run ends INCOMPLETE in a minute, every
        time. So the folder is cleared and the run starts clean."""
+    # THE EARLIER ATTEMPT'S CONSOLE LOG is kept as <run>.prev.log, so a reason
+    # it stopped for is not read back as this attempt's (the log is appended)
+    r.pop("noswitch", None)
+    lp = os.path.join(COMPARE_DIR, "gen_test_logs", _gt_tag(r["sc"], r["gen"]) + ".log")
+    if os.path.isfile(lp):
+        try:
+            if os.path.exists(lp[:-4] + ".prev.log"):
+                os.remove(lp[:-4] + ".prev.log")
+            os.rename(lp, lp[:-4] + ".prev.log")
+        except Exception:
+            pass
     rdir = r.get("rdir")
     if not rdir or not os.path.isdir(rdir):
         return
@@ -18149,6 +18160,26 @@ def _gt_write(runs, faults, gens):
         L.append("%-22s %-40s " % (r["sc"][0], gl) +
                  " | ".join(cell((r.get("m") or {}).get(f)) for f in faults) +
                  ("   " + r["note"] if r.get("note") else ""))
+    # runs that could not take their element out: nothing was simulated
+    ns = []
+    for r in runs:
+        if r.get("state") in ("DONE", "DONE earlier", "RUNNING") or r.get("note", "").startswith("done earlier"):
+            continue
+        why = r.get("noswitch") or _gt_switch_failure(r)
+        if why:
+            ns.append("  %-22s %-44s %s" % (r["sc"][0], _gt_label(r["gen"])[:44], why))
+    _nh = ["NOT RUN -- a setting of the run could not be applied, so it was stopped before simulating",
+           "(machine / cap bank / line not taken out, POI power not met, solver values refused)",
+           "%d run(s)" % len(ns)]
+    L += ["", "=" * 150] + _nh
+    L += ns or ["  (none)"]
+    try:
+        with open(os.path.join(COMPARE_DIR, "GEN_TEST_NOT_RUN_%s.txt" % proj), "w") as fh:
+            fh.write("GEN TEST -- %s  (%s)\n" % (proj, time.strftime("%Y-%m-%d %H:%M")) + "\n".join(_nh)
+                     + "\n\n  %-22s %-44s %s\n" % ("scenario", "what the run takes out", "why it did not run")
+                     + "\n".join(ns or ["  (none)"]) + "\n")
+    except Exception as e:
+        print("[gen-test] GEN_TEST_NOT_RUN not written (%s)" % e)
     # what changed against the same scenario with every machine in
     L += ["", "=" * 150, "MACHINE EFFECT (vs the same scenario with every machine in service)",
           "  a big drop in nc or >1.2 when a machine is OFF = that machine drives the problem", ""]
@@ -18226,12 +18257,47 @@ def _gt_built(tag, rdir, t0, faults=()):
     return False
 
 
+_GT_NOSWITCH = re.compile(r"((?:SPP_(?:MACHINES|SHUNTS|BRANCHES)_OFF: |SPP_SOLVER: |POI_P_TARGET_MW (?:not met|could not be checked|has no entry))[^\r\n]*)")
+
+
+def _gt_switch_failure(r):
+    """The engine's 'could not be switched off / opened' message for this run,
+       from its console log or the logs in its folder -- "" when there is none."""
+    tag = _gt_tag(r["sc"], r["gen"])
+    paths = [r.get("log") or os.path.join(COMPARE_DIR, "gen_test_logs", tag + ".log")] + glob.glob(os.path.join(r.get("rdir") or "", "logs", "*.log")) \
+        + glob.glob(os.path.join(r.get("rdir") or "", "logs", "*.txt"))
+    for p in paths:
+        if not p or not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="latin-1") as fh:
+                m = _GT_NOSWITCH.search(fh.read())
+        except Exception:
+            continue
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _gt_state(r, done):
+    """DONE, NOT RUN (the element could not be taken out, or the POI power
+       was not met -- the build stopped, nothing was simulated) or INCOMPLETE."""
+    if done:
+        return "DONE"
+    return "NOT RUN" if r.get("noswitch") else "INCOMPLETE"
+
+
 def _gt_finish(r, rc, t0):
     tag = _gt_tag(r["sc"], r["gen"])
     done, r["m"] = _gt_done(r["rdir"], r["faults"])
-    r["note"] = ("%.0f min" % ((time.time() - t0) / 60.0)) + ("" if done else "  INCOMPLETE rc=%s" % rc)
+    r["noswitch"] = "" if done else _gt_switch_failure(r)
+    r["note"] = ("%.0f min" % ((time.time() - t0) / 60.0)) + (
+        "" if done else ("  NOT RUN -- %s" % r["noswitch"]) if r["noswitch"]
+        else "  INCOMPLETE rc=%s" % rc)
     if done:
         _gt_clean_build(tag)
+    elif r["noswitch"]:
+        print("[gen-test] *** %s NOT RUN: %s ***" % (tag, r["noswitch"]))
     else:
         print("[gen-test] *** %s did not score every fault (rc=%s) -- see %s\\logs ***"
               % (tag, rc, r["rdir"]))
@@ -18260,6 +18326,7 @@ def _gt_status_write(runs, faults, npar, t_start):
     n_done = sum(1 for x in st if x.startswith("DONE"))
     n_run = st.count("RUNNING")
     n_inc = st.count("INCOMPLETE")
+    n_ns = st.count("NOT RUN")
     n_wait = st.count("WAITING")
     fin = [r for r in runs if r.get("state") in ("DONE", "INCOMPLETE") and r.get("t0") and r.get("t1")]
     avg = (sum(r["t1"] - r["t0"] for r in fin) / float(len(fin))) if fin else 0.0
@@ -18287,8 +18354,8 @@ def _gt_status_write(runs, faults, npar, t_start):
     L = ["GEN-OFF / SOLVER TEST STATUS -- %s  (updated %s, started %s)"
          % (GEN_TEST_PROJECT, time.strftime("%Y-%m-%d %H:%M:%S"),
             time.strftime("%H:%M", time.localtime(t_start))),
-         "runs %d : DONE %d | RUNNING %d | WAITING %d | INCOMPLETE %d%s"
-         % (len(runs), n_done, n_run, n_wait, n_inc, eta),
+         "runs %d : DONE %d | RUNNING %d | WAITING %d | INCOMPLETE %d | NOT RUN %d%s"
+         % (len(runs), n_done, n_run, n_wait, n_inc, n_ns, eta),
          "=" * 150, "", "RUNNING NOW"]
     live = [r for r in runs if r.get("state") == "RUNNING"]
     for r in live:
@@ -18307,7 +18374,7 @@ def _gt_status_write(runs, faults, npar, t_start):
         if r.get("t0"):
             mins = "%.0f" % (((r.get("t1") or now) - r["t0"]) / 60.0)
         L.append("  %-5d %-22s %-34s %-12s %8s  %s"
-                 % (r["k"], r["sc"][0], mach(r["gen"]), s_, mins, res(r)))
+                 % (r["k"], r["sc"][0], mach(r["gen"]), s_, mins, res(r) or r.get("noswitch") or ""))
     p = os.path.join(COMPARE_DIR, "GEN_TEST_STATUS_%s.txt" % GEN_TEST_PROJECT)
     tmp = p + ".tmp"
     try:
@@ -18390,9 +18457,9 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             del live[tag]
             r["faults"] = faults
             ok = _gt_finish(r, box.get("rc"), t0)
-            r["state"], r["t1"] = ("DONE" if ok else "INCOMPLETE"), time.time()
+            r["state"], r["t1"] = _gt_state(r, ok), time.time()
             print("[gen-test] FINISHED %s -- %s (%.0f min) | %d running, %d waiting"
-                  % (tag, "done" if ok else "INCOMPLETE", (time.time() - t0) / 60.0,
+                  % (tag, "done" if ok else r["state"], (time.time() - t0) / 60.0,
                      len(live), len(queue)))
             _gt_write(runs, faults, gens)
         spaced = (last is None or last[0] not in live or _gt_built(*last)
@@ -18619,7 +18686,7 @@ def _gt_execute(todo, runs, faults, gens, npar):
             rc = "raised %s" % e
         r["faults"] = faults
         done = _gt_finish(r, rc, t0)
-        r["state"], r["t1"] = ("DONE" if done else "INCOMPLETE"), time.time()
+        r["state"], r["t1"] = _gt_state(r, done), time.time()
         _gt_write(runs, faults, gens)
 
 
