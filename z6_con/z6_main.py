@@ -19148,6 +19148,14 @@ def run_gen_test():
         for g in gens:
             for sc in gsc:
                 add(sc, g)
+        # A SCENARIO DROPPED FROM THE LIST KEEPS WHAT IT FINISHED. Narrowing
+        # GEN_TEST_GEN_SCENARIOS part-way through stops new runs in the other
+        # scenarios; their finished machine runs stay in every report.
+        if _gmode != "all":
+            for g in gens:
+                for sc in GEN_TEST_SCENARIOS:
+                    if sc not in gsc and _gt_done(_gt_rdir(_gt_tag(sc, g)), faults, g)[0]:
+                        add(sc, g)
 
     def add_best2():
         """s0 (as-is) + the best solver scenario of step 1, for every machine."""
