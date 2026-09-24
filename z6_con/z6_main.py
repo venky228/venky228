@@ -266,6 +266,13 @@ GEN_TEST_BY_PROJECT = {
             "V115_K2":      [("REGCA1", {"Volim": 1.15, "Khv": 2.0, "Accel": 0.7})],
             "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7})],
             "V120_K1_A001": [("REGCA1", {"Volim": 1.20, "Khv": 1.0})],                # Accel left as in the deck
+            # overnight: built on the best so far (V110_K2), one change at a time
+            "V105_K2":      [("REGCA1", {"Volim": 1.05, "Khv": 2.0, "Accel": 0.7})],   # absorb Mvar earlier
+            "V110_K5":      [("REGCA1", {"Volim": 1.10, "Khv": 5.0, "Accel": 0.7})],   # absorb Mvar harder
+            "V105_K5":      [("REGCA1", {"Volim": 1.05, "Khv": 5.0, "Accel": 0.7})],   # both
+            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],  # more absorb headroom
+            "V110_K2_A05":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],   # Accel sensitivity
+            "V110_K2_A09":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.9})],
         },
     },
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
@@ -277,8 +284,8 @@ GEN_TEST_REFERENCE_RUNS = True               # all in service (needed to compare
 GEN_TEST_EACH_GEN = True                      # each machine within GEN_TEST_HOPS off on its own
 GEN_TEST_EXCLUDE_POI_GENS = False            # True = POI plants left out of the one-at-a-time runs and the HOPS group
 GEN_TEST_POI_GROUP = True                    # all POI plants off together
-GEN_TEST_HOPS_GROUP = False                  # all machines within GEN_TEST_HOPS off together
-GEN_TEST_POI_OFF_BASE = False                # True = ALSO every cap / line / gen run again with the POI plants OFF,
+GEN_TEST_HOPS_GROUP = True                   # all machines within GEN_TEST_HOPS off together
+GEN_TEST_POI_OFF_BASE = True                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
                                              #   compared with the POIALL run; same reports, rows "POI OFF + ..."
 GEN_TEST_HOPS = 5                            # "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
@@ -294,7 +301,7 @@ GEN_TEST_SCENARIOS = [
     ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10 -- fewest non-converged steps
     ("s8_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
-GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s6_it400_a010", "s8_it100_a080"]  # "all" | "best2" | [...] -- for the 3c runs
+GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s6_it400_a010"]  # "all" | "best2" | [...] -- for the 3c runs (finished s8 runs stay in the reports)
 # rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
@@ -19545,7 +19552,14 @@ def run_gen_test():
         poi = poi[0]
         mem = list(poi["group"])
         memk = set((int(b), str(i).strip()) for b, i in mem)
-        psc = [r["sc"] for r in runs if r["gen"] is poi]
+        # ONLY THE SCENARIOS NOW ASKED FOR: a POIALL run finished in a scenario
+        # since dropped from GEN_TEST_GEN_SCENARIOS stays in the reports, but
+        # starts no new POI-off runs there (finished ones are still listed)
+        _act = [sc[0] for sc in (GEN_TEST_SCENARIOS if _gmode == "all" else
+                                 _gt_best2(runs, faults) if _gmode == "best2" else
+                                 [s for s in GEN_TEST_SCENARIOS if s[0] in GEN_TEST_GEN_SCENARIOS])]
+        psc_all = [r["sc"] for r in runs if r["gen"] is poi]
+        psc = [sc for sc in psc_all if sc[0] in _act]
         n0 = len(runs)
         for g in ([caps] if caps else []) + list(lines) + list(gens):
             if g is poi or g.get("egf"):
@@ -19563,8 +19577,10 @@ def run_gen_test():
             d["base_off"], d["base_of"], d["name"] = mem, g, "POIOFF+" + g["name"]
             ok = GEN_TEST_CAPS_SCENARIOS if g is caps else \
                 GEN_TEST_LINES_SCENARIOS if g.get("branches") else None
-            for sc in psc:
-                if ok is None or sc[0] in ok:
+            for sc in psc_all:
+                if ok is not None and sc[0] not in ok:
+                    continue
+                if sc in psc or _gt_done(_gt_rdir(_gt_tag(sc, d)), faults, d)[0]:
                     add(sc, d)
         print("[gen-test] GEN_TEST_POI_OFF_BASE: %d run(s) with the %d POI machine(s) off as well, in %s%s"
               % (len(runs) - n0, len(mem), ", ".join(sc[0] for sc in psc) or "(no POIALL run yet)",
