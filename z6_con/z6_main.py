@@ -622,6 +622,18 @@ PSSE_FAULT_LOG = True                     # True = keep PSS/E's own messages for
                                             # z6_spike_find.py then writes SOLVER_LOG_<KIND>_<proj>.txt per project
 
 
+# ---- RUN THE WHOLE STUDY WITH THE SOLVER PARAMETERS BELOW ----------------------
+# FIXED_SOLVER = True: the gen test is switched off and every fault in both cases
+# is simulated with exactly these values. Results that were NOT made with them
+# are moved aside first (<folder>_before_fixed_<time>), so nothing old is reused;
+# a stopped run started again with the same values carries on where it stopped.
+FIXED_SOLVER      = False          # True = use the values below for the whole study
+FIXED_DELT_CYCLES = 8              # time step: 4 = 1/4 cycle (as SPP), 8 = 1/8 cycle
+FIXED_MAXITER     = 400            # network iterations      (SPP: 60)
+FIXED_ACCEL       = 0.10           # acceleration factor     (SPP: 0.60)
+FIXED_TOL         = 0.0000095      # network tolerance       (SPP: 0.0000095)
+
+
 # ---- GEN-OFF / SOLVER TEST ------------------------------------------------------
 # Finds out whether the >1.2 pu spikes and "Network not converged" come from the
 # SOLVER or from a nearby GENERATOR. With GEN_TEST = True this panel runs ONLY
@@ -18598,6 +18610,63 @@ def _gt_execute(todo, runs, faults, gens, npar):
         _gt_write(runs, faults, gens)
 
 
+def _fixed_solver_sig():
+    return ("DELT 1/%g cycle, MAXITER %d, ACCEL %g, TOL %g"
+            % (float(FIXED_DELT_CYCLES), int(FIXED_MAXITER), float(FIXED_ACCEL), float(FIXED_TOL)))
+
+
+def _fixed_solver_apply():
+    """FIXED_SOLVER: the panel's solver settings replaced by the FIXED_* values
+       for the whole study, and every results folder not made with exactly
+       those values moved aside so all faults are simulated again. False =
+       a folder could not be moved (stop rather than reuse old results)."""
+    global DELT_CYCLES, SOLVER_RETRY_ON_NONCONV, SOLVER_RETRY_RECIPES, DYN_TOL
+    sig = _fixed_solver_sig()
+    DELT_CYCLES = float(FIXED_DELT_CYCLES)
+    SOLVER_RETRY_ON_NONCONV = True          # the one recipe below is applied from the first step
+    SOLVER_RETRY_RECIPES = [("fixed %s" % sig, int(FIXED_MAXITER), float(FIXED_ACCEL))]
+    DYN_TOL = float(FIXED_TOL)
+    _banner("FIXED SOLVER -- every fault, both cases: %s" % sig)
+    if GEN_TEST:
+        print("[fixed] GEN_TEST is ignored while FIXED_SOLVER = True")
+    ok = True
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    for case in (CASE_BASE, CASE_TEST):
+        for proj in (_panel_projects() or []):
+            for mode in MODES:
+                rdir = results_dir(case, proj, mode)
+                mark = os.path.join(rdir, "FIXED_SOLVER.txt")
+                if os.path.isdir(rdir):
+                    try:
+                        with open(mark) as fh:
+                            same = fh.read().strip() == sig
+                    except Exception:
+                        same = False
+                    if same:
+                        print("[fixed] %s: made with these values -- carries on" % rdir)
+                        continue
+                    old, n = "%s_before_fixed_%s" % (rdir, stamp), 1
+                    while os.path.exists(old):
+                        n += 1
+                        old = "%s_before_fixed_%s_%d" % (rdir, stamp, n)
+                    try:
+                        os.rename(rdir, old)
+                        print("[fixed] %s: older results moved to %s" % (rdir, os.path.basename(old)))
+                    except Exception as e:
+                        print("[fixed] *** %s could not be moved aside (%s) -- close anything using "
+                              "it (Explorer, Excel, a python.exe) and run again ***" % (rdir, e))
+                        ok = False
+                        continue
+                try:
+                    os.makedirs(rdir)
+                    with open(mark, "w") as fh:
+                        fh.write(sig + "\n")
+                except Exception as e:
+                    print("[fixed] *** could not start %s (%s) ***" % (rdir, e))
+                    ok = False
+    return ok
+
+
 def main():
     _banner("SPP STUDY COMPARISON")
     print("[compare] BASE  %-44s %s" % (CASE_BASE["label"], CASE_BASE["dir"]))
@@ -18626,7 +18695,10 @@ def main():
     if not os.path.isdir(COMPARE_DIR):
         os.makedirs(COMPARE_DIR)
 
-    if GEN_TEST:
+    if FIXED_SOLVER:
+        if not _fixed_solver_apply():
+            return 2
+    elif GEN_TEST:
         return run_gen_test()
 
     # MERGE ONLY -- see the setting at the top. Checked before anything else,
