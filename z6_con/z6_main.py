@@ -230,6 +230,10 @@ CORES_MAX_INCLUDES_REPORTS = True            # True = scoring shares the ceiling
 REPORT_WORKERS = "auto"                      # scoring shards per case: "auto" | 1..8
 DYNAMIC_WORK = True                          # True = shared queue of scenarios
 GEN_TEST_PARALLEL = "auto"                   # GEN TEST: "auto" | N runs at once | 1
+# plots
+PLOT_INRUN = 1                               # plotters per running folder
+PLOT_WORKERS = 2                             # plotters per case
+PLOT_TOTAL_MAX = 4                           # cap on plotters
 # simulation time
 FLAT_RUN_S = 5                               # s, no-fault run
 PRE_FAULT_S = 5                              # s before the fault
@@ -544,9 +548,6 @@ MAKE_PLOTS = None                            # None = draw | False = no PDFs (fa
 PLOT_MISSING_OUTS = False                    # draw PDFs for .out files without one
 FORCE_REPLOT = False                         # True = redraw every PDF
 PLOT_SCOPE = "compact"                       # "compact" | "full"
-PLOT_INRUN = 1                               # plotters per running folder
-PLOT_WORKERS = 2                             # plotters per case
-PLOT_TOTAL_MAX = 4                           # cap on plotters
 PLOT_ONE_PROJECT_AT_A_TIME = True
 PLOT_SKIP_INCOMPLETE = True                  # True = do not draw a run that stopped early
 INDIVIDUAL_KEYWORDS = ["PROJ", "POI", "FLT", "GEN"]  # the SPP channel set ([] = every signal)
