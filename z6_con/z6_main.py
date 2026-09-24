@@ -269,6 +269,7 @@ GEN_TEST_LINES_MIN_KV = 100.0                # skip lines below this kV
 GEN_TEST_LINES_XFMR = True                   # True = 2- and 3-winding transformers too (kV test on the HV side)
 GEN_TEST_LINES_LIST = []                     # [] = auto | [(765911, 531603, "1"), (w1, w2, "1", w3) for 3-winding]
 GEN_TEST_LINES_SCENARIOS = ["s0_asis"]       # solver scenario(s) for the line runs
+GEN_TEST_LINES_SKIP_FAULTED = True           # True = skip a line a fault trips, or that islands buses with a fault's trips
 # GEN_TEST_SCENARIOS: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
@@ -17350,6 +17351,68 @@ def _gt_has_machine(net, b):
     return any(d.get("kind") not in skip and d.get("status", 1) == 1 for d in net["dev"].get(b, []))
 
 
+_GT_ELEM = re.compile(r"(?<![\d.])(\d{4,})-(\d{4,})-(?:(\d{4,})-)?\d+(?:\.\d+)?-(\w{1,2})(?![\w.])")
+
+
+def _gt_fault_trips(faults):
+    """{fault: [(a, b, ck, c), ...]} -- the branches each GEN_TEST fault trips,
+       read from the project's fault list ("765911-531469-345-1" elements).
+       None when no list is found."""
+    paths = [shared_faults_path(GEN_TEST_PROJECT)]
+    paths += glob.glob(os.path.join(results_dir(_gt_case(), GEN_TEST_PROJECT, GEN_TEST_MODE),
+                                    "faults", "*.csv"))
+    want = set(str(f).strip().upper() for f in faults)
+    for p in paths:
+        if not p or not os.path.isfile(p):
+            continue
+        out = {}
+        try:
+            with open(p, encoding="latin-1") as fh:
+                for ln in fh:
+                    m = re.match(r"^\s*\"?([A-Za-z_]*\d+)", ln)
+                    if not m or m.group(1).upper() not in want:
+                        continue
+                    out[m.group(1).upper()] = [
+                        (int(e.group(1)), int(e.group(2)), e.group(4).strip(),
+                         int(e.group(3)) if e.group(3) else 0)
+                        for e in _GT_ELEM.finditer(ln)]
+        except Exception as e:
+            print("[gen-test] could not read the fault list %s: %s" % (p, e))
+            continue
+        if out:
+            return out
+    return None
+
+
+def _gt_edges(br):
+    a, b, _ck, c = br
+    return [(a, b), (a, c)] if c else [(a, b)]
+
+
+def _gt_fault_conflict(net, br, trips):
+    """Why opening branch `br` spoils a fault of the run, or "".
+       * the fault trips `br` itself: PSS/E is asked to open an open branch,
+         and the event is a bus fault with nothing removed;
+       * `br` open plus the fault's trips cut buses off the grid that neither
+         cuts off alone: the fault then islands them (e.g. the POI)."""
+    key = (frozenset([x for x in (br[0], br[1], br[3]) if x]), br[2])
+    alone = set(frozenset(x) for x in _gt_islands(net, _gt_edges(br)))
+    for f in sorted(trips, key=_fault_key):
+        tr = trips[f]
+        if any((frozenset([x for x in (t[0], t[1], t[3]) if x]), t[2]) == key for t in tr):
+            return "%s trips this branch" % f
+        if not tr:
+            continue
+        te = [e for t in tr for e in _gt_edges(t)]
+        base = set(frozenset(x) for x in _gt_islands(net, te))
+        new = [x for x in _gt_islands(net, te + _gt_edges(br))
+               if frozenset(x) not in base and frozenset(x) not in alone]
+        if new:
+            big = max(new, key=len)
+            return "%s would island %d bus(es) incl. %s" % (f, len(big), min(big))
+    return ""
+
+
 def _gt_each_lines():
     """GEN_TEST_LINES_EACH: one plan entry per line (and, with
        GEN_TEST_LINES_XFMR, 2- and 3-winding transformer) near the POI, opened on
@@ -17375,7 +17438,12 @@ def _gt_each_lines():
             want[(frozenset(bs), ck)] = x
     kv = lambda n: net["bus"].get(n, {}).get("kv") or 0.0
     nm = lambda n: (net["bus"].get(n, {}).get("name") or "").strip()
-    out, radial, found = [], [], set()
+    trips = _gt_fault_trips(_gt_expand(GEN_TEST_FAULTS)) if GEN_TEST_LINES_SKIP_FAULTED else {}
+    if trips is None:
+        print("[gen-test] *** fault list not found -- line runs are NOT checked against the "
+              "faults' trips ***")
+        trips = {}
+    out, radial, found, clash = [], [], set(), []
     for r in net["brn"]:
         a, b, ck, z, typ, p = r[:6]
         c = r[6] if len(r) > 6 else 0
@@ -17404,6 +17472,10 @@ def _gt_each_lines():
                 radial.append(_gt_brname(br))
                 continue
             dscn = sorted(list(x)[0] for x in dead)
+        why = _gt_fault_conflict(net, (a, b, ck, c), trips) if trips else ""
+        if why:
+            clash.append("%s (%s)" % (_gt_brname(br), why))
+            continue
         h = max(near.get(x, (0, 0))[0] for x in (a, b)) if a in near and b in near else ""
         out.append({"bus": a, "id": ("BR%dT%dC%s" % (b, c, ck)) if c else ("BR%dC%s" % (b, ck)),
                     "branches": [br], "dscn": dscn,
@@ -17420,6 +17492,9 @@ def _gt_each_lines():
     if radial:
         print("[gen-test] %d radial line(s)/transformer(s) skipped (opening them cuts buses off "
               "the grid): %s" % (len(radial), ", ".join(radial)))
+    if clash:
+        print("[gen-test] %d line(s)/transformer(s) skipped (they clash with a fault of the "
+              "run): %s" % (len(clash), "; ".join(clash)))
     print("[gen-test] %d line(s)/transformer(s) %s, each OPENED on its own: %s"
           % (len(out), "from GEN_TEST_LINES_LIST" if want is not None else
              "within %s buses of POI %s (>= %.0f kV)" % (GEN_TEST_LINES_HOPS, GEN_TEST_POI,
