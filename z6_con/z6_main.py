@@ -261,18 +261,26 @@ GEN_TEST_BY_PROJECT = {
         "POI": 765911,
         "EXTRA_GENS": [],
         "EGF_EDITS": {
-            "KHV":          [("REGCA1", {"Volim": 1.20, "Khv": 1.0, "Accel": 0.7})],   # done
-            "V115_K1":      [("REGCA1", {"Volim": 1.15, "Khv": 1.0, "Accel": 0.7})],   # Volim effect alone
+            # finished -- kept so they stay in the reports (reused, not run again)
+            "KHV":          [("REGCA1", {"Volim": 1.20, "Khv": 1.0, "Accel": 0.7})],
+            "V115_K1":      [("REGCA1", {"Volim": 1.15, "Khv": 1.0, "Accel": 0.7})],
             "V115_K2":      [("REGCA1", {"Volim": 1.15, "Khv": 2.0, "Accel": 0.7})],
-            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7})],
+            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7})],   # best so far
             "V120_K1_A001": [("REGCA1", {"Volim": 1.20, "Khv": 1.0})],                # Accel left as in the deck
-            # overnight: built on the best so far (V110_K2), one change at a time
-            "V105_K2":      [("REGCA1", {"Volim": 1.05, "Khv": 2.0, "Accel": 0.7})],   # absorb Mvar earlier
-            "V110_K5":      [("REGCA1", {"Volim": 1.10, "Khv": 5.0, "Accel": 0.7})],   # absorb Mvar harder
-            "V105_K5":      [("REGCA1", {"Volim": 1.05, "Khv": 5.0, "Accel": 0.7})],   # both
-            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],  # more absorb headroom
+            # REGCA1 around V110_K2 -- ONE NAME PER SET OF VALUES (a name is its run folder)
             "V110_K2_A05":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],   # Accel sensitivity
-            "V110_K2_A09":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.9})],
+            "V110_K2_A10":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
+            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],  # more absorb headroom
+            # REECA1 Kqv on top of V110_K2: reactive current per pu outside Vdip..Vup
+            # (above Vup it ABSORBS). Lower Vup = acts on the post-clearing spike.
+            "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 0.0})],                                # no Iq injection: is Kqv the driver?
+            "V110_K2_KQV5": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 5.0})],
+            "V110_K2_KQV3_VUP110": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                                    ("REECA1", {"Kqv": 3.0, "Vup": 1.10})],
+            "V110_K2_KQV5_VUP110": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                                    ("REECA1", {"Kqv": 5.0, "Vup": 1.10})],
         },
     },
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
@@ -17792,6 +17800,10 @@ def _gt_egf_entries():
         if not edits:
             continue
         nm = re.sub(r"[^A-Za-z0-9]", "", str(name)) or "EDIT"
+        if any(g["id"] == "EGF%s" % nm for g in out):
+            # "V110_K2" and "V110K2" are one folder -- the second would reuse the first
+            raise RuntimeError("GEN_TEST_EGF_EDITS: %r and another entry both become run folder "
+                               "EGF%s -- give them names that differ in letters or digits" % (name, nm))
         out.append({"bus": int(GEN_TEST_POI), "id": "EGF%s" % nm, "egf": edits, "hops": "",
                     "z": None, "mw": None, "mvar": None, "kind": "EGF .dyr EDIT",
                     "name": "EDIT %s" % nm, "models": [_gt_egf_text(edits)]})
@@ -18350,6 +18362,48 @@ def _gt_measure(rdir, faults):
     return res
 
 
+_GT_EGF_WARNED = set()
+
+
+def _gt_egf_mismatch(rdir, g):
+    """Why a .dyr-edit run folder does NOT hold this entry's edits, or None.
+
+       The folder is named after the EGF_EDITS entry, so an entry whose values
+       were changed but whose name was kept pointed at the old run -- and the
+       report filed those results under the new values. The study writes what
+       it changed to EGF_DYR_EDITS.txt; that is compared with the entry. An
+       older run without the file cannot be checked and is taken as it is."""
+    fp = os.path.join(rdir, "EGF_DYR_EDITS.txt")
+    if not os.path.isfile(fp):
+        return None
+    got = set()
+    try:
+        with open(fp, "r", errors="ignore") as fh:
+            for ln in fh:
+                x = re.match(r"^\S+ '[^']*' (\S+) (\S+): \S+ -> (\S+)\s*$", ln.strip())
+                if x:
+                    try:
+                        got.add((x.group(1).upper(), x.group(2).upper(), round(float(x.group(3)), 6)))
+                    except ValueError:
+                        pass
+    except Exception:
+        return None
+    if not got:
+        return None
+    want = set()
+    for mdl, d in g["egf"]:
+        for c, v in d.items():
+            try:
+                want.add((str(mdl).strip().upper(), str(c).strip().upper(), round(float(v), 6)))
+            except (TypeError, ValueError):
+                return None
+    if got == want:
+        return None
+    return "EGF_DYR_EDITS.txt has %s, the panel entry %s" % (
+        ", ".join("%s %s=%g" % t for t in sorted(got - want)) or "fewer changes",
+        ", ".join("%s %s=%g" % t for t in sorted(want - got)) or "fewer changes")
+
+
 def _gt_done(rdir, faults, g=None):
     """Finished = every fault scored, or the study wrote ALL_DONE AND its
        criteria report (a fault it gave up on has no verdict but is not run
@@ -18363,6 +18417,16 @@ def _gt_done(rdir, faults, g=None):
        reads SKIP -- also when an older run on disk scored it: that result
        was a fault with nothing removed, or an island."""
     m = _gt_measure(rdir, faults)
+    if g and g.get("egf"):
+        why = _gt_egf_mismatch(rdir, g)
+        if why:
+            # the folder holds a run of OTHER values under this name: not this
+            # entry's result -- run it again (the folder is moved aside first)
+            if rdir not in _GT_EGF_WARNED:
+                _GT_EGF_WARNED.add(rdir)
+                print("[gen-test] *** %s: %s -- not reused, runs again ***"
+                      % (os.path.basename(rdir), why))
+            return False, m
     for f in ((g or {}).get("skip") or {}):
         if f in m:
             m[f] = {"verdict": "SKIP", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {}}
