@@ -248,7 +248,7 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
 GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
-GEN_TEST_PROJECTS = []                       # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
+GEN_TEST_PROJECTS = ["SantaFe", "EmpirePrairie"]  # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
 GEN_TEST_PROJECT = "SantaFe"                 # the one project run when GEN_TEST_PROJECTS = []
 GEN_TEST_CASE = "base"                       # "base" | "proj"
 GEN_TEST_FAULTS = ["F01-F04"]                # same syntax as ONLY_FAULTS
@@ -261,12 +261,6 @@ GEN_TEST_BY_PROJECT = {
         "POI": 765911,
         "EXTRA_GENS": [],
         "EGF_EDITS": {
-            # finished -- kept so they stay in the reports (reused, not run again)
-            "KHV":          [("REGCA1", {"Volim": 1.20, "Khv": 1.0, "Accel": 0.7})],
-            "V115_K1":      [("REGCA1", {"Volim": 1.15, "Khv": 1.0, "Accel": 0.7})],
-            "V115_K2":      [("REGCA1", {"Volim": 1.15, "Khv": 2.0, "Accel": 0.7})],
-            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7})],   # best so far
-            "V120_K1_A001": [("REGCA1", {"Volim": 1.20, "Khv": 1.0})],                # Accel left as in the deck
             # REGCA1 around V110_K2 -- ONE NAME PER SET OF VALUES (a name is its run folder)
             "V110_K2_A05":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],   # Accel sensitivity
             "V110_K2_A10":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
@@ -283,7 +277,23 @@ GEN_TEST_BY_PROJECT = {
     },
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
     "EastFork":      {"POI": 531623, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCAU1 already Volim 1.2 / Khv 0.2 / Accel 0.7
-    "EmpirePrairie": {"POI": 761383, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCA1 already Volim 1.2 / Khv 0.2 / Accel 0.7
+    "EmpirePrairie": {
+        "POI": 761383,
+        "EXTRA_GENS": [],
+        "EGF_EDITS": {                               # deck REGCA1: Volim 1.2 / Khv 0.2 / Accel 0.7
+            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7})],   # base of the rest
+            "V110_K2_A05":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],
+            "V110_K2_A10":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
+            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],
+            # needs REECA1 at the feeders -- a model not there stops only that run (listed in its log)
+            "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 0.0})],
+            "V110_K2_KQV2": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 2.0})],
+            "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 4.0})],
+        },
+    },
 }
 # -- 3c. machine runs (each one, and each EGF_EDITS run, is done in every GEN_TEST_GEN_SCENARIOS)
 GEN_TEST_REFERENCE_RUNS = True               # all in service (needed to compare; finished ones are reused)
@@ -304,11 +314,12 @@ GEN_TEST_LINES_HOPS = 4                      # lines: both ends within this many
 # -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
-    ("s3_it400_a020",        None, 400,  0.20, None),     # reference: finished with everything in service and the POI plants off
-    ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10 -- fewest non-converged steps
-    ("s8_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
+    ("s1_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10
+    ("s2_it300_a020",        None, 300,  0.20, None),     # 300 iterations, acceleration 0.20
+    ("s3_it250_a030",        None, 250,  0.30, None),     # 250 iterations, acceleration 0.30
+    ("s4_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
-GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s6_it400_a010"]  # "all" | "best2" | [...] -- for the 3c runs (finished s8 runs stay in the reports)
+GEN_TEST_GEN_SCENARIOS = "all"               # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
 # rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
