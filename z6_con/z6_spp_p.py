@@ -8148,7 +8148,71 @@ def _resolve_project_gens():
               "name the (bus, id) pairs explicitly if the ids differ."
               % (PROJECT_GEN_ID,))
     print("")
+    _pg_used_write(PROJECT_GENS)
     return PROJECT_GENS
+
+
+# THE MACHINE IDS THE CASE ACTUALLY HOLDS, for the plots. PROJECT_GENS starts
+# from the feeder list with PROJECT_GEN_ID ("B"); _resolve_project_gens() puts
+# the real id in its place -- but only in the process that built the case. The
+# plot children never run it, so the base-case pages were headed "PROJ 765912
+# 'B'" over the EXISTING unit '1'. The build writes what it found here, and
+# plot_label() reads it back.
+def _pg_used_path():
+    return os.path.join(STUDY_DIR, "%s_%s_project_gens.txt" % (CASE_TAG, RUN_PROJECT))
+
+
+def _pg_used_write(gens):
+    try:
+        with open(_pg_used_path(), "w") as _fh:
+            for _b, _m in gens:
+                _fh.write("%d\t%s\n" % (int(_b), str(_m).strip()))
+    except Exception as _e:
+        print("  [proj] could not record the machine ids (%s) -- plots keep the listed ids" % _e)
+
+
+_PG_USED = [None, None]
+
+
+def _pg_used_read():
+    """[(bus, id)] as the build found them in the case, or None."""
+    p = _pg_used_path()
+    try:
+        mt = os.path.getmtime(p)
+    except Exception:
+        return None
+    if _PG_USED[0] != mt:
+        out = []
+        try:
+            with open(p) as _fh:
+                for _ln in _fh:
+                    _x = _ln.rstrip("\r\n").split("\t")
+                    if _x and _x[0].strip():
+                        out.append((int(_x[0]), _x[1].strip() if len(_x) > 1 else ""))
+        except Exception:
+            return None
+        _PG_USED[0], _PG_USED[1] = mt, out
+    return _PG_USED[1]
+
+
+def _proj_plot_text(n):
+    """What a PLOT calls project machine n: the bus and the id the case holds.
+       The base case has no project -- its PROJ<n> channels are the EXISTING
+       units at the feeders -- so it says EXIST there. Plots only: scoring and
+       the comparison keep chan_label()'s "PROJ <bus>", which they match on."""
+    txt = _proj_bus_text(n)
+    rec = _pg_used_read()
+    _mb = re.search(r"\b(\d{3,})\b", txt)
+    if _mb and rec and 1 <= n <= len(rec) and rec[n - 1][0] == int(_mb.group(1)):
+        _own = re.search(r"( \[[^\]]*\])$", txt)
+        txt = "PROJ %d '%s'%s" % (rec[n - 1][0], rec[n - 1][1], _own.group(1) if _own else "")
+    elif RUN_KIND == "BASE":
+        # no record (a run built before it existed): the listed id is the
+        # BESS's, not the existing unit's -- leave it out rather than show it
+        txt = txt.replace(" '%s'" % str(PROJECT_GEN_ID).strip(), "", 1)
+    if RUN_KIND == "BASE" and txt.startswith("PROJ "):
+        txt = "EXIST " + txt[5:]
+    return txt
 
 
 def _bess_rating_mw(project, mw_level):
@@ -20665,6 +20729,9 @@ def plot_label(title, cat, fault_bus=None):
        DISTANCE_ON_ETERM is kept as the switch for the ETERM channels, since
        those duplicate a bus voltage and the extra text is redundant there."""
     base = chan_label(title)
+    _pn = re.match(r"PROJ(\d+)", re.sub(r"^[^A-Za-z]+", "", chan_core(title)).upper())
+    if _pn:
+        base = _proj_plot_text(int(_pn.group(1)))
     # THE POI TIE FLOWS: say which tie, or that it is the total of them.
     _pm = re.search(r"POI (POWR|VARS) (\d+) (MW|MVAR)(?: F(\d+))?(?: T\d+)?"
                     r"(?: TOTAL \((\d+) TIES\))?", chan_core(title).upper())
