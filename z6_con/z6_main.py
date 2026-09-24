@@ -658,6 +658,9 @@ GEN_TEST_CAPS_SCENARIOS = ["s0_asis"]   # solver scenario(s) for it -- default s
 GEN_TEST_CAPS_LIST = []            # [] = found automatically: fixed caps (+Mvar) and switched shunts
                                    # CAPACITIVE NOW, within GEN_TEST_CAPS_HOPS | or fixed:
                                    # [(763674, "1", "F"), (539715, "", "S")]  F = fixed, S = switched
+GEN_TEST_CAPS_EACH = True          # True = ALSO every capacitor bank near the POI off ON ITS OWN, as one more
+                                   # "machine" of the list -- run under the same scenarios as the machines
+GEN_TEST_CAPS_EACH_HOPS = None     # None = GEN_TEST_HOPS (the machines' radius) | N buses from the POI
 # Solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL). None = the study's own value
 # (DELT 1/4 cycle from DELT_CYCLES above, MAXITER 60, ACCEL 0.60, TOL 0.0000095).
 # Tags: letters, digits and _ only (they become folder names).
@@ -17505,24 +17508,20 @@ def _gt_net():
     return _GT_NET[0]
 
 
-def _gt_find_caps():
-    """GEN_TEST_CAPS_OFF: one plan entry holding every in-service capacitor
-       bank within GEN_TEST_CAPS_HOPS of the POI -- fixed shunts with +Mvar and
-       switched shunts that can go capacitive (BMAX > 0) -- or None."""
-    if not GEN_TEST_CAPS_OFF:
-        return None
+def _gt_cap_list(hops):
+    """[(bus, id, "F"|"S", Mvar, hops)]: GEN_TEST_CAPS_LIST, or every in-service
+       capacitor bank within `hops` of the POI -- fixed shunts with +Mvar and
+       switched shunts capacitive now. None when the network cannot be read."""
     if GEN_TEST_CAPS_LIST:
-        caps = [(int(c[0]), str(c[1]).strip() if len(c) > 1 else "",
+        return [(int(c[0]), str(c[1]).strip() if len(c) > 1 else "",
                  (str(c[2]).strip().upper() if len(c) > 2 else ("F" if len(c) > 1 and str(c[1]).strip() else "S"))[:1],
                  0.0, "") for c in GEN_TEST_CAPS_LIST]
-        return _gt_caps_entry(caps)
     net = _gt_net()
     if net is None:
-        print("[gen-test] caps-off run skipped: the network could not be read")
         return None
     import z6_spike_find as S
     caps = []
-    for b, h, z in S.nearby(net, GEN_TEST_POI, GEN_TEST_CAPS_HOPS):
+    for b, h, z in S.nearby(net, GEN_TEST_POI, hops):
         for d in net["dev"].get(b, []):
             if d.get("status", 1) != 1:
                 continue
@@ -17533,6 +17532,18 @@ def _gt_find_caps():
                 # CAPACITIVE NOW only: one sitting on a reactor step is absorbing,
                 # and switching it off would RAISE the voltage -- the opposite test
                 caps.append((b, "", "S", d.get("mvar") or 0.0, h))
+    return caps
+
+
+def _gt_find_caps():
+    """GEN_TEST_CAPS_OFF: one plan entry holding every capacitor bank within
+       GEN_TEST_CAPS_HOPS of the POI, all off together -- or None."""
+    if not GEN_TEST_CAPS_OFF:
+        return None
+    caps = _gt_cap_list(GEN_TEST_CAPS_HOPS)
+    if caps is None:
+        print("[gen-test] caps-off run skipped: the network could not be read")
+        return None
     if not caps:
         print("[gen-test] caps-off run skipped: no capacitor bank within %s buses of %s"
               % (GEN_TEST_CAPS_HOPS, GEN_TEST_POI))
@@ -17549,6 +17560,29 @@ def _gt_caps_entry(caps):
             "hops": "", "z": None, "mw": None, "mvar": sum(q for _b, _i, _k, q, _h in caps),
             "kind": "%d CAP BANKS" % len(caps), "name": "ALL CAPS <=%s" % GEN_TEST_CAPS_HOPS,
             "models": ["%d%s" % (b, (":" + i) if i else "") + ":" + k for b, i, k, _q, _h in caps]}
+
+
+def _gt_each_caps():
+    """GEN_TEST_CAPS_EACH: one "machine" entry per capacitor bank near the POI,
+       so each is switched off on its own under the machines' scenarios."""
+    if not GEN_TEST_CAPS_EACH:
+        return []
+    hops = GEN_TEST_CAPS_EACH_HOPS if GEN_TEST_CAPS_EACH_HOPS is not None else GEN_TEST_HOPS
+    caps = _gt_cap_list(hops)
+    if caps is None:
+        print("[gen-test] single cap-bank runs skipped: the network could not be read")
+        return []
+    out = []
+    for b, i, k, q, h in caps:
+        out.append({"bus": int(b), "id": "CAPF%s" % i if k == "F" else "CAPSW",
+                    "caps": [(b, i, k)], "hops": h, "z": None, "mw": None, "mvar": q,
+                    "kind": "FIXED CAP" if k == "F" else "SWITCHED SHUNT",
+                    "name": "CAP %s %.0f Mvar" % ("F" if k == "F" else "SW", q),
+                    "models": ["%d%s:%s" % (b, (":" + i) if i else "", k)]})
+    print("[gen-test] %d capacitor bank(s) within %s buses of POI %s, each switched off on its "
+          "own: %s" % (len(out), hops, GEN_TEST_POI,
+                        ", ".join("%d %s" % (g["bus"], g["name"]) for g in out) or "none"))
+    return out
 
 
 def _gt_find_gens():
@@ -18263,6 +18297,7 @@ def run_gen_test():
     gens = _gt_find_gens()
     if gens is None:
         return 2
+    gens = gens + _gt_each_caps()
     gp = os.path.join(COMPARE_DIR, "GEN_TEST_GENS_%s.txt" % GEN_TEST_PROJECT)
     with open(gp, "w") as fh:
         fh.write("machines within %s buses of POI %s (in service, |MW| >= %s), closest first\n\n"
