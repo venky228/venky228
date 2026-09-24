@@ -273,15 +273,13 @@ GEN_TEST_LINES_SKIP_FAULTED = True           # True = skip a line a fault trips,
 # GEN_TEST_SCENARIOS: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
-    ("s1_delt8",             8,    None, None, None),     # 1/8-cycle time step
-    ("s2_it200_a030",        None, 200,  0.30, None),     # more iterations, lower acceleration
-    ("s3_it400_a020",        None, 400,  0.20, None),
-    ("s4_tol1em4",           None, None, None, 0.0001),   # looser network tolerance
-    ("s5_delt8_it400_a020",  8,    400,  0.20, None),     # all together
-    ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10
-    ("s7_delt8_it400_a010",  8,    400,  0.10, None),     # same, 1/8-cycle time step
+    ("s3_it400_a020",        None, 400,  0.20, None),     # reference: finished with everything in service and the POI plants off
+    ("s6_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10 -- fewest non-converged steps
     ("s8_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
+# dropped (their finished folders stay on disk): s1_delt8 and s4_tol1em4 changed nothing
+# against s0; s2_it200_a030, s5_delt8_it400_a020 and s7_delt8_it400_a010 gave up on
+# F01-F03 when a machine was off
 GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s6_it400_a010", "s8_it100_a080"]  # "all" | "best2" | [...] -- machine-off runs
 GEN_TEST_CLEAN_BUILD = True                  # True = delete each finished run's .sav/.cnv/.snp (disk)
 GEN_TEST_START_GAP_MIN = 20                  # max minutes between run starts
