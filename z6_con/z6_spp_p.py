@@ -19882,24 +19882,40 @@ def _panel_style(cat, ptitle):
     yl = _PLOT_YSHORT.get(cat, str(cat))
     if cat == "ANGLE" and ("BUS VOLTAGE ANGLE" in s.upper() or head.startswith("BUS VOLTAGE ANGLE")):
         q, yl = "BUS ANGLE", "Bus V angle (deg)"
+    # THE BADGE NAMES THE BUS AND THE QUANTITY ("765935 P", "531447 Q"), and
+    # the section heading ("BUS VOLTAGES AND OTHER MONITORED SIGNALS", ...) is
+    # no longer repeated on every panel -- on a machine's P or Q it read as if
+    # the panel were a bus voltage.
+    _mb = re.search(r"\b(\d{3,})\b", lbl)
+    bus = _mb.group(1) if _mb else ""
     if re.match(r"POI \d+ TOTAL", L):
-        q = "POI TOTAL " + q
+        q = "POI %s TOTAL %s" % (bus, q)
         yl = "POI total " + yl
-        head = ""
     elif re.match(r"POI \d+ ONE TIE", L):
-        q = "POI TIE " + q
+        q = "POI %s TIE %s" % (bus, q)
         yl = "One tie " + yl
         col = _PLOT_TIE_COLORS.get(cat, col)
-        head = ""
-    elif re.match(r"POI \d+", L) and cat == "VOLT":
-        q = "POI V"
+    elif re.match(r"POI \d+", L):
+        q = "POI %s %s" % (bus, "V" if cat == "VOLT" else q)
     elif "<-- FAULTED BUS" in L or head.startswith("FAULTED BUS"):
-        q = "FAULTED BUS " + ("V" if cat == "VOLT" else q)
-    elif cat == "VOLT" and L.startswith("PROJ "):
-        q = "PROJ BUS V"
-    elif L.startswith("PROJ "):
-        q = "PROJ " + q
-    txt = ("%s  |  %s" % (head, lbl)) if head else lbl
+        q = "FAULTED BUS %s %s" % (bus, "V" if cat == "VOLT" else q)
+    elif head.startswith("SWING"):
+        q = "SWING %s %s" % (bus, q)
+    else:
+        q = ("%s %s" % (bus, "V" if cat == "VOLT" else q)).strip()
+    q = re.sub(r"\s+", " ", q).strip()
+    # NOTHING SAID TWICE: what the badge already says (the bus, POI, TOTAL,
+    # TIE, FAULTED BUS) comes off the title text.
+    txt = lbl
+    if bus:
+        txt = re.sub(r"^POI %s\s*(TOTAL\s*=\s*|ONE TIE,?\s*)?" % bus, "", txt)
+        txt = re.sub(r"^(PROJ [ES]GF) %s\b" % bus, r"\1", txt)
+        txt = re.sub(r"^%s\b\s*" % bus, "", txt)
+    txt = txt.replace("   <-- FAULTED BUS", "").replace("(POI, ", "(").replace(" (POI)", "")
+    _mp = re.match(r"^\(([^()]*)\)\s*(.*)$", txt)
+    if _mp:                             # a bare "(4 nodes from POI, ...)" loses its brackets
+        txt = (_mp.group(1) + ("   " + _mp.group(2) if _mp.group(2) else "")).strip()
+    txt = txt.strip() or lbl
     return q, col, yl, txt
 
 
@@ -20090,10 +20106,16 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
     for pi, (cat, ptitle, series) in enumerate(chunk):
         badge, col, yl, txt = _panel_style(cat, ptitle)
         bw = _pt_width(rend, badge, BFS, weight="bold") + 0.14
+        # THE NOTES (P90 recovery, POI ripple) ON A LINE OF THEIR OWN, in
+        # blue -- text only, never a violation, but not to be missed either.
+        _notes = re.findall(r"\[\[(?!VIOLATION)([^\]]*)\]\]", txt)
+        txt = re.sub(r"\s*\[\[(?!VIOLATION)[^\]]*\]\]", "", txt)
         tl = _fit_lines(rend, txt, (aw - bw - 0.10) * 0.97, TFS,
                         3 if PLOT_VIOLATION_TAG in str(ptitle) else 2)
+        nl = (_fit_lines(rend, "NOTE (text only, not scored): " + "; ".join(_notes),
+                         (aw - bw - 0.10) * 0.97, TFS, 2) if _notes else [])
         nrows = min(len(series), PLOT_VALUE_ROWS_MAX) if PLOT_SHOW_VALUES else 0
-        blocks.append((cat, ptitle, series, badge, col, yl, tl, bw, nrows))
+        blocks.append((cat, ptitle, series, badge, col, yl, tl + nl, bw, nrows, len(tl)))
     def _fixed(nt, nrows, extra):
         tab = ((1 + nrows + extra) * ln(TAB) + 0.04) if PLOT_SHOW_VALUES else 0.0
         return max(nt * ln(TFS), ln(BFS) + 0.06) + 0.07 + TICKS + tab + GAP
@@ -20128,15 +20150,19 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
     except Exception:
         pass
     y = H - HEAD
-    for pi, (cat, ptitle, series, badge, col, yl, tl, bw, nrows) in enumerate(blocks):
+    for pi, (cat, ptitle, series, badge, col, yl, tl, bw, nrows, ntl) in enumerate(blocks):
         vio = PLOT_VIOLATION_TAG in str(ptitle)
         # badge + title
         fig.text(fx(LM + 0.05), fy(y - 0.02), badge, fontsize=BFS, fontweight="bold",
                  color="white", va="top", ha="left",
                  bbox=dict(boxstyle="round,pad=0.25", fc=col, ec="none"))
-        fig.text(fx(LM + bw + 0.10), fy(y), "\n".join(tl), fontsize=TFS, va="top",
+        fig.text(fx(LM + bw + 0.10), fy(y), "\n".join(tl[:ntl]), fontsize=TFS, va="top",
                  ha="left", linespacing=1.15,
                  color=("#b00000" if vio else "#222222"))
+        if tl[ntl:]:
+            fig.text(fx(LM + bw + 0.10), fy(y - ntl * ln(TFS)), "\n".join(tl[ntl:]),
+                     fontsize=TFS, va="top", ha="left", linespacing=1.15,
+                     color="#1f4e9c", fontweight="bold")
         th = max(len(tl) * ln(TFS), ln(BFS) + 0.06) + 0.07
         top = y - th
         ax = fig.add_axes([fx(LM), fy(top - ah), aw / W, ah / H])
@@ -20172,7 +20198,8 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
             yy = yb - ln(TAB)
             srows = chunk_stats[pi] if pi < len(chunk_stats) else None
             for si, (lbl, v) in enumerate(series[:nrows]):
-                nm = re.sub(r"\s+\[\[.*$", "", str(lbl))
+                # one trace: the badge names it; several: each its own label
+                nm = badge if len(series) == 1 else re.sub(r"\s+\[\[.*$", "", str(lbl))
                 if len(nm) > nch:
                     nm = nm[:nch - 3].rstrip() + "..."
                 cells = (nm,) + ((srows[si] if (srows is not None and si < len(srows))
@@ -20219,6 +20246,116 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
              "fault cleared     red frame + red circle = SPP violation (dotted = the limit)",
              fontsize=6.5, color="#666666", va="bottom")
     return fig
+
+
+def _pdf_add_links(path, links):
+    """CLICKABLE PAGES, added to a finished matplotlib PDF. matplotlib cannot
+       write a link to another page of the same file, so this appends them as a
+       standard PDF incremental update (new /Link annotations + the pages that
+       carry them + a new xref), standard library only.
+
+       links: [(on_page, (x0, y0, x1, y1) in points, to_page)], pages 0-based.
+       Any problem leaves the file exactly as it was -- links are a
+       convenience, never a reason to lose a PDF."""
+    if not links:
+        return 0
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        sx = data.rfind(b"startxref")
+        xoff = int(data[sx + 9:].split()[0])
+        # the classic xref table matplotlib writes: "xref / <first> <count> / entries"
+        offs = {}
+        pos = xoff
+        if data[pos:pos + 4] != b"xref":
+            return 0
+        pos += 4
+        toks = data[pos:].split(b"trailer", 1)[0].split()
+        i = 0
+        while i + 1 < len(toks):
+            first, cnt = int(toks[i]), int(toks[i + 1])
+            i += 2
+            for k in range(cnt):
+                o, _g, flag = toks[i], toks[i + 1], toks[i + 2]
+                i += 3
+                if flag == b"n":
+                    offs[first + k] = int(o)
+        trailer = data[data.find(b"trailer", xoff):sx]
+        size = int(re.search(br"/Size\s+(\d+)", trailer).group(1))
+        root = re.search(br"/Root\s+(\d+)\s+0\s+R", trailer).group(1)
+        info = re.search(br"/Info\s+(\d+)\s+0\s+R", trailer)
+
+        def body(n):
+            a = offs[n]
+            a = data.index(b"obj", a) + 3
+            return data[a:data.index(b"endobj", a)].strip()
+
+        cat = body(int(root))
+        pages_ref = int(re.search(br"/Pages\s+(\d+)\s+0\s+R", cat).group(1))
+
+        def kids(n):
+            b = body(n)
+            if re.search(br"/Type\s*/Page\b(?!s)", b):
+                return [n]
+            m = re.search(br"/Kids\s*\[([^\]]*)\]", b)
+            out = []
+            for r in re.findall(br"(\d+)\s+0\s+R", m.group(1) if m else b""):
+                out.extend(kids(int(r)))
+            return out
+
+        pages = kids(pages_ref)
+        by_page = {}
+        for on, rect, to in links:
+            if 0 <= on < len(pages) and 0 <= to < len(pages):
+                by_page.setdefault(on, []).append((rect, to))
+        if not by_page:
+            return 0
+        new, nxt = [], size
+        for on in sorted(by_page):
+            refs = []
+            for (x0, y0, x1, y1), to in by_page[on]:
+                new.append((nxt, ("<< /Type /Annot /Subtype /Link /Rect [ %.2f %.2f %.2f %.2f ] "
+                                  "/Border [ 0 0 0 ] /Dest [ %d 0 R /XYZ null null null ] >>"
+                                  % (x0, y0, x1, y1, pages[to])).encode("ascii")))
+                refs.append(("%d 0 R" % nxt).encode("ascii"))
+                nxt += 1
+            pb = body(pages[on])
+            m = re.search(br"/Annots\s*\[([^\]]*)\]", pb)
+            if m:
+                pb = pb[:m.start()] + b"/Annots [ " + m.group(1).strip() + b" " + \
+                    b" ".join(refs) + b" ]" + pb[m.end():]
+            else:
+                m2 = re.search(br"/Annots\s+(\d+)\s+0\s+R", pb)
+                if m2:
+                    # an indirect array: fold its entries in directly
+                    old = body(int(m2.group(1))).strip().lstrip(b"[").rstrip(b"]")
+                    pb = pb[:m2.start()] + b"/Annots [ " + old.strip() + b" " + \
+                        b" ".join(refs) + b" ]" + pb[m2.end():]
+                else:
+                    k = pb.rfind(b">>")
+                    pb = pb[:k] + b" /Annots [ " + b" ".join(refs) + b" ] " + pb[k:]
+            new.append((pages[on], pb))
+        out = bytearray(b"\n")
+        base = len(data)
+        xref = []
+        for num, b in new:
+            xref.append((num, base + len(out)))
+            out += ("%d 0 obj\n" % num).encode("ascii") + b + b"\nendobj\n"
+        xpos = base + len(out)
+        out += b"xref\n"
+        for num, o in sorted(xref):
+            out += ("%d 1\n%010d 00000 n \n" % (num, o)).encode("ascii")
+        out += ("trailer\n<< /Size %d /Root %s 0 R%s /Prev %d >>\nstartxref\n%d\n%%%%EOF\n"
+                % (nxt, root.decode("ascii"),
+                   (" /Info %s 0 R" % info.group(1).decode("ascii")) if info else "",
+                   xoff, xpos)).encode("ascii")
+        with open(path, "ab") as fh:
+            fh.write(bytes(out))
+        return sum(len(v) for v in by_page.values())
+    except Exception as _e:
+        print("  [plot] %s: page links not added (%s) -- the PDF is unchanged"
+              % (os.path.basename(path), _e))
+        return 0
 
 
 def make_plots(path, is_flat, kb, tclear=None):
@@ -20358,6 +20495,7 @@ def make_plots(path, is_flat, kb, tclear=None):
                     pass
     except Exception:
         pass
+    _links, _npg = [], [0]          # clickable index rows / back links; pages written
     with PdfPages(pdf_tmp) as pdf:
         # ---------- WHAT STUDY THIS IS ----------
         try:
@@ -20368,6 +20506,7 @@ def make_plots(path, is_flat, kb, tclear=None):
             _fig0.text(0.06, 0.90, "\n".join(_plines), fontsize=9,
                        family="monospace", va="top")
             pdf.savefig(_fig0)
+            _npg[0] += 1
             plt.close(_fig0)
         except Exception as _e:
             print("  [plot] %s: could not write the parameter page (%s) -- the "
@@ -20380,7 +20519,7 @@ def make_plots(path, is_flat, kb, tclear=None):
                      fontsize=13, fontweight="bold", va="top")
             fig.text(0.06, 0.915,
                      "Every panel in this PDF that breaks an SPP limit, worst first. "
-                     "Page numbers are this document's.",
+                     "Page numbers are this document's -- CLICK A ROW to go to its page.",
                      fontsize=8, va="top")
             fig.text(0.06, 0.895,
                      "%d of %d panel(s) broke a limit.%s"
@@ -20392,12 +20531,28 @@ def make_plots(path, is_flat, kb, tclear=None):
                      % ("Page", "Quantity", "Element", "What it broke"),
                      fontsize=8, family="monospace", fontweight="bold", va="top")
             _y = 0.850
+            _W0, _H0 = 11.0 * 72.0, 8.5 * 72.0
             for (pno, quan, elem, why) in chunk:
+                # the bus and its distance from the POI, not a label cut
+                # mid-word at 30 characters
+                _e = str(elem)
+                _me = re.match(r"(.*?)\s*\(([^,)]*)", _e)
+                if _me and _me.group(2).strip():
+                    _e = "%s (%s)" % (_me.group(1).strip(), _me.group(2).strip())
                 fig.text(0.06, _y, "%-6s %-9s %-30s %s"
-                         % (pno, str(quan)[:9], str(elem)[:30], str(why)[:78]),
-                         fontsize=7.5, family="monospace", va="top")
+                         % (pno, str(quan)[:9], _e[:30], str(why)[:78]),
+                         fontsize=7.5, family="monospace", va="top",
+                         color="#1f4e9c")
+                try:
+                    _links.append((_npg[0], (0.055 * _W0, (_y - 0.0185) * _H0 + 2,
+                                             0.97 * _W0, _y * _H0 + 2), int(pno) - 1))
+                except (TypeError, ValueError):
+                    pass
                 _y -= 0.0185
+            if pg == 0:
+                _idx0 = _npg[0]
             pdf.savefig(fig)
+            _npg[0] += 1
             plt.close(fig)
         # ---------- PANELS ----------
         for pg in range(npages):
@@ -20415,7 +20570,8 @@ def make_plots(path, is_flat, kb, tclear=None):
                     PLOT_TITLE,
                     "%s run: %s%s" % (kind_txt, name, ("     |     " + _fs) if _fs else ""),
                     # +1 for the study-parameter page, which the index counts too
-                    "page %d / %d" % (pg + 1 + _n_idx + 1, npages + _n_idx + 1),
+                    "page %d / %d%s" % (pg + 1 + _n_idx + 1, npages + _n_idx + 1,
+                                    "   (click: violations index)" if _n_idx else ""),
                     _partial_note.strip().strip("*").strip())
             except Exception as _pe:
                 # ONE PAGE THAT CANNOT BE DRAWN MUST NOT COST THE PDF. A plain
@@ -20435,8 +20591,19 @@ def make_plots(path, is_flat, kb, tclear=None):
                 for _k, (_c, _pt, _sr) in enumerate(chunk):
                     fig.text(0.06, 0.86 - 0.03 * _k, "%s  %s" % (_c, str(_pt)[:160]),
                              fontsize=7, va="top")
+            # BACK TO THE INDEX: the "page x / y" at the top right is a link
+            if _n_idx:
+                try:
+                    _wi, _hi = fig.get_size_inches()
+                    _links.append((_npg[0], ((_wi - 2.6) * 72.0, (_hi - 0.62) * 72.0,
+                                             (_wi - 0.2) * 72.0, (_hi - 0.12) * 72.0),
+                                   _idx0))
+                except Exception:
+                    pass
             pdf.savefig(fig)
+            _npg[0] += 1
             plt.close(fig)
+    _pdf_add_links(pdf_tmp, _links)
     # ONLY NOW does a file appear at the name everything else looks for.
     try:
         os.replace(pdf_tmp, pdf_path)
@@ -20819,8 +20986,11 @@ def _fault_subtitle(fault_bus):
     if not fault_bus:
         return ""
     try:
-        return "   |  fault at bus %d %s (%s)" % (int(fault_bus), sf_nm(fault_bus),
-                                                  _hop_text(int(fault_bus)))
+        _nm = str(sf_nm(fault_bus) or "").strip()
+        if _nm == str(int(fault_bus)):
+            _nm = ""                    # no name: the number is not said twice
+        return ("   |  fault at bus %d%s (%s)"
+                % (int(fault_bus), (" " + _nm) if _nm else "", _hop_text(int(fault_bus))))
     except Exception:
         return "   |  fault at bus %s" % fault_bus
 
@@ -21107,7 +21277,7 @@ def plot_label(title, cat, fault_bus=None):
             _hw = _hw.replace("existing machine(s)", "PROJ EGF machine(s)")
             base = "POI %s TOTAL = sum of %s" % (_pm.group(2), _hw)
         elif _pm.group(4):
-            base = "POI %s ONE TIE, from bus %s (part of the total)" % (_pm.group(2), _pm.group(4))
+            base = "POI %s ONE TIE, from bus %s" % (_pm.group(2), _pm.group(4))
         else:
             base = "POI %s ONE TIE (the only tie)" % _pm.group(2)
     base = _plot_fac_name(base, title)
@@ -21663,6 +21833,40 @@ def _existing_machine_series(ch, want):
     return out
 
 
+def _behind_tie(bus, poi, tie_froms, max_hops=12):
+    """True when machine `bus` reaches the POI THROUGH one of the recorded ties
+       -- its power is already inside that tie's flow. Walked on the case
+       adjacency without passing through the POI itself. None when there is no
+       adjacency to walk (then the caller cannot tell)."""
+    try:
+        bus, poi = int(bus), int(poi)
+        froms = set(int(f) for f in tie_froms if f)
+        if not froms:
+            return False
+        if bus in froms:
+            return True
+        if not _dist_nbrs(bus):
+            return None
+        seen, frontier = {bus}, {bus}
+        for _h in range(max_hops):
+            nxt = set()
+            for u in frontier:
+                for j in _dist_nbrs(u):
+                    j = int(j)
+                    if j == poi or j in seen:
+                        continue
+                    if j in froms:
+                        return True
+                    seen.add(j)
+                    nxt.add(j)
+            frontier = nxt
+            if not frontier:
+                break
+        return False
+    except Exception:
+        return None
+
+
 def _with_poi_totals(ch):
     """Add a synthetic 'POI POWR <poi> MW TOTAL' (and MVAR) series -- the number
        the POI meter reads: EVERY plant tie into the POI, new plant and existing
@@ -21678,11 +21882,12 @@ def _with_poi_totals(ch):
            765932/765935 -- so the meter reading is rebuilt from those. The
            GSU/collector losses between the terminals and the POI (about one
            percent) are not in it, and the label says so."""
-    groups = {}
+    groups, froms = {}, {}
     for k, (t, v) in ch.items():
-        m = re.search(r"POI (POWR|VARS) (\d+) (MW|MVAR)", str(t).upper())
+        m = re.search(r"POI (POWR|VARS) (\d+) (MW|MVAR)(?: F(\d+))?", str(t).upper())
         if m and "TOTAL" not in str(t).upper():
             groups.setdefault((m.group(1), m.group(2), m.group(3)), []).append(v)
+            froms.setdefault((m.group(1), m.group(2), m.group(3)), []).append(m.group(4))
     out = dict(ch)
     try:
         _poi = int(POI_BUS)
@@ -21698,11 +21903,31 @@ def _with_poi_totals(ch):
             note = None
             if len(vs) < 2:
                 ex = _existing_machine_series(ch, q)
+                # NEVER COUNT A MACHINE TWICE. A unit whose path to the POI
+                # runs through the recorded tie is already inside that tie's
+                # flow -- EmpirePrairie's base case, where the four EGF units
+                # sit behind the one tie from 761376, drew 637.9 MW "total"
+                # against a 317.9 MW tie. Only units that reach the POI some
+                # other way are added.
+                if ties and ex:
+                    _fr = froms.get((q, poi, u), [])
+                    _keep = []
+                    for (_b, _v) in ex:
+                        _bt = _behind_tie(_b, poi, _fr)
+                        if _bt is None:
+                            # no adjacency to tell by: a unit inside the tie
+                            # flow is the likelier case, and a doubled total is
+                            # the worse error -- leave it out
+                            continue
+                        if not _bt:
+                            _keep.append((_b, _v))
+                    ex = _keep
                 if not ex:
-                    continue                     # one tie and no machines: nothing to add
+                    continue                     # one tie and nothing outside it: nothing to add
                 vs = vs + [v for (_b, v) in ex]
                 if ties:
-                    note = "%d tie + %d existing machine(s) at terminals" % (len(ties), len(ex))
+                    note = ("%d tie + %d existing machine(s) connected to the POI outside it"
+                            % (len(ties), len(ex)))
                 else:
                     note = "%d existing machine(s) at terminals, no tie channel" % len(ex)
             if len(vs) < 2:
@@ -23870,7 +24095,7 @@ def evaluate_case(path, kind, tclear, kb):
                         _qsrc.append((_poi, _tot[_poi][0]))
                 elif len(_tl) == 1:
                     poi_rows.append([_poi, _unit, "TOTAL delivered into the POI"]
-                                    + _pstat(_tl[0][1]) + ["1 tie (no existing machines in this .out)"])
+                                    + _pstat(_tl[0][1]) + ["1 tie -- the plant's power all flows through it"])
                     if _q == "POWR" and not _prec_src:
                         _prec_src.append((_poi, _tl[0][1]))
                     if _q == "VARS" and not _qsrc:
