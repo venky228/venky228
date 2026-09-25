@@ -1897,11 +1897,11 @@ def _pump(idx, tag, proc, key=None):
                     _DIALOG_HITS.setdefault(key or _key_of_idx(idx), []).append(
                         (time.time(), "psspy import", txt.strip()))
             if QUIET_PSSE_NOISE and _NOISE_RE.match(txt):
-                key = txt.strip()
-                if key in _NOISE_SEEN[idx]:
+                nkey = txt.strip()
+                if nkey in _NOISE_SEEN[idx]:
                     _NOISE_HELD[idx] += 1          # seen it -- say so by counting
                     continue
-                _NOISE_SEEN[idx].add(key)          # first time: print it in full
+                _NOISE_SEEN[idx].add(nkey)         # first time: print it in full
             elif QUIET_BLANK_LINES and not txt.strip():
                 continue
             elif _NOISE_HELD[idx]:
@@ -2411,7 +2411,8 @@ def _resolve_selection(items):
         print("[parallel]     Running the WHOLE list instead would simulate events you")
         print("[parallel]     deselected -- and the other case, whose file IS readable,")
         print("[parallel]     would run the selection. Two different studies, one launch.")
-        print("[parallel]     Stopping. Let the build finish, or clear ONLY_EVENTS.")
+        print("[parallel]     Not applied: the build writes that file (a first launch builds")
+        print("[parallel]     it now and tries again); otherwise the launch stops here.")
         print("")
         return ["__EVENT_LIST_UNREADABLE__"]
     if not ev:
@@ -4710,9 +4711,15 @@ def _write_all_projects_report(passes, done_so_far):
     # run never touched carries its previous results through unchanged.
     _seen_pm = set(passes)
     _extra = []
+    _extra_dir = {}
+    # this run's own folders (with a run tag they are <proj>_<mode>_<tag>, which
+    # the name split below would read as another project)
+    _own = set(os.path.normcase(os.path.normpath(_project_results_dir(p, m))) for p, m in passes)
     try:
         for _d in sorted(glob.glob(os.path.join(_results_root(), "*_*"))):
             if not os.path.isdir(_d):
+                continue
+            if os.path.normcase(os.path.normpath(_d)) in _own:
                 continue
             _nm = os.path.basename(_d)
             if "_gt_" in _nm or "_before_fixed_" in _nm:
@@ -4729,6 +4736,7 @@ def _write_all_projects_report(passes, done_so_far):
                 continue
             _seen_pm.add((_pj, _md))
             _extra.append((_pj, _md))
+            _extra_dir[(_pj, _md)] = _d        # read from THIS folder, never re-derived
     except Exception as e:
         print("[parallel] could not scan results\\ for other projects: %s" % e)
     if _extra:
@@ -4737,7 +4745,7 @@ def _write_all_projects_report(passes, done_so_far):
 
     detail = []
     for proj, mode in list(passes) + _extra:
-        rdir = _project_results_dir(proj, mode)
+        rdir = _extra_dir.get((proj, mode)) or _project_results_dir(proj, mode)
         key = "%s/%s" % (proj or "default", mode)
         # A project from the disk scan was not part of this run, so it has no
         # "done" key -- read it anyway; its folder is the record.
