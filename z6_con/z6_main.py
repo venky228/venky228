@@ -247,10 +247,10 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 # -- 3a. on / off, projects, faults
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
-GEN_TEST_REPORT_ONLY = False                 # True = rewrite every gen-test report from the runs on disk, simulate nothing
+GEN_TEST_REPORT_ONLY = True                 # True = rewrite every gen-test report from the runs on disk, simulate nothing
 GEN_TEST_RESCORE_MISSING = True              # True = a finished run scored before the POI power-recovery row existed is
                                              #   scored again from its .out files (no simulation, no plots)
-GEN_TEST_REPLOT = False                      # True = redraw the PDFs of finished runs from their .out files (no simulation),
+GEN_TEST_REPLOT = True                      # True = redraw the PDFs of finished runs from their .out files (no simulation),
                                              #   once, so the POI panels carry the P90 / ripple tags
 GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
 GEN_TEST_PROJECTS = ["SantaFe", "EmpirePrairie"]  # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
@@ -308,14 +308,14 @@ GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = True                   # all machines within GEN_TEST_HOPS off together
 GEN_TEST_POI_OFF_BASE = True                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
                                              #   compared with the POIGENOFF run; same reports, rows "POI OFF + ..."
-GEN_TEST_HOPS = 5                           # gens: "near" = within this many buses of the POI
+GEN_TEST_HOPS = 7                           # gens: "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
 GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus, id)]
 # -- 3d. cap and line runs (solver scenario s0_asis only)
 GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together
 GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own
 GEN_TEST_LINES_EACH = True                    # each nearby line / transformer opened on its own
-GEN_TEST_LINES_HOPS = 2                      # lines: both ends within this many buses of the POI
+GEN_TEST_LINES_HOPS = 3                      # lines: both ends within this many buses of the POI
 # -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
@@ -417,10 +417,9 @@ V_SS_HIGH = 1.10                             # and high
 POI_P_RECOVERY_FRAC = 0.90                   # POI power back to this fraction of pre-fault (and held +/- 1-this)
 RIPPLE_WINDOW_S = 2.0                        # ripple: the last this many s of each fault run
 RIPPLE_V_PU = 0.01                           # ripple: POI voltage peak-to-peak above this (pu) ...
-RIPPLE_P_FRAC = 0.02                         # ... or POI power peak-to-peak above this fraction of pre-fault
+RIPPLE_P_MW = 2.0                            # ... or POI power peak-to-peak above this many MW
 SETTLE_V_PU = 0.01                           # settled: over the same last RIPPLE_WINDOW_S every V (POI, machines, buses) moves <= this pu p-p
-SETTLE_PQ_FRAC = 0.02                        # ... and every P / Q <= this fraction of its pre-fault max(|P|, |Q|) p-p
-SETTLE_PQ_MIN = 2.0                          # ... never tighter than this many MW / MVAr (GEN_TEST_ANSWER_<proj>.txt)
+SETTLE_PQ_MW = 2.0                           # ... and every P / Q moves <= this many MW / MVAr p-p (GEN_TEST_ANSWER_<proj>.txt)
 TRIP_PGEN_DEAD_MW = 10.0                     # machine ending below this MW = tripped
 ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
 SPPR_MIN_AFTER_FIRST_PEAK = True             # True = SPPR "Minimum Value" as SPP Figure 2 (lowest trough after 1st peak) | False = lowest point after clearing
@@ -621,7 +620,7 @@ PLOT_SKIP_INCOMPLETE = True                  # True = do not draw a run that sto
 INDIVIDUAL_KEYWORDS = ["PROJ", "POI", "FLT", "GEN"]  # the SPP channel set ([] = every signal)
 PLOT_MAX_PANELS = 0                          # 0 = no cap
 PLOT_MAX_POINTS = 1500                       # samples per trace
-PER_PAGE = 3                                 # panels per page
+PER_PAGE = 4                                 # panels per page
 EXPORT_PDF_PUREPY = True
 EXPORT_CSV = False                           # CSV per run
 EXPORT_SVG = False                           # SVG per run
@@ -7525,9 +7524,10 @@ def _poi_note(rows):
         q = (d.get("ripple_q") or "").split("+")
         if "V" in q and d.get("v_pp") is not None:
             out.append("VOLTAGE RIPPLE %.3f pu p-p at the POI" % d["v_pp"])
-        if "P" in q and d.get("p_pp_pct") is not None:
-            out.append("POWER RIPPLE %s%.1f%% of pre-fault p-p at the POI" % (
-                ("%.1f MW = " % d["p_pp_mw"]) if d.get("p_pp_mw") is not None else "", d["p_pp_pct"]))
+        if "P" in q and (d.get("p_pp_mw") is not None or d.get("p_pp_pct") is not None):
+            out.append("POWER RIPPLE %sp-p at the POI" % "".join((
+                ("%.1f MW " % d["p_pp_mw"]) if d.get("p_pp_mw") is not None else "",
+                ("(%.1f%% of pre-fault) " % d["p_pp_pct"]) if d.get("p_pp_pct") is not None else "")))
         if not ("V" in q or "P" in q):
             out.append("RIPPLE at the POI")
     if d.get("settled") == "no":
@@ -18441,16 +18441,15 @@ def _gt_levels():
     # such as 0.0125 pu cannot read as 'other levels' on every launch and
     # score the same runs again for ever
     return (int(round(POI_P_RECOVERY_FRAC * 100)), float("%.1f" % float(RIPPLE_WINDOW_S)),
-            float("%.3f" % float(RIPPLE_V_PU)), int(float("%.0f" % (100.0 * float(RIPPLE_P_FRAC)))))
+            float("%.3f" % float(RIPPLE_V_PU)), "MW", float("%.1f" % float(RIPPLE_P_MW)))
 
 
 def _gt_score_levels():
     """_gt_levels and the panel's SETTLE_* levels, as the study writes them:
        what a finished run must have been scored with (the plots use only
        _gt_levels, so a SETTLE_* change re-scores but never re-plots)."""
-    return _gt_levels() + (float("%.3f" % float(SETTLE_V_PU)),
-                           int(float("%.0f" % (100.0 * float(SETTLE_PQ_FRAC)))),
-                           float("%.1f" % float(SETTLE_PQ_MIN)))
+    return _gt_levels() + (float("%.3f" % float(SETTLE_V_PU)), "MW",
+                           float("%.1f" % float(SETTLE_PQ_MW)))
 
 
 def _gt_settled_parse(d, det):
@@ -18460,9 +18459,13 @@ def _gt_settled_parse(d, det):
     d["settled"] = ("no" if ms else "yes" if "-- SETTLED" in det else "n/a")
     d["unsettled"] = ms.group(1).strip() if ms else ""
     d["unsettled_txt"] = ms.group(2).strip() if ms else ""
-    ml = re.search(r"\(limits ([\d.]+) pu, ([\d.]+)% of pre-fault, min ([\d.]+) MW", det)
-    d["_slim"] = ((round(float(ml.group(1)), 3), int(round(float(ml.group(2)))),
-                   round(float(ml.group(3)), 1)) if ml else None)
+    ml = re.search(r"\(limits ([\d.]+) pu, ([\d.]+) MW/MVAr\)", det)
+    # a row scored under the old percentage levels: read, so it counts as
+    # 'other levels' and is scored again
+    mo = re.search(r"\(limits ([\d.]+) pu, ([\d.]+)% of pre-fault, min ([\d.]+) MW", det)
+    d["_slim"] = ((round(float(ml.group(1)), 3), "MW", round(float(ml.group(2)), 1)) if ml else
+                  (round(float(mo.group(1)), 3), "%", int(round(float(mo.group(2)))),
+                   round(float(mo.group(3)), 1)) if mo else None)
 
 
 def _gt_vpeak_parse(d, rs, det):
@@ -18488,20 +18491,23 @@ def _gt_ripple_parse(d, det):
     d["v_pp"] = float(mv.group(1)) if mv else None
     d["p_pp_pct"] = float(mp.group(1)) if mp else None
     d["ripple"] = ("yes" if "-- RIPPLE" in det else "no" if "no ripple" in det else "n/a")
-    ml = re.search(r"limits ([\d.]+) pu, ([\d.]+)% of pre-fault", det)
-    d["_rlim"] = (round(float(ml.group(1)), 3), int(round(float(ml.group(2))))) if ml else None
+    ml = re.search(r"limits ([\d.]+) pu, ([\d.]+) MW of POI power", det)
+    mo = re.search(r"limits ([\d.]+) pu, ([\d.]+)% of pre-fault", det)     # old % levels
+    d["_rlim"] = ((round(float(ml.group(1)), 3), "MW", round(float(ml.group(2)), 1)) if ml else
+                  (round(float(mo.group(1)), 3), "%", int(round(float(mo.group(2))))) if mo else None)
     # WHICH QUANTITY: the study names it ('RIPPLE in VOLTAGE and POWER'); a row
     # written before it did is read from its own numbers against its limits
     q = []
     if d["ripple"] == "yes":
         if "RIPPLE in " in det:
             q = [x for x, w in (("V", "VOLTAGE"), ("P", "POWER")) if w in det.split("RIPPLE in ", 1)[1]]
-        elif ml:
-            if mv and d["v_pp"] > float(ml.group(1)) and \
+        elif ml or mo:
+            if mv and d["v_pp"] > float((ml or mo).group(1)) and \
                     re.search(r"voltage p-p [\d.]+ pu \(sustained\)", det):
                 q.append("V")
-            if mp and d["p_pp_pct"] > float(ml.group(2)) and \
-                    re.search(r"of pre-fault \(sustained\)", det):
+            _psus = re.search(r"power p-p [\d.]+ MW[^()]*\(sustained\)", det)
+            if _psus and ((ml and mw and d["p_pp_mw"] > float(ml.group(2))) or
+                          (not ml and mp and d["p_pp_pct"] > float(mo.group(2)))):
                 q.append("P")
     d["ripple_q"] = "+".join(q)
 
@@ -18549,16 +18555,19 @@ def _gt_ripple_txt(m, faults):
         q = (d.get("ripple_q") or "").split("+")
         if "V" in q and d.get("v_pp") is not None and (v is None or d["v_pp"] > v[0]):
             v = (d["v_pp"], f)
-        if "P" in q and d.get("p_pp_pct") is not None and (p is None or d["p_pp_pct"] > p[0]):
-            p = (d["p_pp_pct"], f, d.get("p_pp_mw"))
+        if "P" in q and (d.get("p_pp_mw") is not None or d.get("p_pp_pct") is not None):
+            _k = d["p_pp_mw"] if d.get("p_pp_mw") is not None else -1.0
+            if p is None or _k > p[0]:
+                p = (_k, f, d.get("p_pp_pct"))
         if not ("V" in q or "P" in q):
             other.append(f)
     parts = []
     if v:
         parts.append("voltage %.3f pu p-p (%s)" % v)
     if p:
-        parts.append("power %sp-p = %.1f%% of pre-fault (%s)"
-                     % ("%.1f MW " % p[2] if p[2] is not None else "", p[0], p[1]))
+        parts.append("power %sp-p%s (%s)"
+                     % ("%.1f MW " % p[0] if p[0] >= 0 else "",
+                        (" = %.1f%% of pre-fault" % p[2]) if p[2] is not None else "", p[1]))
     if other and not parts:
         parts.append("on %s" % ",".join(other))
     return ("RIPPLE: " + "; ".join(parts)) if parts else ""
@@ -18682,7 +18691,7 @@ def _gt_measure(rdir, faults):
 def _gt_blank_meas():
     return {"verdict": "?", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {},
             "fails": set(), "p_state": None, "p_first": None, "p_held": None,
-            "ripple": None, "v_pp": None, "p_pp_pct": None,
+            "ripple": None, "v_pp": None, "p_pp_pct": None, "p_pp_mw": None,
             "settled": None, "unsettled": "", "unsettled_txt": "", "v_peak": None,
             "v_row": None, "eterm_over": False, "eterm_n": None}
 
@@ -18913,10 +18922,9 @@ def _push_records(env):
     env["SPP_POI_P_RECOVERY_FRAC"] = repr(float(POI_P_RECOVERY_FRAC))
     env["SPP_RIPPLE_WINDOW_S"] = repr(float(RIPPLE_WINDOW_S))
     env["SPP_RIPPLE_V_PU"] = repr(float(RIPPLE_V_PU))
-    env["SPP_RIPPLE_P_FRAC"] = repr(float(RIPPLE_P_FRAC))
+    env["SPP_RIPPLE_P_MW"] = repr(float(RIPPLE_P_MW))
     env["SPP_SETTLE_V_PU"] = repr(float(SETTLE_V_PU))
-    env["SPP_SETTLE_PQ_FRAC"] = repr(float(SETTLE_PQ_FRAC))
-    env["SPP_SETTLE_PQ_MIN"] = repr(float(SETTLE_PQ_MIN))
+    env["SPP_SETTLE_PQ_MW"] = repr(float(SETTLE_PQ_MW))
 
 
 _GT_REPLOTTED = "GT_REPLOTTED.flag"
@@ -19781,7 +19789,7 @@ def _gt_xlsx(runs, faults, proj):
     H1 = ["scenario", "what is changed", "fault", "SPP verdict", "SPP criteria failed",
           "buses > %.2f pu" % V_OVERSHOOT_PU, "peak V after clearing (pu)", "not converged steps",
           "NOTE (text only, no pass/fail)", "P90 power recovery", "P90 held from (s after final clearing)",
-          "ripple", "ripple in", "ripple V p-p (pu)", "ripple P p-p (% pre-fault)",
+          "ripple", "ripple in", "ripple V p-p (pu)", "ripple P p-p (MW)",
           "settled at end", "not settled in", "still moving (worst)", "folder"]
     R1 = []
     for r in runs:
@@ -19802,7 +19810,7 @@ def _gt_xlsx(runs, faults, proj):
                        x.get("ripple") or "",
                        _gt_rq_words(x.get("ripple_q")) if x.get("ripple") == "yes" else "",
                        "" if x.get("v_pp") is None else x["v_pp"],
-                       "" if x.get("p_pp_pct") is None else x["p_pp_pct"],
+                       "" if x.get("p_pp_mw") is None else x["p_pp_mw"],
                        x.get("settled") or "", x.get("unsettled") or "",
                        (x.get("unsettled_txt") or "")[:250],
                        os.path.basename(r.get("rdir") or "")])
@@ -19978,8 +19986,8 @@ def _gt_answer(runs, faults, proj):
          "",
          "  'settled' = over the last %g s of the run, every voltage moves less than %g pu and every P / Q"
          % (RIPPLE_WINDOW_S, SETTLE_V_PU),
-         "  less than %g%% of its pre-fault value (at least %g MW / MVAr), peak-to-peak."
-         % (100.0 * SETTLE_PQ_FRAC, SETTLE_PQ_MIN),
+         "  less than %g MW / MVAr, peak-to-peak."
+         % SETTLE_PQ_MW,
          ""]
     old = sum(1 for z in rows + part for f in z[2]
               if ((z[1].get("m") or {}).get(f) or {}).get("verdict") in ("PASS", "FAIL")
@@ -20119,8 +20127,8 @@ def _gt_write(runs, faults, gens):
           "  out again, NEVER = never gets back, - = not measured (scored before this row existed)",
           "  R-V = VOLTAGE RIPPLE: over the last %g s the POI voltage swings > %g pu peak-to-peak;"
           % (RIPPLE_WINDOW_S, RIPPLE_V_PU),
-          "  R-P = POWER RIPPLE: the POI power swings > %g %% of pre-fault peak-to-peak;  R-V+P = both;"
-          % (100 * RIPPLE_P_FRAC),
+          "  R-P = POWER RIPPLE: the POI power swings > %g MW peak-to-peak;  R-V+P = both;"
+          % RIPPLE_P_MW,
           "  and it is not dying out (non-converged steps or a control hunting)",
           "%-22s %-50s " % ("scenario", "machine OFF / line OPEN") + " | ".join("%-11s" % f for f in faults),
           "-" * 150]
@@ -20184,7 +20192,7 @@ def _gt_write(runs, faults, gens):
             w.writerow(["scenario", "delt_cycles", "maxiter", "accel", "tol", "off_bus", "off_id",
                         "off_name", "off_kind", "off_mw", "nodes", "zdist_pu", "fault", "verdict",
                         "noconv_steps", "buses_over_1p2", "max_pu", "p_recovery", "p_first_s", "p_held_s",
-                        "ripple", "ripple_in", "ripple_v_pp_pu", "ripple_p_pp_pct",
+                        "ripple", "ripple_in", "ripple_v_pp_pu", "ripple_p_pp_mw",
                         "peak_v_pu", "below_1p2", "settled", "not_settled_in",
                         "folder", "note"])
             for r in runs:
@@ -20203,7 +20211,7 @@ def _gt_write(runs, faults, gens):
                                 x.get("ripple") or "",
                                 _gt_rq_words(x.get("ripple_q")) if x.get("ripple") == "yes" else "",
                                 "" if x.get("v_pp") is None else x["v_pp"],
-                                "" if x.get("p_pp_pct") is None else x["p_pp_pct"],
+                                "" if x.get("p_pp_mw") is None else x["p_pp_mw"],
                                 "" if x.get("v_peak") is None else x["v_peak"],
                                 {True: "yes", False: "no"}.get(_gt_below(x), ""),
                                 x.get("settled") or "", x.get("unsettled") or "",

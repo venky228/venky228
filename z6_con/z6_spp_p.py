@@ -3205,12 +3205,11 @@ POI_P_RECOVERY_FRAC = float(_env_num("SPP_POI_P_RECOVERY_FRAC", 0.90))
 # last RIPPLE_WINDOW_S of the run; RIPPLE when it is above these AND not dying out
 RIPPLE_WINDOW_S = float(_env_num("SPP_RIPPLE_WINDOW_S", 2.0))
 RIPPLE_V_PU     = float(_env_num("SPP_RIPPLE_V_PU", 0.01))     # pu peak-to-peak
-RIPPLE_P_FRAC   = float(_env_num("SPP_RIPPLE_P_FRAC", 0.02))   # of the pre-fault POI power
+RIPPLE_P_MW     = float(_env_num("SPP_RIPPLE_P_MW", 2.0))      # MW peak-to-peak of the POI power
 # SETTLED AT THE END (recorded, INFO): over the same last RIPPLE_WINDOW_S, every
 # P, Q and V at the POI, the machines and the buses swings no more than these
 SETTLE_V_PU     = float(_env_num("SPP_SETTLE_V_PU", 0.01))     # pu peak-to-peak
-SETTLE_PQ_FRAC  = float(_env_num("SPP_SETTLE_PQ_FRAC", 0.02))  # of the pre-fault max(|P|, |Q|)
-SETTLE_PQ_MIN   = float(_env_num("SPP_SETTLE_PQ_MIN", 2.0))    # MW / MVAr, never tighter than this
+SETTLE_PQ_MW    = float(_env_num("SPP_SETTLE_PQ_MW", 2.0))     # MW / MVAr peak-to-peak, every P / Q
 V_OVERSHOOT_PU = float(_env_num("SPP_V_OVERSHOOT_PU", V_OVERSHOOT_PU))
 V_SS_LOW       = float(_env_num("SPP_V_SS_LOW", V_SS_LOW))
 V_SS_HIGH      = float(_env_num("SPP_V_SS_HIGH", V_SS_HIGH))
@@ -21947,11 +21946,13 @@ def _poi_record_tag(v, t, tfc, is_power):
                             % (pct, pct, pr["first"] - tfc))
             else:
                 tags.append("P%d held %.2f s after the final clearing" % (pct, pr["held"] - tfc))
-            if win:
-                a, k = _ripple_pp(t, v, win[0], win[1])
-                if a is not None and k == "sustained" and a > RIPPLE_P_FRAC * abs(pr["p0"]):
-                    tags.append("POWER RIPPLE p-p %.1f MW = %.1f%% (last %.1f s)"
-                                % (a, 100.0 * a / abs(pr["p0"]), win[1] - win[0]))
+        if win:
+            a, k = _ripple_pp(t, v, win[0], win[1])
+            if a is not None and k == "sustained" and a > RIPPLE_P_MW:
+                _p0 = abs(pr["p0"]) if (pr and "p0" in pr) else 0.0
+                tags.append("POWER RIPPLE p-p %.1f MW%s (last %.1f s)"
+                            % (a, (" = %.1f%% of pre-fault" % (100.0 * a / _p0)) if _p0 >= 1.0 else "",
+                               win[1] - win[0]))
     elif win:
         a, k = _ripple_pp(t, v, win[0], win[1])
         if a is not None and k == "sustained" and a > RIPPLE_V_PU:
@@ -23410,9 +23411,8 @@ def _settled_detail(t, ch, kb, w0, t_end, vpoi, psrc, qsrc):
     """The 'Settled at the end' row: peak-to-peak over [w0, t_end] of the POI
        P, Q and V, every machine's P (PELEC), Q (QELEC) and terminal V (ETERM),
        and every monitored bus voltage. Settled = p-p <= SETTLE_V_PU for a
-       voltage, <= max(SETTLE_PQ_MIN, SETTLE_PQ_FRAC x its pre-fault
-       max(|P|, |Q|)) for a power. Ends '-- SETTLED' or '-- NOT SETTLED in
-       <groups>: <worst channels>'."""
+       voltage, <= SETTLE_PQ_MW (MW / MVAr) for a power. Ends '-- SETTLED' or
+       '-- NOT SETTLED in <groups>: <worst channels>'."""
     bad = []                                   # (ratio, group, text)
     cnt = {}                                   # group -> [settled, measured]
     iw = [i for i in range(len(t)) if w0 <= t[i] <= t_end]
@@ -23431,8 +23431,6 @@ def _settled_detail(t, ch, kb, w0, t_end, vpoi, psrc, qsrc):
                         ("%s " + fmt + " %s p-p (limit " + fmt + ")") % (lab, a, unit, tol)))
         return a
 
-    def pq_tol(base):
-        return max(SETTLE_PQ_MIN, SETTLE_PQ_FRAC * abs(base))
     mp, mq, mv = [], [], []
     for _k, (ti, v) in ch.items():
         if not _keep(ti, kb):
@@ -23451,30 +23449,18 @@ def _settled_detail(t, ch, kb, w0, t_end, vpoi, psrc, qsrc):
             fs = [x for x in v if x == x]
             if fs and max(fs) <= 5.0:
                 judge("bus V", "%s V" % chan_label(ti), v, SETTLE_V_PU, "pu", "%.4f")
-    p0b = {}                                   # machine bus -> largest pre-fault |P|
     for ti, v in mp:
-        b = _chan_bus(ti)
-        p0b[b] = max(p0b.get(b, 0.0), abs(_pre_avg(t, v)))
-    q0b = {}
+        judge("machine P", "%s P" % chan_label(ti), v, SETTLE_PQ_MW, "MW", "%.1f")
     for ti, v in mq:
-        b = _chan_bus(ti)
-        q0b[b] = max(q0b.get(b, 0.0), abs(_pre_avg(t, v)))
-    for ti, v in mp:
-        b = _chan_bus(ti)
-        judge("machine P", "%s P" % chan_label(ti), v, pq_tol(max(p0b.get(b, 0.0), q0b.get(b, 0.0))), "MW", "%.1f")
-    for ti, v in mq:
-        b = _chan_bus(ti)
-        judge("machine Q", "%s Q" % chan_label(ti), v, pq_tol(max(p0b.get(b, 0.0), q0b.get(b, 0.0))), "MVAr", "%.1f")
+        judge("machine Q", "%s Q" % chan_label(ti), v, SETTLE_PQ_MW, "MVAr", "%.1f")
     for ti, v in mv:
         judge("machine V", "%s V" % chan_label(ti), v, SETTLE_V_PU, "pu", "%.4f")
     poi = []
     _pv = psrc[0][1] if psrc else None
     _qv = [x for (b, x) in (qsrc or []) if not psrc or b == psrc[0][0]]
     _qv = _qv[0] if _qv else None
-    _base = max(abs(_pre_avg(t, _pv)) if _pv is not None else 0.0,
-                abs(_pre_avg(t, _qv)) if _qv is not None else 0.0)
-    for grp, v, tol, unit, fmt in (("POI P", _pv, pq_tol(_base), "MW", "%.1f"),
-                                   ("POI Q", _qv, pq_tol(_base), "MVAr", "%.1f"),
+    for grp, v, tol, unit, fmt in (("POI P", _pv, SETTLE_PQ_MW, "MW", "%.1f"),
+                                   ("POI Q", _qv, SETTLE_PQ_MW, "MVAr", "%.1f"),
                                    ("POI V", vpoi, SETTLE_V_PU, "pu", "%.4f")):
         a = judge(grp, "POI %s %s" % (POI_BUS, grp[4:]), v, tol, unit, fmt) if v is not None else None
         poi.append("%s %s" % (grp[4:], ("no channel" if v is None else "not measured" if a is None
@@ -23487,13 +23473,13 @@ def _settled_detail(t, ch, kb, w0, t_end, vpoi, psrc, qsrc):
             if any(b[1] == g for b in bad)]
     bad.sort(key=lambda x: -x[0])
     return ("%.2f-%.2f s; POI %s: %s; machines settled: P %s, Q %s, V %s; buses settled: V %s -- %s "
-            "(limits %.3f pu, %.0f%% of pre-fault, min %.1f MW/MVAr)"
+            "(limits %.3f pu, %.1f MW/MVAr)"
             % (w0, t_end, POI_BUS, ", ".join(poi), n("machine P"), n("machine Q"), n("machine V"),
                n("bus V"),
                ("NOT SETTLED in %s: %s%s" % (", ".join(grps), "; ".join(b[2] for b in bad[:6]),
                                             (" (+%d more)" % (len(bad) - 6)) if len(bad) > 6 else ""))
                if bad else ("SETTLED" if cnt else "nothing measured"),
-               SETTLE_V_PU, 100.0 * SETTLE_PQ_FRAC, SETTLE_PQ_MIN))
+               SETTLE_V_PU, SETTLE_PQ_MW))
 
 
 def evaluate_case(path, kind, tclear, kb):
@@ -24649,17 +24635,18 @@ def evaluate_case(path, kind, tclear, kb):
                     _p02 = abs(_pr2["p0"]) if (_pr2 and "p0" in _pr2) else 0.0
                     _a, _k = _ripple_pp(t, _prec_src[0][1], _w0, _t_end)
                     if _a is not None:
-                        _parts.append("power p-p %.1f MW = %.1f%% of pre-fault (%s)"
-                                      % (_a, 100.0 * _a / _p02 if _p02 >= 1.0 else 0.0, _k))
-                        if _p02 >= 1.0 and _a > RIPPLE_P_FRAC * _p02 and _k == "sustained":
+                        _parts.append("power p-p %.1f MW%s (%s)"
+                                      % (_a, (" = %.1f%% of pre-fault" % (100.0 * _a / _p02))
+                                         if _p02 >= 1.0 else "", _k))
+                        if _a > RIPPLE_P_MW and _k == "sustained":
                             _flag = True
                             _rq.append("POWER")
                 else:
                     _parts.append("no POI power channel")
-                add(_rc, None, "POI %s, %.2f-%.2f s: %s -- %s (limits %.3f pu, %.0f%% of pre-fault power)"
+                add(_rc, None, "POI %s, %.2f-%.2f s: %s -- %s (limits %.3f pu, %.1f MW of POI power)"
                     % (POI_BUS, _w0, _t_end, ", ".join(_parts),
                        ("RIPPLE in %s" % " and ".join(_rq)) if _flag else "no ripple",
-                       RIPPLE_V_PU, 100.0 * RIPPLE_P_FRAC))
+                       RIPPLE_V_PU, RIPPLE_P_MW))
         except Exception as _e:
             add(_rc, None, "not measured (%s)" % _e)
 
