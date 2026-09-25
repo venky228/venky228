@@ -92,7 +92,7 @@
 ================================================================================
 """
 
-import os, sys, re, csv, glob, time, subprocess, threading, io, json, socket
+import os, sys, re, csv, glob, time, subprocess, threading, io, json, socket, shutil
 # ast: to read BESS_PROJECTS and FEEDER_MAX_MW out of the study script for the
 # preflight, WITHOUT importing it -- importing it needs PSS/E and would run its
 # module-level checks, which is the very thing being checked for.
@@ -18354,8 +18354,11 @@ def _gt_prec_parse(d, det):
 
 def _gt_levels():
     """The panel's recovery / ripple levels, as the study writes them."""
-    return (int(round(POI_P_RECOVERY_FRAC * 100)), round(float(RIPPLE_WINDOW_S), 1),
-            round(float(RIPPLE_V_PU), 3), int(round(RIPPLE_P_FRAC * 100)))
+    # FORMATTED AS THE STUDY PRINTS THEM (%d, %.1f, %.3f, %.0f), so a level
+    # such as 0.0125 pu cannot read as 'other levels' on every launch and
+    # score the same runs again for ever
+    return (int(round(POI_P_RECOVERY_FRAC * 100)), float("%.1f" % float(RIPPLE_WINDOW_S)),
+            float("%.3f" % float(RIPPLE_V_PU)), int(float("%.0f" % (100.0 * float(RIPPLE_P_FRAC)))))
 
 
 def _gt_ripple_parse(d, det):
@@ -18520,11 +18523,42 @@ def _gt_bl_note(bl, f, sc):
 
 def _gt_measure(rdir, faults):
     """{fault: {verdict, noconv, n_over, max_pu}} from what the run wrote."""
-    res = dict((f, {"verdict": "?", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {},
-                    "fails": set(), "p_state": None, "p_first": None, "p_held": None,
-                    "ripple": None, "v_pp": None, "p_pp_pct": None})
-               for f in faults)
+    res = dict((f, _gt_blank_meas()) for f in faults)
     cp = _gt_find(rdir, "SPP_CRITERIA_REPORT", "csv")
+    _gt_read_crit(cp, res, faults)
+    # A FAULT THE LAST SCORING PASS LOST keeps the verdict it had before that
+    # pass (flags\GT_PREV_CRITERIA.csv, kept by _gt_rescore); it is still
+    # scored again (_gt_want_rescore) until it has one of its own
+    _lost = [f for f in faults if res[f]["verdict"] == "?"]
+    _bk = os.path.join(rdir, "flags", _GT_PREV_CRIT)
+    if _lost and os.path.isfile(_bk):
+        _old = dict((f, _gt_blank_meas()) for f in _lost)
+        _gt_read_crit(_bk, _old, _lost)
+        for f in _lost:
+            if _old[f]["verdict"] in ("PASS", "FAIL"):
+                res[f] = _old[f]
+                res[f]["from_prev"] = True
+    _gt_measure_rest(rdir, faults, res)
+    return res
+
+
+def _gt_blank_meas():
+    return {"verdict": "?", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {},
+            "fails": set(), "p_state": None, "p_first": None, "p_held": None,
+            "ripple": None, "v_pp": None, "p_pp_pct": None}
+
+
+def _gt_nscored(cp, faults):
+    """How many of faults have a verdict in criteria report cp (0 if none)."""
+    if not cp or not os.path.isfile(cp):
+        return 0
+    res = dict((f, _gt_blank_meas()) for f in faults)
+    _gt_read_crit(cp, res, faults)
+    return sum(1 for f in faults if res[f]["verdict"] in ("PASS", "FAIL"))
+
+
+def _gt_read_crit(cp, res, faults):
+    """A criteria report's rows for faults into res (verdict, fails, P90, ripple)."""
     if cp:
         try:
             with csv_open(cp) as fh:
@@ -18553,6 +18587,10 @@ def _gt_measure(rdir, faults):
                                 res[f]["verdict"] = "PASS"
         except Exception as e:
             print("[gen-test] could not read %s (%s)" % (cp, e))
+
+
+def _gt_measure_rest(rdir, faults, res):
+    """_gt_measure after the criteria rows: levels, nc counts, spiking buses."""
     # THE LEVELS THE RECORDS WERE MADE WITH (recovery %, ripple window and
     # limits), so a change on the panel is seen and the run scored again
     for f in faults:
@@ -18575,7 +18613,20 @@ def _gt_measure(rdir, faults):
                     res[f]["noconv"] = (res[f]["noconv"] or 0) + n
     vp = _gt_find(rdir, "02_VIOLATIONS", "csv")
     buses = dict((f, set()) for f in faults)
-    if vp:
+    # a fault whose verdict came from the kept report takes its spiking buses
+    # from the violations kept with it -- the new file has none for it, and
+    # 'no bus above 1.2 pu' would read as the best result of all
+    prev = [f for f in faults if res[f].get("from_prev")]
+    _gt_read_viol(vp, [f for f in faults if f not in prev], res, buses)
+    _gt_read_viol(os.path.join(rdir, "flags", _GT_PREV_VIOL), prev, res, buses)
+    for f in faults:
+        res[f]["n_over"] = len(buses[f])
+    return res
+
+
+def _gt_read_viol(vp, faults, res, buses):
+    """The overshoot rows of a 02_VIOLATIONS csv for faults into res / buses."""
+    if faults and vp and os.path.isfile(vp):
         try:
             with csv_open(vp) as fh:
                 for r in csv.DictReader(fh):
@@ -18596,9 +18647,6 @@ def _gt_measure(rdir, faults):
                                 res[f]["max_pu"] = val
         except Exception as e:
             print("[gen-test] could not read %s (%s)" % (vp, e))
-    for f in faults:
-        res[f]["n_over"] = len(buses[f])
-    return res
 
 
 _GT_EGF_WARNED = set()
@@ -18802,29 +18850,57 @@ def _gt_lacks_prec(r, faults):
                               for f in need)
 
 
-_GT_RESCORE_TRIES = 3     # scoring passes a fault with its .out + .done may take to get a verdict
+_GT_RESCORE_TRIES = 3     # scoring passes a run may take, at the panel's current levels
+_GT_PREV_CRIT = "GT_PREV_CRITERIA.csv"   # flags\: the criteria report as it was before a forced pass
+_GT_PREV_VIOL = "GT_PREV_VIOLATIONS.csv" # flags\: and its violations list
+
+
+def _gt_passes(rdir):
+    """Scoring passes the gen test ran in this folder at the panel's CURRENT
+       levels (a line of GT_RESCORED.flag each; a line with no levels, written
+       before they were recorded, counts too)."""
+    lv = "levels=%s" % (_gt_levels(),)
+    try:
+        with open(os.path.join(rdir, "flags", _GT_RESCORED)) as fh:
+            return len([ln for ln in fh if ln.strip() and ("levels=" not in ln or lv in ln)])
+    except Exception:
+        return 0
 
 
 def _gt_lost(r, faults):
     """Faults of a finished run that have their .out AND .done (simulated to the
        end) but no verdict: the scoring lost them -- e.g. a report shard that
-       died while many runs were scored at once (EmpirePrairie s2, 2 of 3
-       after a rescore that had 3 of 3). Scored again, up to _GT_RESCORE_TRIES
-       passes in all; after that, what is missing is a real give-up."""
+       died while many runs were scored at once (EmpirePrairie s2: 2 of 3
+       after a pass that had 3 of 3)."""
     rdir = r.get("rdir") or ""
     m = r.get("m") or {}
-    lost = [f for f in _gt_run_faults(r["gen"], faults)
-            if (m.get(f) or {}).get("verdict") not in ("PASS", "FAIL", "SKIP")
+    return [f for f in _gt_run_faults(r["gen"], faults)
+            if ((m.get(f) or {}).get("verdict") not in ("PASS", "FAIL", "SKIP")
+                 or (m.get(f) or {}).get("from_prev"))
             and os.path.isfile(os.path.join(rdir, "outs", "%s.out" % f))
             and os.path.isfile(os.path.join(rdir, "outs", "%s.done" % f))]
-    if not lost:
-        return []
-    try:
-        with open(os.path.join(rdir, "flags", _GT_RESCORED)) as fh:
-            n = len([ln for ln in fh if ln.strip()])
-    except Exception:
-        n = 0
-    return lost if n < _GT_RESCORE_TRIES else []
+
+
+def _gt_want_rescore(r, faults):
+    """'' or why a FINISHED run is scored again from its .out files (no
+       simulation): a fault simulated to the end has no verdict, or its
+       P90 / ripple rows are missing or made with other levels. At most
+       _GT_RESCORE_TRIES passes at the current levels -- after that what is
+       missing is a real give-up, and a launch never loops on it."""
+    if not r.get("note") or not _gt_outs_ready(r["rdir"], r["gen"], faults):
+        return ""
+    lost = _gt_lost(r, faults)
+    why = ("%s simulated to the end but not scored" % ",".join(lost)) if lost else \
+          ("no P90 / ripple rows at the panel's levels" if _gt_lacks_prec(r, faults) else "")
+    if not why:
+        return ""
+    if _gt_passes(r["rdir"]) >= _GT_RESCORE_TRIES:
+        if r["rdir"] not in _GT_EGF_WARNED:
+            _GT_EGF_WARNED.add(r["rdir"])
+            print("[gen-test] %s: %s -- already scored %d times, left as it is"
+                  % (os.path.basename(r["rdir"]), why, _GT_RESCORE_TRIES))
+        return ""
+    return why
 
 
 def _gt_wait_plotter(rdir):
@@ -18877,9 +18953,9 @@ def _gt_rescore(r, env, faults, log_path=None):
     if r["gen"] and r["gen"].get("egf") and _gt_egf_mismatch(rdir, r["gen"]):
         return None                # not this entry's .dyr values -- scoring it would mislabel it
     try:
-        # APPENDED, one line per pass: _gt_lost counts them
+        # APPENDED, one line per pass, with the levels: _gt_passes counts them
         with open(os.path.join(rdir, "flags", _GT_RESCORED), "a") as fh:
-            fh.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+            fh.write("%s levels=%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), _gt_levels()))
     except Exception:
         pass
     print("[gen-test] %s: scoring the finished .out files (no simulation)"
@@ -18887,6 +18963,23 @@ def _gt_rescore(r, env, faults, log_path=None):
     e = dict(env)
     e["SPP_REPORT_ONLY"] = "1"
     if force:
+        # THE REPORT AS IT IS, KEPT: a forced pass reads every .out again, and a
+        # fault it fails to score must not lose the verdict it had
+        # (_gt_measure falls back to this copy for such a fault only)
+        _cp = _gt_find(rdir, "SPP_CRITERIA_REPORT", "csv")
+        _bk = os.path.join(rdir, "flags", _GT_PREV_CRIT)
+        try:
+            if _cp and _gt_nscored(_cp, faults) >= _gt_nscored(_bk, faults):
+                shutil.copyfile(_cp, _bk)
+                _vp = _gt_find(rdir, "02_VIOLATIONS", "csv")
+                _vb = os.path.join(rdir, "flags", _GT_PREV_VIOL)
+                if _vp:
+                    shutil.copyfile(_vp, _vb)
+                elif os.path.isfile(_vb):
+                    os.remove(_vb)
+        except Exception as _e:
+            print("[gen-test] %s: criteria report not kept before scoring (%s)"
+                  % (os.path.basename(rdir), _e))
         # the saved per-fault scores predate the new row: read the .out again
         e["SPP_FORCE_RESCORE"] = "1"
     return run_study(_gt_case(), projects=[GEN_TEST_PROJECT], modes=[GEN_TEST_MODE],
@@ -19664,9 +19757,24 @@ def _gt_parallel(nf):
             usable = min(usable, int(CORES_MAX))
         return max(1, usable // max(1, int(nf)))
     try:
-        return max(1, int(v))
+        want = max(1, int(v))
     except Exception:
         return 1
+    # NEVER MORE PSS/E SESSIONS THAN CORES: each run -- a scoring-only one
+    # too, its report shards -- holds one session per fault. 18 at once x 3
+    # faults = 54 on this machine, and the scoring passes of that launch lost
+    # a fault in about 15 EmpirePrairie runs.
+    cap = max(1, _cpu_count() // max(1, int(nf)))
+    if want > cap:
+        if not _GT_PAR_SAID:
+            _GT_PAR_SAID.append(1)
+            print("[gen-test] GEN_TEST_PARALLEL = %d x %d fault(s) = %d PSS/E sessions > %d cores: "
+                  "%d run(s) at once instead" % (want, nf, want * nf, _cpu_count(), cap))
+        return cap
+    return want
+
+
+_GT_PAR_SAID = []
 
 
 def _gt_built(tag, rdir, t0, faults=()):
@@ -19784,7 +19892,10 @@ def _gt_status_write(runs, faults, npar, t_start):
             x[0], x[5], x[1], "" if x[4] else "?", x[2], "%.3f" % x[3] if x[3] else "-",
             _GT_PREC_PCT, _gt_prec_worst(m, faults),
             ("   ** scored %d of %d faults -- the rest NO VERDICT **" % (x[5], x[6]))
-            if x[5] < x[6] else "")
+            if x[5] < x[6] else "") + (
+            "   (%s: verdict of the earlier scoring -- the last pass lost it)"
+            % ",".join(f for f in faults if (m.get(f) or {}).get("from_prev"))
+            if any((m.get(f) or {}).get("from_prev") for f in faults) else "")
 
     L = ["GEN-OFF / SOLVER TEST STATUS -- %s  (updated %s, started %s)"
          % (GEN_TEST_PROJECT, time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -20347,9 +20458,7 @@ def run_gen_test():
              ("  [best2: machine runs are added once the %d solver runs finish]"
               % len(GEN_TEST_SCENARIOS)) if (_gmode == "best2" and not base_ready) else ""))
     if GEN_TEST_REPORT_ONLY and not (GEN_TEST_RESCORE_MISSING and any(
-            r["note"] and (_gt_lacks_prec(r, faults) or _gt_lost(r, faults))
-            and _gt_outs_ready(r["rdir"], r["gen"], faults)
-            for r in runs)):
+            _gt_want_rescore(r, faults) for r in runs)):
         # RE-RANK WHAT IS ON DISK: every report is rebuilt from each run's
         # criteria report, so a change in how runs are judged reaches the
         # finished ones without simulating anything
@@ -20374,11 +20483,10 @@ def run_gen_test():
     n_rs = 0
     if GEN_TEST_RESCORE_MISSING:
         for r in runs:
-            if r["note"] and (_gt_lacks_prec(r, faults) or _gt_lost(r, faults)) \
-                    and _gt_outs_ready(r["rdir"], r["gen"], faults):
-                if _gt_lost(r, faults):
-                    print("[gen-test] %s: %s simulated to the end but not scored -- scoring again"
-                          % (os.path.basename(r["rdir"]), ",".join(_gt_lost(r, faults))))
+            _why = _gt_want_rescore(r, faults)
+            if _why:
+                print("[gen-test] %s: %s -- scoring it again (no simulation)"
+                      % (os.path.basename(r["rdir"]), _why))
                 r["note"], r["state"], r["force_score"] = "", "WAITING", True
                 n_rs += 1
     todo = [r for r in runs if not r["note"]]
