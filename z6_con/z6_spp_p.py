@@ -3201,6 +3201,11 @@ V_RECOVERY_S   = float(_env_num("SPP_V_RECOVERY_S", V_RECOVERY_S))
 # from the FINAL clearing until the power delivered into the POI is back to this
 # fraction of its pre-fault value, and whether it then stays there to the end.
 POI_P_RECOVERY_FRAC = float(_env_num("SPP_POI_P_RECOVERY_FRAC", 0.90))
+# POI RIPPLE (recorded, INFO): peak-to-peak of the POI voltage and power over the
+# last RIPPLE_WINDOW_S of the run; RIPPLE when it is above these AND not dying out
+RIPPLE_WINDOW_S = float(_env_num("SPP_RIPPLE_WINDOW_S", 2.0))
+RIPPLE_V_PU     = float(_env_num("SPP_RIPPLE_V_PU", 0.01))     # pu peak-to-peak
+RIPPLE_P_FRAC   = float(_env_num("SPP_RIPPLE_P_FRAC", 0.02))   # of the pre-fault POI power
 V_OVERSHOOT_PU = float(_env_num("SPP_V_OVERSHOOT_PU", V_OVERSHOOT_PU))
 V_SS_LOW       = float(_env_num("SPP_V_SS_LOW", V_SS_LOW))
 V_SS_HIGH      = float(_env_num("SPP_V_SS_HIGH", V_SS_HIGH))
@@ -23790,6 +23795,72 @@ def evaluate_case(path, kind, tclear, kb):
                     add(_pc, None, _d)
         except Exception as _e:
             add(_pc, None, "not measured (%s)" % _e)
+
+    # POI RIPPLE AFTER RECOVERY -- a record (INFO). A voltage and power that
+    # are back inside every band can still step up and down to the end of the
+    # run (non-converged network steps, or a control hunting). Peak-to-peak
+    # over the last RIPPLE_WINDOW_S; 'sustained' when the second half of the
+    # window swings at least half as much as the first, 'decaying' otherwise.
+    if kind != "flat":
+        _rc = "POI ripple after recovery (last %.1f s)" % RIPPLE_WINDOW_S
+        try:
+            _vpoi = None
+            for _ti, _v in list(volts) + list(nonbes):
+                _T = str(_ti).upper().strip()
+                if re.match(r"^POI\s*%d\s+V\b" % int(POI_BUS), _T):
+                    _vpoi = (_ti, _v)
+                    break
+            if _vpoi is None:
+                for _ti, _v in list(volts) + list(nonbes):
+                    _T = str(_ti).upper().strip()
+                    if re.match(r"^POI\s+V\b", _T) or _chan_bus(_ti) == int(POI_BUS):
+                        _vpoi = (_ti, _v)
+                        break
+            _t_end = t[-1] if len(t) else 0.0
+            _w0 = max(_t_end - RIPPLE_WINDOW_S, tclear + _t_rc + 0.5)
+            if _t_end - _w0 < 0.5:
+                add(_rc, None, "not measured -- under 0.5 s of record after the final clearing")
+            else:
+                _wm = (_w0 + _t_end) / 2.0
+
+                def _pp(_v, a, b):
+                    _xs = [float(_v[i]) for i in range(min(len(t), len(_v)))
+                           if a <= t[i] <= b and _v[i] == _v[i]]
+                    return (max(_xs) - min(_xs)) if _xs else None
+
+                def _judge(_v):
+                    _a, _h1, _h2 = _pp(_v, _w0, _t_end), _pp(_v, _w0, _wm), _pp(_v, _wm, _t_end)
+                    if _a is None:
+                        return None, ""
+                    if _a < 1e-6:
+                        return _a, "flat"
+                    _sus = _h1 is not None and _h2 is not None and _h2 >= 0.5 * _h1
+                    return _a, ("sustained" if _sus else "decaying")
+                _parts, _flag = [], False
+                if _vpoi is not None:
+                    _a, _k = _judge(_vpoi[1])
+                    if _a is not None:
+                        _parts.append("voltage p-p %.4f pu (%s)" % (_a, _k))
+                        _flag = _flag or (_a > RIPPLE_V_PU and _k == "sustained")
+                else:
+                    _parts.append("no POI voltage channel")
+                if _prec_src:
+                    _vp2 = _prec_src[0][1]
+                    _pre2 = [float(_vp2[i]) for i in range(min(len(t), len(_vp2)))
+                             if PRE_FAULT_S - 1.0 <= t[i] < PRE_FAULT_S - 0.01 and _vp2[i] == _vp2[i]]
+                    _p02 = abs(sum(_pre2) / len(_pre2)) if _pre2 else 0.0
+                    _a, _k = _judge(_vp2)
+                    if _a is not None:
+                        _parts.append("power p-p %.1f MW = %.1f%% of pre-fault (%s)"
+                                      % (_a, 100.0 * _a / _p02 if _p02 >= 1.0 else 0.0, _k))
+                        _flag = _flag or (_p02 >= 1.0 and _a > RIPPLE_P_FRAC * _p02 and _k == "sustained")
+                else:
+                    _parts.append("no POI power channel")
+                add(_rc, None, "POI %s, %.2f-%.2f s: %s -- %s (limits %.3f pu, %.0f%% of pre-fault power)"
+                    % (POI_BUS, _w0, _t_end, ", ".join(_parts),
+                       "RIPPLE" if _flag else "no ripple", RIPPLE_V_PU, 100.0 * RIPPLE_P_FRAC))
+        except Exception as _e:
+            add(_rc, None, "not measured (%s)" % _e)
 
     # SYSTEM STABILITY -- PRESENT ON EVERY FAULT RUN, NOT ONLY THE DIVERGED ONES.
     #
