@@ -278,6 +278,12 @@ GEN_TEST_BY_PROJECT = {
                              ("REECA1", {"Kqv": 2.0})],
             "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
                              ("REECA1", {"Kqv": 4.0})],
+            # REGCA1 Rrpwr = ramp rate of the active current after a fault (pu/s):
+            # higher = faster P recovery. Deck values otherwise, so each run reads
+            # against 'all in service' -- does the P90 / voltage recovery improve?
+            "RRPWR5":   [("REGCA1", {"Rrpwr": 5.0})],     # slower
+            "RRPWR20":  [("REGCA1", {"Rrpwr": 20.0})],    # faster
+            "RRPWR50":  [("REGCA1", {"Rrpwr": 50.0})],    # much faster
         },
     },
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
@@ -297,6 +303,12 @@ GEN_TEST_BY_PROJECT = {
                              ("REECA1", {"Kqv": 2.0})],
             "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
                              ("REECA1", {"Kqv": 4.0})],
+            # REGCA1 Rrpwr = ramp rate of the active current after a fault (pu/s):
+            # higher = faster P recovery. Deck values otherwise, so each run reads
+            # against 'all in service' -- does the P90 / voltage recovery improve?
+            "RRPWR5":   [("REGCA1", {"Rrpwr": 5.0})],     # slower
+            "RRPWR20":  [("REGCA1", {"Rrpwr": 20.0})],    # faster
+            "RRPWR50":  [("REGCA1", {"Rrpwr": 50.0})],    # much faster
         },
     },
 }
