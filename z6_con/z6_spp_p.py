@@ -19856,6 +19856,248 @@ def _draw_panel_table(ax, t, series, colors, n_nonfinite=0, off_note="", rows=No
                 va="top", ha="left")
 
 
+# >>> PDF LOOK (matplotlib pages) ---------------------------------------------
+# ONE COLOUR PER QUANTITY, the same on every page: P is teal, Q orange, bus
+# voltage blue, terminal voltage purple, angle brown, speed gold. The POI TOTAL
+# is drawn dark and a single TIE light, so the two never read alike.
+PLOT_QTY_COLORS = {"VOLT": "#1f4e9c", "ETERM": "#6a3d9a", "PELEC": "#0b7a75",
+                   "QELEC": "#c8610a", "ANGLE": "#8c564b", "SPEED": "#a07800"}
+_PLOT_TIE_COLORS = {"PELEC": "#3fb3a8", "QELEC": "#f0a050"}
+_PLOT_EXTRA_COLORS = ["#d62728", "#7f7f7f", "#17becf", "#e377c2", "#bcbd22"]
+_PLOT_YSHORT = {"VOLT": "Voltage (pu)", "ETERM": "Terminal V (pu)",
+                "PELEC": "P (MW)", "QELEC": "Q (MVAr)",
+                "ANGLE": "Rotor angle (deg)", "SPEED": "Speed dev. (pu)"}
+_PLOT_QTY_NAME = {"VOLT": "BUS V", "ETERM": "TERMINAL V", "PELEC": "P",
+                  "QELEC": "Q", "ANGLE": "ROTOR ANGLE", "SPEED": "SPEED"}
+
+
+def _panel_style(cat, ptitle):
+    """(badge, colour, y-label, title text) for one panel -- display only."""
+    s = str(ptitle)
+    parts = re.split(r"\s+\|\s+", s, 2)
+    head, lbl = (parts[0].strip(), parts[2].strip()) if len(parts) == 3 else ("", s)
+    L = lbl.upper()
+    col = PLOT_QTY_COLORS.get(cat, "#1f4e79")
+    q = _PLOT_QTY_NAME.get(cat, str(cat))
+    yl = _PLOT_YSHORT.get(cat, str(cat))
+    if cat == "ANGLE" and ("BUS VOLTAGE ANGLE" in s.upper() or head.startswith("BUS VOLTAGE ANGLE")):
+        q, yl = "BUS ANGLE", "Bus V angle (deg)"
+    if re.match(r"POI \d+ TOTAL", L):
+        q = "POI TOTAL " + q
+        yl = "POI total " + yl
+        head = ""
+    elif re.match(r"POI \d+ ONE TIE", L):
+        q = "POI TIE " + q
+        yl = "One tie " + yl
+        col = _PLOT_TIE_COLORS.get(cat, col)
+        head = ""
+    elif re.match(r"POI \d+", L) and cat == "VOLT":
+        q = "POI V"
+    elif "FAULTED BUS" in L or head.startswith("FAULTED BUS"):
+        q = "FAULTED BUS " + ("V" if cat == "VOLT" else q)
+    elif cat == "VOLT" and L.startswith("PROJ "):
+        q = "PROJ BUS V"
+    elif L.startswith("PROJ "):
+        q = "PROJ " + q
+    txt = ("%s  |  %s" % (head, lbl)) if head else lbl
+    return q, col, yl, txt
+
+
+def _pt_width(renderer, text, fs, family=None, weight="normal", dpi=72.0):
+    """Width of `text` in INCHES at font size fs; a character estimate when the
+       renderer cannot measure (an old matplotlib)."""
+    try:
+        from matplotlib.font_manager import FontProperties
+        fp = FontProperties(size=fs, family=family or "sans-serif", weight=weight)
+        w, _h, _d = renderer.get_text_width_height_descent(text, fp, ismath=False)
+        return w / float(renderer.dpi if hasattr(renderer, "dpi") else dpi)
+    except Exception:
+        return len(text) * fs * (0.60 if family == "monospace" else 0.58) / 72.0
+
+
+def _fit_lines(renderer, text, width_in, fs, max_lines, weight="normal"):
+    """Wrap on spaces so every line fits width_in; the last line ends '...'
+       when the text is longer than max_lines."""
+    words, lines, cur = str(text).split(), [], ""
+    i = 0
+    while i < len(words):
+        w = words[i]
+        cand = (cur + " " + w) if cur else w
+        if cur and _pt_width(renderer, cand, fs, weight=weight) > width_in:
+            lines.append(cur)
+            cur = ""
+            if len(lines) == max_lines:
+                break
+            continue
+        cur = cand
+        i += 1
+    if cur and len(lines) < max_lines:
+        lines.append(cur)
+    if i < len(words) and lines:
+        last = lines[-1]
+        while last and _pt_width(renderer, last + " ...", fs, weight=weight) > width_in:
+            last = last[:-1]
+        lines[-1] = last.rstrip() + " ..."
+    return lines or [""]
+
+
+def _fit_ylabel(renderer, text, height_in, fs=7.5):
+    """The y-axis title INSIDE the height of its axes: one line if it fits,
+       else two, else a smaller font."""
+    for f in (fs, fs - 0.5, fs - 1.0, fs - 1.5):
+        if _pt_width(renderer, text, f) <= height_in * 0.96:
+            return text, f
+        ws = text.split()
+        if len(ws) > 1:
+            best = None
+            for k in range(1, len(ws)):
+                a, b = " ".join(ws[:k]), " ".join(ws[k:])
+                m = max(_pt_width(renderer, a, f), _pt_width(renderer, b, f))
+                if best is None or m < best[0]:
+                    best = (m, a + "\n" + b)
+            if best[0] <= height_in * 0.96:
+                return best[1], f
+    return text, fs - 1.5
+
+
+def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
+                     head1, head2, page_txt, warn_txt=""):
+    """One page of PER_PAGE panels, laid out in INCHES so nothing overlaps:
+
+         header (study, run, fault, page)            -- its own band
+         per panel: coloured quantity badge + title  -- above its own axes
+                    axes (y title fitted to the axes height)
+                    time ticks + 'Time (s)'
+                    value table (t=0, min, max, end)
+         footer: what the dashed lines mean
+
+       The axes height is what is left after every text band has its room, so
+       the text can never land on a trace or on the next panel."""
+    W, H = 11.0, 8.5
+    HEAD, FOOT, LM, RM = 0.78, 0.34, 0.95, 0.28
+    TFS, BFS, TAB = 7.2, 6.8, 6.3
+    ln = lambda fs: fs * 1.30 / 72.0
+    GAP, TICKS = 0.20, 0.34
+    aw = W - LM - RM
+    # a short LAST page uses the room it has: its panels grow to at least half
+    # the page rather than sitting at the top of an empty sheet
+    nslots = max(len(chunk), 1, (PER_PAGE + 1) // 2)
+    fig = plt.figure(figsize=(W, H))
+    try:
+        rend = fig.canvas.get_renderer()
+    except Exception:
+        rend = None
+    blocks = []
+    for pi, (cat, ptitle, series) in enumerate(chunk):
+        badge, col, yl, txt = _panel_style(cat, ptitle)
+        bw = _pt_width(rend, badge, BFS, weight="bold") + 0.14
+        tl = _fit_lines(rend, txt, (aw - bw - 0.10) * 0.97, TFS, 2)
+        nrows = min(len(series), PLOT_VALUE_ROWS_MAX) if PLOT_SHOW_VALUES else 0
+        blocks.append((cat, ptitle, series, badge, col, yl, tl, bw, nrows))
+    def _fixed(nt, nrows, extra):
+        tab = ((1 + nrows + extra) * ln(TAB) + 0.04) if PLOT_SHOW_VALUES else 0.0
+        return max(nt * ln(TFS), ln(BFS) + 0.06) + 0.07 + TICKS + tab + GAP
+    need = 0.0
+    for b in blocks:
+        need += _fixed(len(b[6]), b[8], 1)
+    need += (nslots - len(blocks)) * _fixed(1, 1, 1)
+    ah = (H - HEAD - FOOT - need) / float(nslots)
+    if ah < 0.85:                         # a crowded panel grows the page, never overlaps
+        ah = 0.85
+        H = HEAD + FOOT + need + ah * nslots
+        fig.set_size_inches(W, H)
+    fx, fy = (lambda x: x / W), (lambda y: y / H)
+    # ---- header
+    fig.text(fx(LM), fy(H - 0.22), head1, fontsize=11, fontweight="bold", va="top")
+    fig.text(fx(W - RM), fy(H - 0.22), page_txt, fontsize=8.5, va="top", ha="right",
+             color="#444444")
+    fig.text(fx(LM), fy(H - 0.46), head2, fontsize=8.5, va="top", color="#222222")
+    if warn_txt:
+        fig.text(fx(W - RM), fy(H - 0.46), warn_txt, fontsize=8, va="top",
+                 ha="right", color="#b00000", fontweight="bold")
+    try:
+        from matplotlib.lines import Line2D
+        fig.lines.append(Line2D([fx(LM), fx(W - RM)], [fy(H - 0.66)] * 2,
+                                color="#999999", lw=0.6, transform=fig.transFigure,
+                                figure=fig))
+    except Exception:
+        pass
+    y = H - HEAD
+    for pi, (cat, ptitle, series, badge, col, yl, tl, bw, nrows) in enumerate(blocks):
+        vio = PLOT_VIOLATION_TAG in str(ptitle)
+        # badge + title
+        fig.text(fx(LM + 0.05), fy(y - 0.02), badge, fontsize=BFS, fontweight="bold",
+                 color="white", va="top", ha="left",
+                 bbox=dict(boxstyle="round,pad=0.25", fc=col, ec="none"))
+        fig.text(fx(LM + bw + 0.10), fy(y), "\n".join(tl), fontsize=TFS, va="top",
+                 ha="left", linespacing=1.15,
+                 color=("#b00000" if vio else "#222222"))
+        th = max(len(tl) * ln(TFS), ln(BFS) + 0.06) + 0.07
+        top = y - th
+        ax = fig.add_axes([fx(LM), fy(top - ah), aw / W, ah / H])
+        _ix = chunk_idx[pi] if pi < len(chunk_idx) else None
+        _tp = t if _ix is None else [t[i] for i in _ix]
+        cols = []
+        for si, (lbl, v) in enumerate(series):
+            c2 = col if si == 0 else _PLOT_EXTRA_COLORS[(si - 1) % len(_PLOT_EXTRA_COLORS)]
+            cols.append(c2)
+            ax.plot(_tp, v, lw=1.35 if si == 0 else 1.0, color=c2)
+        _off = nice_ylim(ax, [v for _l, v in series], YMIN_SPAN.get(cat))
+        _mark_fault(ax, is_flat, tclear)
+        ylt, yfs = _fit_ylabel(rend, yl, ah)
+        ax.set_ylabel(ylt, fontsize=yfs, color=col, labelpad=3)
+        ax.grid(True, ls=":", alpha=0.45)
+        ax.margins(x=0)
+        ax.tick_params(labelsize=6.5, pad=2)
+        ax.set_xlabel("Time (s)", fontsize=6.8, labelpad=1)
+        for sp in ax.spines.values():
+            sp.set_color("#b00000" if vio else "#888888")
+            sp.set_linewidth(1.1 if vio else 0.7)
+        yb = top - ah - TICKS
+        extra = 0
+        if PLOT_SHOW_VALUES:
+            sigw = aw * 0.47
+            nch = max(20, int((sigw - 0.30) / (0.62 * TAB / 72.0)))
+            xs = [LM + 0.14] + [LM + sigw + k * (aw - sigw) / 6.0 for k in range(6)]
+            for lab, x in zip(_STAT_COLS, xs):
+                fig.text(fx(x), fy(yb), lab, fontsize=TAB, family="monospace",
+                         color="#666666", va="top")
+            yy = yb - ln(TAB)
+            srows = chunk_stats[pi] if pi < len(chunk_stats) else None
+            for si, (lbl, v) in enumerate(series[:nrows]):
+                nm = re.sub(r"\s+\[\[.*$", "", str(lbl))
+                if len(nm) > nch:
+                    nm = nm[:nch - 3].rstrip() + "..."
+                cells = (nm,) + ((srows[si] if (srows is not None and si < len(srows))
+                                  else _panel_stats_row(_tp, v)))
+                fig.text(fx(LM + 0.02), fy(yy), u"■", fontsize=TAB + 1,
+                         color=cols[si], va="top", family="monospace")
+                for cell, x in zip(cells, xs):
+                    fig.text(fx(x), fy(yy), str(cell), fontsize=TAB,
+                             family="monospace", color="#222222", va="top")
+                yy -= ln(TAB)
+            _nnf = 0
+            if series:
+                _nnf = sum(1 for _x in series[0][1] if _x != _x or _x in (_INF, -_INF))
+            notes = []
+            if _nnf:
+                notes.append("%d non-finite sample(s) -- the gap in the trace" % _nnf)
+            if _off:
+                notes.append(_off.strip("[]"))
+            if notes:
+                fig.text(fx(xs[0]), fy(yy), "   ".join(notes), fontsize=TAB,
+                         family="monospace", color="#8a4b00", va="top")
+            yy -= ln(TAB)
+            y = yy - 0.04 - GAP
+        else:
+            y = yb - GAP
+    # ---- footer
+    fig.text(fx(LM), fy(0.14), "red dashed line = fault applied     green dashed line = "
+             "fault cleared     red frame / red title = a panel that broke an SPP limit",
+             fontsize=6.5, color="#666666", va="bottom")
+    return fig
+
+
 def make_plots(path, is_flat, kb, tclear=None):
     """Build one PDF per run with matplotlib, FROM THE SAME PANEL LIST the
        pure-Python writer uses.
@@ -20040,91 +20282,17 @@ def make_plots(path, is_flat, kb, tclear=None):
             # The full-resolution stats travel with their panels, page by page.
             chunk_stats = panel_stats[pg * PER_PAGE:(pg + 1) * PER_PAGE]
             chunk_idx = panel_idx[pg * PER_PAGE:(pg + 1) * PER_PAGE]
-            # THE PAGE IS 11 x 8.5, WHATEVER IS ON IT.
-            #
-            # The height was 1.9 inches PER PANEL, so a page of three panels was
-            # 11 x 5.7 -- the drawing was two thirds of a page and the traces
-            # were squashed into the top of it. A fixed page means the panels
-            # grow to fill whatever room the chunk leaves them, which is what
-            # makes a 30-second recovery readable.
-            # ROOM FOR THE TABLE UNDER EACH PANEL. Without the extra spacing
-            # the rows land on the axis of the panel below.
-            #
-            # gridspec_kw IS NOT IN EVERY MATPLOTLIB. PSS/E 34 ships Python 3.4,
-            # whose matplotlib may predate it, and an unexpected keyword there
-            # would raise inside the page loop -- so every PDF would be lost to
-            # a layout detail. subplots_adjust below sets the same spacing, so
-            # the fallback loses nothing.
-            try:
-                fig, axes = plt.subplots(len(chunk), 1, figsize=(11, 8.5),
-                                         sharex=True,
-                                         gridspec_kw={"hspace": 1.15})
-            except TypeError:
-                fig, axes = plt.subplots(len(chunk), 1, figsize=(11, 8.5),
-                                         sharex=True)
-            if len(chunk) == 1:
-                axes = [axes]
-            for _pi, (ax, (cat, ptitle, series)) in enumerate(zip(axes, chunk)):
-                _ix = chunk_idx[_pi] if _pi < len(chunk_idx) else None
-                _tp = t if _ix is None else [t[i] for i in _ix]
-                for _si, (lbl, v) in enumerate(series):
-                    ax.plot(_tp, v, lw=1.4 if _si == 0 else 1.0,
-                            color=("#1f4e79" if _si == 0 else "#9ecae1"),
-                            label=lbl)
-                _off = nice_ylim(ax, [v for _l, v in series], YMIN_SPAN.get(cat))
-                _mark_fault(ax, is_flat, tclear)
-                _yl = _ylabel_for(cat, ptitle)
-                if cat == "ANGLE" and "BUS VOLTAGE ANGLE" in str(ptitle).upper():
-                    _yl = "Bus Voltage Angle (deg)"
-                ax.set_ylabel(_yl, fontsize=8)
-                # THE TITLE HAS TO FIT ON THE PAGE.
-                #
-                # A panel title is the tier, the quantity, the label with its
-                # distance from the POI and the fault, and -- when the panel
-                # broke something -- the whole violation sentence. On a
-                # diverged run that reached
-                #
-                #   ... transient overvoltage 528099741339423738...224.000 pu
-                #
-                # it ran clean off the right-hand edge of the page and took the
-                # rest of the line with it. Wrapped to the width of the axes
-                # instead, at most three lines, so the violation is READ rather
-                # than merely present.
-                ax.set_title(_wrap_title(ptitle), fontsize=7,
-                             loc="left", linespacing=1.25)
-                ax.grid(True, ls=":", alpha=0.45)
-                ax.margins(x=0)
-                # A TIME AXIS ON EVERY PANEL, not only the bottom one. sharex
-                # keeps the panels aligned but hides the tick labels on all but
-                # the last, so reading an instant off the middle panel meant
-                # counting gridlines down to the foot of the page.
-                ax.set_xlabel("Time (s)", fontsize=8)
-                ax.tick_params(labelbottom=True, labelsize=7)
-                # ...AND THE NUMBERS, so a limit is never judged by eye.
-                # As a TABLE UNDER the panel -- see _draw_panel_table.
-                _nnf = 0
-                if series:
-                    _v0 = series[0][1]
-                    _nnf = sum(1 for _x in _v0
-                               if _x != _x or _x in (_INF, -_INF))
-                _draw_panel_table(ax, _tp, series,
-                                  ["#1f4e79", "#9ecae1", "#d62728", "#2ca02c"],
-                                  _nnf, _off,
-                                  rows=(chunk_stats[_pi]
-                                        if _pi < len(chunk_stats) else None))
-            fig.suptitle("%s  -  %s run: %s   (page %d/%d)%s"
-                         % (PLOT_TITLE, kind_txt, name,
-                            # +1 for the study-parameter page, which the index
-                            # now counts too -- header and index must agree.
-                            pg + 1 + _n_idx + 1, npages + _n_idx + 1,
-                            _fault_subtitle(fbus) + _partial_note), fontsize=10)
-            # tight_layout would undo the hspace the tables need, so the
-            # margins are set directly.
-            # BOTTOM LEAVES ROOM FOR THE LAST PANEL'S TABLE. With the old
-            # 0.085 the final panel's rows fell off the foot of the page --
-            # present in the file, invisible on paper.
-            fig.subplots_adjust(left=0.075, right=0.985, top=0.925,
-                                bottom=0.205, hspace=1.15)
+            # LAID OUT IN INCHES by _draw_panel_page: header, then per panel a
+            # coloured quantity badge and title, the axes, the time ticks and
+            # the value table, each in its own band -- nothing overlaps.
+            _fs = _fault_subtitle(fbus).strip().lstrip("|").strip()
+            fig = _draw_panel_page(
+                plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
+                PLOT_TITLE,
+                "%s run: %s%s" % (kind_txt, name, ("     |     " + _fs) if _fs else ""),
+                # +1 for the study-parameter page, which the index counts too
+                "page %d / %d" % (pg + 1 + _n_idx + 1, npages + _n_idx + 1),
+                _partial_note.strip().strip("*").strip())
             pdf.savefig(fig)
             plt.close(fig)
     # ONLY NOW does a file appear at the name everything else looks for.
@@ -20725,9 +20893,48 @@ def _fault_hop_text(bus, fault_bus):
         return ""
     if h is None:
         return "no path to the faulted bus in the case"
+    # NO BUS NUMBER HERE: the page header already names the faulted bus, and
+    # repeating it on every panel only made the label longer.
     if h == 0:
-        return "at fault bus %d" % int(fault_bus)
-    return "%d node%s from fault bus %d" % (h, "" if h == 1 else "s", int(fault_bus))
+        return "at fault bus"
+    return "%d node%s from fault bus" % (h, "" if h == 1 else "s")
+
+
+def _plot_fac_name(base, title=""):
+    """PLOT TEXT ONLY: 'PROJ SGF <bus>' for a new machine (bus in the 999xxx
+       block the new plants are built into), 'PROJ EGF <bus>' for an existing
+       one -- in place of EXIST / PROJ / NEW. Scoring keeps chan_label()."""
+    b = str(base)
+    m = re.match(r"(EXIST|PROJ|NEW) (\d+)(.*)$", b, re.S)
+    if not m:
+        core = re.sub(r"^[^A-Za-z]+", "", chan_core(title)).upper()
+        mx = re.match(r"(\d+)(.*)$", b, re.S)
+        if core.startswith("XGEN") and mx:
+            m = mx
+            return "PROJ %s %s%s" % ("SGF" if _is_new_plant_bus(m.group(1)) else "EGF",
+                                     m.group(1), m.group(2))
+        return b
+    return "PROJ %s %s%s" % ("SGF" if _is_new_plant_bus(m.group(2)) else "EGF",
+                             m.group(2), m.group(3))
+
+
+def _plot_always(title, cat=None):
+    """Panels drawn ALWAYS, whatever PLOT_SCOPE / INDIVIDUAL_KEYWORDS /
+       PLOT_ONLY_SPP_SET say and whether or not they broke a limit: the POI
+       (voltage, angle, P and Q into it, every tie), the project machines (new
+       and existing), the new plant's buses, the faulted bus and the swing
+       reference."""
+    core = re.sub(r"^[^A-Za-z]+", "", chan_core(str(title))).upper()
+    if re.match(r"(PROJ\d|POI(?![A-Z])|NPGEN|PBUS|XGEN|FLT|SWING)", core):
+        return True
+    try:
+        _b = _chan_bus(title)
+        if _b != "" and (int(_b) in set(int(x) for x in (PROJECT_GEN_BUSES or []))
+                         or _is_new_plant_bus(_b)):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def plot_label(title, cat, fault_bus=None):
@@ -20752,12 +20959,16 @@ def plot_label(title, cat, fault_bus=None):
     if _pm:
         if _pm.group(5):
             _how = re.search(r"\[([^\]]+)\]", str(title))
-            base = "POI %s -- TOTAL delivered into the POI (%s)" % (
-                _pm.group(2), _how.group(1) if _how else "%s ties" % _pm.group(5))
+            # TOTAL and ONE TIE must not read alike: the total is the sum the
+            # POI meter sees, a tie is one of its parts.
+            _hw = (_how.group(1) if _how else "%s ties" % _pm.group(5))
+            _hw = _hw.replace("existing machine(s)", "PROJ EGF machine(s)")
+            base = "POI %s TOTAL = sum of %s" % (_pm.group(2), _hw)
         elif _pm.group(4):
-            base = "POI %s -- tie from bus %s" % (_pm.group(2), _pm.group(4))
+            base = "POI %s ONE TIE, from bus %s (part of the total)" % (_pm.group(2), _pm.group(4))
         else:
-            base = "POI %s -- interconnection tie" % _pm.group(2)
+            base = "POI %s ONE TIE (the only tie)" % _pm.group(2)
+    base = _plot_fac_name(base, title)
     _kind = _machine_kind(title)
     if _kind:
         base = "%s [%s]" % (base, _kind)
@@ -21464,10 +21675,11 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
     _n_compact_drop = [0]
     grouped = {c: [] for c in WANT}
     for k, (title, v) in ch.items():
-        if not _keep(title, kb):
+        _alw = _plot_always(title)
+        if not _alw and not _keep(title, kb):
             continue
         c = categorize(title)
-        _bad = _volt_panel_forced(c, v, tclear, taxis)
+        _bad = _volt_panel_forced(c, v, tclear, taxis) or False
         _trip = False
         try:
             _tb = _chan_bus(title)
@@ -21475,9 +21687,9 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                      and c in ("ANGLE", "ETERM", "PELEC", "QELEC", "SPEED"))
         except Exception:
             _trip = False
-        if not spp_plot_keep(title, c) and not _bad and not _trip:
+        if not spp_plot_keep(title, c) and not _bad and not _trip and not _alw:
             continue
-        if (PLOT_SCOPE == "compact" and not _bad and not _trip
+        if (PLOT_SCOPE == "compact" and not _bad and not _trip and not _alw
                 and _compact_drop(title, c, v, tclear, taxis)):
             _n_compact_drop[0] += 1
             continue
@@ -21585,7 +21797,7 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                 # The label already carries PLOT_VIOLATION_TAG when the channel
                 # broke something. That is the test.
                 _vio_panel = PLOT_VIOLATION_TAG in str(lbl)
-                if (INDIVIDUAL_KEYWORDS and not _vio_panel
+                if (INDIVIDUAL_KEYWORDS and not _vio_panel and not _plot_always(title)
                         and not any(w in title.upper() for w in INDIVIDUAL_KEYWORDS)):
                     continue
                 head = _TIER_TITLE.get(_panel_tier(title), "MONITORED SIGNALS")
