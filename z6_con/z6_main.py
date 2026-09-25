@@ -18673,13 +18673,59 @@ def _gt_readme_write(r, faults):
     if mo:
         L.append("machines OFF (%d): %s" % (len(mo), ", ".join("%s '%s'" % (b, i) for b, i in mo)))
     if g and g.get("branches"):
-        L.append("opened     : %s" % ", ".join("-".join(str(v) for v in br) for br in g["branches"]))
+        L.append("opened     : %s" % ", ".join(
+            "%s-%s%s ckt %s" % (br[0], br[1], ("-%s" % br[3]) if len(br) > 3 and br[3] else "", br[2])
+            for br in g["branches"]))
     if g and g.get("caps"):
         L.append("caps OFF   : %s" % ", ".join("%s '%s' (%s)" % c for c in g["caps"]))
     if g and g.get("egf"):
         L.append(".dyr edits on the existing gens at the feeders: %s" % _gt_egf_text(g["egf"]))
     L.append("compared with: %s" % ("the POIGENOFF run of %s" % sc[0] if g and g.get("base_off")
                                     else "the all-in-service run of %s" % sc[0] if g else "-"))
+    # THE TEST CONDITIONS -- everything the run was simulated with
+    tag, dc, it, acc, tol = sc
+    base = not str(GEN_TEST_CASE).strip().lower().startswith("proj")
+    sav = ((BASE_SAV_BY_PROJECT if base else PROJ_SAV_BY_PROJECT) or {}).get(GEN_TEST_PROJECT) \
+        or (BASE_SAV if base else PROJ_SAV)
+    dyr = ((BASE_DYR_BY_PROJECT if base else PROJ_DYR_BY_PROJECT) or {}).get(GEN_TEST_PROJECT) \
+        or (BASE_DYR if base else PROJ_DYR)
+    L += ["", "TEST CONDITIONS",
+          "case       : %s / %s  (%s case folder)" % (sav, dyr, "base" if base else "project"),
+          "simulation : flat run %s s, fault at %s s, run to %s s per fault"
+          % (FLAT_RUN_S, PRE_FAULT_S, SIM_END_S),
+          "solver     : time step 1/%g cycle, MAXITER %s, ACCEL %s, TOL %s%s"
+          % (float(dc or DELT_CYCLES or 4), it or 60, acc or 0.60, tol or DYN_TOL or 0.0000095,
+             "  (this scenario's values, applied from the start of every fault)" if (it or acc) else
+             "  (as SPP runs it; no solver retry)"),
+          "criteria   : recovery >= %s pu within %s s of the final clearing, no swing above %s pu"
+          % (V_RECOVERY_PU, V_RECOVERY_S, V_OVERSHOOT_PU)]
+    # the actual .dyr values changed, old -> new, as the study wrote them
+    ep = os.path.join(rdir, "EGF_DYR_EDITS.txt")
+    if g and g.get("egf") and os.path.isfile(ep):
+        try:
+            with open(ep, "r", errors="ignore") as fh:
+                ed = [x.rstrip() for x in fh if x.strip()]
+            L += ["", ".dyr VALUES CHANGED (bus id model constant: deck -> used), %d line(s)" % len(ed)]
+            L += ["  " + x for x in ed]
+        except Exception:
+            pass
+    # each fault as the study defined it
+    fp = os.path.join(rdir, "faults", "SPP_FAULTS.csv")
+    if os.path.isfile(fp):
+        try:
+            want = set(_gt_run_faults(g, faults))
+            got = []
+            with csv_open(fp) as fh:
+                for row in csv.DictReader(fh):
+                    fid = (row.get("fault_id") or row.get("id") or "").strip()
+                    if any(_gt_match(fid, f) for f in want):
+                        got.append("  %s: %s" % (fid, "; ".join(
+                            "%s=%s" % (k, str(v).strip()) for k, v in row.items()
+                            if k and v is not None and str(v).strip()
+                            and k not in ("fault_id", "id"))))
+            L += ["", "FAULTS (as defined in faults\\SPP_FAULTS.csv)"] + (got or ["  (not found in the file)"])
+        except Exception:
+            pass
     try:
         with open(os.path.join(rdir, "GEN_TEST_RUN.txt"), "w") as fh:
             fh.write("\n".join(L) + "\n")
