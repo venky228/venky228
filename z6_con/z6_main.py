@@ -18802,6 +18802,31 @@ def _gt_lacks_prec(r, faults):
                               for f in need)
 
 
+_GT_RESCORE_TRIES = 3     # scoring passes a fault with its .out + .done may take to get a verdict
+
+
+def _gt_lost(r, faults):
+    """Faults of a finished run that have their .out AND .done (simulated to the
+       end) but no verdict: the scoring lost them -- e.g. a report shard that
+       died while many runs were scored at once (EmpirePrairie s2, 2 of 3
+       after a rescore that had 3 of 3). Scored again, up to _GT_RESCORE_TRIES
+       passes in all; after that, what is missing is a real give-up."""
+    rdir = r.get("rdir") or ""
+    m = r.get("m") or {}
+    lost = [f for f in _gt_run_faults(r["gen"], faults)
+            if (m.get(f) or {}).get("verdict") not in ("PASS", "FAIL", "SKIP")
+            and os.path.isfile(os.path.join(rdir, "outs", "%s.out" % f))
+            and os.path.isfile(os.path.join(rdir, "outs", "%s.done" % f))]
+    if not lost:
+        return []
+    try:
+        with open(os.path.join(rdir, "flags", _GT_RESCORED)) as fh:
+            n = len([ln for ln in fh if ln.strip()])
+    except Exception:
+        n = 0
+    return lost if n < _GT_RESCORE_TRIES else []
+
+
 def _gt_wait_plotter(rdir):
     """The study returns while its per-fault plotter still draws and scores in
        the background (it holds plots\\_plotter.claim). Judged then, the run read
@@ -18852,7 +18877,8 @@ def _gt_rescore(r, env, faults, log_path=None):
     if r["gen"] and r["gen"].get("egf") and _gt_egf_mismatch(rdir, r["gen"]):
         return None                # not this entry's .dyr values -- scoring it would mislabel it
     try:
-        with open(os.path.join(rdir, "flags", _GT_RESCORED), "w") as fh:
+        # APPENDED, one line per pass: _gt_lost counts them
+        with open(os.path.join(rdir, "flags", _GT_RESCORED), "a") as fh:
             fh.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
     except Exception:
         pass
@@ -20321,7 +20347,8 @@ def run_gen_test():
              ("  [best2: machine runs are added once the %d solver runs finish]"
               % len(GEN_TEST_SCENARIOS)) if (_gmode == "best2" and not base_ready) else ""))
     if GEN_TEST_REPORT_ONLY and not (GEN_TEST_RESCORE_MISSING and any(
-            r["note"] and _gt_lacks_prec(r, faults) and _gt_outs_ready(r["rdir"], r["gen"], faults)
+            r["note"] and (_gt_lacks_prec(r, faults) or _gt_lost(r, faults))
+            and _gt_outs_ready(r["rdir"], r["gen"], faults)
             for r in runs)):
         # RE-RANK WHAT IS ON DISK: every report is rebuilt from each run's
         # criteria report, so a change in how runs are judged reaches the
@@ -20347,7 +20374,11 @@ def run_gen_test():
     n_rs = 0
     if GEN_TEST_RESCORE_MISSING:
         for r in runs:
-            if r["note"] and _gt_lacks_prec(r, faults) and _gt_outs_ready(r["rdir"], r["gen"], faults):
+            if r["note"] and (_gt_lacks_prec(r, faults) or _gt_lost(r, faults)) \
+                    and _gt_outs_ready(r["rdir"], r["gen"], faults):
+                if _gt_lost(r, faults):
+                    print("[gen-test] %s: %s simulated to the end but not scored -- scoring again"
+                          % (os.path.basename(r["rdir"]), ",".join(_gt_lost(r, faults))))
                 r["note"], r["state"], r["force_score"] = "", "WAITING", True
                 n_rs += 1
     todo = [r for r in runs if not r["note"]]
