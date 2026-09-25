@@ -16552,8 +16552,8 @@ def _fit_ylabel(renderer, text, height_in, fs=7.5):
 def _mark_limits(ax, cat, ptitle, tp, v, tclear, vio):
     """WHERE a panel breaks a limit, not only THAT it does: the limit as a
        dotted line and the worst point circled with its value. Red for an SPP
-       violation; amber for a machine terminal voltage above V_OVERSHOOT_PU,
-       which the report lists as INFO (not scored). Returns 'red', 'amber' or ''."""
+       violation. Machine terminal voltage above V_OVERSHOOT_PU (INFO in the
+       report) is not marked. Returns "red" or ""."""
     RED, AMB = "#c00000", "#d98c00"
     s = str(ptitle)
     marks = []
@@ -16573,11 +16573,8 @@ def _mark_limits(ax, cat, ptitle, tp, v, tclear, vio):
         i0 = 0
         if tclear is not None:
             i0 = next((i for i in range(n) if tp[i] >= tclear), n)
-        if not vio and cat == "ETERM" and n:
-            _post = [x for x in v[i0:n] if ok(x)]
-            if _post and max(_post) > V_OVERSHOOT_PU:
-                marks.append(("max", V_OVERSHOOT_PU, AMB,
-                              "> %.2f pu (info, not scored)" % V_OVERSHOOT_PU))
+        # (Machine terminal voltage above V_OVERSHOOT_PU is INFO in the report
+        # and is NOT marked on the plot -- only SPP violations are.)
         # THE WINDOWS THE REPORT JUDGES, so the circled value is the one the
         # title / report names -- not the clearing-sample step before it.
         def _ix(tc, extra):
@@ -16808,8 +16805,7 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
             y = yb - GAP
     # ---- footer
     fig.text(fx(LM), fy(0.14), "red dashed line = fault applied     green dashed line = "
-             "fault cleared     red frame + red circle = SPP violation (dotted = the limit)"
-             "     amber = terminal V above %.2f pu (info, not scored)" % V_OVERSHOOT_PU,
+             "fault cleared     red frame + red circle = SPP violation (dotted = the limit)",
              fontsize=6.5, color="#666666", va="bottom")
     return fig
 
