@@ -408,6 +408,11 @@ V_OVERSHOOT_PU = 1.20                        # no swing above this
 OVERSHOOT_SPIKE_S = 2.0 / 60.0               # above the limit <= this = SPIKE, longer = SWING
 V_SS_LOW = 0.90                              # post-fault steady-state band, low
 V_SS_HIGH = 1.10                             # and high
+# records beside the criteria (INFO, no PASS/FAIL) -- changing one re-scores finished gen-test runs
+POI_P_RECOVERY_FRAC = 0.90                   # POI power back to this fraction of pre-fault (and held +/- 1-this)
+RIPPLE_WINDOW_S = 2.0                        # ripple: the last this many s of each fault run
+RIPPLE_V_PU = 0.01                           # ripple: POI voltage peak-to-peak above this (pu) ...
+RIPPLE_P_FRAC = 0.02                         # ... or POI power peak-to-peak above this fraction of pre-fault
 TRIP_PGEN_DEAD_MW = 10.0                     # machine ending below this MW = tripped
 ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
 SPPR_MIN_AFTER_FIRST_PEAK = True             # True = SPPR "Minimum Value" as SPP Figure 2 (lowest trough after 1st peak) | False = lowest point after clearing
@@ -14071,6 +14076,7 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False,
         env["SPP_PRE_FAULT_S"] = repr(float(PRE_FAULT_S))
     if SIM_END_S is not None:
         env["SPP_SIM_END_S"] = repr(float(SIM_END_S))
+    _push_records(env)
     if RUN_NPLT is not None:
         env["SPP_RUN_NPLT"] = str(int(RUN_NPLT))
     _push_settings(env, case)
@@ -15390,6 +15396,7 @@ def _start_plotter(case, proj, mode, slot, rdir=None):
         env["SPP_PRE_FAULT_S"] = repr(float(PRE_FAULT_S))
     if SIM_END_S is not None:
         env["SPP_SIM_END_S"] = repr(float(SIM_END_S))
+    _push_records(env)
     if RUN_NPLT is not None:
         env["SPP_RUN_NPLT"] = str(int(RUN_NPLT))
     _push_settings(env, case)              # criteria thresholds, radius, the rest
@@ -18338,6 +18345,12 @@ def _gt_prec_parse(d, det):
                     else "never" if "never reached" in det else "n/a")
 
 
+def _gt_levels():
+    """The panel's recovery / ripple levels, as the study writes them."""
+    return (int(round(POI_P_RECOVERY_FRAC * 100)), round(float(RIPPLE_WINDOW_S), 1),
+            round(float(RIPPLE_V_PU), 3), int(round(RIPPLE_P_FRAC * 100)))
+
+
 def _gt_ripple_parse(d, det):
     """The study's 'POI ripple after recovery' row -> ripple yes / no / n/a,
        voltage p-p (pu) and power p-p (% of pre-fault)."""
@@ -18346,6 +18359,8 @@ def _gt_ripple_parse(d, det):
     d["v_pp"] = float(mv.group(1)) if mv else None
     d["p_pp_pct"] = float(mp.group(1)) if mp else None
     d["ripple"] = ("yes" if "-- RIPPLE" in det else "no" if "no ripple" in det else "n/a")
+    ml = re.search(r"limits ([\d.]+) pu, ([\d.]+)% of pre-fault", det)
+    d["_rlim"] = (round(float(ml.group(1)), 3), int(round(float(ml.group(2))))) if ml else None
 
 
 def _gt_prec_cell(d):
@@ -18357,7 +18372,7 @@ def _gt_prec_cell(d):
     return {"not held": "NOT HELD", "never": "NEVER", "n/a": "n/a"}.get(st, "-") + rp
 
 
-_GT_PREC_PCT = 90             # the study's POI_P_RECOVERY_FRAC, for labels only
+_GT_PREC_PCT = int(round(POI_P_RECOVERY_FRAC * 100))   # for labels
 
 
 def _gt_prec_worst(m, faults):
@@ -18409,6 +18424,9 @@ def _gt_measure(rdir, faults):
                             _gt_prec_parse(res[f], r.get("Detail") or "")
                         if case and _gt_match(case, f) and crit.startswith("POI ripple"):
                             _gt_ripple_parse(res[f], r.get("Detail") or "")
+                            res[f]["_rcrit"] = crit
+                        if case and _gt_match(case, f) and crit.startswith("POI active power recovery"):
+                            res[f]["_pcrit"] = crit
                         if case and _gt_match(case, f):
                             # the AND of the rows, as the study scores it
                             if rs == "FAIL":
@@ -18422,6 +18440,15 @@ def _gt_measure(rdir, faults):
                                 res[f]["verdict"] = "PASS"
         except Exception as e:
             print("[gen-test] could not read %s (%s)" % (cp, e))
+    # THE LEVELS THE RECORDS WERE MADE WITH (recovery %, ripple window and
+    # limits), so a change on the panel is seen and the run scored again
+    for f in faults:
+        d = res[f]
+        mp = re.search(r"to (\d+)% of pre-fault", d.pop("_pcrit", "") or "")
+        mw = re.search(r"\(last ([\d.]+) s\)", d.pop("_rcrit", "") or "")
+        rl = d.pop("_rlim", None)
+        d["levels"] = ((int(mp.group(1)), round(float(mw.group(1)), 1)) + rl
+                       if (mp and mw and rl) else None)
     for lp in glob.glob(os.path.join(rdir, "logs", "psse", "*.txt")):
         stem = os.path.splitext(os.path.basename(lp))[0]
         for f in faults:
@@ -18571,14 +18598,25 @@ def _gt_rescorable(r, faults):
             and not os.path.isfile(os.path.join(rdir, "flags", _GT_RESCORED)))
 
 
+def _push_records(env):
+    """The POI power-recovery and ripple levels, to the study (runs AND plotter)."""
+    env["SPP_POI_P_RECOVERY_FRAC"] = repr(float(POI_P_RECOVERY_FRAC))
+    env["SPP_RIPPLE_WINDOW_S"] = repr(float(RIPPLE_WINDOW_S))
+    env["SPP_RIPPLE_V_PU"] = repr(float(RIPPLE_V_PU))
+    env["SPP_RIPPLE_P_FRAC"] = repr(float(RIPPLE_P_FRAC))
+
+
 def _gt_lacks_prec(r, faults):
     """Scored, but before the study wrote the POI power-recovery row."""
     m = r.get("m") or {}
     need = [f for f in _gt_run_faults(r["gen"], faults)
             if (m.get(f) or {}).get("verdict") in ("PASS", "FAIL")]
-    # either row missing (scored before it existed) -> score again
+    # either row missing (scored before it existed), or scored under OTHER
+    # levels than the panel's now -> score again
     return bool(need) and any((m.get(f) or {}).get("p_state") is None
-                              or (m.get(f) or {}).get("ripple") is None for f in need)
+                              or (m.get(f) or {}).get("ripple") is None
+                              or (m.get(f) or {}).get("levels") not in (None, _gt_levels())
+                              for f in need)
 
 
 def _gt_wait_plotter(rdir):
@@ -19303,7 +19341,8 @@ def _gt_write(runs, faults, gens):
           "  its pre-fault value AND stays within +/-%d %% of it to the end.  NOT HELD = reaches it but swings"
           % (100 - _GT_PREC_PCT),
           "  out again, NEVER = never gets back, - = not measured (scored before this row existed)",
-          "  R = RIPPLE: over the last 2 s the POI voltage swings > 0.01 pu or the power > 2 % peak-to-peak,",
+          "  R = RIPPLE: over the last %g s the POI voltage swings > %g pu or the power > %g %% peak-to-peak,"
+          % (RIPPLE_WINDOW_S, RIPPLE_V_PU, 100 * RIPPLE_P_FRAC),
           "  and it is not dying out (non-converged steps or a control hunting)",
           "%-22s %-50s " % ("scenario", "machine OFF / line OPEN") + " | ".join("%-11s" % f for f in faults),
           "-" * 150]
