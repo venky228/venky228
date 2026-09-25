@@ -247,6 +247,7 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 # -- 3a. on / off, projects, faults
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
+GEN_TEST_REPORT_ONLY = False                 # True = rewrite every gen-test report from the runs on disk, simulate nothing
 GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
 GEN_TEST_PROJECTS = ["SantaFe", "EmpirePrairie"]  # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
 GEN_TEST_PROJECT = "SantaFe"                 # the one project run when GEN_TEST_PROJECTS = []
@@ -18313,9 +18314,30 @@ def _gt_find(rdir, stem, ext):
     return ""
 
 
+def _gt_crit(c):
+    """Short name of an SPP criterion row (the report's wording varies)."""
+    s = c.lower()
+    for k, v in (("recovery", "voltage recovery"), ("steady", "steady-state voltage"),
+                 ("tripping", "generator tripping"), ("damping", "rotor-angle damping"),
+                 ("stability", "system stability")):
+        if k in s:
+            return v
+    return c.strip()[:30]
+
+
+def _gt_newfails(mo, mb, fs):
+    """Criteria (other than the 1.2 pu spike) the element-out run FAILS on
+       faults fs that its reference run passes -- such a run is not a fix."""
+    out = set()
+    for f in fs:
+        out |= set((mo.get(f) or {}).get("fails") or ()) - set((mb.get(f) or {}).get("fails") or ())
+    return sorted(out)
+
+
 def _gt_measure(rdir, faults):
     """{fault: {verdict, noconv, n_over, max_pu}} from what the run wrote."""
-    res = dict((f, {"verdict": "?", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {}})
+    res = dict((f, {"verdict": "?", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {},
+                    "fails": set()})
                for f in faults)
     cp = _gt_find(rdir, "SPP_CRITERIA_REPORT", "csv")
     if cp:
@@ -18324,11 +18346,17 @@ def _gt_measure(rdir, faults):
                 for r in csv.DictReader(fh):
                     case = (r.get("Case") or "").strip()
                     rs = (r.get("Result") or "").strip().upper()
+                    crit = (r.get("Criterion") or "").strip()
                     for f in faults:
                         if case and _gt_match(case, f):
                             # the AND of the rows, as the study scores it
                             if rs == "FAIL":
                                 res[f]["verdict"] = "FAIL"
+                                # EVERY OTHER CRITERION IT FAILS, not only the 1.2 pu
+                                # spike: a run whose POI voltage no longer recovers
+                                # shows FEWER spikes and must not read as better
+                                if not crit.lower().startswith("transient voltage"):
+                                    res[f]["fails"].add(_gt_crit(crit))
                             elif res[f]["verdict"] == "?":
                                 res[f]["verdict"] = "PASS"
         except Exception as e:
@@ -18439,7 +18467,8 @@ def _gt_done(rdir, faults, g=None):
             return False, m
     for f in ((g or {}).get("skip") or {}):
         if f in m:
-            m[f] = {"verdict": "SKIP", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {}}
+            m[f] = {"verdict": "SKIP", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {},
+                    "fails": set()}
     need = _gt_run_faults(g, faults)
     ok = all(m[f]["verdict"] in ("PASS", "FAIL") for f in need)
     # PART-SCORED COUNTS AS FINISHED ONLY ONCE IT HAS BEEN SCORED ON PURPOSE:
@@ -18671,7 +18700,9 @@ def _gt_score(m, faults):
     known = all(m[f]["noconv"] is not None for f in sc)
     ov = sum(m[f]["n_over"] for f in sc)
     mx = max([m[f]["max_pu"] or 0.0 for f in sc] or [0.0])
-    return ps, nc, ov, mx, known, len(sc), len(faults)
+    # other criteria failed (recovery, steady state, trips, damping, stability)
+    oth = sum(len(m[f].get("fails") or ()) for f in sc)
+    return ps, nc, ov, mx, known, len(sc), len(faults), oth
 
 
 def _gt_scored(m, faults):
@@ -18727,14 +18758,16 @@ def _gt_ref(refs, r):
 
 
 def _gt_key(sc):
-    return (-sc[0], sc[1], sc[2], sc[3])
+    # fewer OTHER criteria failed ranks first: fewer spikes bought with a
+    # voltage that no longer recovers is not better
+    return (-sc[0], sc[7], sc[1], sc[2], sc[3])
 
 
 def _gt_spike_key(sc):
     """Section C / D order: the SPIKES first (buses > 1.2 pu, then the peak),
        non-convergence only as the tie-break -- opening a line that trims 'not
        converged' steps but raises the peak does not help the spikes."""
-    return (-sc[0], sc[2], round(sc[3] or 0.0, 3), sc[1])
+    return (-sc[0], sc[7], sc[2], round(sc[3] or 0.0, 3), sc[1])
 
 
 def _gt_best(runs, faults, ref):
@@ -18787,8 +18820,12 @@ def _gt_best(runs, faults, ref):
             continue
         k = (g["bus"], g["id"], bool(g.get("base_off")))
         e = per.setdefault(k, {"g": g, "n": 0, "better": 0, "dnc": 0, "dov": 0, "dmx": 0.0,
-                               "fix": 0, "best": None})
+                               "fix": 0, "best": None, "bad": 0, "why": set()})
         e["n"] += 1
+        _nf = _gt_newfails(r.get("m") or {}, b.get("m") or {}, fs)
+        if _nf:
+            e["bad"] += 1
+            e["why"] |= set(_nf)
         e["dnc"] += bx[1] - x[1]
         e["dov"] += bx[2] - x[2]
         e["dmx"] += (bx[3] or 0.0) - (x[3] or 0.0)
@@ -18814,7 +18851,7 @@ def _gt_best(runs, faults, ref):
           "  %-8s %-10s %-14s %-16s %6s %8s %11s %11s %11s %9s  %s" % (
               "bus", "id", "name", "kind", "runs", "better", "avg >1.2 dr", "avg pk drop",
               "avg nc drop", "faults+", "its best scenario (>1.2 / peak)")]
-    pl = sorted(per.values(), key=lambda e: (-e["fix"], -(e["dov"] / float(e["n"])),
+    pl = sorted(per.values(), key=lambda e: (e["bad"] > 0, -e["fix"], -(e["dov"] / float(e["n"])),
                                              -(e["dmx"] / float(e["n"])), -(e["dnc"] / float(e["n"]))))
     for e in pl:
         g = e["g"]
@@ -18823,7 +18860,9 @@ def _gt_best(runs, faults, ref):
             g["bus"], g["id"], g["name"][:14], (g["kind"] or "")[:16], e["n"], e["better"], e["n"],
             e["dov"] / float(e["n"]), e["dmx"] / float(e["n"]), e["dnc"] / float(e["n"]), e["fix"],
             e["best"][1], bxx[2], "%.3f" % bxx[3] if bxx[3] else "-",
-            "" if len(e["best"][2]) == nf else " -- %s ONLY" % ",".join(e["best"][2])))
+            "" if len(e["best"][2]) == nf else " -- %s ONLY" % ",".join(e["best"][2]))
+            + ("  NOT RECOMMENDED: new FAIL (%s) in %d of %d" % (", ".join(sorted(e["why"])), e["bad"], e["n"])
+               if e["bad"] else ""))
     if not pl:
         L.append("  (no machine-off run has finished yet)")
     # D -- what it says
@@ -18846,8 +18885,12 @@ def _gt_best(runs, faults, ref):
         elif s0x and bx[1] > 0:
             L.append("  -> no solver setting makes the network converge: look at section C and at the")
             L.append("     model of the machine at the top of it.")
-    if pl:
-        e = pl[0]
+    if any(e["bad"] for e in pl):
+        L.append("  NOT RECOMMENDED = fewer spikes, but it FAILS another criterion (voltage recovery, steady")
+        L.append("  state, trips, damping, stability) that the reference passes: ranked last, never suggested")
+    pl_ok = [e for e in pl if not e["bad"]]
+    if pl_ok:
+        e = pl_ok[0]
         if e["dov"] > 0 or e["dmx"] > 0.005 * e["n"]:
             bxx = e["best"][0]
             L.append("  top element : %s -- better in %d of %d scenarios, avg >1.2 drop %.1f, "
@@ -18897,16 +18940,24 @@ def _gt_impact(runs, faults, proj):
                          "over_b": len(bb), "over_o": len(bo),
                          "pk_b": mb.get("max_pu") or 0.0, "pk_o": mo.get("max_pu") or 0.0,
                          "nc_b": mb.get("noconv"), "nc_o": mo.get("noconv"),
-                         "v_b": mb.get("verdict"), "v_o": mo.get("verdict"), "bb": bb, "bo": bo})
+                         "v_b": mb.get("verdict"), "v_o": mo.get("verdict"), "bb": bb, "bo": bo,
+                         "newfail": _gt_newfails(m, b["m"], [f])})
     for x in rows:
         x["dpk"] = (x["pk_b"] or 0.0) - (x["pk_o"] or 0.0)
         x["dnc"] = ((x["nc_b"] or 0) - (x["nc_o"] or 0)) if x["nc_b"] is not None and x["nc_o"] is not None else 0
-        d = (x["over_b"] - x["over_o"], round(x["dpk"], 3), x["dnc"],
+        # NOT A CHANGE: 1-2 buses, under 0.005 pu, or 'not converged' steps within
+        # 5 % -- those were being called HOLDS DOWN / CONTRIBUTES on noise
+        dov = x["over_b"] - x["over_o"]
+        dpk = round(x["dpk"], 3)
+        dnc = x["dnc"]
+        d = (0 if abs(dov) <= 2 else dov, 0 if abs(dpk) < 0.005 else dpk,
+             0 if abs(dnc) <= max(10, 0.05 * (x["nc_b"] or 0)) else dnc,
              (x["v_o"] == "PASS") - (x["v_b"] == "PASS"))
         up, down = any(v > 0 for v in d), any(v < 0 for v in d)
-        x["eff"] = ("CONTRIBUTES" if up and not down else "HOLDS DOWN" if down and not up
+        x["eff"] = ("NOT RECOMM." if x["newfail"] else
+                    "CONTRIBUTES" if up and not down else "HOLDS DOWN" if down and not up
                     else "MIXED" if up else "no effect")
-    key = lambda x: (-(x["over_b"] - x["over_o"]), -x["dpk"], -x["dnc"])
+    key = lambda x: (bool(x["newfail"]), -(x["over_b"] - x["over_o"]), -x["dpk"], -x["dnc"])
 
     def scs(fr):
         """The scenario blocks with rows, in panel order: each scenario, then
@@ -18932,7 +18983,9 @@ def _gt_impact(runs, faults, proj):
          "buses>1.2 = buses above 1.2 pu (in service -> element out), peak = highest pu, nc = 'not converged' steps.",
          "Top of each list = taking it out helps most = it CONTRIBUTES most to the spike.",
          "impact: CONTRIBUTES = better with it out (it drives the spike / non-convergence)",
-         "        HOLDS DOWN  = worse with it out (it keeps the voltage down)   MIXED / no effect", ""]
+         "        HOLDS DOWN  = worse with it out (it keeps the voltage down)   MIXED / no effect",
+         "        NOT RECOMM. = fewer spikes, but it FAILS another criterion the reference passes",
+         "                      (voltage recovery, steady state, trips, damping, stability) -- not a fix", ""]
     # SUMMARY -- per fault, the elements that matter (first scenario that has them)
     L += ["SUMMARY -- per fault, the elements with an impact (scenario: first with element runs)", ""]
     for f in faults:
@@ -18958,6 +19011,11 @@ def _gt_impact(runs, faults, proj):
                 L.append("      holds down  : %-50s buses %d -> %d, peak %s -> %s"
                          % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
                             "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-"))
+            for x in [x for x in sr if x["newfail"]][:3]:
+                L.append("      NOT RECOMM. : %-50s buses %d -> %d, peak %s -> %s, new FAIL: %s"
+                         % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
+                            "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-",
+                            ", ".join(x["newfail"])))
             if not con and not hol:
                 L.append("      no single element changes this fault")
     L.append("")
@@ -18983,7 +19041,8 @@ def _gt_impact(runs, faults, proj):
                                   "%.3f" % x["pk_o"] if x["pk_o"] else "-"),
                     "%s -> %s" % ("-" if x["nc_b"] is None else x["nc_b"],
                                   "-" if x["nc_o"] is None else x["nc_o"]),
-                    "%s -> %s" % (x["v_b"], x["v_o"])))
+                    "%s -> %s" % (x["v_b"], x["v_o"]))
+                    + ("   new FAIL: " + ", ".join(x["newfail"]) if x["newfail"] else ""))
         # B -- per spiking bus, the element that lowers it most (first scenario
         # with runs, and the first POI-off block when there is one)
         for sc in firsts(fr):
@@ -18994,7 +19053,8 @@ def _gt_impact(runs, faults, proj):
             if not bb:
                 L.append("  (no bus above 1.2 pu in the reference run)")
             for bus, pk in sorted(bb.items(), key=lambda t: -t[1]):
-                best = sorted(sr, key=lambda x: x["bo"].get(bus, 0.0))[:3]
+                best = sorted([x for x in sr if not x["newfail"]] or sr,
+                              key=lambda x: x["bo"].get(bus, 0.0))[:3]
                 L.append("  %-28s %.3f pu  -> %s" % (bus[:28], pk, "  |  ".join(
                     "%s: %s" % (re.sub(r"^(OFF|EDIT|OPEN) ", "", _gt_label(x["g"])),
                                 ("%.3f" % x["bo"][bus]) if bus in x["bo"] else "below 1.2")
@@ -19010,11 +19070,12 @@ def _gt_impact(runs, faults, proj):
             w.writerow(["fault", "scenario", "impact", "element_out", "kind", "buses_over_1p2_in_service",
                         "buses_over_1p2_out", "buses_cleared", "buses_new", "peak_pu_in_service",
                         "peak_pu_out", "peak_drop", "nc_in_service", "nc_out", "verdict_in_service",
-                        "verdict_out"])
+                        "verdict_out", "new_fails"])
             for x in sorted(rows, key=lambda x: (x["f"], x["sc"]) + key(x)):
                 w.writerow([x["f"], x["sc"], x["eff"], _gt_label(x["g"]), x["g"].get("kind") or "", x["over_b"],
                             x["over_o"], x["cleared"], x["new"], x["pk_b"] or "", x["pk_o"] or "",
-                            round(x["dpk"], 4), x["nc_b"], x["nc_o"], x["v_b"], x["v_o"]])
+                            round(x["dpk"], 4), x["nc_b"], x["nc_o"], x["v_b"], x["v_o"],
+                            "; ".join(x["newfail"])])
     except Exception as e:
         print("[gen-test] GEN_TEST_IMPACT not written (%s)" % e)
 
@@ -19480,6 +19541,10 @@ def _gt_write_all(projs):
             rows_csv.append([pj, r["sc"][0], lab, len(fs), len(faults), bx[2], x[2],
                              "%.3f" % (bx[3] or 0.0), "%.3f" % (x[3] or 0.0), bx[1], x[1],
                              bx[0], x[0]])
+            _nf = _gt_newfails(m, b["m"], fs)
+            if _nf:
+                L.append("  %-18s   -> NOT RECOMMENDED: new FAIL (%s)" % ("", ", ".join(_nf)))
+                continue
             if g.get("base_off"):
                 # measured against the POI-off run, not against all in service:
                 # listed above, but not a candidate for the project's BEST
@@ -19811,6 +19876,15 @@ def run_gen_test():
           % (len(runs), len(faults), ", ".join(faults), len(GEN_TEST_SCENARIOS), len(gens),
              ("  [best2: machine runs are added once the %d solver runs finish]"
               % len(GEN_TEST_SCENARIOS)) if (_gmode == "best2" and not base_ready) else ""))
+    if GEN_TEST_REPORT_ONLY:
+        # RE-RANK WHAT IS ON DISK: every report is rebuilt from each run's
+        # criteria report, so a change in how runs are judged reaches the
+        # finished ones without simulating anything
+        _gt_write(runs, faults, gens)
+        print("[gen-test] REPORT ONLY -- %d run(s) re-ranked from disk, nothing simulated "
+              "(%d not finished). Set GEN_TEST_REPORT_ONLY = False to run them."
+              % (sum(1 for r in runs if r["note"]), sum(1 for r in runs if not r["note"])))
+        return 0
     if GEN_TEST_DRY_RUN:
         for i, r in enumerate(runs, 1):
             g = r["gen"]
