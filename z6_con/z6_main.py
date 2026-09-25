@@ -18641,6 +18641,52 @@ def _gt_machines_off(g):
     return out
 
 
+def _gt_readme(r, faults):
+    """GEN_TEST_RUN.txt -- never allowed to stop a launch."""
+    try:
+        _gt_readme_write(r, faults)
+    except Exception as e:
+        print("[gen-test] GEN_TEST_RUN.txt not written in %s (%s)" % (os.path.basename(r.get("rdir") or ""), e))
+
+
+def _gt_readme_write(r, faults):
+    """GEN_TEST_RUN.txt in the run's folder: what this run took out, by bus
+       number. The folder name is the run's key (renaming it re-runs it), so
+       POIALL / ALL7BUS stay short there and the detail lives here."""
+    rdir = r.get("rdir") or ""
+    if not os.path.isdir(rdir):
+        return
+    sc, g = r["sc"], r["gen"]
+    own = dict(g) if g else {}
+    own.pop("base_off", None)
+    L = ["GEN TEST RUN -- %s  (%s case)" % (GEN_TEST_PROJECT, GEN_TEST_CASE),
+         "run        : %s" % (_gt_label(g) if g else "all in service (reference)"),
+         "scenario   : %s  (%s)" % (sc[0], _gt_scen_desc(sc)),
+         "POI        : %s" % GEN_TEST_POI,
+         "faults     : %s" % ", ".join(_gt_run_faults(g, faults))]
+    if g and g.get("skip"):
+        L.append("left out   : %s (%s)" % (", ".join(sorted(g["skip"])),
+                                           "; ".join("%s %s" % kv for kv in sorted(g["skip"].items()))))
+    if g and g.get("base_off"):
+        L.append("POI gens OFF (POI-off run): %s" % ", ".join("%s '%s'" % (b, i) for b, i in g["base_off"]))
+    mo = [k for k in _gt_machines_off(own)] if own else []
+    if mo:
+        L.append("machines OFF (%d): %s" % (len(mo), ", ".join("%s '%s'" % (b, i) for b, i in mo)))
+    if g and g.get("branches"):
+        L.append("opened     : %s" % ", ".join("-".join(str(v) for v in br) for br in g["branches"]))
+    if g and g.get("caps"):
+        L.append("caps OFF   : %s" % ", ".join("%s '%s' (%s)" % c for c in g["caps"]))
+    if g and g.get("egf"):
+        L.append(".dyr edits on the existing gens at the feeders: %s" % _gt_egf_text(g["egf"]))
+    L.append("compared with: %s" % ("the POIGENOFF run of %s" % sc[0] if g and g.get("base_off")
+                                    else "the all-in-service run of %s" % sc[0] if g else "-"))
+    try:
+        with open(os.path.join(rdir, "GEN_TEST_RUN.txt"), "w") as fh:
+            fh.write("\n".join(L) + "\n")
+    except Exception:
+        pass
+
+
 def _gt_env(sc, g, faults):
     tag, dc, it, acc, tol = sc
     fl = ",".join(_gt_run_faults(g, faults)) if g and g.get("skip") else ",".join(GEN_TEST_FAULTS)
@@ -18788,8 +18834,11 @@ def _gt_label(g):
         return "EDIT %s: %s" % (str(g.get("id") or "EGF")[3:] or "EGF", _gt_egf_text(g["egf"]))
     if g.get("branches"):
         return "OPEN %s %s %s" % (g.get("kind") or "LINE", _gt_brname(g["branches"][0]), g["name"])
-    if g.get("group") and str(g.get("id")) in ("ALL%dBUS" % int(GEN_TEST_HOPS), "POIALL"):
-        return g["name"]            # "ALL GENS OFF 7 BUSES" / "POIGENOFF" (ids ALL7BUS / POIALL stay the folder names)
+    if g.get("group") and str(g.get("id")) == "POIALL":
+        # the POI gens by bus number -- the folder keeps the short id POIALL
+        return "%s %s" % (g["name"], ",".join(str(b) for b, _i in g["group"]))
+    if g.get("group") and str(g.get("id")) == "ALL%dBUS" % int(GEN_TEST_HOPS):
+        return g["name"]            # "ALL GENS OFF 7 BUSES" (id ALL7BUS stays the folder name; buses in GEN_TEST_RUN.txt)
     return "OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])
 
 
@@ -19333,6 +19382,7 @@ def _gt_state(r, done):
 
 def _gt_finish(r, rc, t0):
     tag = _gt_tag(r["sc"], r["gen"])
+    _gt_readme(r, r["faults"])
     done, r["m"] = _gt_done(r["rdir"], r["faults"], r["gen"])
     r["noswitch"] = "" if done else _gt_switch_failure(r)
     r["note"] = ("%.0f min" % ((time.time() - t0) / 60.0)) + (
@@ -19946,6 +19996,8 @@ def run_gen_test():
               % (" + ".join(sc[0] for sc in pick), len(GEN_TEST_SCENARIOS)))
         return [r for r in (add(sc, g) for g in gens for sc in pick) if r and not r["note"]]
 
+    for r in runs:
+        _gt_readme(r, faults)                     # GEN_TEST_RUN.txt: what each run took out
     _GT_LAST[GEN_TEST_PROJECT] = (runs, faults)   # for the all-projects summary
     base_ready = all(r["note"] for r in runs if not r["gen"])
     if _gmode == "best2" and base_ready:
