@@ -19989,19 +19989,33 @@ def _mark_limits(ax, cat, ptitle, tp, v, tclear, vio):
             if _post and max(_post) > V_OVERSHOOT_PU:
                 marks.append(("max", V_OVERSHOOT_PU, AMB,
                               "> %.2f pu (info, not scored)" % V_OVERSHOOT_PU))
+        # THE WINDOWS THE REPORT JUDGES, so the circled value is the one the
+        # title / report names -- not the clearing-sample step before it.
+        def _ix(tc, extra):
+            try:
+                return _post_clear_index(tp[:n], tc, extra) if tc is not None else None
+            except Exception:
+                return None
+        i_ov = _ix(tclear, max(float(V_OVERSHOOT_BLANK_S), float(V_OVERSHOOT_SWING_S))
+                   if V_OVERSHOOT_JUDGE_SWING else float(V_OVERSHOOT_BLANK_S))
+        if i_ov is None:
+            i_ov = 0
+        i_rec = _ix(tclear, V_RECOVERY_S + _REC_EXTRA[0])
+        if i_rec is None:
+            i_rec = _ix(PRE_FAULT_S + 1.0, V_RECOVERY_S)
+        if i_rec is None:
+            i_rec = int(n * 0.4)
         kind = ""
         pts = []                          # (index, colour, texts) -- one label per point
         _tmax = max([x for x in tp[:n] if ok(x)] or [1.0])
         for how, lim, col, txt in marks:
             if how == "max":
-                idx = [i for i in range(i0, n) if ok(v[i])]
+                idx = [i for i in range((i0 if col != RED else i_ov), n) if ok(v[i])]
                 if not idx:
                     continue
                 j = max(idx, key=lambda i: v[i])
             elif how == "min":
-                _t0 = (tclear or 0.0) + V_RECOVERY_S + _REC_EXTRA[0]
-                idx = [i for i in range(i0, n) if ok(v[i]) and tp[i] >= _t0] or \
-                      [i for i in range(i0, n) if ok(v[i])]
+                idx = [i for i in range(i_rec, n) if ok(v[i])]
                 if not idx:
                     continue
                 j = min(idx, key=lambda i: v[i])
@@ -20017,6 +20031,11 @@ def _mark_limits(ax, cat, ptitle, tp, v, tclear, vio):
             else:
                 pts.append((j, col, [txt]))
             kind = "red" if col == RED else (kind or "amber")
+        try:
+            _yl0, _yl1 = ax.get_ylim()
+        except Exception:
+            _yl0, _yl1 = -_INF, _INF
+        pts = [p for p in pts if _yl0 <= v[p[0]] <= _yl1]
         for k, (j, col, txts) in enumerate(pts):
             ax.plot([tp[j]], [v[j]], marker="o", markersize=7, markerfacecolor="none",
                     markeredgecolor=col, markeredgewidth=1.4, linestyle="none",
@@ -20074,7 +20093,8 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
     for pi, (cat, ptitle, series) in enumerate(chunk):
         badge, col, yl, txt = _panel_style(cat, ptitle)
         bw = _pt_width(rend, badge, BFS, weight="bold") + 0.14
-        tl = _fit_lines(rend, txt, (aw - bw - 0.10) * 0.97, TFS, 2)
+        tl = _fit_lines(rend, txt, (aw - bw - 0.10) * 0.97, TFS,
+                        3 if PLOT_VIOLATION_TAG in str(ptitle) else 2)
         nrows = min(len(series), PLOT_VALUE_ROWS_MAX) if PLOT_SHOW_VALUES else 0
         blocks.append((cat, ptitle, series, badge, col, yl, tl, bw, nrows))
     def _fixed(nt, nrows, extra):
@@ -20160,8 +20180,14 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
                     nm = nm[:nch - 3].rstrip() + "..."
                 cells = (nm,) + ((srows[si] if (srows is not None and si < len(srows))
                                   else _panel_stats_row(_tp, v)))
-                fig.text(fx(LM + 0.02), fy(yy), u"■", fontsize=TAB + 1,
-                         color=cols[si], va="top", family="monospace")
+                try:
+                    from matplotlib.patches import Rectangle
+                    fig.patches.append(Rectangle(
+                        (fx(LM + 0.03), fy(yy - 0.075)), 0.07 / W, 0.06 / H,
+                        transform=fig.transFigure, figure=fig,
+                        facecolor=cols[si], edgecolor="none"))
+                except Exception:
+                    pass
                 for cell, x in zip(cells, xs):
                     fig.text(fx(x), fy(yy), str(cell), fontsize=TAB,
                              family="monospace", color="#222222", va="top")
@@ -20174,12 +20200,22 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
                 notes.append("%d non-finite sample(s) -- the gap in the trace" % _nnf)
             if _off:
                 notes.append(_off.strip("[]"))
+            if len(series) > nrows:
+                notes.append("+%d more trace(s) not listed (PLOT_VALUE_ROWS_MAX = %d)"
+                             % (len(series) - nrows, nrows))
             if notes:
                 fig.text(fx(xs[0]), fy(yy), "   ".join(notes), fontsize=TAB,
                          family="monospace", color="#8a4b00", va="top")
             yy -= ln(TAB)
             y = yy - 0.04 - GAP
         else:
+            # no table: the legend names the traces instead
+            if len(series) > 1 and len(series) <= LEGEND_MAX:
+                try:
+                    ax.legend([str(l)[:60] for l, _v in series], fontsize=6,
+                              loc="upper right", framealpha=0.85)
+                except Exception:
+                    pass
             y = yb - GAP
     # ---- footer
     fig.text(fx(LM), fy(0.14), "red dashed line = fault applied     green dashed line = "
@@ -20377,13 +20413,32 @@ def make_plots(path, is_flat, kb, tclear=None):
             # coloured quantity badge and title, the axes, the time ticks and
             # the value table, each in its own band -- nothing overlaps.
             _fs = _fault_subtitle(fbus).strip().lstrip("|").strip()
-            fig = _draw_panel_page(
-                plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
-                PLOT_TITLE,
-                "%s run: %s%s" % (kind_txt, name, ("     |     " + _fs) if _fs else ""),
-                # +1 for the study-parameter page, which the index counts too
-                "page %d / %d" % (pg + 1 + _n_idx + 1, npages + _n_idx + 1),
-                _partial_note.strip().strip("*").strip())
+            try:
+                fig = _draw_panel_page(
+                    plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
+                    PLOT_TITLE,
+                    "%s run: %s%s" % (kind_txt, name, ("     |     " + _fs) if _fs else ""),
+                    # +1 for the study-parameter page, which the index counts too
+                    "page %d / %d" % (pg + 1 + _n_idx + 1, npages + _n_idx + 1),
+                    _partial_note.strip().strip("*").strip())
+            except Exception as _pe:
+                # ONE PAGE THAT CANNOT BE DRAWN MUST NOT COST THE PDF. A plain
+                # page in its place keeps the index's page numbers right.
+                try:
+                    plt.close("all")
+                except Exception:
+                    pass
+                print("  [plot] %s: page %d could not be drawn (%s) -- a text "
+                      "page stands in for it" % (name, pg + 1, _pe))
+                fig = plt.figure(figsize=(11, 8.5))
+                fig.text(0.06, 0.95, "%s  --  %s run: %s   (page %d / %d)"
+                         % (PLOT_TITLE, kind_txt, name, pg + 1 + _n_idx + 1,
+                            npages + _n_idx + 1), fontsize=11, va="top")
+                fig.text(0.06, 0.90, "This page could not be drawn (%s). Its panels:"
+                         % str(_pe)[:120], fontsize=8, va="top", color="#b00000")
+                for _k, (_c, _pt, _sr) in enumerate(chunk):
+                    fig.text(0.06, 0.86 - 0.03 * _k, "%s  %s" % (_c, str(_pt)[:160]),
+                             fontsize=7, va="top")
             pdf.savefig(fig)
             plt.close(fig)
     # ONLY NOW does a file appear at the name everything else looks for.
