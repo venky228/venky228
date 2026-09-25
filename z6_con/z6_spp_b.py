@@ -17953,6 +17953,36 @@ def _with_poi_totals(ch):
     return out
 
 
+def _poi_record_tag(v, t, tfc, is_power):
+    """What the POI voltage / POI power panel title adds: the POI power
+       recovery and a ripple, from the same helpers the report rows use.
+       Not a violation (they are records), so its own bracket, not
+       PLOT_VIOLATION_TAG. '' when there is nothing to say."""
+    tags = []
+    win = _ripple_window(t, tfc)
+    pct = int(round(POI_P_RECOVERY_FRAC * 100))
+    if is_power:
+        pr = _poi_prec(t, v, tfc)
+        if pr and "p0" in pr:
+            if pr["first"] is None:
+                tags.append("P%d NEVER -- power not back after the final clearing" % pct)
+            elif pr["held"] is None:
+                tags.append("P%d NOT HELD -- reaches %d%% at +%.2f s, then leaves the band"
+                            % (pct, pct, pr["first"] - tfc))
+            else:
+                tags.append("P%d held %.2f s after the final clearing" % (pct, pr["held"] - tfc))
+            if win:
+                a, k = _ripple_pp(t, v, win[0], win[1])
+                if a is not None and k == "sustained" and a > RIPPLE_P_FRAC * abs(pr["p0"]):
+                    tags.append("RIPPLE p-p %.1f MW = %.1f%% (last %.1f s)"
+                                % (a, 100.0 * a / abs(pr["p0"]), win[1] - win[0]))
+    elif win:
+        a, k = _ripple_pp(t, v, win[0], win[1])
+        if a is not None and k == "sustained" and a > RIPPLE_V_PU:
+            tags.append("RIPPLE p-p %.3f pu (last %.1f s)" % (a, win[1] - win[0]))
+    return ("   [[%s]]" % "; ".join(tags)) if tags else ""
+
+
 def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
     """Turn the raw channels into an ordered list of panels to draw.
        Each panel = (quantity_category, panel_title, [(label, series), ...]).
@@ -18117,6 +18147,11 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
         # drops "time" from the channel dict -- it is returned separately -- so
         # it is passed in rather than looked for here, where it is not.
         _t_axis = taxis
+        # the POI power panel that carries the recovery / ripple tag: the TOTAL,
+        # or the one tie when the .out holds only one
+        _pw = [str(_ti) for _k0, (_ti, _v0) in ch.items()
+               if re.search(r"POI POWR \d+ MW", str(_ti).upper())]
+        _pw_tag = ([x for x in _pw if "TOTAL" in x.upper()] or (_pw if len(_pw) == 1 else []))[:1]
         indiv = []                                 # (sortkey, panel)
         for c in order:
             for lbl, v, title, _sev in grouped[c]:
@@ -18186,6 +18221,18 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                         head, c, lbl,
                         "   [NO swing channel -- ABSOLUTE angle]"
                         if _is_machine_angle(title) else "")
+                # ---- POI POWER RECOVERY / RIPPLE on the POI panels -- the
+                # same numbers as the report's INFO rows (_poi_prec, _ripple_pp)
+                if tclear is not None and _t_axis is not None:
+                    try:
+                        _tfc = tclear + (_REC_EXTRA[0] or 0.0)
+                        if str(title) in _pw_tag:
+                            ptitle += _poi_record_tag(v, _t_axis, _tfc, True)
+                        elif c == "VOLT" and re.match(r"^POI\s*(%d)?\s+V\b" % int(POI_BUS),
+                                                      str(title).upper().strip()):
+                            ptitle += _poi_record_tag(v, _t_axis, _tfc, False)
+                    except Exception:
+                        pass
                 # ---- ROTOR ANGLES THE DAMPING CRITERION WOULD FAIL --------
                 # Judged here exactly as the report judges it -- relative to
                 # the swing machine, from the clearing instant, through
@@ -19243,6 +19290,75 @@ def _more(lst):
     except Exception:
         _fn = "02_VIOLATIONS*.txt"
     return (" ... and %d more (every one of them, per fault, in %s)" % (n, _fn)) if n > 0 else ""
+
+
+def _poi_volt_series(pairs):
+    """The POI bus voltage out of (title, series) pairs: "POI<bus> V" first,
+       then the legacy "POI V" or any channel on the POI bus. None if absent."""
+    for _ti, _v in pairs:
+        if re.match(r"^POI\s*%d\s+V\b" % int(POI_BUS), str(_ti).upper().strip()):
+            return _v
+    for _ti, _v in pairs:
+        if re.match(r"^POI\s+V\b", str(_ti).upper().strip()) or _chan_bus(_ti) == int(POI_BUS):
+            return _v
+    return None
+
+
+def _poi_prec(t, vp, tfc):
+    """POI active power recovery on one series (MW): pre-fault average over the
+       last 1 s before the fault, then from the final clearing tfc the first
+       instant back at POI_P_RECOVERY_FRAC of it, and the instant from which it
+       stays inside +/- (1 - frac) of it to the end. ONE place, so the report
+       row and the plot title cannot disagree. None when there is no pre-fault
+       sample; {"small": p0} when the pre-fault power is under 1 MW."""
+    n = min(len(t), len(vp))
+    pre = [float(vp[i]) for i in range(n)
+           if PRE_FAULT_S - 1.0 <= t[i] < PRE_FAULT_S - 0.01 and vp[i] == vp[i]]
+    if not pre:
+        return None
+    p0 = sum(pre) / len(pre)
+    if abs(p0) < 1.0:
+        return {"small": p0}
+    tg = POI_P_RECOVERY_FRAC * p0
+    lo, hi = sorted((tg, (2.0 - POI_P_RECOVERY_FRAC) * p0))
+    i0 = idx_after(t, tfc)
+    first = held = None
+    for i in range(i0 if i0 is not None else n, n):
+        x = vp[i]
+        if x == x and ((x >= tg) if p0 > 0 else (x <= tg)) and first is None:
+            first = t[i]
+        if x == x and lo <= x <= hi:
+            if held is None:
+                held = t[i]
+        else:
+            held = None
+    return {"p0": p0, "tg": tg, "lo": lo, "hi": hi, "first": first, "held": held,
+            "end": vp[n - 1] if n else float("nan"), "tfc": tfc}
+
+
+def _ripple_window(t, tfc):
+    """(start, end) of the ripple window -- the last RIPPLE_WINDOW_S, never
+       earlier than 0.5 s after the final clearing -- or None when under 0.5 s."""
+    t_end = t[-1] if len(t) else 0.0
+    w0 = max(t_end - RIPPLE_WINDOW_S, tfc + 0.5)
+    return (w0, t_end) if t_end - w0 >= 0.5 else None
+
+
+def _ripple_pp(t, v, w0, t_end):
+    """(peak-to-peak, 'sustained' | 'decaying' | 'flat') over [w0, t_end], or
+       (None, '') with no finite sample. Sustained = the second half swings at
+       least half as much as the first."""
+    wm = (w0 + t_end) / 2.0
+
+    def pp(a, b):
+        xs = [float(v[i]) for i in range(min(len(t), len(v))) if a <= t[i] <= b and v[i] == v[i]]
+        return (max(xs) - min(xs)) if xs else None
+    a, h1, h2 = pp(w0, t_end), pp(w0, wm), pp(wm, t_end)
+    if a is None:
+        return None, ""
+    if a < 1e-6:
+        return a, "flat"
+    return a, ("sustained" if (h1 is not None and h2 is not None and h2 >= 0.5 * h1) else "decaying")
 
 
 def evaluate_case(path, kind, tclear, kb):
@@ -20335,110 +20451,61 @@ def evaluate_case(path, kind, tclear, kb):
     # back to POI_P_RECOVERY_FRAC of its pre-fault value, and whether it then
     # STAYS there: a run whose power swings back and forth reaches the level
     # and loses it again, and only 'held' tells that apart from a recovery.
+    # Computed by _poi_prec, which the plot titles use too.
+    _tfc = tclear + _t_rc
     if kind != "flat":
         _pc = "POI active power recovery to %d%% of pre-fault (from the final clearing)" \
               % int(round(POI_P_RECOVERY_FRAC * 100))
         try:
+            _pr = _poi_prec(t, _prec_src[0][1], _tfc) if _prec_src else None
             if not _prec_src:
                 add(_pc, None, "no POI power channel in this .out")
+            elif _pr is None:
+                add(_pc, None, "no pre-fault sample of the POI %s power" % _prec_src[0][0])
+            elif "small" in _pr:
+                add(_pc, None, "pre-fault POI %s power %.1f MW -- too small to measure a recovery"
+                    % (_prec_src[0][0], _pr["small"]))
             else:
-                _poi_p, _vp = _prec_src[0]
-                _n = min(len(t), len(_vp))
-                _pre = [float(_vp[i]) for i in range(_n)
-                        if PRE_FAULT_S - 1.0 <= t[i] < PRE_FAULT_S - 0.01 and _vp[i] == _vp[i]]
-                _tfc = tclear + _t_rc
-                if not _pre:
-                    add(_pc, None, "no pre-fault sample of the POI %s power" % _poi_p)
-                elif abs(sum(_pre) / len(_pre)) < 1.0:
-                    add(_pc, None, "pre-fault POI %s power %.1f MW -- too small to measure a recovery"
-                        % (_poi_p, sum(_pre) / len(_pre)))
+                _d = ("POI %s: pre-fault %.1f MW, %d%% = %.1f MW; final clearing %.3f s; "
+                      % (_prec_src[0][0], _pr["p0"], int(round(POI_P_RECOVERY_FRAC * 100)),
+                         _pr["tg"], _tfc))
+                if _pr["first"] is None:
+                    _d += "never reached after the final clearing, ends at %.1f MW" % _pr["end"]
                 else:
-                    _p0 = sum(_pre) / len(_pre)
-                    _tg = POI_P_RECOVERY_FRAC * _p0
-                    # HELD = back INSIDE the band around pre-fault (+/- the same
-                    # margin) to the end: a swing to twice the pre-fault power is
-                    # above 90 % too, and is not a recovery
-                    _lo, _hi = sorted((_tg, (2.0 - POI_P_RECOVERY_FRAC) * _p0))
-                    _i0 = idx_after(t, _tfc)
-                    _first = _held = None
-                    for _i in range(_i0 if _i0 is not None else _n, _n):
-                        _x = _vp[_i]
-                        if _x == _x and ((_x >= _tg) if _p0 > 0 else (_x <= _tg)) and _first is None:
-                            _first = t[_i]
-                        if _x == _x and _lo <= _x <= _hi:
-                            if _held is None:
-                                _held = t[_i]
-                        else:
-                            _held = None
-                    _end = _vp[_n - 1] if _n else float("nan")
-                    _d = ("POI %s: pre-fault %.1f MW, %d%% = %.1f MW; final clearing %.3f s; "
-                          % (_poi_p, _p0, int(round(POI_P_RECOVERY_FRAC * 100)), _tg, _tfc))
-                    if _first is None:
-                        _d += "never reached after the final clearing, ends at %.1f MW" % _end
-                    else:
-                        _d += "first reached %.3f s after it (t=%.3f s); " % (_first - _tfc, _first)
-                        _d += ("held within %.1f-%.1f MW from %.3f s after it to the end (t=%.3f s)"
-                               % (_lo, _hi, _held - _tfc, _held)
-                               if _held is not None else
-                               "NOT held within %.1f-%.1f MW, ends at %.1f MW" % (_lo, _hi, _end))
-                    add(_pc, None, _d)
+                    _d += "first reached %.3f s after it (t=%.3f s); " % (_pr["first"] - _tfc, _pr["first"])
+                    _d += ("held within %.1f-%.1f MW from %.3f s after it to the end (t=%.3f s)"
+                           % (_pr["lo"], _pr["hi"], _pr["held"] - _tfc, _pr["held"])
+                           if _pr["held"] is not None else
+                           "NOT held within %.1f-%.1f MW, ends at %.1f MW" % (_pr["lo"], _pr["hi"], _pr["end"]))
+                add(_pc, None, _d)
         except Exception as _e:
             add(_pc, None, "not measured (%s)" % _e)
 
     # POI RIPPLE AFTER RECOVERY -- a record (INFO). A voltage and power that
     # are back inside every band can still step up and down to the end of the
     # run (non-converged network steps, or a control hunting). Peak-to-peak
-    # over the last RIPPLE_WINDOW_S; 'sustained' when the second half of the
-    # window swings at least half as much as the first, 'decaying' otherwise.
+    # over the last RIPPLE_WINDOW_S (_ripple_pp, shared with the plot titles).
     if kind != "flat":
         _rc = "POI ripple after recovery (last %.1f s)" % RIPPLE_WINDOW_S
         try:
-            _vpoi = None
-            for _ti, _v in list(volts) + list(nonbes):
-                _T = str(_ti).upper().strip()
-                if re.match(r"^POI\s*%d\s+V\b" % int(POI_BUS), _T):
-                    _vpoi = (_ti, _v)
-                    break
-            if _vpoi is None:
-                for _ti, _v in list(volts) + list(nonbes):
-                    _T = str(_ti).upper().strip()
-                    if re.match(r"^POI\s+V\b", _T) or _chan_bus(_ti) == int(POI_BUS):
-                        _vpoi = (_ti, _v)
-                        break
-            _t_end = t[-1] if len(t) else 0.0
-            _w0 = max(_t_end - RIPPLE_WINDOW_S, tclear + _t_rc + 0.5)
-            if _t_end - _w0 < 0.5:
+            _vpoi = _poi_volt_series(list(volts) + list(nonbes))
+            _win = _ripple_window(t, _tfc)
+            if _win is None:
                 add(_rc, None, "not measured -- under 0.5 s of record after the final clearing")
             else:
-                _wm = (_w0 + _t_end) / 2.0
-
-                def _pp(_v, a, b):
-                    _xs = [float(_v[i]) for i in range(min(len(t), len(_v)))
-                           if a <= t[i] <= b and _v[i] == _v[i]]
-                    return (max(_xs) - min(_xs)) if _xs else None
-
-                def _judge(_v):
-                    _a, _h1, _h2 = _pp(_v, _w0, _t_end), _pp(_v, _w0, _wm), _pp(_v, _wm, _t_end)
-                    if _a is None:
-                        return None, ""
-                    if _a < 1e-6:
-                        return _a, "flat"
-                    _sus = _h1 is not None and _h2 is not None and _h2 >= 0.5 * _h1
-                    return _a, ("sustained" if _sus else "decaying")
+                _w0, _t_end = _win
                 _parts, _flag = [], False
                 if _vpoi is not None:
-                    _a, _k = _judge(_vpoi[1])
+                    _a, _k = _ripple_pp(t, _vpoi, _w0, _t_end)
                     if _a is not None:
                         _parts.append("voltage p-p %.4f pu (%s)" % (_a, _k))
                         _flag = _flag or (_a > RIPPLE_V_PU and _k == "sustained")
                 else:
                     _parts.append("no POI voltage channel")
                 if _prec_src:
-                    _vp2 = _prec_src[0][1]
-                    _pre2 = [float(_vp2[i]) for i in range(min(len(t), len(_vp2)))
-                             if PRE_FAULT_S - 1.0 <= t[i] < PRE_FAULT_S - 0.01 and _vp2[i] == _vp2[i]]
-                    _p02 = abs(sum(_pre2) / len(_pre2)) if _pre2 else 0.0
-                    _a, _k = _judge(_vp2)
+                    _pr2 = _poi_prec(t, _prec_src[0][1], _tfc)
+                    _p02 = abs(_pr2["p0"]) if (_pr2 and "p0" in _pr2) else 0.0
+                    _a, _k = _ripple_pp(t, _prec_src[0][1], _w0, _t_end)
                     if _a is not None:
                         _parts.append("power p-p %.1f MW = %.1f%% of pre-fault (%s)"
                                       % (_a, 100.0 * _a / _p02 if _p02 >= 1.0 else 0.0, _k))

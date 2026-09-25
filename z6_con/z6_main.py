@@ -250,6 +250,8 @@ GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate no
 GEN_TEST_REPORT_ONLY = False                 # True = rewrite every gen-test report from the runs on disk, simulate nothing
 GEN_TEST_RESCORE_MISSING = True              # True = a finished run scored before the POI power-recovery row existed is
                                              #   scored again from its .out files (no simulation, no plots)
+GEN_TEST_REPLOT = False                      # True = redraw the PDFs of finished runs from their .out files (no simulation),
+                                             #   once, so the POI panels carry the P90 / ripple tags
 GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
 GEN_TEST_PROJECTS = ["SantaFe", "EmpirePrairie"]  # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
 GEN_TEST_PROJECT = "SantaFe"                 # the one project run when GEN_TEST_PROJECTS = []
@@ -15361,7 +15363,7 @@ def _plotter_log_tail(sl, n=12):
         pass
 
 
-def _start_plotter(case, proj, mode, slot, rdir=None):
+def _start_plotter(case, proj, mode, slot, rdir=None, extra_env=None):
     """One background plotter for one results folder. Returns its Popen, or None.
 
        Everything it needs to find the folder comes through the environment, the
@@ -15446,6 +15448,8 @@ def _start_plotter(case, proj, mode, slot, rdir=None):
     # base SantaFe, 210 in IronStar, gone in seconds, while the project side --
     # which had work selected -- kept every one of its own.
     env["SPP_FRESH_START"] = "0"
+    if extra_env:
+        env.update(extra_env)
     ld = _res_root(case)
     try:
         os.makedirs(ld)
@@ -18606,6 +18610,76 @@ def _push_records(env):
     env["SPP_RIPPLE_P_FRAC"] = repr(float(RIPPLE_P_FRAC))
 
 
+_GT_REPLOTTED = "GT_REPLOTTED.flag"
+
+
+def _gt_replot_mark(rdir):
+    """Its PDFs are drawn by this code, with the panel's recovery / ripple levels."""
+    try:
+        with open(os.path.join(rdir, "flags", _GT_REPLOTTED), "w") as fh:
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), _gt_levels()))
+    except Exception:
+        pass
+
+
+def _gt_needs_replot(r, faults):
+    """Finished, its .out files there, and its PDFs not drawn with the current
+       levels (no GT_REPLOTTED.flag, or one naming other levels)."""
+    rdir = r.get("rdir") or ""
+    if not r.get("note") or not _gt_outs_ready(rdir, r["gen"], faults):
+        return False
+    try:
+        with open(os.path.join(rdir, "flags", _GT_REPLOTTED)) as fh:
+            return str(_gt_levels()) not in fh.read()
+    except Exception:
+        return True
+
+
+def _gt_replot(runs, faults, npar):
+    """GEN_TEST_REPLOT: redraw the PDFs of finished runs from their .out files
+       -- a plot-only process per folder (nothing simulated, nothing scored
+       again), npar at a time -- so every POI panel carries the P90 / ripple
+       tags. Each folder is marked when done and not redrawn on a relaunch."""
+    todo = [r for r in runs if _gt_needs_replot(r, faults)]
+    if not todo:
+        print("[gen-test] GEN_TEST_REPLOT: every finished run's PDFs are already current")
+        return
+    print("[gen-test] GEN_TEST_REPLOT: redrawing the PDFs of %d finished run(s), %d at a time "
+          "(no simulation)" % (len(todo), npar))
+    live, k, t_launch = [], 0, time.time()
+    while todo or live:
+        for x in list(live):
+            pr, r, t0 = x
+            if pr.poll() is None:
+                if time.time() - t0 > 3600:
+                    try:
+                        pr.kill()
+                    except Exception:
+                        pass
+                    print("[gen-test] replot %s: killed after 60 min" % os.path.basename(r["rdir"]))
+                    live.remove(x)
+                continue
+            live.remove(x)
+            if pr.returncode == 0:
+                _gt_replot_mark(r["rdir"])
+            print("[gen-test] replot %s -- %s (%.0f min) | %d left"
+                  % (os.path.basename(r["rdir"]), "done" if pr.returncode == 0 else "rc %s" % pr.returncode,
+                     (time.time() - t0) / 60.0, len(todo) + len(live)))
+        while todo and len(live) < max(1, npar):
+            r = todo.pop(0)
+            k += 1
+            try:
+                pr = _start_plotter(_gt_case(), GEN_TEST_PROJECT, GEN_TEST_MODE, 100 + k, rdir=r["rdir"],
+                                    extra_env={"SPP_REPLOT_BEFORE": str(t_launch),
+                                               "SPP_PLOT_FAULTS": ",".join(_gt_run_faults(r["gen"], faults))})
+            except Exception as e:
+                pr = None
+                print("[gen-test] replot %s could not start (%s)" % (os.path.basename(r["rdir"]), e))
+            if pr is not None:
+                live.append((pr, r, time.time()))
+        time.sleep(5)
+
+
 def _gt_lacks_prec(r, faults):
     """Scored, but before the study wrote the POI power-recovery row."""
     m = r.get("m") or {}
@@ -19500,6 +19574,8 @@ def _gt_finish(r, rc, t0):
         else "  INCOMPLETE rc=%s" % rc)
     if done:
         _gt_clean_build(tag)
+        if not r.get("scored_only"):
+            _gt_replot_mark(r["rdir"])          # simulated now: its PDFs are this code's
     elif r["noswitch"]:
         print("[gen-test] *** %s NOT RUN: %s ***" % (tag, r["noswitch"]))
     else:
@@ -19691,6 +19767,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             tag = _gt_tag(sc, g)
             lp = os.path.join(ldir, tag + ".log")
             only = _gt_rescorable(r, faults)
+            r["scored_only"] = only
             print("[gen-test] START %d/%d  %s -- %s | %s%s | log %s"
                   % (k, len(todo), sc[0],
                      _gt_label(g) if g
@@ -20122,6 +20199,8 @@ def run_gen_test():
         # RE-RANK WHAT IS ON DISK: every report is rebuilt from each run's
         # criteria report, so a change in how runs are judged reaches the
         # finished ones without simulating anything
+        if GEN_TEST_REPLOT:
+            _gt_replot(runs, faults, max(1, _gt_parallel(len(faults))))
         _gt_write(runs, faults, gens)
         print("[gen-test] REPORT ONLY -- %d run(s) re-ranked from disk, nothing simulated "
               "(%d not finished). Set GEN_TEST_REPORT_ONLY = False to run them."
@@ -20197,6 +20276,8 @@ def run_gen_test():
             _gt_execute(more, runs, faults, gens, npar)
     finally:
         _gt_status_stop(_stat)
+    if GEN_TEST_REPLOT:
+        _gt_replot(runs, faults, npar)
     _gt_write(runs, faults, gens)
     print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, _gt_dir()))
     return 0
@@ -20236,6 +20317,7 @@ def _gt_execute(todo, runs, faults, gens, npar):
                 _gt_label(g) if g else "all machines in service"))
         print("[gen-test] %s | folder %s" % (_gt_scen_desc(sc), r["rdir"]))
         only = _gt_rescorable(r, faults)
+        r["scored_only"] = only
         if only:
             print("[gen-test] SCORING ONLY -- its .out files are there")
         else:
