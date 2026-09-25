@@ -18922,11 +18922,17 @@ def _push_records(env):
 _GT_REPLOTTED = "GT_REPLOTTED.flag"
 
 
+def _gt_plot_sig():
+    """What a run's PDFs are drawn with: the recovery / ripple levels AND the
+       page layout -- a PER_PAGE change redraws them too (GEN_TEST_REPLOT)."""
+    return "%s per_page=%s" % (_gt_levels(), PER_PAGE)
+
+
 def _gt_replot_mark(rdir):
-    """Its PDFs are drawn by this code, with the panel's recovery / ripple levels."""
+    """Its PDFs are drawn by this code, with the panel's levels and layout."""
     try:
         with open(os.path.join(rdir, "flags", _GT_REPLOTTED), "w") as fh:
-            fh.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), _gt_levels()))
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), _gt_plot_sig()))
     except Exception:
         pass
 
@@ -18939,7 +18945,7 @@ def _gt_needs_replot(r, faults):
         return False
     try:
         with open(os.path.join(rdir, "flags", _GT_REPLOTTED)) as fh:
-            return str(_gt_levels()) not in fh.read()
+            return _gt_plot_sig() not in fh.read()
     except Exception:
         return True
 
