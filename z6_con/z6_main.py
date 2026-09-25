@@ -19716,8 +19716,11 @@ def _gt_impact(runs, faults, proj):
             if _gt_bl_note(bl, f, sc):
                 L.append("      REFERENCE BORDERLINE (not held against any element): %s" % _gt_bl_note(bl, f, sc))
             for x in con[:6]:
-                L.append("      contributes : %-50s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s, P%d %s -> %s"
-                         % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
+                # the SAME word as the ranked table: fewer buses but a higher
+                # peak is MIXED, not 'contributes'
+                L.append("      %-11s : %-50s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s, P%d %s -> %s"
+                         % ("contributes" if x["eff"] == "CONTRIBUTES" else "mixed",
+                            _gt_label(x["g"])[:50], x["over_b"], x["over_o"],
                             "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-",
                             "-" if x["nc_b"] is None else x["nc_b"], "-" if x["nc_o"] is None else x["nc_o"],
                             x["v_b"], x["v_o"], _GT_PREC_PCT, x["p_b"], x["p_o"]))
