@@ -19893,7 +19893,7 @@ def _panel_style(cat, ptitle):
         head = ""
     elif re.match(r"POI \d+", L) and cat == "VOLT":
         q = "POI V"
-    elif "FAULTED BUS" in L or head.startswith("FAULTED BUS"):
+    elif "<-- FAULTED BUS" in L or head.startswith("FAULTED BUS"):
         q = "FAULTED BUS " + ("V" if cat == "VOLT" else q)
     elif cat == "VOLT" and L.startswith("PROJ "):
         q = "PROJ BUS V"
@@ -19960,6 +19960,89 @@ def _fit_ylabel(renderer, text, height_in, fs=7.5):
     return text, fs - 1.5
 
 
+def _mark_limits(ax, cat, ptitle, tp, v, tclear, vio):
+    """WHERE a panel breaks a limit, not only THAT it does: the limit as a
+       dotted line and the worst point circled with its value. Red for an SPP
+       violation; amber for a machine terminal voltage above V_OVERSHOOT_PU,
+       which the report lists as INFO (not scored). Returns 'red', 'amber' or ''."""
+    RED, AMB = "#c00000", "#d98c00"
+    s = str(ptitle)
+    marks = []
+    if vio:
+        why = s.partition(PLOT_VIOLATION_TAG)[2]
+        if "transient overvoltage" in why:
+            marks.append(("max", V_OVERSHOOT_PU, RED, "> %.2f pu" % V_OVERSHOOT_PU))
+        if "no recovery" in why:
+            marks.append(("min", V_RECOVERY_PU, RED, "< %.2f pu" % V_RECOVERY_PU))
+        _m = re.search(r"steady state [\d.]+ pu ([<>]) ([\d.]+) pu", why)
+        if _m:
+            marks.append(("end", float(_m.group(2)), RED,
+                          "steady state %s %s pu" % (_m.group(1), _m.group(2))))
+    ok = lambda x: x == x and x not in (_INF, -_INF)
+    try:
+        n = min(len(tp), len(v))
+        i0 = 0
+        if tclear is not None:
+            i0 = next((i for i in range(n) if tp[i] >= tclear), n)
+        if not vio and cat == "ETERM" and n:
+            _post = [x for x in v[i0:n] if ok(x)]
+            if _post and max(_post) > V_OVERSHOOT_PU:
+                marks.append(("max", V_OVERSHOOT_PU, AMB,
+                              "> %.2f pu (info, not scored)" % V_OVERSHOOT_PU))
+        kind = ""
+        pts = []                          # (index, colour, texts) -- one label per point
+        _tmax = max([x for x in tp[:n] if ok(x)] or [1.0])
+        for how, lim, col, txt in marks:
+            if how == "max":
+                idx = [i for i in range(i0, n) if ok(v[i])]
+                if not idx:
+                    continue
+                j = max(idx, key=lambda i: v[i])
+            elif how == "min":
+                _t0 = (tclear or 0.0) + V_RECOVERY_S + _REC_EXTRA[0]
+                idx = [i for i in range(i0, n) if ok(v[i]) and tp[i] >= _t0] or \
+                      [i for i in range(i0, n) if ok(v[i])]
+                if not idx:
+                    continue
+                j = min(idx, key=lambda i: v[i])
+            else:
+                idx = [i for i in range(n) if ok(v[i])]
+                if not idx:
+                    continue
+                j = idx[-1]
+            ax.axhline(lim, color=col, ls=":", lw=1.0, alpha=0.9)
+            _same = [p for p in pts if abs(p[0] - j) <= max(1, n // 50)]
+            if _same:
+                _same[0][2].append(txt)
+            else:
+                pts.append((j, col, [txt]))
+            kind = "red" if col == RED else (kind or "amber")
+        for k, (j, col, txts) in enumerate(pts):
+            ax.plot([tp[j]], [v[j]], marker="o", markersize=7, markerfacecolor="none",
+                    markeredgecolor=col, markeredgewidth=1.4, linestyle="none",
+                    clip_on=False)
+            _right = tp[j] > 0.70 * _tmax     # near the right edge: label to the LEFT
+            # near the TOP of the axes the label goes BELOW the point, so it
+            # never climbs into the panel title above
+            try:
+                _y0, _y1 = ax.get_ylim()
+                _high = (v[j] - _y0) > 0.55 * (_y1 - _y0)
+            except Exception:
+                _high = False
+            ax.annotate("%.3f pu %s" % (v[j], "; ".join(txts)), xy=(tp[j], v[j]),
+                        xytext=((-9 if _right else 9),
+                                (-(8 + 11 * k)) if _high else (6 + 11 * k)),
+                        textcoords="offset points",
+                        ha=("right" if _right else "left"),
+                        va=("top" if _high else "bottom"), fontsize=6.5,
+                        color=col, fontweight="bold",
+                        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=col,
+                                  lw=0.6, alpha=0.9))
+        return kind
+    except Exception:
+        return ""
+
+
 def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
                      head1, head2, page_txt, warn_txt=""):
     """One page of PER_PAGE panels, laid out in INCHES so nothing overlaps:
@@ -20012,6 +20095,11 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
     fig.text(fx(W - RM), fy(H - 0.22), page_txt, fontsize=8.5, va="top", ha="right",
              color="#444444")
     fig.text(fx(LM), fy(H - 0.46), head2, fontsize=8.5, va="top", color="#222222")
+    _nv = sum(1 for b in blocks if PLOT_VIOLATION_TAG in str(b[1]))
+    if _nv:
+        warn_txt = ("%s     " % warn_txt if warn_txt else "") + (
+            "%d panel%s on this page BREAK%s AN SPP LIMIT (red)"
+            % (_nv, "" if _nv == 1 else "s", "S" if _nv == 1 else ""))
     if warn_txt:
         fig.text(fx(W - RM), fy(H - 0.46), warn_txt, fontsize=8, va="top",
                  ha="right", color="#b00000", fontweight="bold")
@@ -20044,6 +20132,8 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
             ax.plot(_tp, v, lw=1.35 if si == 0 else 1.0, color=c2)
         _off = nice_ylim(ax, [v for _l, v in series], YMIN_SPAN.get(cat))
         _mark_fault(ax, is_flat, tclear)
+        _mk = _mark_limits(ax, cat, ptitle, _tp, series[0][1] if series else [],
+                           tclear, vio)
         ylt, yfs = _fit_ylabel(rend, yl, ah)
         ax.set_ylabel(ylt, fontsize=yfs, color=col, labelpad=3)
         ax.grid(True, ls=":", alpha=0.45)
@@ -20051,8 +20141,8 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
         ax.tick_params(labelsize=6.5, pad=2)
         ax.set_xlabel("Time (s)", fontsize=6.8, labelpad=1)
         for sp in ax.spines.values():
-            sp.set_color("#b00000" if vio else "#888888")
-            sp.set_linewidth(1.1 if vio else 0.7)
+            sp.set_color("#b00000" if vio else ("#d98c00" if _mk == "amber" else "#888888"))
+            sp.set_linewidth(1.1 if (vio or _mk) else 0.7)
         yb = top - ah - TICKS
         extra = 0
         if PLOT_SHOW_VALUES:
@@ -20093,7 +20183,8 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
             y = yb - GAP
     # ---- footer
     fig.text(fx(LM), fy(0.14), "red dashed line = fault applied     green dashed line = "
-             "fault cleared     red frame / red title = a panel that broke an SPP limit",
+             "fault cleared     red frame + red circle = SPP violation (dotted = the limit)"
+             "     amber = terminal V above %.2f pu (info, not scored)" % V_OVERSHOOT_PU,
              fontsize=6.5, color="#666666", va="bottom")
     return fig
 
