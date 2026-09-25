@@ -19458,8 +19458,9 @@ def _gt_best(runs, faults, ref):
     """The common 'which is best' summary at the top of GEN_TEST_<proj>.txt."""
     nf = len(faults)
     bl = _gt_borderline(runs, faults, ref)
-    L = ["", "=" * 150, "BEST OF ALL -- every run ranked: most faults PASS, then fewest non-converged",
-         "steps (nc), then fewest buses above 1.2 pu, then lowest peak voltage", "=" * 150]
+    L = ["", "=" * 150, "BEST OF ALL -- every run ranked: most faults PASS, then fewest OTHER SPP criteria failed",
+         "(column 'oth': recovery, steady state, trips, damping, stability -- summed over the faults), then fewest",
+         "non-converged steps (nc), then fewest buses above 1.2 pu, then lowest peak voltage", "=" * 150]
     sc_all = []
     part = []                       # line runs with a fault left out: section C only
     for r in runs:
@@ -19474,10 +19475,11 @@ def _gt_best(runs, faults, ref):
         return _gt_label(g)[:50]
 
     def row(i, x, r):
-        return "  %3s  %-22s %-50s %3d/%-3d %8d%s %6d %7s" % (
-            i, r["sc"][0], lab(r), x[0], x[5], x[1], "" if x[4] else "?", x[2],
+        return "  %3s  %-22s %-50s %3d/%-3d %4d %8d%s %6d %7s" % (
+            i, r["sc"][0], lab(r), x[0], x[5], x[7], x[1], "" if x[4] else "?", x[2],
             "%.3f" % x[3] if x[3] else "-")
-    hdr = "  %3s  %-22s %-50s %7s %9s %6s %7s" % ("#", "scenario", "machine", "PASS", "nc", ">1.2", "max pu")
+    hdr = "  %3s  %-22s %-50s %7s %4s %9s %6s %7s" % ("#", "scenario", "machine", "PASS", "oth", "nc",
+                                                     ">1.2", "max pu")
     sc_all.sort(key=lambda t: _gt_key(t[0]))
     L += ["", "A. OVERALL RANKING (top 15 of %d finished runs)" % len(sc_all), hdr]
     for i, (x, r) in enumerate(sc_all[:15], 1):
@@ -19921,7 +19923,16 @@ def _gt_answer(runs, faults, proj):
         if not sc:
             continue
         (rows if len(sc) == len(fs) else part).append((_gt_answer_score(m, fs), r, fs))
-    rows.sort(key=lambda z: (-z[0][0], -z[0][1], -z[0][2], z[0][3], round(z[0][4], 3), z[0][5]))
+    # SHARES, NOT COUNTS: a line run that leaves the worst fault out was ranked
+    # first for having fewer faults to fail. Equal shares: the run judged on
+    # every fault first, then the peak.
+    def _rk(z):
+        n = float(len(z[2]) or 1)
+        _skip = len(z[2]) < len(_gt_run_faults(z[1]["gen"], faults)) or \
+            len(z[2]) < len(faults)
+        return (-z[0][0] / n, -z[0][1] / n, -z[0][2] / n, z[0][3] / n, _skip,
+                round(z[0][4], 3), z[0][5] / n)
+    rows.sort(key=_rk)
 
     def what(r):
         g = r["gen"]
@@ -19967,7 +19978,12 @@ def _gt_answer(runs, faults, proj):
             out.append("%s%s: %s | %s | other SPP criteria: %s" % (
                 ind, f, vtxt, stxt, ("FAIL " + ", ".join(oth)) if oth else "pass"))
             if st == "no" and x.get("unsettled_txt"):
-                out.append("%s      worst still moving: %s" % (ind, x["unsettled_txt"][:220]))
+                _seen, _u = set(), []
+                for _w in x["unsettled_txt"].split("; "):
+                    if _w.strip() and _w.strip() not in _seen:
+                        _seen.add(_w.strip())
+                        _u.append(_w.strip())
+                out.append("%s      worst still moving: %s" % (ind, "; ".join(_u)[:220]))
         b = _gt_ref(ref, r)
         if b and b is not r and r["gen"]:
             bs = _gt_answer_score(b.get("m") or {}, fs)
@@ -19993,12 +20009,13 @@ def _gt_answer(runs, faults, proj):
          "  less than %g MW / MVAr, peak-to-peak."
          % SETTLE_PQ_MW,
          ""]
-    old = sum(1 for z in rows + part for f in z[2]
+    old = sum(1 for z in rows for f in z[2]
               if ((z[1].get("m") or {}).get(f) or {}).get("verdict") in ("PASS", "FAIL")
               and ((z[1].get("m") or {}).get(f) or {}).get("settled") is None)
     if not rows:
         L += ["ANSWER: nothing to say yet -- no run has all its faults scored."]
-    elif old and not full_on:
+    elif old and not full_on and any(
+            z[0][1] == len(z[2]) and not _gt_poi_off(z[1]["gen"]) for z in rows):
         L += ["ANSWER: NOT KNOWN YET -- %d fault result(s) were scored before the 'settled' check" % old,
               "        existed. Launch once more: they are scored again from their .out files (no",
               "        simulation), then this file answers. The voltage part is below already."]

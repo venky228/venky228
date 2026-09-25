@@ -20129,6 +20129,10 @@ def _settled_detail(t, ch, kb, w0, t_end, vpoi, psrc, qsrc):
     grps = [g for g in ("POI P", "POI Q", "POI V", "machine P", "machine Q", "machine V", "bus V")
             if any(b[1] == g for b in bad)]
     bad.sort(key=lambda x: -x[0])
+    # EACH CHANNEL ONCE: the POI / faulted bus is also in the bus sweep, and
+    # one bus can carry two channels -- the same text listed twice
+    _seen = set()
+    bad = [b for b in bad if not (b[2] in _seen or _seen.add(b[2]))]
     return ("%.2f-%.2f s; POI %s: %s; machines settled: P %s, Q %s, V %s; buses settled: V %s -- %s "
             "(limits %.3f pu, %.1f MW/MVAr)"
             % (w0, t_end, POI_BUS, ", ".join(poi), n("machine P"), n("machine Q"), n("machine V"),
