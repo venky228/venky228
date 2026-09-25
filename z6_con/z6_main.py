@@ -20207,9 +20207,15 @@ def _gt_write(runs, faults, gens):
     except Exception as e:
         print("[gen-test] GEN_TEST_NOT_RUN not written (%s)" % e)
     # what changed against the same scenario with every machine in
-    L += ["", "=" * 150, "MACHINE EFFECT (vs the same scenario with every machine in service)",
-          "  a big drop in nc or >1.2 when a machine is OFF = that machine drives the problem", ""]
+    L += ["", "=" * 150, "MACHINE EFFECT (vs the same scenario with every machine in service;",
+          "  a 'POI OFF + ...' run vs the same scenario with the POI plants off -- the POIGENOFF run)",
+          "  a big drop in nc or >1.2 when a machine is OFF = that machine drives the problem;",
+          "  NOT RECOMM. = it FAILS another SPP criterion its reference passes -- not a fix", ""]
     eff = []
+    try:
+        _bl = _gt_borderline(runs, faults, ref)
+    except Exception:
+        _bl = {}
     for r in runs:
         g, m = r["gen"], r.get("m")
         b = _gt_ref(ref, r)
@@ -20222,17 +20228,22 @@ def _gt_write(runs, faults, gens):
         dnc = sum((b["m"][f]["noconv"] or 0) - (m[f]["noconv"] or 0) for f in fs)
         dov = sum(b["m"][f]["n_over"] - m[f]["n_over"] for f in fs)
         fixed = [f for f in fs if b["m"][f]["verdict"] == "FAIL" and m[f]["verdict"] == "PASS"]
-        eff.append((dnc, dov, r["sc"][0], g, fixed, len(fs)))
+        try:
+            _nf = _gt_newfails(m, b["m"], fs, _gt_ign(_bl, r, fs))
+        except Exception:
+            _nf = []
+        eff.append((dnc, dov, r["sc"][0], g, fixed, len(fs), _nf))
     eff.sort(key=lambda x: (-x[1], -x[0]))
     if eff:
         L.append("  %-22s %7s %9s %6s  %s" % ("scenario", "nc drop", ">1.2 drop", "faults",
                                               "machine OFF / line OPEN"))
     else:
         L.append("  (nothing to compare yet)")
-    for dnc, dov, sc, g, fixed, nfs in eff[:40]:
-        L.append("  %-22s %7d %9d %6s  %-50s %s%s" % (
+    for dnc, dov, sc, g, fixed, nfs, nf in eff[:40]:
+        L.append("  %-22s %7d %9d %6s  %-50s %s%s%s" % (
             sc, dnc, dov, "%d/%d" % (nfs, len(faults)), _gt_label(g)[:50], g["kind"],
-            ("  FIXES " + ",".join(fixed)) if fixed else ""))
+            ("  FIXES " + ",".join(fixed)) if fixed else "",
+            ("  NOT RECOMM. (new FAIL: %s)" % ", ".join(nf)) if nf else ""))
     with open(txt, "w") as fh:
         fh.write("\n".join(L) + "\n")
     try:
