@@ -20465,6 +20465,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
     t_say = 0.0
     gap_s = float(GEN_TEST_START_GAP_MIN or 0) * 60.0
     while queue or live:
+        _fin = False
         for tag in list(live):
             th, r, t0, box = live[tag]
             if th.is_alive():
@@ -20476,6 +20477,10 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             print("[gen-test] FINISHED %s -- %s (%.0f min) | %d running, %d waiting"
                   % (tag, "done" if ok else r["state"], (time.time() - t0) / 60.0,
                      len(live), len(queue)))
+            _fin = True
+        if _fin:
+            # ONCE for every run that finished in this look, not once per run:
+            # eight scoring passes ending together rewrote every report 8 times
             _gt_write(runs, faults, gens)
         spaced = (last is None or last[0] not in live or _gt_built(*last)
                   or (time.time() - last[2]) >= gap_s)
