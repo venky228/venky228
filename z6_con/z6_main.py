@@ -428,7 +428,7 @@ RIPPLE_V_PU = 0.01                           # ripple: POI voltage peak-to-peak 
 RIPPLE_P_MW = 10.0                            # ... or POI power peak-to-peak above this many MW
 SETTLE_V_PU = 0.01                           # settled: over the same last RIPPLE_WINDOW_S every V (POI, machines, buses) moves <= this pu p-p
 SETTLE_PQ_MW = 2.0                           # ... and every P / Q moves <= this many MW / MVAr p-p (GEN_TEST_ANSWER_<proj>.txt)
-TRIP_PGEN_DEAD_MW = 5.0                     # machine ending below this MW = tripped
+TRIP_PGEN_DEAD_MW = 1.0                     # machine ending below this MW = tripped (and under 10 % of pre-fault)
 ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
 SPPR_MIN_AFTER_FIRST_PEAK = True             # True = SPPR "Minimum Value" as SPP Figure 2 (lowest trough after 1st peak) | False = lowest point after clearing
 # FLAT_TOL_BY_KIND: flat-run tolerance per quantity
@@ -18457,7 +18457,8 @@ def _gt_score_levels():
        what a finished run must have been scored with (the plots use only
        _gt_levels, so a SETTLE_* change re-scores but never re-plots)."""
     return _gt_levels() + (float("%.3f" % float(SETTLE_V_PU)), "MW",
-                           float("%.1f" % float(SETTLE_PQ_MW)))
+                           float("%.1f" % float(SETTLE_PQ_MW)),
+                           "TRIP", float("%.2f" % float(TRIP_PGEN_DEAD_MW)))
 
 
 def _gt_settled_parse(d, det):
@@ -18732,6 +18733,12 @@ def _gt_read_crit(cp, res, faults):
                             res[f]["_pcrit"] = crit
                         if case and _gt_match(case, f) and crit.startswith("Settled at the end"):
                             _gt_settled_parse(res[f], r.get("Detail") or "")
+                        if case and _gt_match(case, f) and crit.startswith("No generator tripping"):
+                            # the trip rule it was judged by; a row written
+                            # before the rule was stated reads '?' -- other
+                            # levels, so it is scored once more
+                            _mt = re.search(r"tripped = ends below ([\d.]+) MW", r.get("Detail") or "")
+                            res[f]["_tlim"] = ("TRIP", round(float(_mt.group(1)), 2)) if _mt else ("TRIP", "?")
                         if case and _gt_match(case, f) and re.match(r"Transient voltage <= [\d.]+ pu$", crit):
                             _gt_vpeak_parse(res[f], rs, r.get("Detail") or "")
                         if case and _gt_match(case, f) and crit.startswith("Machine terminal voltage >"):
@@ -18764,7 +18771,8 @@ def _gt_measure_rest(rdir, faults, res):
         mw = re.search(r"\(last ([\d.]+) s\)", d.pop("_rcrit", "") or "")
         rl = d.pop("_rlim", None)
         sl = d.pop("_slim", None)
-        d["levels"] = ((int(mp.group(1)), round(float(mw.group(1)), 1)) + rl + sl
+        tl = d.pop("_tlim", None) or ("TRIP", "?")
+        d["levels"] = ((int(mp.group(1)), round(float(mw.group(1)), 1)) + rl + sl + tl
                        if (mp and mw and rl and sl) else None)
     for lp in glob.glob(os.path.join(rdir, "logs", "psse", "*.txt")):
         stem = os.path.splitext(os.path.basename(lp))[0]
@@ -18941,7 +18949,8 @@ _GT_REPLOTTED = "GT_REPLOTTED.flag"
 def _gt_plot_sig():
     """What a run's PDFs are drawn with: the recovery / ripple levels AND the
        page layout -- a PER_PAGE change redraws them too (GEN_TEST_REPLOT)."""
-    return "%s per_page=%s" % (_gt_levels(), PER_PAGE)
+    # the trip rule too: a machine judged tripped is framed red on its panel
+    return "%s per_page=%s trip=%.2f" % (_gt_levels(), PER_PAGE, float(TRIP_PGEN_DEAD_MW))
 
 
 def _gt_replot_mark(rdir):
@@ -19986,17 +19995,25 @@ def _gt_answer(runs, faults, proj):
             out.append("%s%s: %s | %s | other SPP criteria: %s" % (
                 ind, f, vtxt, stxt, ("FAIL " + ", ".join(oth)) if oth else "pass"))
             if st == "no" and x.get("unsettled_txt"):
+                # the '(+N more)' tail rides on the last entry: set it aside,
+                # or that entry never matches its twin
+                _txt = x["unsettled_txt"]
+                _mm = re.search(r"\s*\(\+\d+ more\)\s*$", _txt)
+                _tail = _mm.group(0).strip() if _mm else ""
+                if _mm:
+                    _txt = _txt[:_mm.start()]
                 _seen, _u = set(), []
-                for _w in x["unsettled_txt"].split("; "):
+                for _w in _txt.split("; "):
                     if _w.strip() and _w.strip() not in _seen:
                         _seen.add(_w.strip())
                         _u.append(_w.strip())
-                out.append("%s      worst still moving: %s" % (ind, "; ".join(_u)[:220]))
+                out.append("%s      worst still moving: %s%s" % (ind, "; ".join(_u)[:220],
+                                                                (" " + _tail) if _tail else ""))
         b = _gt_ref(ref, r)
         if b and b is not r and r["gen"]:
             bs = _gt_answer_score(b.get("m") or {}, fs)
             me = _gt_answer_score(r.get("m") or {}, fs)
-            out.append("%svs %s, %s: peak %.3f -> %.3f pu, buses above %.2f pu %d -> %d, "
+            out.append("%svs %s, %s: peak %.3f -> %.3f pu, buses above %.2f pu (summed over the faults) %d -> %d, "
                        "faults settled %d -> %d of %d" % (
                            ind, "the POIGENOFF run" if r["gen"].get("base_off") else "nothing changed",
                            r["sc"][0], bs[4], me[4], lim, bs[5], me[5], bs[2], me[2], len(fs)))

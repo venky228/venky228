@@ -20099,6 +20099,9 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
         # THE NOTES (P90 recovery, POI ripple) are listed on the index page,
         # not on the figure: they come off the title here.
         txt = re.sub(r"\s*\[\[(?!VIOLATION)[^\]]*\]\]", "", txt)
+        # the violation tag is for the code; the reader sees the red frame and
+        # red title, and a plain separator before what was broken
+        txt = re.sub(r"\s*" + re.escape(PLOT_VIOLATION_TAG) + r"\s*", "  --  ", txt).strip(" -")
         tl = _fit_lines(rend, txt, (aw - bw - 0.10) * 0.97, TFS,
                         3 if PLOT_VIOLATION_TAG in str(ptitle) else 2)
         nl = []                         # the notes are listed on the index page
@@ -20220,7 +20223,7 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
             # no table: the legend names the traces instead
             if len(series) > 1 and len(series) <= LEGEND_MAX:
                 try:
-                    ax.legend([str(l)[:60] for l, _v in series], fontsize=6,
+                    ax.legend([re.sub(r"\s*\[\[[^\]]*\]\].*$", "", str(l))[:60] for l, _v in series], fontsize=6,
                               loc="upper right", framealpha=0.85)
                 except Exception:
                     pass
@@ -20438,7 +20441,13 @@ def make_plots(path, is_flat, kb, tclear=None):
                 _cut = _txt if len(_txt) <= 95 else (_txt[:96].rsplit(" ", 1)[0] or _txt[:95])
                 _nlines.append((_i, _bd, _cut, _first))
                 _txt, _first = _txt[len(_cut):].strip(), False
-        _nhead = (5 if _rows else 4) if _nlines else 0     # gap, title, 2 meaning lines, columns
+        _blk = (4 + len(_nlines)) if _nlines else 0         # title, 2 meaning lines, columns, notes
+        _free = (-len(_rows)) % INDEX_ROWS_PER_PAGE          # rows left on the last violations page
+        if _rows and _nlines:
+            _gap = (_free if (1 + _blk > _free and _blk <= INDEX_ROWS_PER_PAGE) else 1)
+        else:
+            _gap = 0
+        _nhead = (_gap + 4) if _nlines else 0
         _tot = len(_rows) + _nhead + len(_nlines)
         _n_idx = (_tot + INDEX_ROWS_PER_PAGE - 1) // INDEX_ROWS_PER_PAGE if _tot else 0
         _rows = (_violation_index_rows(panels, PER_PAGE, _n_idx + 1 + _PARAM_PAGES)
@@ -20446,8 +20455,7 @@ def make_plots(path, is_flat, kb, tclear=None):
         _pct = int(round(POI_P_RECOVERY_FRAC * 100))
         _items = [("V", r) for r in _rows]
         if _nlines:
-            if _rows:
-                _items.append(("G", None))
+            _items.extend([("G", None)] * _gap)
             _items.append(("H", "NOTES  (text only -- not scored, never a violation)"))
             _items.append(("M", "P%d held X s = X s after the FINAL fault clearing the POI power is back to %d%% "
                                 "of its pre-fault value and stays within +/-%d%% of it to the end."
@@ -20545,10 +20553,13 @@ def make_plots(path, is_flat, kb, tclear=None):
                         ("   Page %d of %d of this index." % (pg + 1, _n_idx))
                         if _n_idx > 1 else ""),
                      fontsize=8, va="top")
-            fig.text(0.06, 0.868, ("%-6s %-9s %-30s %s"
-                                   % ("Page", "Quantity", "Element", "What it broke")) if _rows else
-                     ("%-6s %-34s %s" % ("Page", "Panel", "Note")),
-                     fontsize=8, family="monospace", fontweight="bold", va="top")
+            _has_v = any(_kd == "V" for _kd, _it in chunk)
+            _has_c = any(_kd == "C" for _kd, _it in chunk)
+            if _has_v or not _has_c:
+                fig.text(0.06, 0.868, ("%-6s %-9s %-30s %s"
+                                       % ("Page", "Quantity", "Element", "What it broke")) if _has_v else
+                         ("%-6s %-34s %s" % ("Page", "Panel", "Note")),
+                         fontsize=8, family="monospace", fontweight="bold", va="top")
             _y = 0.850
             _W0, _H0 = 11.0 * 72.0, 8.5 * 72.0
             for (_kd, _it) in chunk:
@@ -23724,10 +23735,23 @@ def evaluate_case(path, kind, tclear, kb):
             "%.3f s; the >= 0.70 pu test starts %.1f s after the second, at %.3f s"
             % (tclear, tclear + _t_rc, V_RECOVERY_S, tclear + _t_rc + V_RECOVERY_S))
     i_ss  = idx_after(t, t[-1] - SS_WINDOW_S)
+    # THE STEADY-STATE WINDOW MUST BE AFTER THE RECOVERY. A record that ends
+    # soon after clearing has a 'final second' that still holds the fault, and
+    # every depressed bus read as a steady-state violation (2,290 of them on a
+    # run that stopped 0.3 s after clearing).
+    _ss_late = (kind != "flat" and len(t)
+                and float(t[-1]) - SS_WINDOW_S < tclear + _t_rc + V_RECOVERY_S)
     _short = [nm for nm, ix in (("post-clearing", i_clr),
                                 ("recovery (clear + %.1f s)" % V_RECOVERY_S, i_rec),
-                                ("steady-state (final %.1f s)" % SS_WINDOW_S, i_ss))
+                                ("steady-state (final %.1f s)" % SS_WINDOW_S,
+                                 None if _ss_late else i_ss))
               if ix is None]
+    # which criteria have no window of their own: those are NOT judged on
+    # whatever samples are left -- the 'Record long enough' FAIL carries it
+    _nojudge = set(k for k, ix in (("clr", i_clr), ("rec", i_rec),
+                                   ("ss", None if _ss_late else i_ss)) if ix is None)
+    _nj_txt = ("not judged -- the record ends at %.3f s, before this criterion's window "
+               "(see 'Record long enough to judge')" % (float(t[-1]) if len(t) else float("nan")))
     if _short:
         add("Record long enough to judge",
             False,
@@ -23840,8 +23864,11 @@ def evaluate_case(path, kind, tclear, kb):
             v_low.append("%s=%.3f@%.2fs" % (chan_label(ti), mn, tm))
             v_low_all.append((chan_label(ti), mn, tm))
     v_low_all.sort(key=lambda r: r[1])                 # worst first
+    if "rec" in _nojudge:
+        v_low, v_low_all = [], []
     add("Voltage recovery >= %.2f pu within %.1f s" % (V_RECOVERY_PU, V_RECOVERY_S),
-        not v_low,
+        None if "rec" in _nojudge else not v_low,
+        _nj_txt if "rec" in _nojudge else
         ("OK -- lowest of %d bus(es) after t=%.2fs is %.3f pu (%s @ %.2fs)"
          % (len(volts), tclear + _t_rc + V_RECOVERY_S, v_low_worst[0], v_low_worst[2], v_low_worst[1]))
         if not v_low else
@@ -23968,8 +23995,11 @@ def evaluate_case(path, kind, tclear, kb):
                  "%s]"
                  % (v_step_worst[0], v_step_worst[2], v_step_worst[1],
                     ("NOT judged" if V_OVERSHOOT_JUDGE_SWING else "and it IS judged here")))
+    if "clr" in _nojudge:
+        v_high, v_high_all = [], []
     add("Transient voltage <= %.2f pu" % V_OVERSHOOT_PU,
-        not v_high,
+        None if "clr" in _nojudge else not v_high,
+        _nj_txt if "clr" in _nojudge else
         ("OK -- highest of %d bus(es) over %s is %.3f pu (%s @ %.2fs).%s"
          % (len(volts), _win_txt, v_high_worst[0],
             v_high_worst[2], v_high_worst[1], _step_txt))
@@ -24021,8 +24051,11 @@ def evaluate_case(path, kind, tclear, kb):
             ss_bad.append("%s=%.3f" % (chan_label(ti), ssv))
             ss_all.append((chan_label(ti), ssv))
     ss_all.sort(key=lambda r: r[1])
+    if "ss" in _nojudge:
+        ss_bad, ss_all = [], []
     add("Steady-state voltage %.2f-%.2f pu" % (V_SS_LOW, V_SS_HIGH),
-        not ss_bad,
+        None if "ss" in _nojudge else not ss_bad,
+        _nj_txt if "ss" in _nojudge else
         ("OK -- last %.1fs average over %d bus(es) spans %.3f (%s) to %.3f (%s)"
          % (SS_WINDOW_S, len(volts), ss_lo[0], ss_lo[1], ss_hi[0], ss_hi[1]))
         if not ss_bad else
@@ -24234,15 +24267,19 @@ def evaluate_case(path, kind, tclear, kb):
                "the event disconnects the project from the POI" if not _evd else
                "drop_machines / project disconnected", ", ".join(_ev_out[:VIOLATION_LIST_MAX])
                + _more(_ev_out)))
+    # THE RULE IT WAS JUDGED BY, in the row: the gen test reads it back, so a
+    # changed TRIP_PGEN_DEAD_MW re-scores its finished runs once
+    _trip_rule = (" (tripped = ends below %.2f MW and under %.0f%% of pre-fault)"
+                  % (TRIP_PGEN_DEAD_MW, 100.0 * TRIP_RESIDUAL_FRAC))
     add("No generator tripping (PELEC + ETERM)",
         not (trips or proj_trips),
-        ("None -- %d machine(s) checked on power and %d on terminal voltage, "
-         "all still connected at t=%.1fs"
-         % (len(pelecs), len(eterms), t[-1])) if not (trips or proj_trips) else
-        ((("*** PROJECT MACHINE TRIPPED: %s *** " % ", ".join(proj_trips))
-          if proj_trips else "")
-         + (("%d other machine(s) tripped: " % len(trips) + ", ".join(trips[:VIOLATION_LIST_MAX]) + _more(trips))
-            if trips else "")))
+        (("None -- %d machine(s) checked on power and %d on terminal voltage, "
+          "all still connected at t=%.1fs"
+          % (len(pelecs), len(eterms), t[-1])) if not (trips or proj_trips) else
+         ((("*** PROJECT MACHINE TRIPPED: %s *** " % ", ".join(proj_trips))
+           if proj_trips else "")
+          + (("%d other machine(s) tripped: " % len(trips) + ", ".join(trips[:VIOLATION_LIST_MAX]) + _more(trips))
+             if trips else ""))) + _trip_rule)
 
     # ROTOR-ANGLE DAMPING. Only machine rotor angles reach here (bus voltage
     # angles were separated out above). A machine is judged only if its
