@@ -20052,7 +20052,9 @@ def run_gen_test():
           % (len(runs), len(faults), ", ".join(faults), len(GEN_TEST_SCENARIOS), len(gens),
              ("  [best2: machine runs are added once the %d solver runs finish]"
               % len(GEN_TEST_SCENARIOS)) if (_gmode == "best2" and not base_ready) else ""))
-    if GEN_TEST_REPORT_ONLY:
+    if GEN_TEST_REPORT_ONLY and not (GEN_TEST_RESCORE_MISSING and any(
+            r["note"] and _gt_lacks_prec(r, faults) and _gt_outs_ready(r["rdir"], r["gen"], faults)
+            for r in runs)):
         # RE-RANK WHAT IS ON DISK: every report is rebuilt from each run's
         # criteria report, so a change in how runs are judged reaches the
         # finished ones without simulating anything
@@ -20079,8 +20081,14 @@ def run_gen_test():
                 r["note"], r["state"], r["force_score"] = "", "WAITING", True
                 n_rs += 1
     todo = [r for r in runs if not r["note"]]
+    if GEN_TEST_REPORT_ONLY:
+        # REPORT ONLY + RESCORE_MISSING: score the finished runs again from their
+        # .out files, simulate NOTHING -- unfinished runs are left as they are
+        n_skip = sum(1 for r in todo if not r.get("force_score"))
+        todo = [r for r in todo if r.get("force_score")]
+        print("[gen-test] REPORT ONLY: %d unfinished run(s) left alone (not simulated)" % n_skip)
     print("[gen-test] %d run(s) to simulate, %d already done%s"
-          % (len(todo) - n_rs, len(runs) - len(todo),
+          % (len(todo) - n_rs, sum(1 for r in runs if r["note"] or r.get("force_score")),
              (" -- and %d finished run(s) to SCORE AGAIN for the POI power recovery "
               "(no simulation; GEN_TEST_RESCORE_MISSING)" % n_rs) if n_rs else ""))
     # THE STUDY MUST BE THERE BEFORE ANYTHING STARTS. Without it every run
