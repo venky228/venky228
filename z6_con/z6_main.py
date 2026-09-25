@@ -253,7 +253,7 @@ GEN_TEST_RESCORE_MISSING = True              # True = a finished run scored befo
 GEN_TEST_REPLOT = True                      # True = redraw the PDFs of finished runs from their .out files (no simulation),
                                              #   once, so the POI panels carry the P90 / ripple tags
 GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
-GEN_TEST_PROJECTS = ["SantaFe", "EmpirePrairie"]  # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
+GEN_TEST_PROJECTS = ["SantaFe", "EmpirePrairie", "IronStar", "EastFork"]  # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
 GEN_TEST_PROJECT = "SantaFe"                 # the one project run when GEN_TEST_PROJECTS = []
 GEN_TEST_CASE = "base"                       # "base" | "proj"
 GEN_TEST_FAULTS = ["F01-F03"]                # same syntax as ONLY_FAULTS
@@ -285,7 +285,17 @@ GEN_TEST_BY_PROJECT = {
         },
     },
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
-    "EastFork":      {"POI": 531623, "EXTRA_GENS": [], "EGF_EDITS": {}},   # REGCAU1 already Volim 1.2 / Khv 0.2 / Accel 0.7
+    "EastFork": {
+        "POI": 531623,
+        "EXTRA_GENS": [],
+        "EGF_EDITS": {                               # deck REGCAU1 (not REGCA1): Volim 1.2 / Khv 0.2 / Accel 0.7
+            "V110_K2_A05":  [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],
+            "V110_K2_A10":  [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
+            "V110_K2_IO15": [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],
+            # Kqv runs need the name of EastFork's electrical model (REECAU1 / REECCU1 ...)
+            "RRPWR10":      [("REGCAU1", {"Rrpwr": 10.0})],
+        },
+    },
     "EmpirePrairie": {
         "POI": 761383,
         "EXTRA_GENS": [],

@@ -8175,6 +8175,15 @@ def _dyr_apply_one(rec, edits, hits, labels=None):
     if (not labels and not is_usr and model.upper() in _STD_LABELS
             and len(names) != len(toks)):
         names = []          # this deck's record is not the library shape
+    if not labels and is_usr and names and len(names) != len(toks):
+        # A USER MODEL NAMED FROM BESS_MODEL_TEMPLATE: the template's layout is
+        # only right for this record when the counts agree. Otherwise "Rrpwr"
+        # could land on another constant with no word said -- so names are not
+        # used and a named edit is refused (a numbered one still works).
+        print("  [dyr] %s at bus %s holds %d value(s), BESS_MODEL_TEMPLATE's %s %d -- "
+              "its names are not used for this record" % (model, bus, len(toks), model,
+                                                          len(names)))
+        names = []
     out = rec
     for (_b, _i, _m, n, val) in want:
         k, kind = _dyr_pos(n, n_icon, names)
