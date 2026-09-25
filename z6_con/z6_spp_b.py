@@ -16453,10 +16453,10 @@ PLOT_QTY_COLORS = {"VOLT": "#1f4e9c", "ETERM": "#6a3d9a", "PELEC": "#0b7a75",
                    "QELEC": "#c8610a", "ANGLE": "#8c564b", "SPEED": "#a07800"}
 _PLOT_TIE_COLORS = {"PELEC": "#3fb3a8", "QELEC": "#f0a050"}
 _PLOT_EXTRA_COLORS = ["#d62728", "#7f7f7f", "#17becf", "#e377c2", "#bcbd22"]
-_PLOT_YSHORT = {"VOLT": "Voltage (pu)", "ETERM": "Terminal V (pu)",
+_PLOT_YSHORT = {"VOLT": "Voltage (pu)", "ETERM": "ETERM (pu)",
                 "PELEC": "P (MW)", "QELEC": "Q (MVAr)",
                 "ANGLE": "Rotor angle (deg)", "SPEED": "Speed dev. (pu)"}
-_PLOT_QTY_NAME = {"VOLT": "BUS V", "ETERM": "TERMINAL V", "PELEC": "P",
+_PLOT_QTY_NAME = {"VOLT": "BUS V", "ETERM": "ETERM", "PELEC": "P",
                   "QELEC": "Q", "ANGLE": "ROTOR ANGLE", "SPEED": "SPEED"}
 
 
@@ -16485,7 +16485,8 @@ def _panel_style(cat, ptitle):
         yl = "One tie " + yl
         col = _PLOT_TIE_COLORS.get(cat, col)
     elif re.match(r"POI \d+", L):
-        q = "POI %s %s" % (bus, "V" if cat == "VOLT" else q)
+        q = "POI %s%s %s" % (bus, " = FAULTED BUS" if "<-- FAULTED BUS" in L else "",
+                             "V" if cat == "VOLT" else q)
     elif "<-- FAULTED BUS" in L or head.startswith("FAULTED BUS"):
         q = "FAULTED BUS %s %s" % (bus, "V" if cat == "VOLT" else q)
     elif head.startswith("SWING"):
@@ -16708,11 +16709,6 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
     fig.text(fx(W - RM), fy(H - 0.22), page_txt, fontsize=8.5, va="top", ha="right",
              color="#444444")
     fig.text(fx(LM), fy(H - 0.46), head2, fontsize=8.5, va="top", color="#222222")
-    _nv = sum(1 for b in blocks if PLOT_VIOLATION_TAG in str(b[1]))
-    if _nv:
-        warn_txt = ("%s     " % warn_txt if warn_txt else "") + (
-            "%d panel%s on this page BREAK%s AN SPP LIMIT (red)"
-            % (_nv, "" if _nv == 1 else "s", "S" if _nv == 1 else ""))
     if warn_txt:
         fig.text(fx(W - RM), fy(H - 0.46), warn_txt, fontsize=8, va="top",
                  ha="right", color="#b00000", fontweight="bold")
@@ -18552,6 +18548,58 @@ def _poi_record_tag(v, t, tfc, is_power):
     return ("   [[%s]]" % "; ".join(tags)) if tags else ""
 
 
+def _dedupe_same_trace(ordered, indiv):
+    """ONE PANEL PER TRACE. When the faulted bus is the POI, the same voltage
+       is recorded three times -- the POI channel, the faulted-bus channel and
+       the bus sweep -- and the PDF drew three identical pages of it. Panels
+       with the same quantity, the same bus and the same samples are drawn
+       once: the POI panel if there is one, else the faulted-bus one, placed
+       where the first of them was, and it says every role it stands for."""
+    try:
+        tier = {}
+        for _k, _p, _vv in indiv:
+            tier[id(_p)] = _k[3] if len(_k) > 3 else 9
+        seen, out, drop = {}, [], set()
+        for p in ordered:
+            c, pt, ser = p
+            if len(ser) != 1:
+                out.append(p)
+                continue
+            lbl, v = ser[0]
+            mb = re.search(r"\b(\d{3,})\b", str(lbl))
+            if not mb or not v:
+                out.append(p)
+                continue
+            n = len(v)
+            st = max(1, n // 40)
+            sig = (c, mb.group(1), n,
+                   tuple(round(float(v[i]), 5) if v[i] == v[i] else None
+                         for i in range(0, n, st)))
+            if sig not in seen:
+                seen[sig] = len(out)
+                out.append(p)
+                continue
+            j = seen[sig]
+            a, b = out[j], p
+            # the survivor: the lower tier (POI 1 before FAULTED BUS 3 before the sweep)
+            keep, gone = (a, b) if tier.get(id(a), 9) <= tier.get(id(b), 9) else (b, a)
+            kc, kpt, kser = keep
+            roles = []
+            for q in (a, b):
+                _U = str(q[1]).upper()
+                if "<-- FAULTED BUS" in _U or _U.startswith("FAULTED BUS"):
+                    roles.append("FAULTED")
+            if "FAULTED" in roles and "<-- FAULTED BUS" not in kpt.upper() \
+                    and not kpt.upper().startswith("FAULTED BUS"):
+                kpt = kpt + "   <-- FAULTED BUS"
+            _new = (kc, kpt, kser)
+            tier[id(_new)] = tier.get(id(keep), 9)   # the survivor keeps its tier
+            out[j] = _new
+        return out
+    except Exception:
+        return ordered
+
+
 def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
     """Turn the raw channels into an ordered list of panels to draw.
        Each panel = (quantity_category, panel_title, [(label, series), ...]).
@@ -18895,6 +18943,7 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
             for _p2, _v2 in _rest[:_room]:
                 _keep_set.add(id(_p2))
             ordered = [_p2 for _p2 in ordered if id(_p2) in _keep_set]
+        ordered = _dedupe_same_trace(ordered, indiv)
         panels.extend(ordered)
         # WHAT WENT IN, BY BLOCK. "I don't see the new gens" and "the swing angle
         # isn't there" are both questions about whether the CHANNEL existed, not
@@ -32025,8 +32074,13 @@ def plot_missing_outs():
         outs = _keep
 
     todo = []
+    # files an earlier plotter of THIS replot chain already handled -- never
+    # picked again by its successors (see SPP_REPLOT_CHAIN below)
+    _handled = set(x for x in (os.environ.get("SPP_REPLOT_HANDLED") or "").split(",") if x)
     for p in outs:
         sid = os.path.splitext(os.path.basename(p))[0]
+        if sid in _handled:
+            continue
         pdf = os.path.join(PLOT_DIR, "%s_plots.pdf" % sid)
         had_done = os.path.isfile(_state_path(sid, "done"))
         had_pdf = _pdf_current(sid)
@@ -32250,6 +32304,7 @@ def plot_missing_outs():
               "-- those files are free to draw again" % _dead)
 
     _relaunch_for_next = False
+    _left_here = 0
     for i, (sid, p, had_done, had_pdf) in enumerate(todo, 1):
         # TAKE THIS FILE OR LEAVE IT. One claim per file with the owner's PID
         # inside, so plotters running side by side each take the next free file
@@ -32750,6 +32805,8 @@ def plot_missing_outs():
                   "address space (%d of %d done in this process)"
                   % (sid, i, len(todo)))
             _relaunch_for_next = True
+            _left_here = len(todo) - i
+            _handled.add(sid)
             break
     if _nan_skipped:
         print("")
@@ -32877,7 +32934,37 @@ def plot_missing_outs():
     # So if files still need a PDF, this launches its own successor before it
     # goes. Same script, same environment, fresh 2 GB. The chain continues
     # until the folder is finished, whether or not a run is going on.
-    if _relaunch_for_next and MAKE_PLOTS and _env_bool("SPP_PLOT_FLEET", False):
+    # A REPLOT (SPP_REPLOT_BEFORE) IS WAITED ON, NOT SUPERVISED. The gen-test
+    # replot starts ONE plotter per run folder and takes its clean exit as
+    # "every PDF redrawn" -- but a plotter draws one file and exits, so only
+    # F01 (the smallest, drawn first) was ever redrawn. Here the next file is
+    # drawn by a fresh process (its own address space, as always) and THIS one
+    # waits for it, so the exit the launcher sees comes after the last file.
+    # SPP_REPLOT_CHAIN caps the chain, so a file that cannot be drawn can
+    # never make it relaunch for ever.
+    try:
+        _rb_on = float(os.environ.get("SPP_REPLOT_BEFORE") or 0) > 0
+    except ValueError:
+        _rb_on = False
+    try:
+        _depth = int(os.environ.get("SPP_REPLOT_CHAIN") or 0)
+    except ValueError:
+        _depth = 0
+    if _relaunch_for_next and MAKE_PLOTS and _rb_on and _left_here > 0 and _depth < 12:
+        try:
+            import subprocess as _sp
+            _env = dict(os.environ)
+            _env["SPP_REPLOT_CHAIN"] = str(_depth + 1)
+            _env["SPP_REPLOT_HANDLED"] = ",".join(sorted(_handled))
+            _kw = {"cwd": os.getcwd(), "env": _env}
+            if os.name == "nt":
+                _kw["creationflags"] = 0x08000000            # CREATE_NO_WINDOW
+            sys.stdout.flush()
+            _rc = _sp.call([sys.executable, "-u", os.path.abspath(__file__)], **_kw)
+            print("[plot-missing] replot: the next plotter finished (rc %s)" % _rc)
+        except Exception as _e:
+            print("[plot-missing] replot: could not start the next plotter (%s)" % _e)
+    elif _relaunch_for_next and MAKE_PLOTS and _env_bool("SPP_PLOT_FLEET", False):
         # UNDER THE PANEL'S FLEET the slot is refilled by z6_main.py the
         # moment this process exits. Starting a successor here as well put a
         # second, unsupervised chain of plotters beside the fleet -- outside
