@@ -418,6 +418,9 @@ POI_P_RECOVERY_FRAC = 0.90                   # POI power back to this fraction o
 RIPPLE_WINDOW_S = 2.0                        # ripple: the last this many s of each fault run
 RIPPLE_V_PU = 0.01                           # ripple: POI voltage peak-to-peak above this (pu) ...
 RIPPLE_P_FRAC = 0.02                         # ... or POI power peak-to-peak above this fraction of pre-fault
+SETTLE_V_PU = 0.01                           # settled: over the same last RIPPLE_WINDOW_S every V (POI, machines, buses) moves <= this pu p-p
+SETTLE_PQ_FRAC = 0.02                        # ... and every P / Q <= this fraction of its pre-fault max(|P|, |Q|) p-p
+SETTLE_PQ_MIN = 2.0                          # ... never tighter than this many MW / MVAr (GEN_TEST_ANSWER_<proj>.txt)
 TRIP_PGEN_DEAD_MW = 10.0                     # machine ending below this MW = tripped
 ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
 SPPR_MIN_AFTER_FIRST_PEAK = True             # True = SPPR "Minimum Value" as SPP Figure 2 (lowest trough after 1st peak) | False = lowest point after clearing
@@ -18361,6 +18364,40 @@ def _gt_levels():
             float("%.3f" % float(RIPPLE_V_PU)), int(float("%.0f" % (100.0 * float(RIPPLE_P_FRAC)))))
 
 
+def _gt_score_levels():
+    """_gt_levels and the panel's SETTLE_* levels, as the study writes them:
+       what a finished run must have been scored with (the plots use only
+       _gt_levels, so a SETTLE_* change re-scores but never re-plots)."""
+    return _gt_levels() + (float("%.3f" % float(SETTLE_V_PU)),
+                           int(float("%.0f" % (100.0 * float(SETTLE_PQ_FRAC)))),
+                           float("%.1f" % float(SETTLE_PQ_MIN)))
+
+
+def _gt_settled_parse(d, det):
+    """The study's 'Settled at the end' row -> settled yes / no / n/a, the
+       groups not settled ('POI Q, machine Q, bus V') and the worst channels."""
+    ms = re.search(r"-- NOT SETTLED in ([^:]+): (.*?) \(limits ", det)
+    d["settled"] = ("no" if ms else "yes" if "-- SETTLED" in det else "n/a")
+    d["unsettled"] = ms.group(1).strip() if ms else ""
+    d["unsettled_txt"] = ms.group(2).strip() if ms else ""
+    ml = re.search(r"\(limits ([\d.]+) pu, ([\d.]+)% of pre-fault, min ([\d.]+) MW", det)
+    d["_slim"] = ((round(float(ml.group(1)), 3), int(round(float(ml.group(2)))),
+                   round(float(ml.group(3)), 1)) if ml else None)
+
+
+def _gt_vpeak_parse(d, rs, det):
+    """The 'Transient voltage <= 1.20 pu' row -> its verdict and the highest bus
+       voltage after clearing (pu), whether or not it is above the limit."""
+    d["v_row"] = rs or None
+    mo = (re.search(r"^OK -- highest of \d+ bus\(es\) over .*? is ([\d.]+) pu", det)
+          or re.search(r"^\d+ bus\(es\) over .*?, worst ([\d.]+) pu", det))
+    if mo:
+        try:
+            d["v_peak"] = float(mo.group(1))
+        except ValueError:
+            pass
+
+
 def _gt_ripple_parse(d, det):
     """The study's 'POI ripple after recovery' row -> ripple yes / no / n/a,
        voltage p-p (pu) and power p-p (% of pre-fault)."""
@@ -18545,7 +18582,9 @@ def _gt_measure(rdir, faults):
 def _gt_blank_meas():
     return {"verdict": "?", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {},
             "fails": set(), "p_state": None, "p_first": None, "p_held": None,
-            "ripple": None, "v_pp": None, "p_pp_pct": None}
+            "ripple": None, "v_pp": None, "p_pp_pct": None,
+            "settled": None, "unsettled": "", "unsettled_txt": "", "v_peak": None,
+            "v_row": None, "eterm_over": False, "eterm_n": None}
 
 
 def _gt_nscored(cp, faults):
@@ -18574,6 +18613,15 @@ def _gt_read_crit(cp, res, faults):
                             res[f]["_rcrit"] = crit
                         if case and _gt_match(case, f) and crit.startswith("POI active power recovery"):
                             res[f]["_pcrit"] = crit
+                        if case and _gt_match(case, f) and crit.startswith("Settled at the end"):
+                            _gt_settled_parse(res[f], r.get("Detail") or "")
+                        if case and _gt_match(case, f) and re.match(r"Transient voltage <= [\d.]+ pu$", crit):
+                            _gt_vpeak_parse(res[f], rs, r.get("Detail") or "")
+                        if case and _gt_match(case, f) and crit.startswith("Machine terminal voltage >"):
+                            _me = re.match(r"(\d+) machine terminal\(s\) above", r.get("Detail") or "")
+                            res[f]["eterm_n"] = int(_me.group(1)) if _me else 0
+                            if rs == "FAIL":
+                                res[f]["eterm_over"] = True
                         if case and _gt_match(case, f):
                             # the AND of the rows, as the study scores it
                             if rs == "FAIL":
@@ -18598,8 +18646,9 @@ def _gt_measure_rest(rdir, faults, res):
         mp = re.search(r"to (\d+)% of pre-fault", d.pop("_pcrit", "") or "")
         mw = re.search(r"\(last ([\d.]+) s\)", d.pop("_rcrit", "") or "")
         rl = d.pop("_rlim", None)
-        d["levels"] = ((int(mp.group(1)), round(float(mw.group(1)), 1)) + rl
-                       if (mp and mw and rl) else None)
+        sl = d.pop("_slim", None)
+        d["levels"] = ((int(mp.group(1)), round(float(mw.group(1)), 1)) + rl + sl
+                       if (mp and mw and rl and sl) else None)
     for lp in glob.glob(os.path.join(rdir, "logs", "psse", "*.txt")):
         stem = os.path.splitext(os.path.basename(lp))[0]
         for f in faults:
@@ -18765,6 +18814,9 @@ def _push_records(env):
     env["SPP_RIPPLE_WINDOW_S"] = repr(float(RIPPLE_WINDOW_S))
     env["SPP_RIPPLE_V_PU"] = repr(float(RIPPLE_V_PU))
     env["SPP_RIPPLE_P_FRAC"] = repr(float(RIPPLE_P_FRAC))
+    env["SPP_SETTLE_V_PU"] = repr(float(SETTLE_V_PU))
+    env["SPP_SETTLE_PQ_FRAC"] = repr(float(SETTLE_PQ_FRAC))
+    env["SPP_SETTLE_PQ_MIN"] = repr(float(SETTLE_PQ_MIN))
 
 
 _GT_REPLOTTED = "GT_REPLOTTED.flag"
@@ -18846,7 +18898,8 @@ def _gt_lacks_prec(r, faults):
     # levels than the panel's now -> score again
     return bool(need) and any((m.get(f) or {}).get("p_state") is None
                               or (m.get(f) or {}).get("ripple") is None
-                              or (m.get(f) or {}).get("levels") not in (None, _gt_levels())
+                              or (m.get(f) or {}).get("settled") is None
+                              or (m.get(f) or {}).get("levels") not in (None, _gt_score_levels())
                               for f in need)
 
 
@@ -18859,7 +18912,7 @@ def _gt_passes(rdir):
     """Scoring passes the gen test ran in this folder at the panel's CURRENT
        levels (a line of GT_RESCORED.flag each; a line with no levels, written
        before they were recorded, counts too)."""
-    lv = "levels=%s" % (_gt_levels(),)
+    lv = "levels=%s" % (_gt_score_levels(),)
     try:
         with open(os.path.join(rdir, "flags", _GT_RESCORED)) as fh:
             return len([ln for ln in fh if ln.strip() and ("levels=" not in ln or lv in ln)])
@@ -18891,7 +18944,7 @@ def _gt_want_rescore(r, faults):
         return ""
     lost = _gt_lost(r, faults)
     why = ("%s simulated to the end but not scored" % ",".join(lost)) if lost else \
-          ("no P90 / ripple rows at the panel's levels" if _gt_lacks_prec(r, faults) else "")
+          ("no P90 / ripple / settled rows at the panel's levels" if _gt_lacks_prec(r, faults) else "")
     if not why:
         return ""
     if _gt_passes(r["rdir"]) >= _GT_RESCORE_TRIES:
@@ -18955,7 +19008,7 @@ def _gt_rescore(r, env, faults, log_path=None):
     try:
         # APPENDED, one line per pass, with the levels: _gt_passes counts them
         with open(os.path.join(rdir, "flags", _GT_RESCORED), "a") as fh:
-            fh.write("%s levels=%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), _gt_levels()))
+            fh.write("%s levels=%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), _gt_score_levels()))
     except Exception:
         pass
     print("[gen-test] %s: scoring the finished .out files (no simulation)"
@@ -19608,6 +19661,209 @@ def _gt_impact(runs, faults, proj):
         print("[gen-test] GEN_TEST_IMPACT not written (%s)" % e)
 
 
+def _gt_below(x):
+    """A fault's bus voltages after clearing: True = none above the limit
+       (the 'Transient voltage <= 1.20 pu' row PASSES and no machine terminal
+       is above it), False = some are, None = not known."""
+    x = x or {}
+    if x.get("verdict") not in ("PASS", "FAIL"):
+        return None
+    if x.get("eterm_over") or x.get("v_row") == "FAIL" or (x.get("n_over") or 0) > 0:
+        return False
+    return True if x.get("v_row") == "PASS" else None
+
+
+def _gt_poi_off(g):
+    """The run has the POI plants off (the POIGENOFF run, or 'POI OFF + ...')."""
+    return bool(g) and (bool(g.get("base_off")) or g.get("id") == "POIALL")
+
+
+def _gt_answer_score(m, fs):
+    """(n_full, n_below, n_settled, n_other, worst_peak, n_over) over faults fs.
+       full = below the limit AND settled AND no other SPP criterion failed."""
+    nb = ns = nfull = noth = nov = 0
+    pk = 0.0
+    for f in fs:
+        x = m.get(f) or {}
+        b, st = _gt_below(x), x.get("settled") == "yes"
+        oth = bool(x.get("fails"))
+        nb += 1 if b else 0
+        ns += 1 if st else 0
+        noth += 1 if oth else 0
+        nfull += 1 if (b and st and not oth) else 0
+        nov += x.get("n_over") or 0
+        pk = max(pk, x.get("v_peak") or x.get("max_pu") or 0.0)
+    return nfull, nb, ns, noth, pk, nov
+
+
+def _gt_answer(runs, faults, proj):
+    """GEN_TEST_ANSWER_<proj>.txt -- the plain answer: which run keeps every bus
+       below the limit after each fault AND has P, Q and V settled (POI,
+       machines, buses) at the end, the best one, and every run ranked."""
+    lim = float(V_OVERSHOOT_PU)
+    ref = _gt_refs(runs)
+    rows, part = [], []
+    for r in runs:
+        m = r.get("m") or {}
+        fs = [f for f in _gt_run_faults(r["gen"], faults)
+              if (m.get(f) or {}).get("verdict") != "SKIP"]
+        sc = [f for f in fs if (m.get(f) or {}).get("verdict") in ("PASS", "FAIL")]
+        if not sc:
+            continue
+        (rows if len(sc) == len(fs) else part).append((_gt_answer_score(m, fs), r, fs))
+    rows.sort(key=lambda z: (-z[0][0], -z[0][1], -z[0][2], z[0][3], round(z[0][4], 3), z[0][5]))
+
+    def what(r):
+        g = r["gen"]
+        return _gt_label(g) if g else "NOTHING CHANGED (all in service)"
+
+    def yn(v):
+        return "YES" if v is True else "NO" if v is False else "?"
+
+    def cell(x):
+        x = x or {}
+        if x.get("verdict") == "SKIP":
+            return "skip"
+        if x.get("verdict") not in ("PASS", "FAIL"):
+            return "not scored"
+        pk = x.get("v_peak") or x.get("max_pu")
+        return "%s %s %s" % ("%.3f" % pk if pk else "  ?  ",
+                             {True: "Y", False: "N"}.get(_gt_below(x), "?"),
+                             {"yes": "Y", "no": "N"}.get(x.get("settled"), "?"))
+
+    def detail(r, fs, ind="    "):
+        m = r.get("m") or {}
+        out = []
+        for f in fs:
+            x = m.get(f) or {}
+            if x.get("verdict") not in ("PASS", "FAIL"):
+                out.append("%s%s: not scored" % (ind, f))
+                continue
+            b = _gt_below(x)
+            pk = x.get("v_peak") or x.get("max_pu")
+            vtxt = ("peak %.3f pu -- " % pk if pk else "") + (
+                "below %.2f pu: YES" % lim if b else
+                ("below %.2f pu: NO, %d bus(es) above%s" % (lim, x.get("n_over") or 0,
+                 ", machine terminal above too" if x.get("eterm_over") else "")) if b is False else
+                "below %.2f pu: ?" % lim)
+            if x.get("eterm_n") and not x.get("eterm_over"):
+                vtxt += " (%d machine terminal(s) above, not scored)" % x["eterm_n"]
+            st = x.get("settled")
+            stxt = ("settled: YES" if st == "yes" else
+                    "settled: NO, moving at the end: %s" % (x.get("unsettled") or "?") if st == "no" else
+                    "settled: not measured" if st == "n/a" else
+                    "settled: ? (scored before this check -- scored again on the next launch)")
+            oth = sorted(x.get("fails") or ())
+            out.append("%s%s: %s | %s | other SPP criteria: %s" % (
+                ind, f, vtxt, stxt, ("FAIL " + ", ".join(oth)) if oth else "pass"))
+            if st == "no" and x.get("unsettled_txt"):
+                out.append("%s      worst still moving: %s" % (ind, x["unsettled_txt"][:220]))
+        b = _gt_ref(ref, r)
+        if b and b is not r and r["gen"]:
+            bs = _gt_answer_score(b.get("m") or {}, fs)
+            me = _gt_answer_score(r.get("m") or {}, fs)
+            out.append("%svs %s, %s: peak %.3f -> %.3f pu, buses above %.2f pu %d -> %d, "
+                       "faults settled %d -> %d of %d" % (
+                           ind, "the POIGENOFF run" if r["gen"].get("base_off") else "nothing changed",
+                           r["sc"][0], bs[4], me[4], lim, bs[5], me[5], bs[2], me[2], len(fs)))
+        return out
+
+    nf = len(faults)
+    full = [z for z in rows if z[0][0] == len(z[2])]
+    full_on = [z for z in full if not _gt_poi_off(z[1]["gen"])]
+    L = ["%s -- THE ANSWER  (%s)" % (proj.upper(), time.strftime("%Y-%m-%d %H:%M")),
+         "",
+         "QUESTION: after each fault (%s), does every bus stay below %.2f pu, and are P, Q and V"
+         % (", ".join(faults), lim),
+         "          settled at the end (POI, every recorded machine, every monitored bus), with no",
+         "          other SPP criterion failing?",
+         "",
+         "  'settled' = over the last %g s of the run, every voltage moves less than %g pu and every P / Q"
+         % (RIPPLE_WINDOW_S, SETTLE_V_PU),
+         "  less than %g%% of its pre-fault value (at least %g MW / MVAr), peak-to-peak."
+         % (100.0 * SETTLE_PQ_FRAC, SETTLE_PQ_MIN),
+         ""]
+    old = sum(1 for z in rows + part for f in z[2]
+              if ((z[1].get("m") or {}).get(f) or {}).get("verdict") in ("PASS", "FAIL")
+              and ((z[1].get("m") or {}).get(f) or {}).get("settled") is None)
+    if not rows:
+        L += ["ANSWER: nothing to say yet -- no run has all its faults scored."]
+    elif old and not full_on:
+        L += ["ANSWER: NOT KNOWN YET -- %d fault result(s) were scored before the 'settled' check" % old,
+              "        existed. Launch once more: they are scored again from their .out files (no",
+              "        simulation), then this file answers. The voltage part is below already."]
+    elif full_on:
+        L += ["ANSWER: YES -- %d run(s) with the POI plants in service do all of it on every fault."
+              % len(full_on)]
+    elif full:
+        L += ["ANSWER: ONLY WITH THE POI PLANTS OFF -- %d run(s) do all of it on every fault, and every"
+              % len(full),
+              "        one of them has the POI plants switched off (a diagnosis, not a fix)."]
+    else:
+        L += ["ANSWER: NO -- no run keeps every bus below %.2f pu AND settles on every fault." % lim]
+    if rows:
+        nb_any = [z for z in rows if z[0][1] == len(z[2]) and not _gt_poi_off(z[1]["gen"])]
+        ns_any = [z for z in rows if z[0][2] == len(z[2]) and not _gt_poi_off(z[1]["gen"])]
+        L += ["        (POI plants in service: %d run(s) keep every bus below %.2f pu on every fault; "
+              "%d run(s) settle on every fault)" % (len(nb_any), lim, len(ns_any))]
+        if nb_any:
+            L += ["", "BELOW %.2f pu ON EVERY FAULT (POI plants in service), best first:" % lim]
+            L += ["  %-16s %-60s peak %.3f pu, settled on %d of %d"
+                  % (z[1]["sc"][0][:16], what(z[1])[:60], z[0][4], z[0][2], len(z[2]))
+                  for z in nb_any[:10]]
+            if len(nb_any) > 10:
+                L.append("  ... and %d more (ALL RUNS below)" % (len(nb_any) - 10))
+    for title, cand in (("BEST FOR %s (POI plants in service -- the one to use)" % proj.upper(),
+                         [z for z in rows if not _gt_poi_off(z[1]["gen"])]),
+                        ("BEST WITH THE POI PLANTS OFF (for diagnosis only)",
+                         [z for z in rows if _gt_poi_off(z[1]["gen"])])):
+        if not cand:
+            continue
+        (nfull, nb, ns, noth, pk, nov), r, fs = cand[0]
+        L += ["", "=" * 110, title, "=" * 110,
+              "  %s" % what(r),
+              "  solver scenario %s   (folder %s)" % (r["sc"][0], os.path.basename(r.get("rdir") or "")),
+              "  on %d fault(s): below %.2f pu on %d, settled on %d, all good on %d, other SPP fails on %d"
+              % (len(fs), lim, nb, ns, nfull, noth)]
+        L += detail(r, fs)
+    # nothing changed, for reference
+    refs = [z for z in rows + part if not z[1]["gen"]]
+    if refs:
+        L += ["", "=" * 110, "NOTHING CHANGED (all in service) -- the starting point", "=" * 110]
+        for z in refs:
+            L += ["  solver scenario %s" % z[1]["sc"][0]] + detail(z[1], z[2])
+    L += ["", "=" * 110,
+          "ALL RUNS, BEST FIRST",
+          "  each fault: highest bus voltage after clearing (pu), below %.2f pu Y/N, settled Y/N" % lim,
+          "  ALL GOOD = faults with both Y and no other SPP criterion failing;  * = POI plants off",
+          "=" * 110,
+          "  %4s  %-16s %-46s " % ("rank", "scenario", "what is changed")
+          + " ".join("%-13s" % f for f in faults) + " %8s  %s" % ("ALL GOOD", "moving at the end | other SPP fails"),
+          "  " + "-" * (70 + 14 * nf + 30)]
+    for i, ((nfull, nb, ns, noth, pk, nov), r, fs) in enumerate(rows, 1):
+        m = r.get("m") or {}
+        mv = sorted(set(w.strip() for f in fs for w in ((m.get(f) or {}).get("unsettled") or "").split(",")
+                        if w.strip()))
+        of = sorted(set(c for f in fs for c in ((m.get(f) or {}).get("fails") or ())))
+        L.append("  %4d  %-16s %-46s " % (i, r["sc"][0][:16],
+                                           ("* " if _gt_poi_off(r["gen"]) else "") + what(r)[:44])
+                 + " ".join("%-13s" % cell(m.get(f)) for f in faults)
+                 + " %8s  %s" % ("%d/%d" % (nfull, len(fs)), (", ".join(mv) or "-")
+                                 + ((" | " + ", ".join(of)) if of else "")))
+    if part:
+        L += ["", "NOT COMPLETE (some faults not scored yet -- not ranked):"]
+        for z, r, fs in part:
+            m = r.get("m") or {}
+            L.append("        %-16s %-46s " % (r["sc"][0][:16], what(r)[:46])
+                     + " ".join("%-13s" % cell(m.get(f)) for f in faults))
+    if old:
+        L += ["", "NOTE: %d fault result(s) were scored before the 'settled' check existed (shown ?)."
+              % old,
+              "      The next launch scores them again from their .out files -- no simulation."]
+    with open(os.path.join(_gt_dir(), "GEN_TEST_ANSWER_%s.txt" % proj), "w") as fh:
+        fh.write("\n".join(L) + "\n")
+
+
 def _gt_write(runs, faults, gens):
     proj = GEN_TEST_PROJECT
     txt = os.path.join(_gt_dir(), "GEN_TEST_%s.txt" % proj)
@@ -19635,6 +19891,10 @@ def _gt_write(runs, faults, gens):
     _best = _gt_best(runs, faults, ref)
     L += _best
     _gt_impact(runs, faults, proj)
+    try:
+        _gt_answer(runs, faults, proj)
+    except Exception as e:
+        print("[gen-test] GEN_TEST_ANSWER not written (%s)" % e)
     try:
         with open(os.path.join(_gt_dir(), "GEN_TEST_BEST_%s.txt" % proj), "w") as fh:
             fh.write("\n".join(L[:3] + _best) + "\n")
@@ -19723,6 +19983,7 @@ def _gt_write(runs, faults, gens):
                         "off_name", "off_kind", "off_mw", "nodes", "zdist_pu", "fault", "verdict",
                         "noconv_steps", "buses_over_1p2", "max_pu", "p_recovery", "p_first_s", "p_held_s",
                         "ripple", "ripple_in", "ripple_v_pp_pu", "ripple_p_pp_pct",
+                        "peak_v_pu", "below_1p2", "settled", "not_settled_in",
                         "folder", "note"])
             for r in runs:
                 sc, g, m = r["sc"], r["gen"], r.get("m") or {}
@@ -19741,6 +20002,9 @@ def _gt_write(runs, faults, gens):
                                 _gt_rq_words(x.get("ripple_q")) if x.get("ripple") == "yes" else "",
                                 "" if x.get("v_pp") is None else x["v_pp"],
                                 "" if x.get("p_pp_pct") is None else x["p_pp_pct"],
+                                "" if x.get("v_peak") is None else x["v_peak"],
+                                {True: "yes", False: "no"}.get(_gt_below(x), ""),
+                                x.get("settled") or "", x.get("unsettled") or "",
                                 r["rdir"], r.get("note", "")])
     except Exception as e:
         print("[gen-test] CSV not written (%s)" % e)
@@ -20498,7 +20762,7 @@ def run_gen_test():
         print("[gen-test] REPORT ONLY: %d unfinished run(s) left alone (not simulated)" % n_skip)
     print("[gen-test] %d run(s) to simulate, %d already done%s"
           % (len(todo) - n_rs, sum(1 for r in runs if r["note"] or r.get("force_score")),
-             (" -- and %d finished run(s) to SCORE AGAIN for the POI power recovery "
+             (" -- and %d finished run(s) to SCORE AGAIN for the P90 / ripple / settled rows "
               "(no simulation; GEN_TEST_RESCORE_MISSING)" % n_rs) if n_rs else ""))
     # THE STUDY MUST BE THERE BEFORE ANYTHING STARTS. Without it every run
     # ended INCOMPLETE in seconds (rc 2) and the queue raced through all of

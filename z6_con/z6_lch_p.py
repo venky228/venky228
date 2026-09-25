@@ -1545,6 +1545,8 @@ def _key_of_idx(idx):
         return "build"
     if idx == -2:
         return "report-merge"
+    if not isinstance(idx, int):
+        return str(idx)           # report shards / background report / plotter: their own key
     return "w%d" % idx
 
 
@@ -1699,9 +1701,13 @@ def _dialog_sweeper():
         time.sleep(5)
 
 
+_SWEEPER_ON = [False]
+
+
 def _dialog_sweeper_start():
-    if not CLOSE_PSSE_DIALOGS or os.name != "nt":
+    if not CLOSE_PSSE_DIALOGS or os.name != "nt" or _SWEEPER_ON[0]:
         return
+    _SWEEPER_ON[0] = True             # one sweeper for the launch, not one per pass
     th = threading.Thread(target=_dialog_sweeper)
     th.daemon = True
     th.start()
@@ -1740,7 +1746,7 @@ def _pid_holds_claim(pid):
 _SCEN_SCAN = {"t": 0.0, "rows": {}}
 
 
-def _worker_scenario_age(i):
+def _worker_scenario_age(i, since=0.0):
     """(scenario_id, seconds_it_has_been_RUNNING) for the scenario worker i holds,
        or (None, 0). Read from the study's own PROGRESS rows -- the same source the
        live table uses -- and cached, because this is asked every POLL_SECS.
@@ -1765,9 +1771,14 @@ def _worker_scenario_age(i):
         if (st or "").strip() != "RUNNING" or (wk or "").strip() != want or not tm:
             continue
         try:
-            age = now - time.mktime(time.strptime(tm, "%Y-%m-%d %H:%M:%S"))
+            ts = time.mktime(time.strptime(tm, "%Y-%m-%d %H:%M:%S"))
         except Exception:
             continue
+        # A ROW WRITTEN BEFORE THIS LAUNCH OF THE WORKER is the killed one's:
+        # read as the new process's, it killed the relaunch at once, for ever
+        if since and ts < since - 2.0:
+            continue
+        age = now - ts
         if age > best[1]:
             best = (sid, age)
     return best
@@ -1841,7 +1852,25 @@ def _reset_attempts(ids, why):
           % (why, len(ids), ", ".join(ids[:10]), " ..." if len(ids) > 10 else "", n))
 
 
-def _pump(idx, tag, proc):
+def _pump_lines(proc):
+    """proc's output line by line, READ AS BYTES and decoded with 'replace'. A
+       byte the console codec cannot decode used to raise inside the text
+       reader and end the reading: the pipe then filled and the child blocked
+       until the hang watchdog killed it (one attempt lost)."""
+    enc = getattr(proc.stdout, "encoding", None) or "latin-1"
+    raw = getattr(proc.stdout, "buffer", None)
+    while True:
+        if raw is not None:
+            b = raw.readline()
+            line = b.decode(enc, "replace").replace("\r\n", "\n").replace("\r", "\n") if b else ""
+        else:
+            line = proc.stdout.readline()
+        if not line:
+            return
+        yield line
+
+
+def _pump(idx, tag, proc, key=None):
     """Read a child's stdout line-by-line and echo each line prefixed with its tag. Also stamp
        this worker's 'last activity' time so the hang watchdog can spot a frozen worker.
 
@@ -1850,9 +1879,7 @@ def _pump(idx, tag, proc):
     _NOISE_SEEN.setdefault(idx, set())
     _NOISE_HELD.setdefault(idx, 0)
     try:
-        for line in iter(proc.stdout.readline, ""):
-            if not line:
-                break
+        for line in _pump_lines(proc):
             _LAST_ACTIVITY[idx] = time.time()
             txt = line.rstrip("\n")
             # "import psspy" DYING IS THE LICENCE, NOT THE SCRIPT. psseng.dll
@@ -1867,7 +1894,7 @@ def _pump(idx, tag, proc):
             # so the exit takes the backoff + cooldown path instead.
             if _DLL_INIT_RE.search(txt):
                 with _DIALOG_LOCK:
-                    _DIALOG_HITS.setdefault(_key_of_idx(idx), []).append(
+                    _DIALOG_HITS.setdefault(key or _key_of_idx(idx), []).append(
                         (time.time(), "psspy import", txt.strip()))
             if QUIET_PSSE_NOISE and _NOISE_RE.match(txt):
                 key = txt.strip()
@@ -2112,6 +2139,7 @@ def _apply_skip_done(selected):
 
        Called after the id/event selection so it narrows THAT, never widens it."""
     global SKIP_DONE_SELECTED
+    SKIP_DONE_SELECTED = False     # this pass's own answer, not the last project's
     if not SKIP_DONE:
         return selected
     # FRESH_START MEANS START OVER, AND IT HAS TO WIN HERE.
@@ -2444,7 +2472,10 @@ def _progress_rows(since=None):
                     tm = (r.get("time") or "").strip()
                     if since and tm and tm < since:
                         continue                    # a previous run's row
-                    if sid:
+                    # THE NEWEST ROW WINS, not the last file read: PROGRESS_w10
+                    # sorts before PROGRESS_w2, and an old RUNNING row of one
+                    # worker hid the DONE another wrote later
+                    if sid and (sid not in latest or not tm or tm >= latest[sid][3]):
                         latest[sid] = ((r.get("status") or "").strip(),
                                        (r.get("attempts") or "").strip(),
                                        (r.get("worker") or "").strip(),
@@ -3349,7 +3380,7 @@ def _run_phase(role, suffix, n=1, widx=0):
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              universal_newlines=True, bufsize=1)
         _register_child("phase:%s" % role, p)
-        th = threading.Thread(target=_pump, args=(idx, tag, p)); th.daemon = True; th.start()
+        th = threading.Thread(target=_pump, args=(idx, tag, p, "phase:%s" % role)); th.daemon = True; th.start()
         killed = False
         licence = None
         while p.poll() is None:
@@ -3429,7 +3460,7 @@ def _start_report_bg(proj, mode, rdir):
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          universal_newlines=True, bufsize=1)
     _register_child("report-bg", p)
-    th = threading.Thread(target=_pump, args=(key, "[R:%s]" % (proj or "def")[:8], p))
+    th = threading.Thread(target=_pump, args=(key, "[R:%s]" % (proj or "def")[:8], p, "report-bg"))
     th.daemon = True; th.start()
     _REPORT_BG.append({"proj": proj, "mode": mode, "dir": rdir,
                        "proc": p, "thread": th, "t0": time.time(), "key": key})
@@ -3690,7 +3721,7 @@ def _run_report_sharded(n, selected=None):
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     universal_newlines=True, bufsize=1)
         _register_child("shard%d" % i, procs[i])
-        th = threading.Thread(target=_pump, args=(key, "[S%d]" % i, procs[i]))
+        th = threading.Thread(target=_pump, args=(key, "[S%d]" % i, procs[i], "shard%d" % i))
         th.daemon = True; th.start(); threads[i] = th
 
     for i in range(n):
@@ -4093,7 +4124,7 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
             #     instead of 18 hours. The kill goes through _quiet_watch so
             #     KILL_GRACE_S still applies to it.
             if SCENARIO_MAX_S > 0:
-                _sid, _on = _worker_scenario_age(i)
+                _sid, _on = _worker_scenario_age(i, launched_at.get(i, 0.0))
                 if _sid and _on > SCENARIO_MAX_S and _on > KILL_GRACE_S:
                     _banner("worker %d has been on %s for %s > SCENARIO_MAX_S=%s -- the slowest "
                             "scenario ever measured here took 24 min. Killing the worker; %s goes "
@@ -4199,7 +4230,7 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                                universal_newlines=True, bufsize=1)
         _register_child("plot-catchup", _pp)
         _LAST_ACTIVITY["plot"] = time.time()
-        _pt = threading.Thread(target=_pump, args=("plot", "[PLOT]", _pp))
+        _pt = threading.Thread(target=_pump, args=("plot", "[PLOT]", _pp, "plot-catchup"))
         _pt.daemon = True; _pt.start()
         _t0c = time.time()
         _killed = ""
@@ -4503,8 +4534,18 @@ def _echo_run_summary():
 
 
 def _project_results_dir(proj, mode):
-    return os.path.join(_results_root(),
-                        ("%s_%s" % (proj, mode)) if proj else "dynamics")
+    """<proj>_<mode> WITH the SPP_CAP_TAG / SPP_RUN_TAG suffix, as the study
+       names it (see _study_results_subdir) -- a sweep's reports were read from
+       the untagged folder of another run."""
+    sub = ("%s_%s" % (proj, mode)) if proj else "dynamics"
+    if proj:
+        cap = (os.environ.get("SPP_CAP_TAG") or "").strip()
+        run = (os.environ.get("SPP_RUN_TAG") or "").strip()
+        if cap:
+            sub += "_cap%s" % cap
+        if run:
+            sub += "_%s" % run
+    return os.path.join(_results_root(), sub)
 
 
 def _read_project_verdicts(rdir, proj=None):
@@ -5151,6 +5192,14 @@ def _run_one_study():
     del _LOCKED[:]
     try:
         if not os.path.isdir(LOGS_DIR): os.makedirs(LOGS_DIR)
+        if _CONSOLE_FH is not None:
+            # the previous project's log: closed, not left open (and locked) per pass
+            with _PRINT_LOCK:
+                try:
+                    _CONSOLE_FH.close()
+                except Exception:
+                    pass
+                _CONSOLE_FH = None
         _CONSOLE_FH = open(CONSOLE_LOG, "w", buffering=1)   # combined tagged output of all workers
         print("[parallel] combined worker console -> %s" % CONSOLE_LOG)
     except Exception as e:
@@ -5227,6 +5276,18 @@ def _run_one_study():
 
     check_study_version()
     selected = _resolve_selection(RUN_ONLY_FAULTS)
+    if selected == ["__EVENT_LIST_UNREADABLE__"] and not _have_fault_file():
+        # FIRST LAUNCH: the fault list ONLY_EVENTS needs is written by the build.
+        # Build now, then apply the selection -- it used to go on and start
+        # workers with an id that matches nothing, simulate nothing, and end rc 0
+        _dialog_sweeper_start()
+        _banner("PHASE 1/3: BUILD first -- ONLY_EVENTS needs the fault list it writes")
+        if not _run_phase("build", "_build"):
+            print("[parallel] BUILD failed -- aborting."); return 1
+        selected = _resolve_selection(RUN_ONLY_FAULTS)
+    if selected == ["__EVENT_LIST_UNREADABLE__"]:
+        print("[parallel] *** ONLY_EVENTS cannot be applied -- stopped, nothing simulated ***")
+        return 1
 
     # FRESH_START AND SKIP_DONE ASK FOR OPPOSITE THINGS. FRESH_START deletes the
     # .done markers; SKIP_DONE reads them to decide what has already run. With
