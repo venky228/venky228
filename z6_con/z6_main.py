@@ -308,14 +308,14 @@ GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = True                   # all machines within GEN_TEST_HOPS off together
 GEN_TEST_POI_OFF_BASE = True                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
                                              #   compared with the POIGENOFF run; same reports, rows "POI OFF + ..."
-GEN_TEST_HOPS = 7                            # gens: "near" = within this many buses of the POI
+GEN_TEST_HOPS = 5                           # gens: "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
 GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus, id)]
 # -- 3d. cap and line runs (solver scenario s0_asis only)
 GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together
 GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own
 GEN_TEST_LINES_EACH = True                    # each nearby line / transformer opened on its own
-GEN_TEST_LINES_HOPS = 3                      # lines: both ends within this many buses of the POI
+GEN_TEST_LINES_HOPS = 2                      # lines: both ends within this many buses of the POI
 # -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
@@ -328,6 +328,9 @@ GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s2_it300_a020"]  # "all" | "best2" | [...]
 GEN_TEST_POIGENOFF_SCENARIOS = "all"          # all POI gens off (POIGENOFF): "all" | [...] | None = as GEN_TEST_GEN_SCENARIOS
 GEN_TEST_LINES_SCENARIOS = ["s0_asis", "s2_it300_a020"]  # each line / transformer opened (and its POI-off run)
 GEN_TEST_CAPS_SCENARIOS = ["s0_asis", "s2_it300_a020"]   # caps off (and its POI-off run)
+GEN_TEST_BORDERLINE_REF = 0.5                # a 'new FAIL' that more than this share of the element runs of one
+                                             #   fault + scenario get (4+ runs) = the REFERENCE is borderline on it:
+                                             #   noted, not held against any element (None = off). Reports only.
 # rarely changed: see "GEN TEST -- advanced defaults" further down (fixed lists, radii, disk)
 
 # ---- 4. SOLVER -----------------------------------------------------------------
@@ -18391,22 +18394,78 @@ def _gt_prec_worst(m, faults):
     return ("%.2fs" % max(hs) if hs else "-") + (" RIPPLE" if any(d.get("ripple") == "yes" for d in ds) else "")
 
 
-def _gt_newfails(mo, mb, fs):
-    """Criteria (other than the 1.2 pu spike) the element-out run FAILS on
-       faults fs that its reference run passes -- such a run is not a fix."""
+def _gt_newfails_f(mo, mb, f):
+    """The criteria (other than the 1.2 pu spike) the element-out run FAILS on
+       fault f that its reference run passes: a set."""
+    out = set((mo.get(f) or {}).get("fails") or ()) - set((mb.get(f) or {}).get("fails") or ())
+    # POWER THAT NO LONGER COMES BACK: the reference's POI power recovered
+    # and stayed, this run's did not -- the oscillating 'fix'
+    if ((mb.get(f) or {}).get("p_state") == "held"
+            and (mo.get(f) or {}).get("p_state") in ("not held", "never")):
+        out.add("POI power recovery")
+    # A RIPPLE THE REFERENCE DOES NOT HAVE: voltage / power stepping up and
+    # down to the end of the run with the element out
+    if ((mb.get(f) or {}).get("ripple") == "no" and (mo.get(f) or {}).get("ripple") == "yes"):
+        out.add("POI ripple")
+    return out
+
+
+def _gt_newfails(mo, mb, fs, ign=None):
+    """Criteria the element-out run FAILS on faults fs that its reference run
+       passes -- such a run is not a fix. ign = {fault: criteria} the
+       reference is borderline on (_gt_borderline): not held against it."""
     out = set()
     for f in fs:
-        out |= set((mo.get(f) or {}).get("fails") or ()) - set((mb.get(f) or {}).get("fails") or ())
-        # POWER THAT NO LONGER COMES BACK: the reference's POI power recovered
-        # and stayed, this run's did not -- the oscillating 'fix'
-        if ((mb.get(f) or {}).get("p_state") == "held"
-                and (mo.get(f) or {}).get("p_state") in ("not held", "never")):
-            out.add("POI power recovery")
-        # A RIPPLE THE REFERENCE DOES NOT HAVE: voltage / power stepping up and
-        # down to the end of the run with the element out
-        if ((mb.get(f) or {}).get("ripple") == "no" and (mo.get(f) or {}).get("ripple") == "yes"):
-            out.add("POI ripple")
+        out |= _gt_newfails_f(mo, mb, f) - set((ign or {}).get(f) or ())
     return sorted(out)
+
+
+def _gt_borderline(runs, faults, ref):
+    """{(fault, scenario block): {criterion: (runs with it, runs)}} -- a 'new
+       FAIL' that more than GEN_TEST_BORDERLINE_REF of the element runs of one
+       fault and scenario get (4 runs or more): nearly everything taken out
+       'causes' it, so the REFERENCE only just passes it (F02 s2: rotor-angle
+       damping in 33 of 44, BUFF_DUNES13 off among them). Noted in the
+       reports, not held against any element. Scenario block = the scenario
+       tag, plus _GT_POIOFF_SC for a POI-off run."""
+    frac = GEN_TEST_BORDERLINE_REF
+    if not frac:
+        return {}
+    cnt, tot = {}, {}
+    for r in runs:
+        g, m = r["gen"], r.get("m")
+        b = _gt_ref(ref, r)
+        if not g or not m or not b:
+            continue
+        sc = r["sc"][0] + (_GT_POIOFF_SC if g.get("base_off") else "")
+        for f in faults:
+            if (m.get(f) or {}).get("verdict") not in ("PASS", "FAIL") or \
+                    (b["m"].get(f) or {}).get("verdict") not in ("PASS", "FAIL"):
+                continue
+            k = (f, sc)
+            tot[k] = tot.get(k, 0) + 1
+            for c in _gt_newfails_f(m, b["m"], f):
+                d = cnt.setdefault(k, {})
+                d[c] = d.get(c, 0) + 1
+    out = {}
+    for k, cs in cnt.items():
+        for c, n in cs.items():
+            if tot[k] >= 4 and n > float(frac) * tot[k]:
+                out.setdefault(k, {})[c] = (n, tot[k])
+    return out
+
+
+def _gt_ign(bl, r, faults):
+    """{fault: borderline criteria} for run r (its scenario block)."""
+    sc = r["sc"][0] + (_GT_POIOFF_SC if (r["gen"] or {}).get("base_off") else "")
+    return dict((f, set((bl.get((f, sc)) or {}).keys())) for f in faults)
+
+
+def _gt_bl_note(bl, f, sc):
+    """One line for a report: the criteria the reference is borderline on."""
+    d = bl.get((f, sc)) or {}
+    return "; ".join("%s FAILS in %d of %d element runs but PASSES in the reference" % (c, n, t)
+                     for c, (n, t) in sorted(d.items()))
 
 
 def _gt_measure(rdir, faults):
@@ -19059,6 +19118,7 @@ def _gt_spike_key(sc):
 def _gt_best(runs, faults, ref):
     """The common 'which is best' summary at the top of GEN_TEST_<proj>.txt."""
     nf = len(faults)
+    bl = _gt_borderline(runs, faults, ref)
     L = ["", "=" * 150, "BEST OF ALL -- every run ranked: most faults PASS, then fewest non-converged",
          "steps (nc), then fewest buses above 1.2 pu, then lowest peak voltage", "=" * 150]
     sc_all = []
@@ -19108,7 +19168,7 @@ def _gt_best(runs, faults, ref):
         e = per.setdefault(k, {"g": g, "n": 0, "better": 0, "dnc": 0, "dov": 0, "dmx": 0.0,
                                "fix": 0, "best": None, "bad": 0, "why": set()})
         e["n"] += 1
-        _nf = _gt_newfails(r.get("m") or {}, b.get("m") or {}, fs)
+        _nf = _gt_newfails(r.get("m") or {}, b.get("m") or {}, fs, _gt_ign(bl, r, fs))
         if _nf:
             e["bad"] += 1
             e["why"] |= set(_nf)
@@ -19209,6 +19269,7 @@ def _gt_impact(runs, faults, proj):
          B. per fault, each bus that spikes in the all-in-service run and the
             element whose removal brings THAT bus down the most."""
     ref = _gt_refs(runs)
+    bl = _gt_borderline(runs, faults, ref)
     rows = []
     for r in runs:
         g, m = r["gen"], r.get("m")
@@ -19227,7 +19288,8 @@ def _gt_impact(runs, faults, proj):
                          "pk_b": mb.get("max_pu") or 0.0, "pk_o": mo.get("max_pu") or 0.0,
                          "nc_b": mb.get("noconv"), "nc_o": mo.get("noconv"),
                          "v_b": mb.get("verdict"), "v_o": mo.get("verdict"), "bb": bb, "bo": bo,
-                         "newfail": _gt_newfails(m, b["m"], [f]),
+                         "newfail": _gt_newfails(m, b["m"], [f], _gt_ign(bl, r, [f])),
+                         "border": sorted(_gt_newfails_f(m, b["m"], f) & _gt_ign(bl, r, [f])[f]),
                          "p_b": _gt_prec_cell(mb), "p_o": _gt_prec_cell(mo)})
     for x in rows:
         x["dpk"] = (x["pk_b"] or 0.0) - (x["pk_o"] or 0.0)
@@ -19272,7 +19334,9 @@ def _gt_impact(runs, faults, proj):
          "impact: CONTRIBUTES = better with it out (it drives the spike / non-convergence)",
          "        HOLDS DOWN  = worse with it out (it keeps the voltage down)   MIXED / no effect",
          "        NOT RECOMM. = fewer spikes, but it FAILS another criterion the reference passes",
-         "                      (voltage recovery, steady state, trips, damping, stability) -- not a fix", ""]
+         "                      (voltage recovery, steady state, trips, damping, stability) -- not a fix",
+         "        REFERENCE BORDERLINE = a criterion that most element runs of a fault + scenario 'newly' fail:",
+         "                      the reference only just passes it, so it is noted, not held against any element", ""]
     # SUMMARY -- per fault, the elements that matter (first scenario that has them)
     L += ["SUMMARY -- per fault, the elements with an impact (scenario: first with element runs)", ""]
     for f in faults:
@@ -19288,6 +19352,8 @@ def _gt_impact(runs, faults, proj):
                      % (f, sc, ref_txt(sc), sr[0]["v_b"], sr[0]["over_b"],
                         "%.3f" % sr[0]["pk_b"] if sr[0]["pk_b"] else "-",
                         "-" if sr[0]["nc_b"] is None else sr[0]["nc_b"]))
+            if _gt_bl_note(bl, f, sc):
+                L.append("      REFERENCE BORDERLINE (not held against any element): %s" % _gt_bl_note(bl, f, sc))
             for x in con[:6]:
                 L.append("      contributes : %-50s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s, P%d %s -> %s"
                          % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
@@ -19320,6 +19386,9 @@ def _gt_impact(runs, faults, proj):
                      "-" if b0["nc_b"] is None else b0["nc_b"]),
                   "  %-3s %-12s %-50s %-14s %-12s %-15s %-11s %s"
                   % ("#", "impact", "element taken out", "kind", "buses>1.2", "peak pu", "nc", "verdict")]
+            if _gt_bl_note(bl, f, sc):
+                L[-1:-1] = ["  REFERENCE BORDERLINE: %s -- so it is not a new FAIL of any element here "
+                            "(marked 'ref borderline' on the rows; GEN_TEST_BORDERLINE_REF)" % _gt_bl_note(bl, f, sc)]
             for i, x in enumerate(sr, 1):
                 L.append("  %-3d %-12s %-50s %-14s %-12s %-15s %-11s %s" % (
                     i, x["eff"], _gt_label(x["g"])[:50], (x["g"].get("kind") or "")[:14],
@@ -19330,7 +19399,8 @@ def _gt_impact(runs, faults, proj):
                                   "-" if x["nc_o"] is None else x["nc_o"]),
                     "%s -> %s" % (x["v_b"], x["v_o"]))
                     + "   P%d %s -> %s" % (_GT_PREC_PCT, x["p_b"], x["p_o"])
-                    + ("   new FAIL: " + ", ".join(x["newfail"]) if x["newfail"] else ""))
+                    + ("   new FAIL: " + ", ".join(x["newfail"]) if x["newfail"] else "")
+                    + ("   ref borderline: " + ", ".join(x["border"]) if x["border"] else ""))
         # B -- per spiking bus, the element that lowers it most (first scenario
         # with runs, and the first POI-off block when there is one)
         for sc in firsts(fr):
@@ -19358,12 +19428,13 @@ def _gt_impact(runs, faults, proj):
             w.writerow(["fault", "scenario", "impact", "element_out", "kind", "buses_over_1p2_in_service",
                         "buses_over_1p2_out", "buses_cleared", "buses_new", "peak_pu_in_service",
                         "peak_pu_out", "peak_drop", "nc_in_service", "nc_out", "verdict_in_service",
-                        "verdict_out", "p_recovery_in_service", "p_recovery_out", "new_fails"])
+                        "verdict_out", "p_recovery_in_service", "p_recovery_out", "new_fails",
+                        "ref_borderline_fails"])
             for x in sorted(rows, key=lambda x: (x["f"], x["sc"]) + key(x)):
                 w.writerow([x["f"], x["sc"], x["eff"], _gt_label(x["g"]), x["g"].get("kind") or "", x["over_b"],
                             x["over_o"], x["cleared"], x["new"], x["pk_b"] or "", x["pk_o"] or "",
                             round(x["dpk"], 4), x["nc_b"], x["nc_o"], x["v_b"], x["v_o"],
-                            x["p_b"], x["p_o"], "; ".join(x["newfail"])])
+                            x["p_b"], x["p_o"], "; ".join(x["newfail"]), "; ".join(x["border"])])
     except Exception as e:
         print("[gen-test] GEN_TEST_IMPACT not written (%s)" % e)
 
@@ -19835,6 +19906,7 @@ def _gt_write_all(projs):
             continue
         runs, faults = _GT_LAST[pj]
         ref = _gt_refs(runs)
+        bl = _gt_borderline(runs, faults, ref)
         L += ["=" * 130, "%s  (faults %s)" % (pj, ", ".join(faults)), "=" * 130,
               "  %-18s %-52s %6s %13s %15s %12s %9s" % (
                   "scenario", "element run", "faults", ">1.2 in->out", "peak in->out",
@@ -19856,7 +19928,7 @@ def _gt_write_all(projs):
             rows_csv.append([pj, r["sc"][0], lab, len(fs), len(faults), bx[2], x[2],
                              "%.3f" % (bx[3] or 0.0), "%.3f" % (x[3] or 0.0), bx[1], x[1],
                              bx[0], x[0]])
-            _nf = _gt_newfails(m, b["m"], fs)
+            _nf = _gt_newfails(m, b["m"], fs, _gt_ign(bl, r, fs))
             if _nf:
                 L.append("  %-18s   -> NOT RECOMMENDED: new FAIL (%s)" % ("", ", ".join(_nf)))
                 continue
