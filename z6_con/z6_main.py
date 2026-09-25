@@ -18363,17 +18363,39 @@ def _gt_ripple_parse(d, det):
        voltage p-p (pu) and power p-p (% of pre-fault)."""
     mv = re.search(r"voltage p-p ([\d.]+) pu", det)
     mp = re.search(r"= ([\d.]+)% of pre-fault", det)
+    mw = re.search(r"power p-p ([\d.]+) MW", det)
+    d["p_pp_mw"] = float(mw.group(1)) if mw else None
     d["v_pp"] = float(mv.group(1)) if mv else None
     d["p_pp_pct"] = float(mp.group(1)) if mp else None
     d["ripple"] = ("yes" if "-- RIPPLE" in det else "no" if "no ripple" in det else "n/a")
     ml = re.search(r"limits ([\d.]+) pu, ([\d.]+)% of pre-fault", det)
     d["_rlim"] = (round(float(ml.group(1)), 3), int(round(float(ml.group(2))))) if ml else None
+    # WHICH QUANTITY: the study names it ('RIPPLE in VOLTAGE and POWER'); a row
+    # written before it did is read from its own numbers against its limits
+    q = []
+    if d["ripple"] == "yes":
+        if "RIPPLE in " in det:
+            q = [x for x, w in (("V", "VOLTAGE"), ("P", "POWER")) if w in det.split("RIPPLE in ", 1)[1]]
+        elif ml:
+            if mv and d["v_pp"] > float(ml.group(1)) and \
+                    re.search(r"voltage p-p [\d.]+ pu \(sustained\)", det):
+                q.append("V")
+            if mp and d["p_pp_pct"] > float(ml.group(2)) and \
+                    re.search(r"of pre-fault \(sustained\)", det):
+                q.append("P")
+    d["ripple_q"] = "+".join(q)
+
+
+def _gt_rq_words(q):
+    """'V+P' -> 'voltage and power'."""
+    w = [{"V": "voltage", "P": "power"}.get(x, "?") for x in (q or "?").split("+") if x]
+    return " and ".join(w) or "?"
 
 
 def _gt_prec_cell(d):
     """One fault's POI power recovery for a table: seconds, NOT HELD, NEVER, -."""
     st = (d or {}).get("p_state")
-    rp = " R" if (d or {}).get("ripple") == "yes" else ""
+    rp = (" R-" + ((d or {}).get("ripple_q") or "?")) if (d or {}).get("ripple") == "yes" else ""
     if st == "held":
         return "%.2f%s" % (d["p_held"], rp)
     return {"not held": "NOT HELD", "never": "NEVER", "n/a": "n/a"}.get(st, "-") + rp
@@ -18391,7 +18413,35 @@ def _gt_prec_worst(m, faults):
         if bad in st:
             return txt
     hs = [d["p_held"] for d in ds if d.get("p_state") == "held"]
-    return ("%.2fs" % max(hs) if hs else "-") + (" RIPPLE" if any(d.get("ripple") == "yes" for d in ds) else "")
+    return ("%.2fs" % max(hs) if hs else "-") + ("  " + _gt_ripple_txt(m, faults)).rstrip()
+
+
+def _gt_ripple_txt(m, faults):
+    """A run's ripple in words, the largest over its faults for each quantity:
+       'RIPPLE: voltage 0.023 pu p-p (F02); power 12.0 MW p-p = 3.1% (F01)'.
+       '' when no fault has one."""
+    v = p = None
+    other = []
+    for f in faults:
+        d = (m or {}).get(f) or {}
+        if d.get("ripple") != "yes":
+            continue
+        q = (d.get("ripple_q") or "").split("+")
+        if "V" in q and d.get("v_pp") is not None and (v is None or d["v_pp"] > v[0]):
+            v = (d["v_pp"], f)
+        if "P" in q and d.get("p_pp_pct") is not None and (p is None or d["p_pp_pct"] > p[0]):
+            p = (d["p_pp_pct"], f, d.get("p_pp_mw"))
+        if not ("V" in q or "P" in q):
+            other.append(f)
+    parts = []
+    if v:
+        parts.append("voltage %.3f pu p-p (%s)" % v)
+    if p:
+        parts.append("power %sp-p = %.1f%% of pre-fault (%s)"
+                     % ("%.1f MW " % p[2] if p[2] is not None else "", p[0], p[1]))
+    if other and not parts:
+        parts.append("on %s" % ",".join(other))
+    return ("RIPPLE: " + "; ".join(parts)) if parts else ""
 
 
 def _gt_newfails_f(mo, mb, f):
@@ -18406,7 +18456,7 @@ def _gt_newfails_f(mo, mb, f):
     # A RIPPLE THE REFERENCE DOES NOT HAVE: voltage / power stepping up and
     # down to the end of the run with the element out
     if ((mb.get(f) or {}).get("ripple") == "no" and (mo.get(f) or {}).get("ripple") == "yes"):
-        out.add("POI ripple")
+        out.add("POI ripple (%s)" % _gt_rq_words((mo.get(f) or {}).get("ripple_q")))
     return out
 
 
@@ -19486,15 +19536,18 @@ def _gt_write(runs, faults, gens):
           "  its pre-fault value AND stays within +/-%d %% of it to the end.  NOT HELD = reaches it but swings"
           % (100 - _GT_PREC_PCT),
           "  out again, NEVER = never gets back, - = not measured (scored before this row existed)",
-          "  R = RIPPLE: over the last %g s the POI voltage swings > %g pu or the power > %g %% peak-to-peak,"
-          % (RIPPLE_WINDOW_S, RIPPLE_V_PU, 100 * RIPPLE_P_FRAC),
+          "  R-V = VOLTAGE RIPPLE: over the last %g s the POI voltage swings > %g pu peak-to-peak;"
+          % (RIPPLE_WINDOW_S, RIPPLE_V_PU),
+          "  R-P = POWER RIPPLE: the POI power swings > %g %% of pre-fault peak-to-peak;  R-V+P = both;"
+          % (100 * RIPPLE_P_FRAC),
           "  and it is not dying out (non-converged steps or a control hunting)",
           "%-22s %-50s " % ("scenario", "machine OFF / line OPEN") + " | ".join("%-11s" % f for f in faults),
           "-" * 150]
     for r in runs:
         g, m = r["gen"], r.get("m") or {}
         L.append("%-22s %-50s " % (r["sc"][0], _gt_label(g)[:50] if g else "(none -- all in service)")
-                 + " | ".join("%-11s" % _gt_prec_cell(m.get(f)) for f in faults))
+                 + " | ".join("%-11s" % _gt_prec_cell(m.get(f)) for f in faults)
+                 + ("   " + _gt_ripple_txt(m, faults) if _gt_ripple_txt(m, faults) else ""))
     # runs that could not take their element out: nothing was simulated
     ns = []
     for r in runs:
@@ -19550,7 +19603,7 @@ def _gt_write(runs, faults, gens):
             w.writerow(["scenario", "delt_cycles", "maxiter", "accel", "tol", "off_bus", "off_id",
                         "off_name", "off_kind", "off_mw", "nodes", "zdist_pu", "fault", "verdict",
                         "noconv_steps", "buses_over_1p2", "max_pu", "p_recovery", "p_first_s", "p_held_s",
-                        "ripple", "ripple_v_pp_pu", "ripple_p_pp_pct",
+                        "ripple", "ripple_in", "ripple_v_pp_pu", "ripple_p_pp_pct",
                         "folder", "note"])
             for r in runs:
                 sc, g, m = r["sc"], r["gen"], r.get("m") or {}
@@ -19565,7 +19618,9 @@ def _gt_write(runs, faults, gens):
                                 x.get("n_over", ""), x.get("max_pu", ""),
                                 x.get("p_state") or "", "" if x.get("p_first") is None else x["p_first"],
                                 "" if x.get("p_held") is None else x["p_held"],
-                                x.get("ripple") or "", "" if x.get("v_pp") is None else x["v_pp"],
+                                x.get("ripple") or "",
+                                _gt_rq_words(x.get("ripple_q")) if x.get("ripple") == "yes" else "",
+                                "" if x.get("v_pp") is None else x["v_pp"],
                                 "" if x.get("p_pp_pct") is None else x["p_pp_pct"],
                                 r["rdir"], r.get("note", "")])
     except Exception as e:

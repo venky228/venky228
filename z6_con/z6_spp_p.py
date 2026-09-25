@@ -21385,12 +21385,12 @@ def _poi_record_tag(v, t, tfc, is_power):
             if win:
                 a, k = _ripple_pp(t, v, win[0], win[1])
                 if a is not None and k == "sustained" and a > RIPPLE_P_FRAC * abs(pr["p0"]):
-                    tags.append("RIPPLE p-p %.1f MW = %.1f%% (last %.1f s)"
+                    tags.append("POWER RIPPLE p-p %.1f MW = %.1f%% (last %.1f s)"
                                 % (a, 100.0 * a / abs(pr["p0"]), win[1] - win[0]))
     elif win:
         a, k = _ripple_pp(t, v, win[0], win[1])
         if a is not None and k == "sustained" and a > RIPPLE_V_PU:
-            tags.append("RIPPLE p-p %.3f pu (last %.1f s)" % (a, win[1] - win[0]))
+            tags.append("VOLTAGE RIPPLE p-p %.3f pu (last %.1f s)" % (a, win[1] - win[0]))
     return ("   [[%s]]" % "; ".join(tags)) if tags else ""
 
 
@@ -23905,12 +23905,14 @@ def evaluate_case(path, kind, tclear, kb):
                 add(_rc, None, "not measured -- under 0.5 s of record after the final clearing")
             else:
                 _w0, _t_end = _win
-                _parts, _flag = [], False
+                _parts, _flag, _rq = [], False, []
                 if _vpoi is not None:
                     _a, _k = _ripple_pp(t, _vpoi, _w0, _t_end)
                     if _a is not None:
                         _parts.append("voltage p-p %.4f pu (%s)" % (_a, _k))
-                        _flag = _flag or (_a > RIPPLE_V_PU and _k == "sustained")
+                        if _a > RIPPLE_V_PU and _k == "sustained":
+                            _flag = True
+                            _rq.append("VOLTAGE")
                 else:
                     _parts.append("no POI voltage channel")
                 if _prec_src:
@@ -23920,12 +23922,15 @@ def evaluate_case(path, kind, tclear, kb):
                     if _a is not None:
                         _parts.append("power p-p %.1f MW = %.1f%% of pre-fault (%s)"
                                       % (_a, 100.0 * _a / _p02 if _p02 >= 1.0 else 0.0, _k))
-                        _flag = _flag or (_p02 >= 1.0 and _a > RIPPLE_P_FRAC * _p02 and _k == "sustained")
+                        if _p02 >= 1.0 and _a > RIPPLE_P_FRAC * _p02 and _k == "sustained":
+                            _flag = True
+                            _rq.append("POWER")
                 else:
                     _parts.append("no POI power channel")
                 add(_rc, None, "POI %s, %.2f-%.2f s: %s -- %s (limits %.3f pu, %.0f%% of pre-fault power)"
                     % (POI_BUS, _w0, _t_end, ", ".join(_parts),
-                       "RIPPLE" if _flag else "no ripple", RIPPLE_V_PU, 100.0 * RIPPLE_P_FRAC))
+                       ("RIPPLE in %s" % " and ".join(_rq)) if _flag else "no ripple",
+                       RIPPLE_V_PU, 100.0 * RIPPLE_P_FRAC))
         except Exception as _e:
             add(_rc, None, "not measured (%s)" % _e)
 
