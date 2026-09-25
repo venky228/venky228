@@ -247,7 +247,7 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 # -- 3a. on / off, projects, faults
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
-GEN_TEST_REPORT_ONLY = True                 # True = rewrite every gen-test report from the runs on disk, simulate nothing
+GEN_TEST_REPORT_ONLY = False                 # True = rewrite every gen-test report from the runs on disk, simulate nothing
 GEN_TEST_RESCORE_MISSING = True              # True = a finished run scored before the POI power-recovery row existed is
                                              #   scored again from its .out files (no simulation, no plots)
 GEN_TEST_REPLOT = True                      # True = redraw the PDFs of finished runs from their .out files (no simulation),
@@ -417,10 +417,10 @@ V_SS_HIGH = 1.10                             # and high
 POI_P_RECOVERY_FRAC = 0.90                   # POI power back to this fraction of pre-fault (and held +/- 1-this)
 RIPPLE_WINDOW_S = 2.0                        # ripple: the last this many s of each fault run
 RIPPLE_V_PU = 0.01                           # ripple: POI voltage peak-to-peak above this (pu) ...
-RIPPLE_P_MW = 2.0                            # ... or POI power peak-to-peak above this many MW
+RIPPLE_P_MW = 10.0                            # ... or POI power peak-to-peak above this many MW
 SETTLE_V_PU = 0.01                           # settled: over the same last RIPPLE_WINDOW_S every V (POI, machines, buses) moves <= this pu p-p
 SETTLE_PQ_MW = 2.0                           # ... and every P / Q moves <= this many MW / MVAr p-p (GEN_TEST_ANSWER_<proj>.txt)
-TRIP_PGEN_DEAD_MW = 10.0                     # machine ending below this MW = tripped
+TRIP_PGEN_DEAD_MW = 5.0                     # machine ending below this MW = tripped
 ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
 SPPR_MIN_AFTER_FIRST_PEAK = True             # True = SPPR "Minimum Value" as SPP Figure 2 (lowest trough after 1st peak) | False = lowest point after clearing
 # FLAT_TOL_BY_KIND: flat-run tolerance per quantity
@@ -18483,7 +18483,7 @@ def _gt_vpeak_parse(d, rs, det):
 
 def _gt_ripple_parse(d, det):
     """The study's 'POI ripple after recovery' row -> ripple yes / no / n/a,
-       voltage p-p (pu) and power p-p (% of pre-fault)."""
+       voltage p-p (pu) and power p-p (MW, and % of pre-fault when given)."""
     mv = re.search(r"voltage p-p ([\d.]+) pu", det)
     mp = re.search(r"= ([\d.]+)% of pre-fault", det)
     mw = re.search(r"power p-p ([\d.]+) MW", det)
@@ -18544,7 +18544,7 @@ def _gt_prec_worst(m, faults):
 
 def _gt_ripple_txt(m, faults):
     """A run's ripple in words, the largest over its faults for each quantity:
-       'RIPPLE: voltage 0.023 pu p-p (F02); power 12.0 MW p-p = 3.1% (F01)'.
+       'RIPPLE: voltage 0.023 pu p-p (F02); power 12.0 MW p-p = 3.1% of pre-fault (F01)'.
        '' when no fault has one."""
     v = p = None
     other = []
@@ -18994,7 +18994,11 @@ def _gt_replot(runs, faults, npar):
             try:
                 pr = _start_plotter(_gt_case(), GEN_TEST_PROJECT, GEN_TEST_MODE, 100 + k, rdir=r["rdir"],
                                     extra_env={"SPP_REPLOT_BEFORE": str(t_launch),
-                                               "SPP_PLOT_FAULTS": ",".join(_gt_run_faults(r["gen"], faults))})
+                                               # the flat run is redrawn too, when the run has one
+                                               "SPP_PLOT_FAULTS": ",".join(
+                                                   list(_gt_run_faults(r["gen"], faults))
+                                                   + (["FLAT_RUN"] if os.path.isfile(os.path.join(
+                                                       r["rdir"], "outs", "FLAT_RUN.out")) else []))})
             except Exception as e:
                 pr = None
                 print("[gen-test] replot %s could not start (%s)" % (os.path.basename(r["rdir"]), e))

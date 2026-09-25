@@ -19920,8 +19920,7 @@ def _panel_style(cat, ptitle):
     txt = txt.strip() or lbl
     if re.match(r"POI \d+ ONE TIE", L) and bus:
         # the distance / area are the POI's, not the tie's far end
-        txt = "POI %s: %s" % (bus, txt.replace("   (", " (").replace("the only tie (", "the only tie, ")
-                               .rstrip(")") if txt.startswith("the only tie") else txt)
+        txt = "POI %s: %s" % (bus, re.sub(r"^the only tie\s+\(([^()]*)\)", r"the only tie, \1", txt))
     return q, col, yl, txt
 
 
@@ -20097,14 +20096,12 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
     for pi, (cat, ptitle, series) in enumerate(chunk):
         badge, col, yl, txt = _panel_style(cat, ptitle)
         bw = _pt_width(rend, badge, BFS, weight="bold") + 0.14
-        # THE NOTES (P90 recovery, POI ripple) ON A LINE OF THEIR OWN, in
-        # blue -- text only, never a violation, but not to be missed either.
-        _notes = re.findall(r"\[\[(?!VIOLATION)([^\]]*)\]\]", txt)
+        # THE NOTES (P90 recovery, POI ripple) are listed on the index page,
+        # not on the figure: they come off the title here.
         txt = re.sub(r"\s*\[\[(?!VIOLATION)[^\]]*\]\]", "", txt)
         tl = _fit_lines(rend, txt, (aw - bw - 0.10) * 0.97, TFS,
                         3 if PLOT_VIOLATION_TAG in str(ptitle) else 2)
-        nl = (_fit_lines(rend, "NOTE (text only, not scored): " + "; ".join(_notes),
-                         (aw - bw - 0.10) * 0.97, TFS, 2) if _notes else [])
+        nl = []                         # the notes are listed on the index page
         nrows = min(len(series), PLOT_VALUE_ROWS_MAX) if PLOT_SHOW_VALUES else 0
         blocks.append((cat, ptitle, series, badge, col, yl, tl + nl, bw, nrows, len(tl)))
     def _fixed(nt, nrows, extra):
@@ -20425,13 +20422,46 @@ def make_plots(path, is_flat, kb, tclear=None):
         # short, landing them on the page before the one they wanted.
         _PARAM_PAGES = 1
         _rows = _violation_index_rows(panels, PER_PAGE, 1)
-        _n_idx = (len(_rows) + INDEX_ROWS_PER_PAGE - 1) // INDEX_ROWS_PER_PAGE if _rows else 0
+        # THE NOTES (P90 recovery, POI ripple) ARE LISTED HERE, not on the
+        # figure: [(panel number, badge, note line, first line of its note)]
+        _nlines = []
+        for _i, (_c, _pt, _sr) in enumerate(panels):
+            _ns = re.findall(r"\[\[(?!VIOLATION)([^\]]*)\]\]", str(_pt))
+            if not _ns:
+                continue
+            try:
+                _bd = _panel_style(_c, re.sub(r"\s*\[\[[^\]]*\]\]", "", str(_pt)))[0]
+            except Exception:
+                _bd = str(_c)
+            _txt, _first = "; ".join(x.strip() for x in _ns), True
+            while _txt:
+                _cut = _txt if len(_txt) <= 95 else (_txt[:96].rsplit(" ", 1)[0] or _txt[:95])
+                _nlines.append((_i, _bd, _cut, _first))
+                _txt, _first = _txt[len(_cut):].strip(), False
+        _nhead = (5 if _rows else 4) if _nlines else 0     # gap, title, 2 meaning lines, columns
+        _tot = len(_rows) + _nhead + len(_nlines)
+        _n_idx = (_tot + INDEX_ROWS_PER_PAGE - 1) // INDEX_ROWS_PER_PAGE if _tot else 0
         _rows = (_violation_index_rows(panels, PER_PAGE, _n_idx + 1 + _PARAM_PAGES)
                  if _rows else [])
+        _pct = int(round(POI_P_RECOVERY_FRAC * 100))
+        _items = [("V", r) for r in _rows]
+        if _nlines:
+            if _rows:
+                _items.append(("G", None))
+            _items.append(("H", "NOTES  (text only -- not scored, never a violation)"))
+            _items.append(("M", "P%d held X s = X s after the FINAL fault clearing the POI power is back to %d%% "
+                                "of its pre-fault value and stays within +/-%d%% of it to the end."
+                                % (_pct, _pct, 100 - _pct)))
+            _items.append(("M", "RIPPLE = the POI voltage / power still swings (above %g pu / %g MW peak-to-peak, "
+                                "not dying out) in the last %g s of the run."
+                                % (RIPPLE_V_PU, RIPPLE_P_MW, RIPPLE_WINDOW_S)))
+            _items.append(("C", "%-6s %-34s %s" % ("Page", "Panel", "Note")))
+            for (_i, _bd, _ln, _f) in _nlines:
+                _items.append(("N", (_n_idx + 1 + _PARAM_PAGES + _i // PER_PAGE, _bd, _ln, _f)))
     except Exception as _e:
         print("  [plot] %s: could not build the violations index (%s) -- the "
               "panels are unaffected" % (name, _e))
-        _rows, _n_idx = [], 0
+        _rows, _n_idx, _items = [], 0, []
 
     # WRITE TO A TEMPORARY FILE AND RENAME ON SUCCESS.
     #
@@ -20500,13 +20530,14 @@ def make_plots(path, is_flat, kb, tclear=None):
                   "panels are unaffected" % (name, _e))
         # ---------- VIOLATIONS INDEX ----------
         for pg in range(_n_idx):
-            chunk = _rows[pg * INDEX_ROWS_PER_PAGE:(pg + 1) * INDEX_ROWS_PER_PAGE]
+            chunk = _items[pg * INDEX_ROWS_PER_PAGE:(pg + 1) * INDEX_ROWS_PER_PAGE]
             fig = plt.figure(figsize=(11, 8.5))
-            fig.text(0.06, 0.95, "VIOLATIONS INDEX -- %s run: %s" % (kind_txt, name),
+            fig.text(0.06, 0.95, "%s -- %s run: %s" % ("VIOLATIONS INDEX" if _rows else "INDEX", kind_txt, name),
                      fontsize=13, fontweight="bold", va="top")
             fig.text(0.06, 0.915,
-                     "Every panel in this PDF that breaks an SPP limit, worst first. "
-                     "Page numbers are this document's -- CLICK A ROW to go to its page.",
+                     ("Every panel in this PDF that breaks an SPP limit, worst first, then the notes. "
+                      if _rows else "No panel in this PDF breaks an SPP limit. The notes on its panels: ")
+                     + "Page numbers are this document's -- CLICK A ROW to go to its page.",
                      fontsize=8, va="top")
             fig.text(0.06, 0.895,
                      "%d of %d panel(s) broke a limit.%s"
@@ -20514,18 +20545,49 @@ def make_plots(path, is_flat, kb, tclear=None):
                         ("   Page %d of %d of this index." % (pg + 1, _n_idx))
                         if _n_idx > 1 else ""),
                      fontsize=8, va="top")
-            fig.text(0.06, 0.868, "%-6s %-9s %-30s %s"
-                     % ("Page", "Quantity", "Element", "What it broke"),
+            fig.text(0.06, 0.868, ("%-6s %-9s %-30s %s"
+                                   % ("Page", "Quantity", "Element", "What it broke")) if _rows else
+                     ("%-6s %-34s %s" % ("Page", "Panel", "Note")),
                      fontsize=8, family="monospace", fontweight="bold", va="top")
             _y = 0.850
             _W0, _H0 = 11.0 * 72.0, 8.5 * 72.0
-            for (pno, quan, elem, why) in chunk:
+            for (_kd, _it) in chunk:
+                if _kd != "V":
+                    if _kd == "H":
+                        fig.text(0.06, _y, _it, fontsize=8.5, fontweight="bold",
+                                 va="top", color="#1f4e9c")
+                    elif _kd == "M":
+                        fig.text(0.06, _y, _it, fontsize=7, va="top", color="#333333")
+                    elif _kd == "C":
+                        fig.text(0.06, _y, _it, fontsize=8, family="monospace",
+                                 fontweight="bold", va="top")
+                    elif _kd == "N":
+                        _pn, _bd, _ln, _f = _it
+                        fig.text(0.06, _y, "%-6s %-34s %s"
+                                 % (_pn, (str(_bd)[:34] if _f else ""), _ln),
+                                 fontsize=7.5, family="monospace", va="top", color="#1f4e9c")
+                        _links.append((_npg[0], (0.055 * _W0, (_y - 0.0185) * _H0 + 2,
+                                                 0.97 * _W0, _y * _H0 + 2), int(_pn) - 1))
+                    _y -= 0.0185
+                    continue
+                pno, quan, elem, why = _it
                 # the bus and its distance from the POI, not a label cut
                 # mid-word at 30 characters
                 _e = str(elem)
                 _me = re.match(r"(.*?)\s*\(([^,)]*)", _e)
                 if _me and _me.group(2).strip():
                     _e = "%s (%s)" % (_me.group(1).strip(), _me.group(2).strip())
+                if len(_e) > 30 and "(" in _e:
+                    # too long for the column: cut on a word, bracket closed
+                    _h, _b = _e.split("(", 1)
+                    _room = 30 - len(_h) - 2
+                    _b = _b.rstrip(")")
+                    if len(_b) > _room:
+                        _b = _b[:_room].rsplit(" ", 1)[0]
+                        _b = re.sub(r"(\s+(in|the|to|of|a|and|from))+$", "", _b)
+                    _e = "%s(%s)" % (_h, _b.rstrip(" ,;")) if _room > 3 else _h.strip()
+                if len(_e) > 30:
+                    _e = _e[:31].rsplit(" ", 1)[0] or _e[:30]
                 fig.text(0.06, _y, "%-6s %-9s %-30s %s"
                          % (pno, str(quan)[:9], _e[:30], str(why)[:78]),
                          fontsize=7.5, family="monospace", va="top",
@@ -20558,7 +20620,7 @@ def make_plots(path, is_flat, kb, tclear=None):
                     "%s run: %s%s" % (kind_txt, name, ("     |     " + _fs) if _fs else ""),
                     # +1 for the study-parameter page, which the index counts too
                     "page %d / %d%s" % (pg + 1 + _n_idx + 1, npages + _n_idx + 1,
-                                    "   (click: violations index)" if _n_idx else ""),
+                                    "   (click: index)" if _n_idx else ""),
                     _partial_note.strip().strip("*").strip())
             except Exception as _pe:
                 # ONE PAGE THAT CANNOT BE DRAWN MUST NOT COST THE PDF. A plain
@@ -35474,13 +35536,6 @@ def plot_missing_outs():
     _pf = [x.strip().upper() for x in
            (os.environ.get("SPP_PLOT_FAULTS") or "").replace(";", ",").split(",")
            if x.strip()]
-    # A REPLOT REDRAWS THE FLAT RUN TOO. The gen test names only its faults, so
-    # FLAT_RUN_plots.pdf kept the old layout while F01..Fn were redrawn.
-    try:
-        if _pf and float(os.environ.get("SPP_REPLOT_BEFORE") or 0) > 0 and "FLAT_RUN" not in _pf:
-            _pf.append("FLAT_RUN")
-    except ValueError:
-        pass
     if _pf and not _only_one:
         _keep = [o for o in outs
                  if os.path.splitext(os.path.basename(o))[0].upper() in _pf]
