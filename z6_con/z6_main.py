@@ -18472,7 +18472,10 @@ def _gt_rescorable(r, faults):
     """Not finished, but only the scoring is missing -- and the gen test has
        not scored it itself yet (after that, what is missing is a real give-up)."""
     rdir = r.get("rdir") or ""
-    return (os.path.isdir(rdir) and _gt_outs_ready(rdir, r["gen"], faults)
+    g = r["gen"]
+    if g and g.get("egf") and _gt_egf_mismatch(rdir, g):
+        return False               # a run of OTHER .dyr values: simulate again, do not score it
+    return (os.path.isdir(rdir) and _gt_outs_ready(rdir, g, faults)
             and not os.path.isfile(os.path.join(rdir, "flags", _GT_RESCORED)))
 
 
@@ -18481,8 +18484,17 @@ def _gt_wait_plotter(rdir):
        the background (it holds plots\\_plotter.claim). Judged then, the run read
        INCOMPLETE and its criteria report appeared a minute later. Wait for it."""
     cp = os.path.join(rdir, "plots", "_plotter.claim")
-    t0, said = time.time(), False
-    while os.path.isfile(cp) and time.time() - t0 < float(GEN_TEST_PLOT_WAIT_MIN) * 60.0:
+    t0, said, free = time.time(), False, 0
+    while time.time() - t0 < float(GEN_TEST_PLOT_WAIT_MIN) * 60.0:
+        # FREE FOR 30 s, NOT ONE LOOK: the last fault's plotter may be just
+        # starting, or taking over from the one that has just let go
+        if not os.path.isfile(cp):
+            free += 1
+            if free >= 3:
+                break
+            time.sleep(10)
+            continue
+        free = 0
         try:
             with open(cp, "r") as fh:
                 txt = fh.read(200)
@@ -18512,6 +18524,8 @@ def _gt_rescore(r, env, faults, log_path=None):
     _gt_wait_plotter(rdir)
     if _gt_done(rdir, faults, r["gen"])[0] or not _gt_outs_ready(rdir, r["gen"], faults):
         return None
+    if r["gen"] and r["gen"].get("egf") and _gt_egf_mismatch(rdir, r["gen"]):
+        return None                # not this entry's .dyr values -- scoring it would mislabel it
     try:
         with open(os.path.join(rdir, "flags", _GT_RESCORED), "w") as fh:
             fh.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
