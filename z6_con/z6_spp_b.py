@@ -16480,8 +16480,10 @@ def _panel_style(cat, ptitle):
         q = "POI %s TOTAL %s" % (bus, q)
         yl = "POI total " + yl
     elif re.match(r"POI \d+ ONE TIE", L):
-        q = "POI %s TIE %s" % (bus, q)
-        yl = "One tie " + yl
+        # ONE TIE READS AS THE FLOW IT IS: "POWER 765930 TO 765911"
+        _fb = re.search(r"ONE TIE, FROM BUS (\d+)", L)
+        _w = "REACTIVE POWER" if cat == "QELEC" else "POWER"
+        q = ("%s %s TO %s" % (_w, _fb.group(1), bus)) if _fb else ("%s INTO %s" % (_w, bus))
         col = _PLOT_TIE_COLORS.get(cat, col)
     elif re.match(r"POI \d+", L):
         q = "POI %s%s %s" % (bus, " = FAULTED BUS" if "<-- FAULTED BUS" in L else "",
@@ -16497,7 +16499,7 @@ def _panel_style(cat, ptitle):
     # TIE, FAULTED BUS) comes off the title text.
     txt = lbl
     if bus:
-        txt = re.sub(r"^POI %s\s*(TOTAL\s*=\s*|ONE TIE,?\s*)?" % bus, "", txt)
+        txt = re.sub(r"^POI %s\s*(TOTAL\s*=\s*|ONE TIE,?\s*(from bus \d+\s*)?)?" % bus, "", txt)
         txt = re.sub(r"^(PROJ [ES]GF) %s\b" % bus, r"\1", txt)
         txt = re.sub(r"^%s\b\s*" % bus, "", txt)
     txt = txt.replace("   <-- FAULTED BUS", "").replace("(POI, ", "(").replace(" (POI)", "")
@@ -16505,6 +16507,10 @@ def _panel_style(cat, ptitle):
     if _mp:                             # a bare "(4 nodes from POI, ...)" loses its brackets
         txt = (_mp.group(1) + ("   " + _mp.group(2) if _mp.group(2) else "")).strip()
     txt = txt.strip() or lbl
+    if re.match(r"POI \d+ ONE TIE", L) and bus:
+        # the distance / area are the POI's, not the tie's far end
+        txt = "POI %s: %s" % (bus, txt.replace("   (", " (").replace("the only tie (", "the only tie, ")
+                               .rstrip(")") if txt.startswith("the only tie") else txt)
     return q, col, yl, txt
 
 
