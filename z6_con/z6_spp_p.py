@@ -35474,6 +35474,13 @@ def plot_missing_outs():
     _pf = [x.strip().upper() for x in
            (os.environ.get("SPP_PLOT_FAULTS") or "").replace(";", ",").split(",")
            if x.strip()]
+    # A REPLOT REDRAWS THE FLAT RUN TOO. The gen test names only its faults, so
+    # FLAT_RUN_plots.pdf kept the old layout while F01..Fn were redrawn.
+    try:
+        if _pf and float(os.environ.get("SPP_REPLOT_BEFORE") or 0) > 0 and "FLAT_RUN" not in _pf:
+            _pf.append("FLAT_RUN")
+    except ValueError:
+        pass
     if _pf and not _only_one:
         _keep = [o for o in outs
                  if os.path.splitext(os.path.basename(o))[0].upper() in _pf]
