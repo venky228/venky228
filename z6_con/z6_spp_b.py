@@ -16642,23 +16642,8 @@ def _mark_limits(ax, cat, ptitle, tp, v, tclear, vio):
             ax.plot([tp[j]], [v[j]], marker="o", markersize=7, markerfacecolor="none",
                     markeredgecolor=col, markeredgewidth=1.4, linestyle="none",
                     clip_on=False)
-            _right = tp[j] > 0.70 * _tmax     # near the right edge: label to the LEFT
-            # near the TOP of the axes the label goes BELOW the point, so it
-            # never climbs into the panel title above
-            try:
-                _y0, _y1 = ax.get_ylim()
-                _high = (v[j] - _y0) > 0.55 * (_y1 - _y0)
-            except Exception:
-                _high = False
-            ax.annotate("%.3f pu %s" % (v[j], "; ".join(txts)), xy=(tp[j], v[j]),
-                        xytext=((-9 if _right else 9),
-                                (-(8 + 11 * k)) if _high else (6 + 11 * k)),
-                        textcoords="offset points",
-                        ha=("right" if _right else "left"),
-                        va=("top" if _high else "bottom"), fontsize=6.5,
-                        color=col, fontweight="bold",
-                        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=col,
-                                  lw=0.6, alpha=0.9))
+            # NO TEXT ON THE TRACE: the circle and the dotted limit line mark
+            # the point; the value is in the title and the table below.
         return kind
     except Exception:
         return ""
@@ -16764,8 +16749,9 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
             ax.plot(_tp, v, lw=1.35 if si == 0 else 1.0, color=c2)
         _off = nice_ylim(ax, [v for _l, v in series], YMIN_SPAN.get(cat))
         _mark_fault(ax, is_flat, tclear)
-        _mk = _mark_limits(ax, cat, ptitle, _tp, series[0][1] if series else [],
-                           tclear, vio)
+        # NOTHING DRAWN ON THE TRACE: a violation is shown by the red frame
+        # and red title only (_mark_limits is kept but not called).
+        _mk = ""
         ylt, yfs = _fit_ylabel(rend, yl, ah)
         ax.set_ylabel(ylt, fontsize=yfs, color=col, labelpad=3)
         ax.grid(True, ls=":", alpha=0.45)
@@ -16832,7 +16818,7 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
             y = yb - GAP
     # ---- footer
     fig.text(fx(LM), fy(0.14), "red dashed line = fault applied     green dashed line = "
-             "fault cleared     red frame + red circle = SPP violation (dotted = the limit)",
+             "fault cleared     red frame + red title = SPP violation",
              fontsize=6.5, color="#666666", va="bottom")
     return fig
 
