@@ -4245,6 +4245,13 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix="",
     rt = results_dir(test_case, proj, mode) + (test_suffix or "")
     cb, src_cb = read_criteria(rb, proj)
     ct, src_ct = read_criteria(rt, proj)
+    _pn = {"b": {}, "t": {}}
+    for _side, _cr in (("b", cb), ("t", ct)):
+        for _case, _e in (_cr or {}).items():
+            try:
+                _pn[_side][_case] = _poi_note(_e.get("rows"))
+            except Exception as _e2:
+                _pn[_side][_case] = "note not read (%s)" % _e2
     vb, src_vb = read_violations(rb, proj)
     vt, src_vt = read_violations(rt, proj)
     sb, st = read_states(rb, proj), read_states(rt, proj)
@@ -4625,7 +4632,8 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix="",
             "dirs": {"base": rb, "test": rt},
             "meas_b": meas_b, "meas_t": meas_t,
             "extra_b": _VIO_EXTRA.get(_side_key(rb), {}),
-            "extra_t": _VIO_EXTRA.get(_side_key(rt), {})}
+            "extra_t": _VIO_EXTRA.get(_side_key(rt), {}),
+            "poi_notes": _pn}
 
 
 def _fault_key(fid):
@@ -7277,9 +7285,13 @@ _SUMMARY_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "project
                  "worst_criterion", "base_value", "project_value", "limit",
                  "unit", "past_limit", "elements_over", "new_criteria",
                  "violating_buses", "cause",
-                 "description"]
+                 "description",
+                 # TEXT ONLY, no pass / fail: said when the POI power does not
+                 # recover to its P90 level and stay, when the POI voltage /
+                 # power ripples at the end, or when P, Q, V are still moving
+                 "note_base", "note_projects"]
 
-_SUMMARY_WIDTHS = [26, 22, 14, 9, 12, 9, 8, 11, 13, 14, 26, 21, 11, 13, 9, 6, 10, 13, 16, 60, 80, 60]
+_SUMMARY_WIDTHS = [26, 22, 14, 9, 12, 9, 8, 11, 13, 14, 26, 21, 11, 13, 9, 6, 10, 13, 16, 60, 80, 60, 60, 60]
 
 # What the reader is being asked to DO about this fault, in the words of the
 # comparison rather than its jargon. The classification is kept beside it: the
@@ -7477,8 +7489,50 @@ def _summary_rows(results, want=None):
                         _n_elements_over(r) or "",
                         ", ".join(r.get("new_crit") or []),
                         ] + list(_violation_cause(res, r)) + [
-                        (r.get("description") or "").replace("\n", " ").strip()])
+                        (r.get("description") or "").replace("\n", " ").strip(),
+                        ((res.get("poi_notes") or {}).get("b") or {}).get(r["fault"], ""),
+                        ((res.get("poi_notes") or {}).get("t") or {}).get(r["fault"], "")])
     return out
+
+
+def _poi_note(rows):
+    """The note (TEXT ONLY -- never a pass or fail) for one case of one fault,
+       from its criteria rows: the POI power recovery when it is not held or
+       never reached, the POI ripple, and P / Q / V still moving at the end.
+       '' when there is nothing to say; 'not recorded' when the case was scored
+       before these rows existed."""
+    d, seen = {}, False
+    for crit, _res, det in rows or ():
+        if crit.startswith("POI active power recovery"):
+            _gt_prec_parse(d, det)
+            d["_p_end"] = re.search(r"ends at ([-\d.]+) MW", det)
+            seen = True
+        elif crit.startswith("POI ripple"):
+            _gt_ripple_parse(d, det)
+            seen = True
+        elif crit.startswith("Settled at the end"):
+            _gt_settled_parse(d, det)
+    if not seen:
+        return "not recorded (scored before the power recovery / ripple rows)" if rows else ""
+    out = []
+    if d.get("p_state") == "not held":
+        out.append("POI power recovers to %d%% but is NOT HELD%s" % (
+            _GT_PREC_PCT, (" (ends %s MW)" % d["_p_end"].group(1)) if d.get("_p_end") else ""))
+    elif d.get("p_state") == "never":
+        out.append("POI power NEVER recovers to %d%%%s" % (
+            _GT_PREC_PCT, (" (ends %s MW)" % d["_p_end"].group(1)) if d.get("_p_end") else ""))
+    if d.get("ripple") == "yes":
+        q = (d.get("ripple_q") or "").split("+")
+        if "V" in q and d.get("v_pp") is not None:
+            out.append("VOLTAGE RIPPLE %.3f pu p-p at the POI" % d["v_pp"])
+        if "P" in q and d.get("p_pp_pct") is not None:
+            out.append("POWER RIPPLE %s%.1f%% of pre-fault p-p at the POI" % (
+                ("%.1f MW = " % d["p_pp_mw"]) if d.get("p_pp_mw") is not None else "", d["p_pp_pct"]))
+        if not ("V" in q or "P" in q):
+            out.append("RIPPLE at the POI")
+    if d.get("settled") == "no":
+        out.append("not settled at the end: %s" % (d.get("unsettled") or "?"))
+    return "; ".join(out)
 
 
 _NOTRUN_COLS = ["run_setting", "dyr_edits", "project_output", "fault", "project", "planning_event", "fault_source",
@@ -8303,6 +8357,32 @@ def write_one_report(results, only_base, only_test):
         L.append(" PASSED IN BOTH CASES (%d)" % len(ok))
         rule("-")
         L.append("   " + ", ".join(r["fault"] for _res, r in ok))
+        L.append("")
+
+    # POI POWER RECOVERY / RIPPLE -- TEXT ONLY, no pass or fail
+    _notes = []
+    for _res in results:
+        _pn = _res.get("poi_notes") or {}
+        for _r in _res.get("rows") or []:
+            _nb = (_pn.get("b") or {}).get(_r["fault"], "")
+            _nt = (_pn.get("t") or {}).get(_r["fault"], "")
+            if (_nb and not _nb.startswith("not recorded")) or (_nt and not _nt.startswith("not recorded")):
+                _notes.append((_res.get("project") or "", _r["fault"], _nb, _nt))
+    _nrec = sum(1 for _res in results for _side in ("b", "t")
+                for _v in ((_res.get("poi_notes") or {}).get(_side) or {}).values()
+                if _v.startswith("not recorded"))
+    if _notes or _nrec:
+        rule("-")
+        L.append(" NOTES -- POI POWER RECOVERY AND RIPPLE (text only; they do not change any verdict)")
+        rule("-")
+        for _pj, _f, _nb, _nt in sorted(_notes, key=lambda x: (x[0], _fault_key(x[1]))):
+            L.append("   %s%s" % ((_pj + " ") if len(results) > 1 else "", _f))
+            L.append("      base     : %s" % (_nb or "nothing to note"))
+            L.append("      projects : %s" % (_nt or "nothing to note"))
+        if not _notes:
+            L.append("   nothing to note")
+        if _nrec:
+            L.append("   (%d fault result(s) were scored before these rows existed -- re-score to see them)" % _nrec)
         L.append("")
 
     if only_base or only_test:
@@ -18487,17 +18567,37 @@ def _gt_ripple_txt(m, faults):
 def _gt_newfails_f(mo, mb, f):
     """The criteria (other than the 1.2 pu spike) the element-out run FAILS on
        fault f that its reference run passes: a set."""
-    out = set((mo.get(f) or {}).get("fails") or ()) - set((mb.get(f) or {}).get("fails") or ())
-    # POWER THAT NO LONGER COMES BACK: the reference's POI power recovered
-    # and stayed, this run's did not -- the oscillating 'fix'
-    if ((mb.get(f) or {}).get("p_state") == "held"
-            and (mo.get(f) or {}).get("p_state") in ("not held", "never")):
-        out.add("POI power recovery")
-    # A RIPPLE THE REFERENCE DOES NOT HAVE: voltage / power stepping up and
-    # down to the end of the run with the element out
-    if ((mb.get(f) or {}).get("ripple") == "no" and (mo.get(f) or {}).get("ripple") == "yes"):
-        out.add("POI ripple (%s)" % _gt_rq_words((mo.get(f) or {}).get("ripple_q")))
+    # SPP CRITERIA ONLY. The POI power recovery, ripple and settled records
+    # are FLAGGED (_gt_flags_f), never evaluated: they do not make a run
+    # NOT RECOMMENDED and do not move it in any ranking
+    return set((mo.get(f) or {}).get("fails") or ()) - set((mb.get(f) or {}).get("fails") or ())
+
+
+def _gt_flag_words(d):
+    """A fault's POI power recovery / ripple / settled records, as flags (not
+       evaluated): [] when there is nothing to flag."""
+    d = d or {}
+    out = []
+    if d.get("p_state") in ("not held", "never"):
+        out.append("P90 %s" % ("NOT HELD" if d["p_state"] == "not held" else "NEVER reached"))
+    if d.get("ripple") == "yes":
+        out.append("ripple in %s" % _gt_rq_words(d.get("ripple_q")))
+    if d.get("settled") == "no":
+        out.append("not settled (%s)" % (d.get("unsettled") or "?"))
     return out
+
+
+def _gt_flags_f(mo, mb, f):
+    """The flags run mo has on fault f that its reference mb does NOT: a set.
+       NOTICED AND SHOWN, NOT EVALUATED."""
+    return set(_gt_flag_words(mo.get(f))) - set(_gt_flag_words(mb.get(f)))
+
+
+def _gt_flags(mo, mb, fs):
+    out = set()
+    for f in fs:
+        out |= _gt_flags_f(mo, mb, f)
+    return sorted(out)
 
 
 def _gt_newfails(mo, mb, fs, ign=None):
@@ -19264,8 +19364,7 @@ def _gt_score(m, faults):
     ov = sum(m[f]["n_over"] for f in sc)
     mx = max([m[f]["max_pu"] or 0.0 for f in sc] or [0.0])
     # other criteria failed (recovery, steady state, trips, damping, stability)
-    oth = sum(len(m[f].get("fails") or ()) + (m[f].get("p_state") in ("not held", "never"))
-              + (m[f].get("ripple") == "yes") for f in sc)
+    oth = sum(len(m[f].get("fails") or ()) for f in sc)      # SPP criteria only (records are flags)
     return ps, nc, ov, mx, known, len(sc), len(faults), oth
 
 
@@ -19512,6 +19611,7 @@ def _gt_impact(runs, faults, proj):
                          "v_b": mb.get("verdict"), "v_o": mo.get("verdict"), "bb": bb, "bo": bo,
                          "newfail": _gt_newfails(m, b["m"], [f], _gt_ign(bl, r, [f])),
                          "border": sorted(_gt_newfails_f(m, b["m"], f) & _gt_ign(bl, r, [f])[f]),
+                         "flags": _gt_flags(m, b["m"], [f]),
                          "p_b": _gt_prec_cell(mb), "p_o": _gt_prec_cell(mo)})
     for x in rows:
         x["dpk"] = (x["pk_b"] or 0.0) - (x["pk_o"] or 0.0)
@@ -19558,7 +19658,9 @@ def _gt_impact(runs, faults, proj):
          "        NOT RECOMM. = fewer spikes, but it FAILS another criterion the reference passes",
          "                      (voltage recovery, steady state, trips, damping, stability) -- not a fix",
          "        REFERENCE BORDERLINE = a criterion that most element runs of a fault + scenario 'newly' fail:",
-         "                      the reference only just passes it, so it is noted, not held against any element", ""]
+         "                      the reference only just passes it, so it is noted, not held against any element",
+         "        NOTE        = P90 power recovery not held / never reached, POI ripple, or not settled",
+         "                      at the end, where the reference had none: noticed and shown, never a FAIL", ""]
     # SUMMARY -- per fault, the elements that matter (first scenario that has them)
     L += ["SUMMARY -- per fault, the elements with an impact (scenario: first with element runs)", ""]
     for f in faults:
@@ -19622,7 +19724,8 @@ def _gt_impact(runs, faults, proj):
                     "%s -> %s" % (x["v_b"], x["v_o"]))
                     + "   P%d %s -> %s" % (_GT_PREC_PCT, x["p_b"], x["p_o"])
                     + ("   new FAIL: " + ", ".join(x["newfail"]) if x["newfail"] else "")
-                    + ("   ref borderline: " + ", ".join(x["border"]) if x["border"] else ""))
+                    + ("   ref borderline: " + ", ".join(x["border"]) if x["border"] else "")
+                    + ("   NOTE: " + ", ".join(x["flags"]) if x["flags"] else ""))
         # B -- per spiking bus, the element that lowers it most (first scenario
         # with runs, and the first POI-off block when there is one)
         for sc in firsts(fr):
@@ -19651,14 +19754,103 @@ def _gt_impact(runs, faults, proj):
                         "buses_over_1p2_out", "buses_cleared", "buses_new", "peak_pu_in_service",
                         "peak_pu_out", "peak_drop", "nc_in_service", "nc_out", "verdict_in_service",
                         "verdict_out", "p_recovery_in_service", "p_recovery_out", "new_fails",
-                        "ref_borderline_fails"])
+                        "ref_borderline_fails", "note_p90_ripple_settled"])
             for x in sorted(rows, key=lambda x: (x["f"], x["sc"]) + key(x)):
                 w.writerow([x["f"], x["sc"], x["eff"], _gt_label(x["g"]), x["g"].get("kind") or "", x["over_b"],
                             x["over_o"], x["cleared"], x["new"], x["pk_b"] or "", x["pk_o"] or "",
                             round(x["dpk"], 4), x["nc_b"], x["nc_o"], x["v_b"], x["v_o"],
-                            x["p_b"], x["p_o"], "; ".join(x["newfail"]), "; ".join(x["border"])])
+                            x["p_b"], x["p_o"], "; ".join(x["newfail"]), "; ".join(x["border"]),
+                            "; ".join(x["flags"])])
     except Exception as e:
         print("[gen-test] GEN_TEST_IMPACT not written (%s)" % e)
+
+
+def _gt_xlsx(runs, faults, proj):
+    """GEN_TEST_<proj>.xlsx -- every run, every fault: the SPP verdict and the
+       SPP criteria it fails, and BESIDE them, FLAGGED (not evaluated), the POI
+       power recovery (P90), the POI ripple and whether P, Q, V settled. Second
+       sheet: each element run against its reference (all in service, or the
+       POIGENOFF run for a 'POI OFF +' run)."""
+    ref = _gt_refs(runs)
+    H1 = ["scenario", "what is changed", "fault", "SPP verdict", "SPP criteria failed",
+          "buses > %.2f pu" % V_OVERSHOOT_PU, "peak V after clearing (pu)", "not converged steps",
+          "NOTE (text only, no pass/fail)", "P90 power recovery", "P90 held from (s after final clearing)",
+          "ripple", "ripple in", "ripple V p-p (pu)", "ripple P p-p (% pre-fault)",
+          "settled at end", "not settled in", "still moving (worst)", "folder"]
+    R1 = []
+    for r in runs:
+        m = r.get("m") or {}
+        lab = _gt_label(r["gen"]) if r["gen"] else "nothing changed (all in service)"
+        for f in faults:
+            x = m.get(f) or {}
+            v = x.get("verdict")
+            if v is None:
+                continue
+            R1.append([r["sc"][0], lab, f,
+                       {"?": "not scored"}.get(v, v),
+                       ", ".join(sorted(x.get("fails") or ())),
+                       x.get("n_over", ""), x.get("v_peak") or x.get("max_pu") or "",
+                       "" if x.get("noconv") is None else x["noconv"],
+                       "; ".join(_gt_flag_words(x)),
+                       x.get("p_state") or "", "" if x.get("p_held") is None else x["p_held"],
+                       x.get("ripple") or "",
+                       _gt_rq_words(x.get("ripple_q")) if x.get("ripple") == "yes" else "",
+                       "" if x.get("v_pp") is None else x["v_pp"],
+                       "" if x.get("p_pp_pct") is None else x["p_pp_pct"],
+                       x.get("settled") or "", x.get("unsettled") or "",
+                       (x.get("unsettled_txt") or "")[:250],
+                       os.path.basename(r.get("rdir") or "")])
+    H2 = ["scenario", "what is changed", "fault", "compared with", "SPP verdict ref -> run",
+          "buses > %.2f pu ref -> run" % V_OVERSHOOT_PU, "buses cleared", "peak pu ref", "peak pu run",
+          "new SPP FAIL (not a fix)", "new NOTE (text only)", "P90 ref -> run",
+          "ripple ref -> run", "settled ref -> run"]
+    R2 = []
+    for r in runs:
+        g, m = r["gen"], r.get("m") or {}
+        b = _gt_ref(ref, r)
+        if not g or not b or b is r:
+            continue
+        bm = b.get("m") or {}
+        for f in faults:
+            x, y = m.get(f) or {}, bm.get(f) or {}
+            if x.get("verdict") not in ("PASS", "FAIL") or y.get("verdict") not in ("PASS", "FAIL"):
+                continue
+            bb, bo = y.get("bus_pu") or {}, x.get("bus_pu") or {}
+            R2.append([r["sc"][0], _gt_label(g), f,
+                       "POIGENOFF run" if g.get("base_off") else "all in service",
+                       "%s -> %s" % (y["verdict"], x["verdict"]),
+                       "%s -> %s" % (y.get("n_over", 0), x.get("n_over", 0)),
+                       len([k for k in bb if k not in bo]),
+                       y.get("v_peak") or y.get("max_pu") or "", x.get("v_peak") or x.get("max_pu") or "",
+                       ", ".join(sorted(_gt_newfails_f(m, bm, f))),
+                       ", ".join(sorted(_gt_flags_f(m, bm, f))),
+                       "%s -> %s" % (_gt_prec_cell(y), _gt_prec_cell(x)),
+                       "%s -> %s" % (y.get("ripple") or "-", x.get("ripple") or "-"),
+                       "%s -> %s" % (y.get("settled") or "-", x.get("settled") or "-")])
+
+    def st1(row):
+        if row[3] == "FAIL":
+            return 2
+        if row[8]:
+            return 3
+        return 4 if row[3] == "PASS" else 6
+
+    def st2(row):
+        if row[9]:
+            return 2
+        if row[10]:
+            return 3
+        return None
+    legend = [(2, "red", "SPP FAIL -- a criterion of the SPP study (voltage, recovery, steady state, trips, damping, stability)"),
+              (3, "amber", "NOTE (text only, no pass/fail) -- P90 power not held / never reached, POI ripple, or not settled at the end"),
+              (4, "green", "SPP PASS, nothing flagged"),
+              (6, "grey", "not scored")]
+    p = os.path.join(_gt_dir(), "GEN_TEST_%s.xlsx" % proj)
+    write_xlsx_multi(p, [("Runs", H1, R1, None, st1), ("Element vs reference", H2, R2, None, st2)],
+                     legend=legend,
+                     title_rows=["GEN TEST -- %s, %s case (%s)" % (proj, GEN_TEST_CASE, time.strftime("%Y-%m-%d %H:%M")),
+                                 "Verdicts are the SPP criteria only. P90, ripple and settled are flagged, never evaluated."])
+    return p
 
 
 def _gt_below(x):
@@ -19895,6 +20087,10 @@ def _gt_write(runs, faults, gens):
         _gt_answer(runs, faults, proj)
     except Exception as e:
         print("[gen-test] GEN_TEST_ANSWER not written (%s)" % e)
+    try:
+        _gt_xlsx(runs, faults, proj)
+    except Exception as e:
+        print("[gen-test] GEN_TEST_%s.xlsx not written (%s)" % (proj, e))
     try:
         with open(os.path.join(_gt_dir(), "GEN_TEST_BEST_%s.txt" % proj), "w") as fh:
             fh.write("\n".join(L[:3] + _best) + "\n")
@@ -20385,6 +20581,9 @@ def _gt_write_all(projs):
                              "%.3f" % (bx[3] or 0.0), "%.3f" % (x[3] or 0.0), bx[1], x[1],
                              bx[0], x[0]])
             _nf = _gt_newfails(m, b["m"], fs, _gt_ign(bl, r, fs))
+            _fl = _gt_flags(m, b["m"], fs)
+            if _fl:
+                L.append("  %-18s   -> NOTE: %s" % ("", ", ".join(_fl)))
             if _nf:
                 L.append("  %-18s   -> NOT RECOMMENDED: new FAIL (%s)" % ("", ", ".join(_nf)))
                 continue
