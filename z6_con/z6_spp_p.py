@@ -3197,6 +3197,10 @@ ANGLE_DEV_DEG  = 16.0
 # report would say so.
 V_RECOVERY_PU  = float(_env_num("SPP_V_RECOVERY_PU", V_RECOVERY_PU))
 V_RECOVERY_S   = float(_env_num("SPP_V_RECOVERY_S", V_RECOVERY_S))
+# POI ACTIVE POWER RECOVERY (recorded, INFO -- not an SPP criterion): the time
+# from the FINAL clearing until the power delivered into the POI is back to this
+# fraction of its pre-fault value, and whether it then stays there to the end.
+POI_P_RECOVERY_FRAC = float(_env_num("SPP_POI_P_RECOVERY_FRAC", 0.90))
 V_OVERSHOOT_PU = float(_env_num("SPP_V_OVERSHOOT_PU", V_OVERSHOOT_PU))
 V_SS_LOW       = float(_env_num("SPP_V_SS_LOW", V_SS_LOW))
 V_SS_HIGH      = float(_env_num("SPP_V_SS_HIGH", V_SS_HIGH))
@@ -23229,6 +23233,7 @@ def evaluate_case(path, kind, tclear, kb):
     # report and the comparison show the 983 MW the study was set up for and
     # not only the BESS tie.
     poi_rows = []
+    _prec_src = []                  # (POI, total MW series) for the power-recovery row
     try:
         def _pfin(x):
             try:
@@ -23273,9 +23278,13 @@ def evaluate_case(path, kind, tclear, kb):
                 if _poi in _tot:
                     poi_rows.append([_poi, _unit, "TOTAL delivered into the POI"]
                                     + _pstat(_tot[_poi][0]) + [_tot[_poi][1]])
+                    if _q == "POWR" and not _prec_src:
+                        _prec_src.append((_poi, _tot[_poi][0]))
                 elif len(_tl) == 1:
                     poi_rows.append([_poi, _unit, "TOTAL delivered into the POI"]
                                     + _pstat(_tl[0][1]) + ["1 tie (no existing machines in this .out)"])
+                    if _q == "POWR" and not _prec_src:
+                        _prec_src.append((_poi, _tl[0][1]))
                 _new = [v for (f, v) in _tl if _isnew(f) or (not f and len(_tl) == 1)]
                 _old = [v for (f, v) in _tl if f and not _isnew(f)]
                 if _new:
@@ -23726,6 +23735,61 @@ def evaluate_case(path, kind, tclear, kb):
         add("Bus voltage angles (recorded, not scored as rotor angles)", None,
             "%d bus angle channel(s); largest post-fault excursion %.1f deg (%s)"
             % (len(bus_angles), bworst[0], bworst[1]))
+
+    # POI ACTIVE POWER RECOVERY -- a record (INFO), not an SPP criterion. The
+    # time from the FINAL clearing until the power delivered into the POI is
+    # back to POI_P_RECOVERY_FRAC of its pre-fault value, and whether it then
+    # STAYS there: a run whose power swings back and forth reaches the level
+    # and loses it again, and only 'held' tells that apart from a recovery.
+    if kind != "flat":
+        _pc = "POI active power recovery to %d%% of pre-fault (from the final clearing)" \
+              % int(round(POI_P_RECOVERY_FRAC * 100))
+        try:
+            if not _prec_src:
+                add(_pc, None, "no POI power channel in this .out")
+            else:
+                _poi_p, _vp = _prec_src[0]
+                _n = min(len(t), len(_vp))
+                _pre = [float(_vp[i]) for i in range(_n)
+                        if PRE_FAULT_S - 1.0 <= t[i] < PRE_FAULT_S - 0.01 and _vp[i] == _vp[i]]
+                _tfc = tclear + _t_rc
+                if not _pre:
+                    add(_pc, None, "no pre-fault sample of the POI %s power" % _poi_p)
+                elif abs(sum(_pre) / len(_pre)) < 1.0:
+                    add(_pc, None, "pre-fault POI %s power %.1f MW -- too small to measure a recovery"
+                        % (_poi_p, sum(_pre) / len(_pre)))
+                else:
+                    _p0 = sum(_pre) / len(_pre)
+                    _tg = POI_P_RECOVERY_FRAC * _p0
+                    # HELD = back INSIDE the band around pre-fault (+/- the same
+                    # margin) to the end: a swing to twice the pre-fault power is
+                    # above 90 % too, and is not a recovery
+                    _lo, _hi = sorted((_tg, (2.0 - POI_P_RECOVERY_FRAC) * _p0))
+                    _i0 = idx_after(t, _tfc)
+                    _first = _held = None
+                    for _i in range(_i0 if _i0 is not None else _n, _n):
+                        _x = _vp[_i]
+                        if _x == _x and ((_x >= _tg) if _p0 > 0 else (_x <= _tg)) and _first is None:
+                            _first = t[_i]
+                        if _x == _x and _lo <= _x <= _hi:
+                            if _held is None:
+                                _held = t[_i]
+                        else:
+                            _held = None
+                    _end = _vp[_n - 1] if _n else float("nan")
+                    _d = ("POI %s: pre-fault %.1f MW, %d%% = %.1f MW; final clearing %.3f s; "
+                          % (_poi_p, _p0, int(round(POI_P_RECOVERY_FRAC * 100)), _tg, _tfc))
+                    if _first is None:
+                        _d += "never reached after the final clearing, ends at %.1f MW" % _end
+                    else:
+                        _d += "first reached %.3f s after it (t=%.3f s); " % (_first - _tfc, _first)
+                        _d += ("held within %.1f-%.1f MW from %.3f s after it to the end (t=%.3f s)"
+                               % (_lo, _hi, _held - _tfc, _held)
+                               if _held is not None else
+                               "NOT held within %.1f-%.1f MW, ends at %.1f MW" % (_lo, _hi, _end))
+                    add(_pc, None, _d)
+        except Exception as _e:
+            add(_pc, None, "not measured (%s)" % _e)
 
     # SYSTEM STABILITY -- PRESENT ON EVERY FAULT RUN, NOT ONLY THE DIVERGED ONES.
     #

@@ -248,6 +248,8 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 GEN_TEST = True                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
 GEN_TEST_REPORT_ONLY = False                 # True = rewrite every gen-test report from the runs on disk, simulate nothing
+GEN_TEST_RESCORE_MISSING = True              # True = a finished run scored before the POI power-recovery row existed is
+                                             #   scored again from its .out files (no simulation, no plots)
 GEN_TEST_FORCE_RERUN = False                 # True = start even when finished-looking run folders count as not done
 GEN_TEST_PROJECTS = ["SantaFe", "EmpirePrairie"]  # [] = GEN_TEST_PROJECT only | ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
 GEN_TEST_PROJECT = "SantaFe"                 # the one project run when GEN_TEST_PROJECTS = []
@@ -18325,19 +18327,58 @@ def _gt_crit(c):
     return c.strip()[:30]
 
 
+def _gt_prec_parse(d, det):
+    """The study's 'POI active power recovery' row -> p_state held / not held /
+       never / n/a, p_first and p_held in s after the final clearing."""
+    mf = re.search(r"first reached ([\d.]+) s after", det)
+    mh = re.search(r"held within .*? MW from ([\d.]+) s after", det)
+    d["p_first"] = float(mf.group(1)) if mf else None
+    d["p_held"] = float(mh.group(1)) if mh else None
+    d["p_state"] = ("held" if mh else "not held" if "NOT held" in det
+                    else "never" if "never reached" in det else "n/a")
+
+
+def _gt_prec_cell(d):
+    """One fault's POI power recovery for a table: seconds, NOT HELD, NEVER, -."""
+    st = (d or {}).get("p_state")
+    if st == "held":
+        return "%.2f" % d["p_held"]
+    return {"not held": "NOT HELD", "never": "NEVER", "n/a": "n/a"}.get(st, "-")
+
+
+_GT_PREC_PCT = 90             # the study's POI_P_RECOVERY_FRAC, for labels only
+
+
+def _gt_prec_worst(m, faults):
+    """A run's POI power recovery over its faults, in one cell: NOT HELD /
+       NEVER if any fault's power did not come back, else the slowest time."""
+    ds = [(m or {}).get(f) or {} for f in faults]
+    st = [d.get("p_state") for d in ds]
+    for bad, txt in (("never", "NEVER"), ("not held", "NOT HELD")):
+        if bad in st:
+            return txt
+    hs = [d["p_held"] for d in ds if d.get("p_state") == "held"]
+    return "%.2fs" % max(hs) if hs else "-"
+
+
 def _gt_newfails(mo, mb, fs):
     """Criteria (other than the 1.2 pu spike) the element-out run FAILS on
        faults fs that its reference run passes -- such a run is not a fix."""
     out = set()
     for f in fs:
         out |= set((mo.get(f) or {}).get("fails") or ()) - set((mb.get(f) or {}).get("fails") or ())
+        # POWER THAT NO LONGER COMES BACK: the reference's POI power recovered
+        # and stayed, this run's did not -- the oscillating 'fix'
+        if ((mb.get(f) or {}).get("p_state") == "held"
+                and (mo.get(f) or {}).get("p_state") in ("not held", "never")):
+            out.add("POI power recovery")
     return sorted(out)
 
 
 def _gt_measure(rdir, faults):
     """{fault: {verdict, noconv, n_over, max_pu}} from what the run wrote."""
     res = dict((f, {"verdict": "?", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {},
-                    "fails": set()})
+                    "fails": set(), "p_state": None, "p_first": None, "p_held": None})
                for f in faults)
     cp = _gt_find(rdir, "SPP_CRITERIA_REPORT", "csv")
     if cp:
@@ -18348,6 +18389,8 @@ def _gt_measure(rdir, faults):
                     rs = (r.get("Result") or "").strip().upper()
                     crit = (r.get("Criterion") or "").strip()
                     for f in faults:
+                        if case and _gt_match(case, f) and crit.startswith("POI active power recovery"):
+                            _gt_prec_parse(res[f], r.get("Detail") or "")
                         if case and _gt_match(case, f):
                             # the AND of the rows, as the study scores it
                             if rs == "FAIL":
@@ -18502,10 +18545,20 @@ def _gt_rescorable(r, faults):
        not scored it itself yet (after that, what is missing is a real give-up)."""
     rdir = r.get("rdir") or ""
     g = r["gen"]
+    if r.get("force_score"):
+        return os.path.isdir(rdir) and _gt_outs_ready(rdir, g, faults)
     if g and g.get("egf") and _gt_egf_mismatch(rdir, g):
         return False               # a run of OTHER .dyr values: simulate again, do not score it
     return (os.path.isdir(rdir) and _gt_outs_ready(rdir, g, faults)
             and not os.path.isfile(os.path.join(rdir, "flags", _GT_RESCORED)))
+
+
+def _gt_lacks_prec(r, faults):
+    """Scored, but before the study wrote the POI power-recovery row."""
+    m = r.get("m") or {}
+    need = [f for f in _gt_run_faults(r["gen"], faults)
+            if (m.get(f) or {}).get("verdict") in ("PASS", "FAIL")]
+    return bool(need) and all((m.get(f) or {}).get("p_state") is None for f in need)
 
 
 def _gt_wait_plotter(rdir):
@@ -18550,8 +18603,10 @@ def _gt_rescore(r, env, faults, log_path=None):
        while every .out is there, score the .out files (REPORT_ONLY, no
        simulation). Returns the scoring pass's rc, or None when none was needed."""
     rdir = r["rdir"]
-    _gt_wait_plotter(rdir)
-    if _gt_done(rdir, faults, r["gen"])[0] or not _gt_outs_ready(rdir, r["gen"], faults):
+    force = r.pop("force_score", False)
+    if not force:
+        _gt_wait_plotter(rdir)
+    if (not force and _gt_done(rdir, faults, r["gen"])[0]) or not _gt_outs_ready(rdir, r["gen"], faults):
         return None
     if r["gen"] and r["gen"].get("egf") and _gt_egf_mismatch(rdir, r["gen"]):
         return None                # not this entry's .dyr values -- scoring it would mislabel it
@@ -18564,6 +18619,9 @@ def _gt_rescore(r, env, faults, log_path=None):
           % os.path.basename(rdir))
     e = dict(env)
     e["SPP_REPORT_ONLY"] = "1"
+    if force:
+        # the saved per-fault scores predate the new row: read the .out again
+        e["SPP_FORCE_RESCORE"] = "1"
     return run_study(_gt_case(), projects=[GEN_TEST_PROJECT], modes=[GEN_TEST_MODE],
                      extra_env=e, log_path=log_path)
 
@@ -18701,7 +18759,8 @@ def _gt_score(m, faults):
     ov = sum(m[f]["n_over"] for f in sc)
     mx = max([m[f]["max_pu"] or 0.0 for f in sc] or [0.0])
     # other criteria failed (recovery, steady state, trips, damping, stability)
-    oth = sum(len(m[f].get("fails") or ()) for f in sc)
+    oth = sum(len(m[f].get("fails") or ()) + (m[f].get("p_state") in ("not held", "never"))
+              for f in sc)
     return ps, nc, ov, mx, known, len(sc), len(faults), oth
 
 
@@ -18941,7 +19000,8 @@ def _gt_impact(runs, faults, proj):
                          "pk_b": mb.get("max_pu") or 0.0, "pk_o": mo.get("max_pu") or 0.0,
                          "nc_b": mb.get("noconv"), "nc_o": mo.get("noconv"),
                          "v_b": mb.get("verdict"), "v_o": mo.get("verdict"), "bb": bb, "bo": bo,
-                         "newfail": _gt_newfails(m, b["m"], [f])})
+                         "newfail": _gt_newfails(m, b["m"], [f]),
+                         "p_b": _gt_prec_cell(mb), "p_o": _gt_prec_cell(mo)})
     for x in rows:
         x["dpk"] = (x["pk_b"] or 0.0) - (x["pk_o"] or 0.0)
         x["dnc"] = ((x["nc_b"] or 0) - (x["nc_o"] or 0)) if x["nc_b"] is not None and x["nc_o"] is not None else 0
@@ -19002,11 +19062,11 @@ def _gt_impact(runs, faults, proj):
                         "%.3f" % sr[0]["pk_b"] if sr[0]["pk_b"] else "-",
                         "-" if sr[0]["nc_b"] is None else sr[0]["nc_b"]))
             for x in con[:6]:
-                L.append("      contributes : %-50s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s"
+                L.append("      contributes : %-50s buses %d -> %d, peak %s -> %s, nc %s -> %s, %s -> %s, P%d %s -> %s"
                          % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
                             "%.3f" % x["pk_b"] if x["pk_b"] else "-", "%.3f" % x["pk_o"] if x["pk_o"] else "-",
                             "-" if x["nc_b"] is None else x["nc_b"], "-" if x["nc_o"] is None else x["nc_o"],
-                            x["v_b"], x["v_o"]))
+                            x["v_b"], x["v_o"], _GT_PREC_PCT, x["p_b"], x["p_o"]))
             for x in hol[:3]:
                 L.append("      holds down  : %-50s buses %d -> %d, peak %s -> %s"
                          % (_gt_label(x["g"])[:50], x["over_b"], x["over_o"],
@@ -19042,6 +19102,7 @@ def _gt_impact(runs, faults, proj):
                     "%s -> %s" % ("-" if x["nc_b"] is None else x["nc_b"],
                                   "-" if x["nc_o"] is None else x["nc_o"]),
                     "%s -> %s" % (x["v_b"], x["v_o"]))
+                    + "   P%d %s -> %s" % (_GT_PREC_PCT, x["p_b"], x["p_o"])
                     + ("   new FAIL: " + ", ".join(x["newfail"]) if x["newfail"] else ""))
         # B -- per spiking bus, the element that lowers it most (first scenario
         # with runs, and the first POI-off block when there is one)
@@ -19070,12 +19131,12 @@ def _gt_impact(runs, faults, proj):
             w.writerow(["fault", "scenario", "impact", "element_out", "kind", "buses_over_1p2_in_service",
                         "buses_over_1p2_out", "buses_cleared", "buses_new", "peak_pu_in_service",
                         "peak_pu_out", "peak_drop", "nc_in_service", "nc_out", "verdict_in_service",
-                        "verdict_out", "new_fails"])
+                        "verdict_out", "p_recovery_in_service", "p_recovery_out", "new_fails"])
             for x in sorted(rows, key=lambda x: (x["f"], x["sc"]) + key(x)):
                 w.writerow([x["f"], x["sc"], x["eff"], _gt_label(x["g"]), x["g"].get("kind") or "", x["over_b"],
                             x["over_o"], x["cleared"], x["new"], x["pk_b"] or "", x["pk_o"] or "",
                             round(x["dpk"], 4), x["nc_b"], x["nc_o"], x["v_b"], x["v_o"],
-                            "; ".join(x["newfail"])])
+                            x["p_b"], x["p_o"], "; ".join(x["newfail"])])
     except Exception as e:
         print("[gen-test] GEN_TEST_IMPACT not written (%s)" % e)
 
@@ -19120,6 +19181,19 @@ def _gt_write(runs, faults, gens):
         L.append("%-22s %-50s " % (r["sc"][0], gl) +
                  " | ".join(cell((r.get("m") or {}).get(f)) for f in faults) +
                  ("   " + r["note"] if r.get("note") else ""))
+    # POI POWER RECOVERY, every run, every fault
+    L += ["", "=" * 150,
+          "POI POWER RECOVERY -- s after the FINAL clearing until the power into the POI is back to %d %% of"
+          % _GT_PREC_PCT,
+          "  its pre-fault value AND stays within +/-%d %% of it to the end.  NOT HELD = reaches it but swings"
+          % (100 - _GT_PREC_PCT),
+          "  out again, NEVER = never gets back, - = not measured (scored before this row existed)",
+          "%-22s %-50s " % ("scenario", "machine OFF / line OPEN") + " | ".join("%-9s" % f for f in faults),
+          "-" * 150]
+    for r in runs:
+        g, m = r["gen"], r.get("m") or {}
+        L.append("%-22s %-50s " % (r["sc"][0], _gt_label(g)[:50] if g else "(none -- all in service)")
+                 + " | ".join("%-9s" % _gt_prec_cell(m.get(f)) for f in faults))
     # runs that could not take their element out: nothing was simulated
     ns = []
     for r in runs:
@@ -19174,7 +19248,8 @@ def _gt_write(runs, faults, gens):
             w = csv.writer(fh)
             w.writerow(["scenario", "delt_cycles", "maxiter", "accel", "tol", "off_bus", "off_id",
                         "off_name", "off_kind", "off_mw", "nodes", "zdist_pu", "fault", "verdict",
-                        "noconv_steps", "buses_over_1p2", "max_pu", "folder", "note"])
+                        "noconv_steps", "buses_over_1p2", "max_pu", "p_recovery", "p_first_s", "p_held_s",
+                        "folder", "note"])
             for r in runs:
                 sc, g, m = r["sc"], r["gen"], r.get("m") or {}
                 for f in faults:
@@ -19186,6 +19261,8 @@ def _gt_write(runs, faults, gens):
                                 ("%.4f" % g["z"]) if g and g["z"] is not None else "",
                                 f, x.get("verdict", ""), x.get("noconv", ""),
                                 x.get("n_over", ""), x.get("max_pu", ""),
+                                x.get("p_state") or "", "" if x.get("p_first") is None else x["p_first"],
+                                "" if x.get("p_held") is None else x["p_held"],
                                 r["rdir"], r.get("note", "")])
     except Exception as e:
         print("[gen-test] CSV not written (%s)" % e)
@@ -19315,8 +19392,9 @@ def _gt_status_write(runs, faults, npar, t_start):
         x = _gt_score(m, faults) if m else None
         if not x:
             return ""
-        return "%d/%d PASS  nc %d%s  >1.2 %d  max %s%s" % (
+        return "%d/%d PASS  nc %d%s  >1.2 %d  max %s  P%d %s%s" % (
             x[0], x[5], x[1], "" if x[4] else "?", x[2], "%.3f" % x[3] if x[3] else "-",
+            _GT_PREC_PCT, _gt_prec_worst(m, faults),
             ("   ** scored %d of %d faults -- the rest NO VERDICT **" % (x[5], x[6]))
             if x[5] < x[6] else "")
 
@@ -19894,8 +19972,19 @@ def run_gen_test():
         _gt_write(runs, faults, gens)
         print("[gen-test] DRY RUN -- nothing simulated. Set GEN_TEST_DRY_RUN = False to run.")
         return 0
+    # SCORED BEFORE THE POI POWER-RECOVERY ROW EXISTED: score those again from
+    # their .out files (no simulation, no plots) so every run carries it
+    n_rs = 0
+    if GEN_TEST_RESCORE_MISSING:
+        for r in runs:
+            if r["note"] and _gt_lacks_prec(r, faults) and _gt_outs_ready(r["rdir"], r["gen"], faults):
+                r["note"], r["state"], r["force_score"] = "", "WAITING", True
+                n_rs += 1
     todo = [r for r in runs if not r["note"]]
-    print("[gen-test] %d run(s) to simulate, %d already done" % (len(todo), len(runs) - len(todo)))
+    print("[gen-test] %d run(s) to simulate, %d already done%s"
+          % (len(todo) - n_rs, len(runs) - len(todo),
+             (" -- and %d finished run(s) to SCORE AGAIN for the POI power recovery "
+              "(no simulation; GEN_TEST_RESCORE_MISSING)" % n_rs) if n_rs else ""))
     # THE STUDY MUST BE THERE BEFORE ANYTHING STARTS. Without it every run
     # ended INCOMPLETE in seconds (rc 2) and the queue raced through all of
     # them -- each one moving its folder aside on the way.
@@ -19909,7 +19998,7 @@ def run_gen_test():
     # AND A LAUNCH THAT FINDS NOTHING DONE WHEN THE FOLDERS SAY OTHERWISE IS
     # POINTED AT THE WRONG PLACE, OR CANNOT READ THEM: stop and say so rather
     # than re-run (and move aside) everything
-    _had = [r for r in todo if os.path.isdir(r["rdir"])
+    _had = [r for r in todo if os.path.isdir(r["rdir"]) and not r.get("force_score")
             and glob.glob(os.path.join(r["rdir"], "reports", "SPP_CRITERIA_REPORT*.csv"))]
     if todo and len(_had) >= 3 and len(runs) - len(todo) == 0:
         print("[gen-test] *** %d run folder(s) hold a criteria report, yet NONE counts as done."
