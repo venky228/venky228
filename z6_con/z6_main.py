@@ -18442,11 +18442,87 @@ def _gt_done(rdir, faults, g=None):
             m[f] = {"verdict": "SKIP", "noconv": None, "n_over": 0, "max_pu": None, "bus_pu": {}}
     need = _gt_run_faults(g, faults)
     ok = all(m[f]["verdict"] in ("PASS", "FAIL") for f in need)
+    # PART-SCORED COUNTS AS FINISHED ONLY ONCE IT HAS BEEN SCORED ON PURPOSE:
+    # the per-fault plotter scores in the background and was still at work when
+    # the run was judged, so "1 of 3 scored" was often just "not scored yet".
     if (not ok and glob.glob(os.path.join(rdir, "flags", "ALL_DONE*.flag"))
             and _gt_find(rdir, "SPP_CRITERIA_REPORT", "csv")
-            and any(m[f]["verdict"] in ("PASS", "FAIL") for f in need)):
+            and any(m[f]["verdict"] in ("PASS", "FAIL") for f in need)
+            and (os.path.isfile(os.path.join(rdir, "flags", _GT_RESCORED))
+                 or not _gt_outs_ready(rdir, g, faults))):
         ok = True
     return ok, m
+
+
+_GT_RESCORED = "GT_RESCORED.flag"      # the gen test's own scoring pass ran in this folder
+GEN_TEST_PLOT_WAIT_MIN = 60            # max minutes to wait for a run's background plotter
+
+
+def _gt_outs_ready(rdir, g, faults):
+    """Every fault this run needs has its .out AND its .done (written once the
+       fault finished and its .out was checked): scoring it needs no simulation.
+       A run stopped part-way has a half-written .out but no .done."""
+    need = _gt_run_faults(g, faults)
+    return bool(need) and all(
+        os.path.isfile(os.path.join(rdir, "outs", "%s.out" % f))
+        and os.path.isfile(os.path.join(rdir, "outs", "%s.done" % f)) for f in need)
+
+
+def _gt_rescorable(r, faults):
+    """Not finished, but only the scoring is missing -- and the gen test has
+       not scored it itself yet (after that, what is missing is a real give-up)."""
+    rdir = r.get("rdir") or ""
+    return (os.path.isdir(rdir) and _gt_outs_ready(rdir, r["gen"], faults)
+            and not os.path.isfile(os.path.join(rdir, "flags", _GT_RESCORED)))
+
+
+def _gt_wait_plotter(rdir):
+    """The study returns while its per-fault plotter still draws and scores in
+       the background (it holds plots\\_plotter.claim). Judged then, the run read
+       INCOMPLETE and its criteria report appeared a minute later. Wait for it."""
+    cp = os.path.join(rdir, "plots", "_plotter.claim")
+    t0, said = time.time(), False
+    while os.path.isfile(cp) and time.time() - t0 < float(GEN_TEST_PLOT_WAIT_MIN) * 60.0:
+        try:
+            with open(cp, "r") as fh:
+                txt = fh.read(200)
+        except Exception:
+            txt = ""
+        pid = host = None
+        for tok in (txt or "").split():
+            if tok.startswith("pid"):
+                pid = tok[3:]
+            elif tok.startswith("host="):
+                host = tok[5:]
+        if pid is not None and (host is None or host == socket.gethostname()) \
+                and not _pid_alive_here(pid):
+            break                              # left behind by a plotter that is gone
+        if not said:
+            print("[gen-test] %s: waiting for its plotter to finish scoring"
+                  % os.path.basename(rdir))
+            said = True
+        time.sleep(10)
+
+
+def _gt_rescore(r, env, faults, log_path=None):
+    """After a run: let its plotter finish, and if a fault still has no verdict
+       while every .out is there, score the .out files (REPORT_ONLY, no
+       simulation). Returns the scoring pass's rc, or None when none was needed."""
+    rdir = r["rdir"]
+    _gt_wait_plotter(rdir)
+    if _gt_done(rdir, faults, r["gen"])[0] or not _gt_outs_ready(rdir, r["gen"], faults):
+        return None
+    try:
+        with open(os.path.join(rdir, "flags", _GT_RESCORED), "w") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+    except Exception:
+        pass
+    print("[gen-test] %s: scoring the finished .out files (no simulation)"
+          % os.path.basename(rdir))
+    e = dict(env)
+    e["SPP_REPORT_ONLY"] = "1"
+    return run_study(_gt_case(), projects=[GEN_TEST_PROJECT], modes=[GEN_TEST_MODE],
+                     extra_env=e, log_path=log_path)
 
 
 def _gt_machines_off(g):
@@ -19301,14 +19377,17 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             sc, g = r["sc"], r["gen"]
             tag = _gt_tag(sc, g)
             lp = os.path.join(ldir, tag + ".log")
-            print("[gen-test] START %d/%d  %s -- %s | %s | log %s"
+            only = _gt_rescorable(r, faults)
+            print("[gen-test] START %d/%d  %s -- %s | %s%s | log %s"
                   % (k, len(todo), sc[0],
                      _gt_label(g) if g
-                     else "all machines in service", _gt_scen_desc(sc), lp))
-            _gt_reset(r)
-            if r.pop("reset_failed", False):
-                r["state"] = "INCOMPLETE"
-                continue
+                     else "all machines in service", _gt_scen_desc(sc),
+                     " | SCORING ONLY (its .out files are there)" if only else "", lp))
+            if not only:
+                _gt_reset(r)
+                if r.pop("reset_failed", False):
+                    r["state"] = "INCOMPLETE"
+                    continue
             env = _gt_env(sc, g, faults)
             # THIS RUN'S SHARE, NOT THE MACHINE: nf sessions each, no handover
             # file to grow on, and no shared live-status file to fight over.
@@ -19319,10 +19398,14 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             env["SPP_LIVE_STATUS_ALL"] = ""
             box = {}
 
-            def _go(r=r, env=env, lp=lp, box=box):
+            def _go(r=r, env=env, lp=lp, box=box, only=only):
                 try:
-                    box["rc"] = run_study(_gt_case(), projects=[GEN_TEST_PROJECT],
-                                          modes=[GEN_TEST_MODE], extra_env=env, log_path=lp)
+                    if not only:
+                        box["rc"] = run_study(_gt_case(), projects=[GEN_TEST_PROJECT],
+                                              modes=[GEN_TEST_MODE], extra_env=env, log_path=lp)
+                    rc2 = _gt_rescore(r, env, faults, lp)
+                    if only:
+                        box["rc"] = rc2
                 except Exception as e:
                     box["rc"] = "raised %s" % e
             th = threading.Thread(target=_go)
@@ -19331,7 +19414,9 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             th.start()
             live[tag] = (th, r, t0, box)
             r["state"], r["t0"], r["log"] = "RUNNING", t0, lp
-            last = (tag, r["rdir"], t0, _gt_run_faults(g, faults))
+            if not only:
+                # a scoring-only run builds nothing, so it does not space the starts
+                last = (tag, r["rdir"], t0, _gt_run_faults(g, faults))
             continue
         if time.time() - t_say >= 300.0 and live:
             t_say = time.time()
@@ -19803,15 +19888,23 @@ def _gt_execute(todo, runs, faults, gens, npar):
         _banner("GEN TEST %d/%d -- %s -- %s" % (k, len(todo), sc[0],
                 _gt_label(g) if g else "all machines in service"))
         print("[gen-test] %s | folder %s" % (_gt_scen_desc(sc), r["rdir"]))
-        _gt_reset(r)
-        if r.pop("reset_failed", False):
-            r["state"] = "INCOMPLETE"
-            continue
+        only = _gt_rescorable(r, faults)
+        if only:
+            print("[gen-test] SCORING ONLY -- its .out files are there")
+        else:
+            _gt_reset(r)
+            if r.pop("reset_failed", False):
+                r["state"] = "INCOMPLETE"
+                continue
         t0 = time.time()
         r["state"], r["t0"] = "RUNNING", t0
+        env = _gt_env(sc, g, faults)
         try:
-            rc = run_study(_gt_case(), projects=[GEN_TEST_PROJECT], modes=[GEN_TEST_MODE],
-                           extra_env=_gt_env(sc, g, faults))
+            rc = None if only else run_study(_gt_case(), projects=[GEN_TEST_PROJECT],
+                                             modes=[GEN_TEST_MODE], extra_env=env)
+            rc2 = _gt_rescore(r, env, faults)
+            if only:
+                rc = rc2
         except Exception as e:
             rc = "raised %s" % e
         r["faults"] = faults
