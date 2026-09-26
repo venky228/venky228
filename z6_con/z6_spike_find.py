@@ -162,6 +162,12 @@ def find_folders():
     return out
 
 
+def _known(x):
+    """A 02_VIOLATIONS cell, or "" for the study's words for unknown."""
+    x = (x or "").strip()
+    return "" if x.lower() in ("not in case", "no path", "no name", "not on record") else x
+
+
 def read_overshoots(path):
     rows = []
     with open(path, newline="") as fh:
@@ -175,8 +181,8 @@ def read_overshoots(path):
             rows.append({"fault": (r.get("fault_id") or "").strip(),
                          "element": (r.get("element") or "").strip(),
                          "bus": b, "value": v, "time": _f(r.get("time_s")),
-                         "area": (r.get("area") or "").strip(),
-                         "area_name": (r.get("area_name") or "").strip(),
+                         "area": _known(r.get("area")),
+                         "area_name": _known(r.get("area_name")),
                          "hops": _f(r.get("hops_from_fault")),
                          "fault_bus": (r.get("fault_bus") or "").strip(),
                          "dur": _f(r.get("above_limit_s"))})

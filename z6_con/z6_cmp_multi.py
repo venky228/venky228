@@ -1703,7 +1703,8 @@ def _sbs_poi(z4, ref, group, tags, rk, lay=None):
             per[fid][t] = r
             if "POI" in PC:
                 _merge_add(head[fid], "POI", t, r[PC["POI"]], z4)
-            for c in ("base total P0 (MW)", "base total end (MW)", "base total Q0 (MVAr)"):
+            for c in ("base total P0 (MW)", "base total end (MW)", "base total Q0 (MVAr)",
+                      "base total Q end (MVAr)", "base min P after clearing (MW)"):
                 if c in PC:
                     _merge_add(hb[fid][lay["rk_of"][t]], c, t, r[PC[c]], z4)
     proj = group[0]["proj"]
@@ -1714,8 +1715,9 @@ def _sbs_poi(z4, ref, group, tags, rk, lay=None):
               ("existing P0 (MW)", None, "project existing P0 (MW)", 16),
               ("existing end (MW)", None, "project existing end (MW)", 16),
               ("total Q0 (MVAr)", "base total Q0 (MVAr)", "project total Q0 (MVAr)", 14),
-              ("total Q end (MVAr)", None, "project total Q end (MVAr)", 14),
-              ("min P after clearing (MW)", None, "project min P after clearing (MW)", 18),
+              ("total Q end (MVAr)", "base total Q end (MVAr)", "project total Q end (MVAr)", 14),
+              ("min P after clearing (MW)", "base min P after clearing (MW)",
+               "project min P after clearing (MW)", 18),
               ("how measured", None, "how the project total was measured", 40)]
     blocks = [b for b in blocks if b[2] in PC]
     header, widths = ["fault", "project", "POI"], [8, 12, 9]

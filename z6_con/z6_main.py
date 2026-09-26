@@ -2858,6 +2858,12 @@ def read_violations(rdir, proj):
                     # own area or four areas away. Kept in a parallel map so the
                     # existing {element: value} shape -- which several callers
                     # index directly -- is untouched.
+                    # THE STUDY'S WORDS FOR "UNKNOWN" (no blank cells in its CSV)
+                    # read back as unknown -- never as an area or a hop count
+                    _unk = ("not in case", "no path", "no name", "not on record")
+                    for _uk in ("area", "area_name", "hops_from_fault", "fault_bus"):
+                        if (r.get(_uk) or "").strip().lower() in _unk:
+                            r[_uk] = ""
                     _ar = (r.get("area") or "").strip()
                     _hp = (r.get("hops_from_fault") or "").strip()
                     if _ar or _hp:
@@ -2870,6 +2876,14 @@ def read_violations(rdir, proj):
                     # came from so base and project never overwrite each other.
                     _tm = (r.get("time_s") or "").strip()
                     _ab = (r.get("above_limit_s") or "").strip()
+                    try:
+                        float(_ab)
+                    except ValueError:
+                        _ab = ""                    # "n/a (overshoot only)", "not recorded"
+                    try:
+                        float(_tm)
+                    except ValueError:
+                        _tm = ""                    # "avg last 1.0 s" etc. -- no instant
                     if _tm or _ab:
                         _VIO_EXTRA.setdefault(_side_key(rdir), {})[(fid, kind, el)] = (
                             _tm, _ab)
@@ -3211,6 +3225,45 @@ def measured_fault_ids(rdir, proj):
         except Exception as e:
             print("[compare] could not count scenarios in %s (%s)" % (fp, _err_text(e)))
     ids |= set(_part_meas_files(rdir))      # a scored part counts even before the merge catches up
+    return ids
+
+
+def poi_measured_ids(rdir, proj):
+    """Scenario ids with a POI POWER row (MW, 'TOTAL delivered into the POI'),
+       from SPP_MEASURE_POI and from the per-scenario parts.
+
+       Counted on its own: measured_fault_ids() counts a fault with bus voltages
+       and no POI row as measured, so runs scored before the POI rows existed
+       were never re-scored and the POI power sheet read n/a for them."""
+    ids = set()
+    fp = rfile(rdir, "SPP_MEASURE_POI", "csv", proj)
+    if fp:
+        try:
+            with csv_open(fp) as fh:
+                rd = csv.reader(fh)
+                H = dict((h.strip(), i) for i, h in enumerate(next(rd, None) or []))
+                i_sc, i_q, i_c = H.get("Scenario"), H.get("Quantity"), H.get("Component")
+                if None not in (i_sc, i_q, i_c):
+                    for r in rd:
+                        try:
+                            if r[i_q].strip() == "MW" and r[i_c].strip().startswith("TOTAL"):
+                                ids.add(r[i_sc].strip())
+                        except IndexError:
+                            continue
+        except Exception as e:
+            print("[compare] could not count POI rows in %s (%s)" % (fp, _err_text(e)))
+    for fid, pp in _part_meas_files(rdir).items():
+        if fid in ids:
+            continue
+        try:
+            with open(pp) as fh:
+                for ln in fh:
+                    if ",poi," in ln and ",MW,TOTAL" in ln:
+                        ids.add(fid)
+                        break
+        except Exception:
+            pass
+    ids.discard("")
     return ids
 
 
@@ -4152,7 +4205,8 @@ def _criterion_family(criterion):
     # INFO rows that describe; they carry the words of a criterion without being
     # one, and read as one they would hand the overshoot or angle delta a
     # number that belongs to no limit.
-    if c.startswith(("transient voltage:", "rotor angle:", "generator tripping:", "***")):
+    if c.startswith(("transient voltage:", "rotor angle:", "generator tripping:", "***",
+                     "back at the pre-fault level")):
         return ""
     # BEFORE the "swing" test below: "Rotor angles measured relative to the
     # system swing machine" is a yes/no statement, and matched "swing" first --
@@ -4622,14 +4676,41 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix="",
     el_ok = bool(src_vb) and bool(src_vt)
     el_cov_warn = ""
     if el_ok and (nb_ or nt_):
-        # One side listing violations for many faults while the other lists them
-        # for very few is truncation, not physics.
-        if nb_ and nt_ and (min(cov_b, cov_t) * 4 < max(cov_b, cov_t)):
+        # TRUNCATION IS A FAILING FAULT WITH NO ELEMENTS, not a ratio. This
+        # compared how MANY faults each side's file listed, and called it
+        # truncated when one side listed four times as many -- which is exactly
+        # what a project that introduces violations (or an EGF edit that fixes
+        # them) produces. The element comparison was then dropped for the whole
+        # study, and every element row fell back to rounded criterion numbers.
+        # The evidence of a cut-short file is a fault that FAILS an element
+        # criterion and has no entry in that side's list.
+        def _vio_missing(vio, crit):
+            _fams = ("overshoot", "recovery", "steady", "angle", "trip")
+            fails = []
+            for k, d in crit.items():
+                if norm_verdict(d.get("verdict")) != "FAIL":
+                    continue
+                for _row in d.get("rows") or []:
+                    try:
+                        _c, _res = _row[0], _row[1]
+                    except (IndexError, TypeError):
+                        continue
+                    if (str(_res).upper() == "FAIL"
+                            and _criterion_family(str(_c)) in _fams):
+                        fails.append(k)
+                        break
+            return fails, [k for k in fails if k not in vio]
+        _fb, _mb = _vio_missing(vb, cb)
+        _ft, _mt = _vio_missing(vt, ct)
+        _bad = [(side, f, m) for side, f, m in (("base", _fb, _mb), ("project", _ft, _mt))
+                if len(m) >= 3 and len(m) * 2 >= len(f)]
+        if _bad:
             el_ok = False
-            el_cov_warn = ("violations cover %d of %d scored fault(s) in the base study "
-                           "and %d of %d with the projects -- one of those files was "
-                           "written by a PARTIAL re-score and does not describe the whole "
-                           "study" % (nb_, tb_, nt_, tt_))
+            el_cov_warn = "; ".join(
+                "the %s study FAILS %d fault(s) on element criteria and its violations "
+                "file lists %d of them -- it was written by a PARTIAL re-score and does "
+                "not describe the whole study" % (side, len(f), len(f) - len(m))
+                for side, f, m in _bad)
     crit_ok = bool(src_cb) and bool(src_ct)
     faults = sorted(set(cb) | set(ct) | set(sb) | set(st), key=_fault_key)
     # EVERY PLANNED FAULT, NOT ONLY THE ONES THAT LEFT A TRACE. A fault with no
@@ -4856,6 +4937,12 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix="",
                          "state_b": sb.get(fid, ""), "state_t": st.get(fid, ""),
                          "crits": crits, "new_crit": new_crit,
                          "hidden_new": hidden_new, "elements": {},
+                         # WHAT THE SCORED SIDE FOUND, for display only: never
+                         # diffed (no new / gone), so it cannot be read as a change
+                         "side_elements": dict(
+                             (_k, {"vb": vb.get(fid, {}).get(_k, {}),
+                                   "vt": vt.get(fid, {}).get(_k, {})})
+                             for _k in (set(vb.get(fid, {})) | set(vt.get(fid, {})))),
                          "vio_gap": _vio_gap, "one_sided": _one_sided,
                          "description": descs.get(fid, ""),
                          "worse_within": any(c["worse_within"] for c in crits)})
@@ -6210,7 +6297,34 @@ def _worst_of(res, r):
             _limit_for(fam, res.get("limits") or {}), c["unit"])
 
 
-def _worst_crit_of(res, r):
+_FAM_UNIT = {"overshoot": "pu", "recovery": "pu", "steady": "pu", "eterm": "pu",
+             "angle": "deg", "trip": "MW"}
+
+
+def _elem_worst(r, fam, lim, side="vt"):
+    """(value, how far past the limit) of the worst ELEMENT of one criterion
+       family on one side ("vb" / "vt"), or (None, None).
+
+       A criterion whose own wording carries no single number -- a steady-state
+       band that lists buses, a trip -- is still measured element by element;
+       this is that measurement, so the summary shows a value, its unit and how
+       far past the limit it is instead of a blank."""
+    k = {"angle": "undamped", "trip": "tripped"}.get(fam, fam)
+    d = (((r.get("elements") or r.get("side_elements") or {}).get(k) or {})
+         .get(side) or {})
+    best = None
+    for _el, v in d.items():
+        try:
+            a = exceedance(k, v, lim)[0]
+        except Exception:
+            a = None
+        key = a if a is not None else -1e9
+        if best is None or key > best[0]:
+            best = (key, v, a)
+    return (best[1], best[2]) if best else (None, None)
+
+
+def _worst_crit_of(res, r, side="test"):
     """(criterion dict, family, how far past the limit) for the worst failing
        criterion, or None.
 
@@ -6223,15 +6337,18 @@ def _worst_crit_of(res, r):
        blank for every overvoltage in the study."""
     lim = res.get("limits") or {}
     best = None
+    _mk, _vk = ("mt", "vt") if side == "test" else ("mb", "vb")
     for c in r["crits"]:
-        if (c["test"] or "").upper() != "FAIL":
+        if (c[side] or "").upper() != "FAIL":
             continue
         # exceedance() takes the whole LIMITS DICT and its own kind names --
         # "undamped" and "tripped" rather than the family's "angle" and "trip".
         # Passing a single float made it call .get on a number.
         fam = _criterion_family(c["criterion"])
         kind = {"angle": "undamped", "trip": "tripped"}.get(fam, fam)
-        amt, _txt = exceedance(kind, c["mt"], lim)
+        amt, _txt = exceedance(kind, c[_mk], lim)
+        if amt is None:
+            amt = _elem_worst(r, fam, lim, _vk)[1]      # no single number: its worst element
         key = amt if amt is not None else -1.0
         if best is None or key > best[0]:
             best = (key, c, fam, amt)
@@ -7462,8 +7579,10 @@ _POI_COLS = ["project", "fault", "POI",
              "project new plant P0 (MW)", "project new plant end (MW)",
              "project existing P0 (MW)", "project existing end (MW)",
              "base total Q0 (MVAr)", "project total Q0 (MVAr)", "project total Q end (MVAr)",
-             "project min P after clearing (MW)", "how the project total was measured"]
-_POI_WIDTHS = [14, 8, 9, 14, 14, 14, 14, 16, 16, 16, 16, 14, 14, 16, 18, 48]
+             "project min P after clearing (MW)", "how the project total was measured",
+             "base total Q end (MVAr)", "base min P after clearing (MW)",
+             "project P change vs base at end (MW)"]
+_POI_WIDTHS = [14, 8, 9, 14, 14, 14, 14, 16, 16, 16, 16, 14, 14, 16, 18, 48, 14, 16, 16]
 
 
 def _xl_style_poi(row):
@@ -7531,7 +7650,17 @@ def _poi_power_rows(results):
                     _num(tn, "p0"), _num(tn, "end"),
                     _num(te, "p0"), _num(te, "end"),
                     _num(bq, "p0"), _num(tq, "p0"), _num(tq, "end"),
-                    _num(tt, "min"), _how]
+                    _num(tt, "min"), _how,
+                    _num(bq, "end"), _num(bt, "min"),
+                    (round(float(tt["end"]) - float(bt["end"]), 1)
+                     if (tt and bt and tt.get("end") is not None and bt.get("end") is not None)
+                     else "")]
+            # SAID, NOT "n/a": the project side HAS a total but no 999xxx tie --
+            # there is no new plant in this run, so its split is the whole total
+            if tt and not tn:
+                _row[7] = _row[8] = "no new plant in this run"
+            if tt and not te:
+                _row[9] = _row[10] = "no existing plant tie"
             rows.append([(EMPTY_CELL if v in ("", None) else v) for v in _row])
     return rows
 
@@ -7611,7 +7740,7 @@ _NOT_COMPARED = (CLS_ONLY_B, CLS_ONLY_T, CLS_NEITHER)
 def _n_elements_over(r):
     """How many distinct elements are over a limit with the projects in."""
     seen = set()
-    for _kind, d in (r.get("elements") or {}).items():
+    for _kind, d in (r.get("elements") or r.get("side_elements") or {}).items():
         for el in (d.get("vt") or {}):
             seen.add(el)
     return len(seen)
@@ -7696,6 +7825,22 @@ def _violation_cause(res, r):
                         ("; %d NEW with the projects, %d pre-existing"
                          % (n_new, n_pre)) if n_new else
                         ("; all %d pre-existing" % n_pre if n_pre else "")))
+    if not cause and r.get("class") == CLS_RESOLVED:
+        # WHAT THE PROJECTS FIXED, named: the base-side elements that no longer
+        # fail -- "n/a" would hide the very buses the improvement is about
+        for kind in ("tripped", "undamped", "overshoot", "recovery", "steady"):
+            e = (r.get("elements") or {}).get(kind) or {}
+            _g = e.get("gone") or []
+            if not _g:
+                continue
+            _vb = e.get("vb") or {}
+            buses.append("%s: %s" % (kind.upper(), ", ".join(
+                "%s=%s" % (el, _v(_vb.get(el))) for el in _g)))
+            cause.append("%d element(s) past %s in the base case, none with the projects"
+                         % (len(_g), _KIND_LIMIT_TXT.get(kind, kind)))
+        if cause:
+            return ("none with the projects (base: %s)" % " | ".join(buses),
+                    "RESOLVED: " + " | ".join(cause))
     if not cause and r.get("unswitched"):
         # EMPTIED ON PURPOSE -- see compare_project: a trip or reclose did not
         # take, so the event is not the one named and is not compared.
@@ -7712,9 +7857,34 @@ def _violation_cause(res, r):
     if not cause and r.get("one_sided"):
         _has = [s for s, v in (("base", r.get("vb")), ("project", r.get("vt")))
                 if norm_verdict(v) in ("PASS", "FAIL")]
-        return ("not compared -- see sheet 4",
-                "NOT COMPARED: scored in the %s case only -- sheet 4 gives the other "
+        _msg = ("NOT COMPARED: scored in the %s case only -- sheet 4 gives the other "
                 "side's state and why" % (" and ".join(_has) or "neither"))
+        # WHAT THE SCORED SIDE FOUND, named -- not diffed against anything
+        _sb, _sc = [], []
+        _sk = "vt" if "project" in _has else "vb"
+        _fid1 = str(r.get("fault") or "").strip()
+        for kind in ("tripped", "undamped", "overshoot", "recovery", "steady"):
+            _d = ((r.get("side_elements") or {}).get(kind) or {}).get(_sk) or {}
+            if not _d:
+                continue
+            _sc2 = []
+            for el, v in _d.items():
+                try:
+                    amt = exceedance(kind, v, lim)[0]
+                except Exception:
+                    amt = None
+                _sc2.append((-(amt if amt is not None else -1e9), str(el), v))
+            _sc2.sort()
+            _top = _sc2 if not CAUSE_BUSES_MAX else _sc2[:int(CAUSE_BUSES_MAX)]
+            _sb.append("%s: %s%s" % (kind.upper(), ", ".join(
+                "%s=%s" % (el, _v(v)) for _k, el, v in _top),
+                (" +%d more" % (len(_sc2) - len(_top))) if len(_sc2) > len(_top) else ""))
+            _sc.append("%d element(s) past %s -- worst %s = %s"
+                       % (len(_sc2), _KIND_LIMIT_TXT.get(kind, kind), _sc2[0][1], _v(_sc2[0][2])))
+        if _sb:
+            return (" | ".join(_sb) + " (%s case only)" % _has[0] if _has else " | ".join(_sb),
+                    _msg + ". " + " | ".join(_sc))
+        return ("not compared -- see sheet 4", _msg)
     if not cause and (r.get("vt") or "").upper() == "FAIL":
         # FAIL with an empty element list is a data problem, not a clean cell.
         return ("", "FAIL, but no element list reached the comparison -- the "
@@ -7733,6 +7903,12 @@ def _summary_rows(results, want=None):
             if want is not None and not (cls in want or (intro and CLS_NEW in want)):
                 continue
             got = _worst_crit_of(res, r)
+            _base_side = False
+            if not got and norm_verdict(r.get("vb")) == "FAIL":
+                # RESOLVED / BASE ONLY: nothing fails with the projects, so the
+                # row names what failed WITHOUT them rather than nothing
+                got = _worst_crit_of(res, r, side="base")
+                _base_side = bool(got)
             if got:
                 _c, _fam, _amt = got
                 crit = _short_crit(_c["criterion"])
@@ -7747,7 +7923,7 @@ def _summary_rows(results, want=None):
                     # THE CRITERION CARRIES NO SINGLE NUMBER (a trip, a band):
                     # the worst ELEMENT's value on each side, from the same
                     # element table the Detail sheet prints.
-                    _e = (r.get("elements") or {}).get(
+                    _e = (r.get("elements") or r.get("side_elements") or {}).get(
                         {"angle": "undamped", "trip": "tripped"}.get(_fam, _fam)) or {}
                     def _worst_val(d, _k={"angle": "undamped", "trip": "tripped"}.get(_fam, _fam)):
                         _best = None
@@ -7764,7 +7940,36 @@ def _summary_rows(results, want=None):
                         bv = _worst_val(_e.get("vb"))
                     if tv is None:
                         tv = _worst_val(_e.get("vt"))
+                # THE ELEMENT'S EXACT VALUE WHEN THERE IS ONE. The criterion
+                # text rounds (a rotor angle is written "62deg"); the element
+                # table carries 61.7 -- and Detail prints that one, so the
+                # Summary must too or the two sheets disagree.
+                _ev_t, _ea_t = _elem_worst(r, _fam, _lim, "vt")
+                _ev_b, _ea_b = _elem_worst(r, _fam, _lim, "vb")
+                if _ev_t is not None and not _base_side:
+                    tv = _ev_t
+                    if _ea_t is not None:
+                        _amt = _ea_t
+                if _ev_b is not None:
+                    bv = _ev_b
+                if not unit:
+                    unit = _FAM_UNIT.get(_fam, "")
+                if _base_side:
+                    _amt = None                 # past-limit is the PROJECT side's
+                if _amt is None and tv is not None:
+                    try:
+                        _amt = exceedance({"angle": "undamped", "trip": "tripped"}.get(_fam, _fam),
+                                          tv, _lim)[0]
+                    except Exception:
+                        _amt = None
                 past = round(_amt, 3) if _amt is not None else ""
+                _vt_state = norm_verdict(r.get("vt"))
+                if tv is None and _vt_state == "PASS":
+                    tv = "passes"
+                if past == "" and _vt_state == "PASS":
+                    past = "within limit"
+                if bv is None and norm_verdict(r.get("vb")) == "PASS":
+                    bv = "passes"
             else:
                 crit = bv = tv = unit = ""
                 shown, past = None, ""
@@ -7785,7 +7990,7 @@ def _summary_rows(results, want=None):
                         crit, bv if bv is not None else "",
                         tv if tv is not None else "",
                         shown if shown is not None else "", unit, past,
-                        _n_elements_over(r) or "",
+                        _n_elements_over(r) or (0 if norm_verdict(r.get("vt")) == "PASS" else ""),
                         ", ".join(r.get("new_crit") or []),
                         ] + list(_violation_cause(res, r)) + [
                         (r.get("description") or "").replace("\n", " ").strip(),
@@ -8297,9 +8502,10 @@ def write_one_report(results, only_base, only_test):
                         _r[_SCOL["verdict_projects"]] or "-",
                         _r[_SCOL["classification"]],
                         (_r[_SCOL["worst_criterion"]] or "-")[:22],
-                        ("%s %s" % (_gv, _u)).strip() if _gv != "" else "-",
-                        ("+%.3f" % _pl) if isinstance(_pl, float) else "-",
-                        _r[_SCOL["elements_over"]] or ""))
+                        (("%s %s" % (_gv, _u)).strip() if isinstance(_gv, (int, float))
+                         else (str(_gv) if _gv != "" else "-")),
+                        ("%+.3f" % _pl) if isinstance(_pl, (int, float)) else (str(_pl) or "-"),
+                        "" if _r[_SCOL["elements_over"]] in (None, "") else _r[_SCOL["elements_over"]]))
             # THE BUSES AND THE CAUSE, under every row that demands action.
             # "ACT" pointing at a fault id alone sends the reader to another
             # sheet to learn what to act ON; the buses belong on the same page.
@@ -9227,9 +9433,26 @@ def run_egf_variants(proj, mode):
                       "uses what finished" % (proj, case["key"], tag, rc))
 
 
+def _egf_label(proj, sub):
+    """The dyr_edits cell of an EGF comparison: WHAT was changed, and on which
+       side(s) -- never "as studied" for a run that carries edits."""
+    if "egf_off" in sub:
+        what = "existing machines at the feeders OFF"
+    else:
+        ed = _egf_edits_for(proj)
+        what = ("existing machines EDITED: " + "; ".join(
+            "%s %s" % (m, ", ".join("%s=%s" % kv for kv in sorted(d.items(), key=lambda x: str(x[0]))))
+            for m, d in ed)) if ed else "existing machines EDITED (edits no longer in the panel)"
+    if sub.startswith("PROJECT_VS_BASE"):
+        return what + " -- both sides"
+    if sub.startswith("BASE_CASE"):
+        return what + " -- BASE case, vs the BASE as it is"
+    return what + " -- PROJECT case, vs the PROJECT as it is"
+
+
 def _egf_write(res, proj, sub, label, runtimes_suffix=None):
     with _scen_into(proj, *sub.split("/")):
-        _RUN_OUTPUT[0] = label
+        _RUN_LABEL[0] = _egf_label(proj, sub)
         try:
             if ONE_REPORT:
                 write_one_report([res], [], [])
@@ -9242,7 +9465,7 @@ def _egf_write(res, proj, sub, label, runtimes_suffix=None):
             if runtimes_suffix is not None and not SIMPLE_OUTPUT:
                 write_runtime_comparison(proj, res["mode"], test_suffix=runtimes_suffix)
         finally:
-            _RUN_OUTPUT[0] = ""
+            _RUN_LABEL[0] = ""
 
 
 def compare_egf_variants(proj, mode):
@@ -17695,6 +17918,7 @@ def ensure_reports(mode_list):
     env_extra_base = {"SPP_REPORT_ONLY": "1"}
     for case in (CASE_BASE, CASE_TEST):
         need, stale, thin, nomeas, gaps = [], [], [], [], []
+        nopoi, nopoi_asked = [], []
         for nm, proj, md, rep, n_out, _when in inventory(case):
             if md not in mode_list or not n_out:
                 continue
@@ -17799,6 +18023,33 @@ def ensure_reports(mode_list):
                 if 0 <= _n_meas and _n_den and _n_meas < REPORT_COVERAGE_MIN * _n_den:
                     nomeas.append((proj, _n_meas, _n_den))
                     need.append(proj)
+            # THE POI POWER, ON ITS OWN -- selected runs included. One scoring
+            # pass is asked for per version of the .out files (flags\
+            # POI_RESCORE.stamp): if the .out files have no POI channel a
+            # second pass would find nothing either, and that is said instead.
+            if proj not in need and _n_den:
+                try:
+                    _rd3 = results_dir(case, proj, md)
+                    _pids = poi_measured_ids(_rd3, proj)
+                    if _sel_tag():
+                        _pids = set(x for x in _pids if _id_selected(x))
+                    if len(_pids) < REPORT_COVERAGE_MIN * _n_den:
+                        _mk = os.path.join(_rd3, "flags", "POI_RESCORE.stamp")
+                        _outs = glob.glob(os.path.join(_rd3, "outs", "*.out"))
+                        _newest = max([os.path.getmtime(q) for q in _outs] or [0])
+                        if os.path.isfile(_mk) and os.path.getmtime(_mk) >= _newest:
+                            nopoi_asked.append((proj, len(_pids), _n_den))
+                        else:
+                            nopoi.append((proj, len(_pids), _n_den))
+                            need.append(proj)
+                            try:
+                                if not os.path.isdir(os.path.dirname(_mk)):
+                                    os.makedirs(os.path.dirname(_mk))
+                                open(_mk, "w").write("asked %s\n" % time.strftime("%Y-%m-%d %H:%M"))
+                            except Exception:
+                                pass
+                except Exception as _e:
+                    print("[compare] could not count POI power rows for %s (%s)" % (proj, _e))
             # A SCORABLE SCENARIO WITH NO VERDICT IS UNFINISHED WORK, WHATEVER
             # THE RATIO. The coverage test above asks "is at least 90 % scored";
             # project SantaFe was at 268 of 292 and its six partial runs (a
@@ -17888,6 +18139,19 @@ def ensure_reports(mode_list):
             print("[compare]     few scenarios it reached. Every base value, machine MW and POI")
             print("[compare]     power in the workbook comes from those files. Re-scoring the")
             print("[compare]     scenarios that have no measurements -- no simulation.")
+        if nopoi:
+            print("")
+            print("[compare] *** %s: POI POWER missing for most faults -- re-scoring (no "
+                  "simulation) so the POI power sheet is filled ***" % case["key"])
+            for proj, npf, no in nopoi:
+                print("[compare]     %-16s POI power rows for %d fault(s) of %d" % (proj, npf, no))
+        if nopoi_asked:
+            print("")
+            print("[compare] %s: POI power is still missing after a re-score -- the .out files "
+                  "carry no POI power channel (runs made before it was recorded). Re-run those "
+                  "faults to get POI power:" % case["key"])
+            for proj, npf, no in nopoi_asked:
+                print("[compare]     %-16s POI power rows for %d fault(s) of %d" % (proj, npf, no))
         if gaps:
             print("")
             print("[compare] %s: %d folder(s) hold finished or partial runs that have NO "

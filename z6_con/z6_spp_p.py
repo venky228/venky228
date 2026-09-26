@@ -3258,6 +3258,11 @@ V_OVERSHOOT_PU = 1.20
 V_OVERSHOOT_EXEMPT = {}
 V_SS_LOW, V_SS_HIGH = 0.90, 1.10
 SS_WINDOW_S    = 1.0
+# SPP: post-fault steady state "should return to the pre-contingency level or
+# remain within 0.9 - 1.1 pu". A bus outside the band that ends within this many
+# pu of its OWN pre-fault level is not a violation (listed as INFO instead).
+# 0 = off: the band alone decides.
+SS_PRE_RETURN_PU = 0.01
 ANGLE_DEV_DEG  = 16.0
 # ---- the limits, when z6_main.py sets them ------------------------------
 # Applied here, below the definitions. These decide PASS and FAIL, so they must
@@ -20214,6 +20219,9 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
        the text can never land on a trace or on the next panel."""
     W, H = 11.0, 8.5
     HEAD, FOOT, LM, RM = 0.78, 0.34, 0.95, 0.28
+    _edits = _run_edits_text().strip().lstrip("|").strip()
+    if _edits:
+        HEAD += 0.18                    # one more header line: the model edits
     TFS, BFS, TAB = 7.2, 6.8, 6.3
     ln = lambda fs: fs * 1.30 / 72.0
     GAP, TICKS = 0.20, 0.34
@@ -20262,9 +20270,12 @@ def _draw_panel_page(plt, chunk, chunk_stats, chunk_idx, t, is_flat, tclear,
     if warn_txt:
         fig.text(fx(W - RM), fy(H - 0.46), warn_txt, fontsize=8, va="top",
                  ha="right", color="#b00000", fontweight="bold")
+    if _edits:
+        fig.text(fx(LM), fy(H - 0.64), _edits, fontsize=8.5, va="top",
+                 color="#1f4e9a", fontweight="bold")
     try:
         from matplotlib.lines import Line2D
-        fig.lines.append(Line2D([fx(LM), fx(W - RM)], [fy(H - 0.66)] * 2,
+        fig.lines.append(Line2D([fx(LM), fx(W - RM)], [fy(H - (0.84 if _edits else 0.66))] * 2,
                                 color="#999999", lw=0.6, transform=fig.transFigure,
                                 figure=fig))
     except Exception:
@@ -21175,8 +21186,38 @@ def _machine_kind(title):
     return ""
 
 
+def _run_edits_text():
+    """'   |  .dyr EDITED: REECA1 Kqv=2.0 | EXISTING MACHINES EDITED: REGCA1 Khv=1.0'
+       for a plot page -- every model change this run carries, so a page from
+       an edited run can never be read as the deck as it is. "" = none."""
+    def _fmt(e):
+        e = list(e)
+        if len(e) == 2 and isinstance(e[1], dict):
+            return "%s %s" % (e[0], ", ".join("%s=%s" % kv for kv in
+                                              sorted(e[1].items(), key=lambda x: str(x[0]))))
+        if len(e) >= 3:
+            return "%s con%s=%s" % tuple(e[-3:])
+        return " ".join(str(x) for x in e)
+    bits = []
+    try:
+        if DYR_EDITS:
+            bits.append(".dyr EDITED: " + "; ".join(_fmt(e) for e in DYR_EDITS))
+        if EGF_DYR_EDITS:
+            bits.append("EXISTING MACHINES EDITED: " + "; ".join(_fmt(e) for e in EGF_DYR_EDITS))
+        if EGF_OFF:
+            bits.append("EXISTING MACHINES OFF")
+    except Exception:
+        pass
+    return ("   |  " + "  |  ".join(bits)) if bits else ""
+
+
 def _fault_subtitle(fault_bus):
-    """'   |  fault at bus 530555 (2 nodes from POI)' for a plot title."""
+    """'   |  fault at bus 530555 (2 nodes from POI)' for a plot title. The
+       model edits are drawn on their own header line (_run_edits_text)."""
+    return _fault_subtitle_bus(fault_bus)
+
+
+def _fault_subtitle_bus(fault_bus):
     if not fault_bus:
         return ""
     try:
@@ -22545,11 +22586,18 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                                              and _machine_kind(title) == "ASYNC")):
                                 _okd, _infd = spp_damping(_seg)
                                 if not _okd and not _infd.get("floor_limited"):
-                                    ptitle += ("   %s rotor angle not damped -- "
-                                               "deviation %.1f deg, SPPR1=%s"
-                                               % (PLOT_VIOLATION_TAG, _dev,
-                                                  "n/a" if _infd.get("sppr1") is None
-                                                  else "%.3f" % _infd["sppr1"]))
+                                    if _infd.get("poleslip"):
+                                        ptitle += ("   %s rotor angle POLE SLIP -- runs away "
+                                                   "%.1f deg and is still moving at the end"
+                                                   % (PLOT_VIOLATION_TAG, _dev))
+                                    else:
+                                        ptitle += ("   %s rotor angle not damped -- "
+                                                   "deviation %.1f deg, SPPR1=%s, SPPR5=%s"
+                                                   % (PLOT_VIOLATION_TAG, _dev,
+                                                      "n/a" if _infd.get("sppr1") is None
+                                                      else "%.3f" % _infd["sppr1"],
+                                                      "n/a" if _infd.get("sppr5") is None
+                                                      else "%.3f" % _infd["sppr5"]))
                                     _vio_panel = True
                                     _sev = float(_dev) - float(ANGLE_DEV_DEG)
                     except Exception:
@@ -22702,6 +22750,10 @@ def svg_plots(path, is_flat, kb, tclear=None):
     kind_txt = "No-fault (flat)" if is_flat else "Fault"
     body.append('<text x="%d" y="24" font-size="16" font-weight="bold">%s  -  %s run: %s%s</text>'
                 % (margL, _sx(PLOT_TITLE), kind_txt, _sx(name), _sx(_fault_subtitle(fbus))))
+    _ed = _run_edits_text().strip().lstrip("|").strip()
+    if _ed:
+        body.append('<text x="%d" y="40" font-size="11" font-weight="bold" fill="#1f4e9a">%s</text>'
+                    % (margL, _sx(_ed)))
     pw = W - margL - margR
     for idx, (cat, ptitle, series) in enumerate(panels):
         series = [(lbl, v[::st]) for lbl, v in series]   # decimate each trace
@@ -23318,8 +23370,16 @@ def spp_damping(seg):
         # i.e. it went and did not come back.
         _span = max(seg) - vmin
         _end = seg[-1]
+        # STILL GOING AT THE END, or past 180 deg. A machine that steps to a
+        # new operating angle and SETTLES there (a line out: 10 -> 30 deg and
+        # flat) also has no peaks and ends at its extreme -- that is a new
+        # steady state, not a slip. A slipping rotor is still moving in the
+        # last fifth of the record (or has already gone past 180 deg).
+        _tail = seg[int(0.8 * len(seg)):] or seg[-1:]
+        _moving = abs(_tail[-1] - _tail[0]) > max(1.0, 0.05 * _span)
         _ramped = (_span >= float(ANGLE_DEV_DEG)
-                   and abs(_end - max(seg)) <= 0.10 * _span)
+                   and abs(_end - max(seg)) <= 0.10 * _span
+                   and (_moving or _span >= 180.0))
         if _ramped:
             info["poleslip"] = True
             info["span"] = _span
@@ -24232,6 +24292,21 @@ def evaluate_case(path, kind, tclear, kb):
          + ", ".join(v_high[:VIOLATION_LIST_MAX]) + _more(v_high)))
 
     ss_bad, ss_lo, ss_hi, ss_all = [], (9.99, ""), (-9.99, ""), []
+    ss_pre_ok = []
+    # PRE-FAULT LEVEL: the average before the fault, ending 0.3 s before the
+    # first clearing (a 16-cycle P4 is 0.27 s) and never after the fault start
+    _t_pre_end = min(float(PRE_FAULT_S), float(tclear) - 0.3) if kind != "flat" else -1.0
+    _i_pre = [i for i, x in enumerate(t) if 0.1 <= float(x) <= _t_pre_end]
+
+    def _ss_out(ssv, v):
+        """Outside the band AND not back at its own pre-fault level."""
+        if V_SS_LOW <= ssv <= V_SS_HIGH:
+            return False
+        if SS_PRE_RETURN_PU and _i_pre:
+            _pre = sum(v[i] for i in _i_pre) / len(_i_pre)
+            if abs(ssv - _pre) <= SS_PRE_RETURN_PU:
+                return None                  # back at its pre-contingency level
+        return True
     for ti, v in volts:
         ssv = sum(v[i_ss:]) / max(1, len(v[i_ss:]))
         # The measurement row for this bus, built here because this is the loop
@@ -24247,8 +24322,11 @@ def evaluate_case(path, kind, tclear, kb):
                 _flags.append("OVERSHOOT")
             elif _why and _mx > V_OVERSHOOT_PU:
                 _flags.append("OVERSHOOT-EXEMPT")
-            if not (V_SS_LOW <= ssv <= V_SS_HIGH):
+            _so = _ss_out(ssv, v)
+            if _so:
                 _flags.append("STEADY-STATE")
+            elif _so is None:
+                _flags.append("STEADY-STATE-AT-PRE-FAULT-LEVEL")
             _b = _chan_bus(ti)
             # HOW LONG IT WAS OVER, for every bus that was -- zero for the
             # rest, so the column is a number in every row and sorts.
@@ -24269,9 +24347,12 @@ def evaluate_case(path, kind, tclear, kb):
             pass
         if ssv < ss_lo[0]: ss_lo = (ssv, chan_label(ti))
         if ssv > ss_hi[0]: ss_hi = (ssv, chan_label(ti))
-        if not (V_SS_LOW <= ssv <= V_SS_HIGH):
+        _so = _ss_out(ssv, v)
+        if _so:
             ss_bad.append("%s=%.3f" % (chan_label(ti), ssv))
             ss_all.append((chan_label(ti), ssv))
+        elif _so is None:
+            ss_pre_ok.append("%s=%.3f" % (chan_label(ti), ssv))
     ss_all.sort(key=lambda r: r[1])
     if "ss" in _nojudge:
         ss_bad, ss_all = [], []
@@ -24282,6 +24363,13 @@ def evaluate_case(path, kind, tclear, kb):
          % (SS_WINDOW_S, len(volts), ss_lo[0], ss_lo[1], ss_hi[0], ss_hi[1]))
         if not ss_bad else
         ("%d bus(es) outside: " % len(ss_bad)) + ", ".join(ss_bad[:VIOLATION_LIST_MAX]) + _more(ss_bad))
+    if ss_pre_ok and "ss" not in _nojudge:
+        add("Back at the pre-fault level (SPP steady-state allowance)", None,
+            "%d bus(es) end outside %.2f-%.2f pu within %.3f pu of their own pre-fault "
+            "level -- SPP: 'return to the pre-contingency level or remain within "
+            "0.9-1.1 pu', so NOT a violation: %s"
+            % (len(ss_pre_ok), V_SS_LOW, V_SS_HIGH, SS_PRE_RETURN_PU,
+               ", ".join(ss_pre_ok[:VIOLATION_LIST_MAX]) + _more(ss_pre_ok)))
 
     # GENERATOR TRIPPING. A machine counts as tripped if it was carrying load
     # before the fault and is delivering essentially nothing at the end.
@@ -27621,6 +27709,38 @@ def _noelem_fail_reasons(rows, case):
     return out
 
 
+# WORDS FOR WHAT HAS NO NUMBER, so no cell of 02_VIOLATIONS.csv is blank. The
+# comparison (z6_main read_violations) reads these words back as "unknown".
+VIO_UNKNOWN = ("not in case", "no path", "no name", "not on record")
+
+
+def _vio_csv_fill(row):
+    """One 02_VIOLATIONS.csv row (13 columns) with every empty cell stated."""
+    row = list(row) + [""] * (13 - len(row))
+    kind = row[2]
+    if row[6] in ("", None):                          # time_s
+        row[6] = {"steady": "avg last %.1f s" % SS_WINDOW_S,
+                  "undamped": "whole post-fault swing",
+                  "review": "whole post-fault swing",
+                  "tripped": "by end of run"}.get(kind, "n/a")
+    if row[7] in ("", None):
+        row[7] = "not in case"                        # area
+    if row[8] in ("", None):
+        row[8] = "no name"                            # area_name
+    if row[9] in ("", None):
+        row[9] = "no path"                            # hops_from_fault
+    if row[10] in ("", None):
+        row[10] = "not on record"                     # fault_bus
+    if row[11] in ("", None):                         # note
+        row[11] = {"recovery": "below %.2f pu %.1f s after clearing" % (V_RECOVERY_PU, V_RECOVERY_S),
+                   "steady": "average of the last %.1f s outside %.2f-%.2f pu"
+                             % (SS_WINDOW_S, V_SS_LOW, V_SS_HIGH),
+                   "overshoot": "above the limit after clearing"}.get(kind, kind)
+    if row[12] in ("", None):                         # above_limit_s
+        row[12] = "n/a (overshoot only)" if kind != "overshoot" else "not recorded"
+    return row
+
+
 def write_violations_report(cases, verdicts, crit_rows=None):
     """SPP_VIOLATIONS.txt / .csv -- EVERY non-compliant bus and machine, per
        fault, with the measured value and the time it occurred.
@@ -28059,14 +28179,15 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                                    _where_text(lbl, _fbus)))
                         _ar, _nm = _bus_area(_elem_bus(lbl))
                         _hh = _hops_to_fault(_elem_bus(lbl), _fbus)
-                        rows.append([case, verdicts.get(case, "?"), kind, lbl,
+                        rows.append(_vio_csv_fill([case, verdicts.get(case, "?"), kind, lbl,
                                      "%.1f" % dev, "deg", "",
                                      "" if _ar is None else _ar,
                                      _nm, "" if _hh is None else _hh,
                                      "" if not _fbus else _fbus,
                                      "SPPR1=%s SPPR5=%s"
                                      % (("%.3f" % r1) if r1 is not None else "n/a",
-                                        ("%.3f" % r5) if r5 is not None else "n/a")])
+                                        ("%.3f" % r5) if r5 is not None else "n/a"),
+                                     ""]))
                     else:
                         _w = _where_text(it[0], _fbus)
                         # THE OVERSHOOT RECORD CARRIES A FOURTH FIELD -- how
@@ -28100,12 +28221,12 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                             note = "above limit for %s" % _dur_text(_dur)
                         _ar, _nm = _bus_area(_elem_bus(it[0]))
                         _hh = _hops_to_fault(_elem_bus(it[0]), _fbus)
-                        rows.append([case, verdicts.get(case, "?"), kind, it[0],
+                        rows.append(_vio_csv_fill([case, verdicts.get(case, "?"), kind, it[0],
                                      "%.3f" % val, unit, tm,
                                      "" if _ar is None else _ar,
                                      _nm, "" if _hh is None else _hh,
                                      "" if not _fbus else _fbus, note,
-                                     ("%.4f" % _dur) if _dur is not None else ""])
+                                     ("%.4f" % _dur) if _dur is not None else ""]))
         f.write("\n" + "=" * 92 + "\n")
         f.write("%d of %d scored fault(s) had at least one non-compliant element; "
                 "%d element record(s) in total.\n" % (n_faults_with, len(cases), len(rows)))
