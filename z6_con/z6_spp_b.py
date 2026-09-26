@@ -1597,6 +1597,9 @@ def _apply_only_events():
 # own list; slicing that list again by worker index keeps only the overlap,
 # which is about a third of it.
 ONLY_PRESLICED = (os.environ.get("SPP_ONLY_PRESLICED") or "").strip() in ("1", "true", "yes", "on")
+# .SAV ONLY (SAV_FIRST in z6_main.py): build the case up to the solved power
+# flow the run converts, save it, and stop -- so it can be checked first.
+SAV_ONLY = (os.environ.get("SPP_SAV_ONLY") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _only_mode():
@@ -6750,7 +6753,7 @@ def add_channels():
                 _extra = [2, 3, 4] if _g3.get(bus, (None, False))[1] else []
                 for code in codes + [c for c in _extra if c not in codes]:
                     rc = psspy.machine_array_channel([-1, code, bus], mid,
-                                                     "GEN%d_%s" % (bus, _CODE_SUFFIX[code]))
+                                                     "GEN%s_%s" % (_mach_tag(bus, mid), _CODE_SUFFIX[code]))
                     if (rc[0] if isinstance(rc, (list, tuple)) else rc) in (0, None):
                         n += 1
             na = 0
@@ -6786,7 +6789,7 @@ def add_channels():
                     for _ac in _acodes:
                         rc = psspy.machine_array_channel(
                             [-1, _ac, bus], mid,
-                            "AGEN%d_%s" % (bus, _CODE_SUFFIX[_ac]))
+                            "AGEN%s_%s" % (_mach_tag(bus, mid), _CODE_SUFFIX[_ac]))
                         if (rc[0] if isinstance(rc, (list, tuple)) else rc) in (0, None):
                             na += 1
                 _group3_write(_g3, gens, agens)
@@ -6899,7 +6902,7 @@ def add_channels():
                 for _ix, _mx in enumerate(_idsx.get(_bx) or []):
                     if (_bx, _mx) in _own:
                         continue           # already channelled as PROJ*
-                    _tagx = "XGEN%d%s" % (_bx, "" if _ix == 0 else ("_" + str(_mx)))
+                    _tagx = "XGEN%s" % _mach_tag(_bx, _mx)
                     for _code, _sfx in _PROJ_CODES:
                         rc = psspy.machine_array_channel(
                             [-1, _code, _bx], _mx, "%s_%s" % (_tagx, _sfx))
@@ -6938,7 +6941,7 @@ def add_channels():
         print("  detected %d synchronous gen(s) within %d nodes of bus %d (kV>=%.0f)"
               % (len(_DETECTED_SYNC), SYNC_RADIUS_HOPS, SYNC_CENTER_BUS, SYNC_KV_MIN))
         for bus, mid in _DETECTED_SYNC:
-            tag = "SYNC%d" % bus
+            tag = "SYNC%s" % _mach_tag(bus, mid)
             chk(psspy.machine_array_channel([-1, 1, bus], mid, "%s_ANGL" % tag),  "%s ANGL"  % tag)
             chk(psspy.machine_array_channel([-1, 2, bus], mid, "%s_PELEC" % tag), "%s PELEC" % tag)
             chk(psspy.machine_array_channel([-1, 3, bus], mid, "%s_QELEC" % tag), "%s QELEC" % tag)
@@ -12547,6 +12550,14 @@ def _apply_collector_impedance():
     _collector_record(rows, changed, skipped)
 
 
+def _sav_only_path():
+    """Where SAV_ONLY saves: the modified case when this run adds a plant,
+       otherwise <deck>_<project>_BASE_solved.sav -- never the deck itself."""
+    if ENABLE_BESS:
+        return MOD_SAV
+    return os.path.join(STUDY_DIR, "%s_%s_BASE_solved.sav" % (CASE_TAG, ACTIVE_PROJECT or "case"))
+
+
 def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
     global _SF_ALL_BRANCHES, _SF_ALL_XFMR, _POI_TIES
     """Build .cnv + .snp following RUN1C1.IDV (Run1-create-snap) EXACTLY:
@@ -12689,6 +12700,13 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # harder to attribute. This one judges the ordinary solved case, which
         # is the one the collector change and the BESS dispatch actually alter.
         _solve_to_mismatch(tag="post-solve")
+        # .SAV ONLY: the solved case, saved under its own name (the deck is
+        # never written over), and nothing after it.
+        if SAV_ONLY and tag == "BUILD":
+            if not ENABLE_BESS:
+                chk(psspy.save(_sav_only_path()), "save solved .sav (%s)"
+                    % os.path.basename(_sav_only_path()))
+            return "sav_only"
         # 4) GNET
         _apply_deck(GNET_IDV, required=True)
         # 5) CONL + save .cnl
@@ -16147,6 +16165,31 @@ def _chan_bus(title):
         return ""
 
 
+def _mach_tag(bus, mid):
+    """<bus> for machine id '1', <bus>_<ID> for any other -- so two units on
+       one bus get two channel names (GEN542963_ANGL, GEN542963_2_ANGL), and
+       every reader still finds the bus as the first run of digits."""
+    m = re.sub(r"[^A-Za-z0-9]", "", str(mid or "").strip()).upper()[:2]
+    return ("%d" % int(bus)) if m in ("", "1") else ("%d_%s" % (int(bus), m))
+
+
+def _chan_unit(title):
+    """The machine id a machine channel's title carries ('' for id 1, or for a
+       channel that is not a machine's) -- see _mach_tag()."""
+    try:
+        core = re.sub(r"^[^A-Za-z]+", "", chan_core(title)).upper()
+        m = re.match(r"[A-Z]*\d{4,}_([A-Z0-9]{1,2})_[A-Z]", core)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def _chan_unit_key(title):
+    """(bus, unit) of a machine channel, None when it has no bus."""
+    b = _chan_bus(title)
+    return (int(b), _chan_unit(title)) if b != "" else None
+
+
 def _chan_area(title):
     """(area number, area name) for a channel's bus, or ("", "") if unknown."""
     b = _chan_bus(title)
@@ -16178,6 +16221,9 @@ def chan_label(title):
         # never be mislabelled by a PROJECT_GENS that changed after the run.
         _n = re.match(r"NPGEN(\d+)", core)
         return ("NEW %s" % _n.group(1)) if _n else "NEW PLANT"
+    _unit = _chan_unit(title)
+    if bus and _unit:
+        bus = "%s-%s" % (bus, _unit)       # the second unit on a bus is its own machine
     if re.match(r"SYNC\d", core):       return ("SYNC %s" % bus).strip()
     if re.match(r"POI(?![A-Z])", core): return ("POI %s" % (bus or POI_BUS)).strip()  # "POI V", not "POINT..."
     return bus or raw[:14]
@@ -18654,10 +18700,10 @@ def _existing_machine_series(ch, want):
             continue
         b = _chan_bus(t)
         if b != "" and int(b) in _pbuses and not _is_new_plant_bus(int(b)):
-            other.setdefault(int(b), v)
+            other.setdefault((int(b), _chan_unit(t)), v)
     covered = set(b for (b, _m) in proj_series)
     out = [(b, v) for (b, _m), v in sorted(proj_series.items())]
-    for b, v in sorted(other.items()):
+    for (b, _u), v in sorted(other.items()):
         if b not in covered:
             out.append((b, v))
     return out
@@ -18918,9 +18964,9 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
             _tail = [x for x in _v2[-_nst:] if x == x and x not in (_INF, -_INF)]
             if (_v2 and float(_v2[0]) >= TRIP_ETERM_PREFAULT_PU and _tail
                     and sum(_tail) / float(len(_tail)) < TRIP_ETERM_DEAD_PU):
-                _b2 = _chan_bus(_t2)
-                if _b2 != "":
-                    _trip_buses.add(int(_b2))
+                _k2 = _chan_unit_key(_t2)
+                if _k2:
+                    _trip_buses.add(_k2)
         except Exception:
             pass
     # ...AND THE MACHINES THE REPORT CALLS TRIPPED ON POWER. evaluate_case has
@@ -18945,15 +18991,15 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
             _p0, _p1 = abs(float(_v2[0])), abs(float(_v2[-1]))
             if (_p0 > TRIP_PGEN_MIN_MW and _p1 < TRIP_PGEN_DEAD_MW
                     and _p1 < TRIP_RESIDUAL_FRAC * _p0):
-                _b2 = _chan_bus(_t2)
-                if _b2 != "":
-                    _trip_buses.add(int(_b2))
+                _k2 = _chan_unit_key(_t2)
+                if _k2:
+                    _trip_buses.add(_k2)
         except Exception:
             pass
     if _trip_buses:
         print("  [plot] %d machine(s) tripped -- their P/Q/Eterm/angle panels are "
               "drawn whatever the filters say: %s"
-              % (len(_trip_buses), ", ".join(str(b) for b in sorted(_trip_buses))))
+              % (len(_trip_buses), ", ".join(("%d-%s" % b) if b[1] else str(b[0]) for b in sorted(_trip_buses))))
 
     # keep the ORIGINAL title too, so we can filter/prioritise individual panels
     _n_compact_drop = [0]
@@ -18967,7 +19013,7 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
         _trip = False
         try:
             _tb = _chan_bus(title)
-            _trip = (_tb != "" and int(_tb) in _trip_buses
+            _trip = (_tb != "" and _chan_unit_key(title) in _trip_buses
                      and c in ("ANGLE", "ETERM", "PELEC", "QELEC", "SPEED"))
         except Exception:
             _trip = False
@@ -19023,9 +19069,9 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
             _nst = max(3, len(_v) // 20)
             if (float(_v[0]) >= TRIP_ETERM_PREFAULT_PU
                     and sum(_v[-_nst:]) / float(_nst) < TRIP_ETERM_DEAD_PU):
-                _mb = re.search(r"\d{3,}", chan_core(_t))
-                if _mb:
-                    _dead_buses.add(int(_mb.group(0)))
+                _k3 = _chan_unit_key(_t)
+                if _k3:
+                    _dead_buses.add(_k3)
         except Exception:
             pass
     order = [c for c in WANT if c in grouped]
@@ -19200,7 +19246,7 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                 _mb = re.search(r"\d{3,}", chan_core(title))
                 # a MACHINE's panels only: not the POI power / tie panels and
                 # not a bus voltage angle, which share the bus number
-                if (_mb and int(_mb.group(0)) in _dead_buses
+                if (_mb and _chan_unit_key(title) in _dead_buses
                         and c in ("ANGLE", "ETERM", "PELEC", "QELEC", "SPEED")
                         and _panel_tier(title) != -1
                         and not (c == "ANGLE" and not _is_machine_angle(title))):
@@ -21160,8 +21206,20 @@ def evaluate_case(path, kind, tclear, kb):
         def _bus_of(_s):
             _mb = re.search(r"\d{3,}", _s.split("(")[0])
             return int(_mb.group(0)) if _mb else None
-        _ev_out = [x for x in trips if _bus_of(x) in _evd]
-        trips = [x for x in trips if _bus_of(x) not in _evd]
+        _evu = _event_dropped_units(case)
+
+        def _dropped(_s):
+            # THE UNIT, NOT THE BUS: the event dropping unit 2 of a bus does not
+            # excuse unit 1 of the same bus tripping.
+            _mm = re.search(r"(\d{3,})(?:-([A-Z0-9]{1,2}))?\s*$", _s.split("(")[0].strip())
+            if not _mm:
+                return False
+            _b, _u = int(_mm.group(1)), (_mm.group(2) or "")
+            if _evu:
+                return (_b, _u) in _evu or (_b, "*") in _evu
+            return _b in _evd
+        _ev_out = [x for x in trips if _dropped(x)]
+        trips = [x for x in trips if not _dropped(x)]
         _ev_p = [x for x in proj_trips if _isl or _bus_of(x) in _evd]
         proj_trips = [x for x in proj_trips if x not in _ev_p]
         _ev_out += _ev_p
@@ -25225,7 +25283,7 @@ def _is_done(scen_id, out_path):
     return True
 
 
-_FAULT_CYCLES_CACHE = {"loaded": False, "map": {}, "rc": {}, "drop": {}}
+_FAULT_CYCLES_CACHE = {"loaded": False, "map": {}, "rc": {}, "drop": {}, "drop_u": {}}
 
 
 def _tclear_from_faultlist(scen_id):
@@ -25304,6 +25362,10 @@ def _tclear_from_faultlist(scen_id):
                             _mb = re.match(r"\s*(\d+)", _x)
                             if _mb:
                                 _dm.add(int(_mb.group(1)))
+                                _mu = re.match(r"\s*\d+\s*-\s*(\S+)", _x)
+                                _FAULT_CYCLES_CACHE["drop_u"].setdefault(_fid, set()).add(
+                                    (int(_mb.group(1)),
+                                     _mach_tag(0, _mu.group(1)).partition("_")[2] if _mu else "*"))
                         if _dm:
                             _FAULT_CYCLES_CACHE["drop"][_fid] = _dm
                         # UNSUCCESSFUL RECLOSE: the fault is cleared a SECOND
@@ -25346,6 +25408,18 @@ def _final_clear_extra(scen_id):
         return float(_m[_s])
     _h = re.split(r"[_\s]", _s)[0]
     return float(_m.get(_h, 0.0))
+
+
+def _event_dropped_units(scen_id):
+    """{(bus, unit)} the fault EVENT removes on purpose -- unit '' for id 1, '*'
+       when the fault list names the bus without an id (every unit on it)."""
+    try:
+        _tclear_from_faultlist(scen_id)
+    except Exception:
+        pass
+    _s = str(scen_id).strip().upper()
+    _m = _FAULT_CYCLES_CACHE.get("drop_u") or {}
+    return _m.get(_s) or _m.get(re.split(r"[_\s]", _s)[0]) or set()
 
 
 def _event_dropped_buses(scen_id):
@@ -31471,6 +31545,27 @@ def main():
             sys.exit(1)
         print("[faults-only] %d fault(s) -> %s" % (len(_fl), _dst))
         print("[%s] RUN COMPLETE (faults only) -- took %s"
+              % (_ts(), _fmt_hms(time.time() - _t0)))
+        return
+
+    # ---- BUILD THE SOLVED .SAV AND STOP (SAV_FIRST in z6_main.py) ----------
+    if SAV_ONLY:
+        print("")
+        print("[sav-only] building the solved power-flow case for THIS run and exiting.")
+        print("[sav-only] no .cnv/.snp, no initialisation, no dynamics.")
+        _t_sav = time.time()
+        try:
+            build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD")
+        except Exception as _e:
+            print("[sav-only] *** build failed: %s ***" % _e)
+            traceback.print_exc()
+            sys.exit(1)
+        _sp = _sav_only_path()
+        if not os.path.isfile(_sp) or os.path.getmtime(_sp) < _t_sav - 1:
+            print("[sav-only] *** no .sav was written (%s) ***" % _sp)
+            sys.exit(1)
+        print("[sav-only] SAV: %s" % _sp)
+        print("[%s] RUN COMPLETE (sav only) -- took %s"
               % (_ts(), _fmt_hms(time.time() - _t0)))
         return
 

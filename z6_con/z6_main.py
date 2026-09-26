@@ -218,9 +218,10 @@ MERGE_ONLY = False                           # True = only rebuild the reports f
 COMPARE_REQUIRE_COMPLETE = False             # True = no comparison if a project did not finish
 RUN_STUDIES = False                          # old setting -- PIPELINE wins
 RUN_MISSING = False                          # old setting -- same as PIPELINE = "missing"
-SAV_FIRST = True                             # True = build every .sav first (base, project, each SURPLUS scenario)
+SAV_FIRST = True                             # True = build every .sav first: base, GIA, each SURPLUS scenario, all projects
 SAV_FIRST_STOP = True                        # True = stop after them to check | False = go straight on to the runs
 SAV_FIRST_WORKERS = 6                        # .sav builds at once (one PSS/E each)
+SURPLUS_SIDE_BY_SIDE = True                  # True = one workbook per project: BASE | GIA | each SURPLUS scenario
 
 # ---- 2. WORKERS, CORES AND SIMULATION TIME -------------------------------------
 RUN_IN_PARALLEL = True                       # True = base and project at once
@@ -9295,6 +9296,51 @@ def run_surplus_scenarios(proj, mode):
                   "scored" % (sc["tag"], rc))
 
 
+def compare_three_way(proj, mode):
+    """Base | GIA | each SURPLUS scenario for one project, in ONE side-by-side
+       workbook (z6_cmp_multi.py, run for this project's folders only): every
+       fault with each run's verdict, worst criterion, values and POI power.
+       Written to <root>\\comparison_pairs\\<project>\\."""
+    cm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "z6_cmp_multi.py")
+    if not os.path.isfile(cm):
+        print("[3-way] z6_cmp_multi.py is not beside %s -- no side-by-side"
+              % os.path.basename(__file__))
+        return False
+    rb = results_dir(CASE_BASE, proj, mode)
+    rt = results_dir(CASE_TEST, proj, mode)
+    tests = [(rt, "GIA")] + [(rt + "_" + sc["tag"], sc["tag"]) for sc in surplus_scenarios()]
+    if not os.path.isdir(rb):
+        print("[3-way] %s: no base folder (%s) -- no side-by-side" % (proj, rb))
+        return False
+    tests = [(d, t) for d, t in tests if os.path.isdir(d)]
+    if len(tests) < 2:
+        print("[3-way] %s: fewer than two project runs on disk -- the base comparison "
+              "above is the whole story" % proj)
+        return False
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="z6_3way_")
+    pj, dj = os.path.join(tmp, "pairs.json"), os.path.join(tmp, "done.json")
+    with open(pj, "w") as fh:
+        json.dump([[rb, d, re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_%s_vs_BASE" % (proj, t))]
+                   for d, t in tests], fh)
+    env = dict(os.environ)
+    env["CMP_MULTI_PAIRS"] = pj
+    env["CMP_MULTI_DONE"] = dj
+    env["CMP_MULTI_FULL"] = "1"          # every value read, none left '-'
+    _banner("%s: BASE | %s -- SIDE BY SIDE" % (proj, " | ".join(t for _d, t in tests)))
+    p = subprocess.Popen([PYTHON, "-u", cm], cwd=os.path.dirname(cm), env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         universal_newlines=True, bufsize=1)
+    th = threading.Thread(target=_pump, args=("[3-way]", p))
+    th.daemon = True
+    th.start()
+    rc = p.wait()
+    th.join(timeout=5)
+    if rc not in (0, None):
+        print("[3-way] *** %s: z6_cmp_multi ended rc=%s ***" % (proj, rc))
+    return rc in (0, None)
+
+
 def compare_surplus_scenarios(proj, mode):
     """One full comparison per surplus scenario, each in its own folder."""
     for sc in surplus_scenarios():
@@ -15019,13 +15065,18 @@ def make_shared_fault_list(case, dest, proj=None):
 
 
 def _sav_runs():
-    """[(project, tag or '', label, extra env)] -- every project-case run whose
-       .sav SAV_FIRST builds: the main (GIA) run and each SURPLUS scenario."""
+    """[(case, project, tag or '', label, extra env)] -- every run whose .sav
+       SAV_FIRST builds: the base, the project's main (GIA) run and each SURPLUS
+       scenario, for every project -- limited to the cases RUN_CASES runs."""
     out = []
+    cases = _cases_to_run()
     for proj in (_panel_projects() or compare_projects()):
-        out.append((proj, "", "GIA (SGF + EGF)", {}))
-        for sc in surplus_scenarios():
-            out.append((proj, sc["tag"], sc["label"], _surplus_env(sc)))
+        if any(c is CASE_BASE for c in cases):
+            out.append((CASE_BASE, proj, "", "BASE", {}))
+        if any(c is CASE_TEST for c in cases):
+            out.append((CASE_TEST, proj, "", "GIA (SGF + EGF)", {}))
+            for sc in surplus_scenarios():
+                out.append((CASE_TEST, proj, sc["tag"], sc["label"], _surplus_env(sc)))
     return out
 
 
@@ -15034,8 +15085,8 @@ _SAV_KEEP = re.compile(r"\[sav-only\] SAV:|VERIFY |EGF OFF|CURTAILED|REFUSED|NOT
 
 
 def build_all_savs():
-    """SAV_FIRST: build the modified .sav of every project run -- GIA and each
-       SURPLUS scenario, every project -- before anything is simulated.
+    """SAV_FIRST: build the .sav of every run -- base, GIA and each SURPLUS
+       scenario, every project -- before anything is simulated.
 
        Each build is the study script's own build (the same settings the runs
        get) stopped straight after the .sav is saved. Logs go to
@@ -15045,10 +15096,13 @@ def build_all_savs():
     if not runs:
         print("[sav] no project runs to build")
         return True
-    sp = os.path.join(CASE_TEST["dir"], CASE_TEST["script"])
-    if not os.path.isfile(sp):
-        print("[sav] *** %s not found ***" % sp)
-        return False
+    for _case in (CASE_BASE, CASE_TEST):
+        if not any(r[0] is _case for r in runs):
+            continue
+        _sp = os.path.join(_case["dir"], _case["script"])
+        if not os.path.isfile(_sp):
+            print("[sav] *** %s not found ***" % _sp)
+            return False
     logdir = os.path.join(STUDY_ROOT, "sav_check")
     if not os.path.isdir(logdir):
         os.makedirs(logdir)
@@ -15058,15 +15112,16 @@ def build_all_savs():
     lock = threading.Lock()
     todo = list(runs)
 
-    def _one(proj, tag, label, extra):
+    def _one(case, proj, tag, label, extra):
+        sp = os.path.join(case["dir"], case["script"])
         env = dict(os.environ)
         _push_records(env)
-        _push_settings(env, CASE_TEST)
+        _push_settings(env, case)
         env.pop("SPP_EGF_DYR_EDITS", None)
         env.pop("SPP_EGF_OFF", None)
         env.pop("SPP_RUN_TAG", None)
         env.update(extra)
-        env["SPP_STUDY_DIR"] = CASE_TEST["dir"]
+        env["SPP_STUDY_DIR"] = case["dir"]
         env["SPP_PROJECT"] = proj
         env["SPP_FAULT_MODE"] = MODES[0]
         env["SPP_ROLE"] = "build"
@@ -15074,11 +15129,11 @@ def build_all_savs():
         env["SPP_WORKER"] = "0"
         env["SPP_FRESH_START"] = "0"
         env["SPP_SAV_ONLY"] = "1"
-        name = proj + (("_" + tag) if tag else "")
+        name = "%s_%s%s" % (proj, "base" if case is CASE_BASE else "proj", ("_" + tag) if tag else "")
         log = os.path.join(logdir, name + ".log")
         t0 = time.time()
         with open(log, "w") as fh:
-            rc = subprocess.call([PYTHON, "-u", sp], cwd=CASE_TEST["dir"], env=env,
+            rc = subprocess.call([PYTHON, "-u", sp], cwd=case["dir"], env=env,
                                  stdout=fh, stderr=subprocess.STDOUT)
         keep, sav = [], None
         try:
@@ -15092,9 +15147,10 @@ def build_all_savs():
             pass
         ok = rc == 0 and bool(sav) and os.path.isfile(sav) and os.path.getmtime(sav) >= t0 - 1
         with lock:
-            res[(proj, tag)] = (ok, rc, sav, log, label, keep)
-            print("[sav] %-4s %-15s %-12s %s" % ("OK" if ok else "FAIL", proj, tag or "GIA",
-                                                sav if ok else "rc=%s -- see %s" % (rc, log)))
+            res[(case["key"], proj, tag)] = (ok, rc, sav, log, label, keep)
+            print("[sav] %-4s %-15s %-4s %-12s %s"
+                  % ("OK" if ok else "FAIL", proj, case["key"], tag or label.split()[0],
+                     sav if ok else "rc=%s -- see %s" % (rc, log)))
 
     def _worker():
         while True:
@@ -15106,8 +15162,8 @@ def build_all_savs():
                 _one(*r)
             except Exception as e:
                 with lock:
-                    res[(r[0], r[1])] = (False, "error", None, "", r[2], [str(e)])
-                    print("[sav] FAIL %s %s: %s" % (r[0], r[1] or "GIA", e))
+                    res[(r[0]["key"], r[1], r[2])] = (False, "error", None, "", r[3], [str(e)])
+                    print("[sav] FAIL %s %s %s: %s" % (r[1], r[0]["key"], r[2] or r[3], e))
 
     ths = [threading.Thread(target=_worker)
            for _ in range(max(1, min(int(SAV_FIRST_WORKERS or 1), len(runs))))]
@@ -15121,9 +15177,11 @@ def build_all_savs():
     rep = os.path.join(logdir, "SAV_CHECK.txt")
     with open(rep, "w") as fh:
         fh.write("SAV CHECK  %s\n\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
-        for proj, tag, label, _e in runs:
-            ok, rc, sav, log, label, keep = res.get((proj, tag), (False, "?", None, "", label, []))
-            fh.write("=== %s  %s  (%s)  %s\n" % (proj, tag or "GIA", label, "OK" if ok else "FAIL rc=%s" % rc))
+        for case, proj, tag, label, _e in runs:
+            ok, rc, sav, log, label, keep = res.get((case["key"], proj, tag),
+                                                    (False, "?", None, "", label, []))
+            fh.write("=== %s  %s %s  (%s)  %s\n" % (proj, case["key"], tag, label,
+                                                   "OK" if ok else "FAIL rc=%s" % rc))
             fh.write("    sav : %s\n    log : %s\n" % (sav or "-", log))
             for ln in keep[-40:]:
                 fh.write("    | %s\n" % ln.strip()[:200])
@@ -22396,8 +22454,8 @@ def main():
             print("[compare]     no results at all on one side, which is much harder to")
             print("[compare]     see afterwards than it is to fix now.")
             return 2
-        # EVERY .sav FIRST (SAV_FIRST): GIA and each SURPLUS scenario, every project.
-        if SAV_FIRST and any(c is CASE_TEST for c in _cases_to_run()):
+        # EVERY .sav FIRST (SAV_FIRST): base, GIA and each SURPLUS scenario, every project.
+        if SAV_FIRST:
             if not build_all_savs():
                 print("[compare] *** stopping: a .sav build failed -- see sav_check\\SAV_CHECK.txt ***")
                 return 2
@@ -23112,6 +23170,13 @@ def main():
                 compare_surplus_scenarios(res["project"], res["mode"])
             except Exception as e:
                 print("[surplus] the scenario comparisons failed (%s)" % e)
+    # BASE | GIA | EACH SURPLUS SCENARIO, side by side, one workbook per project.
+    if results and SURPLUS_SCENARIOS and SURPLUS_SIDE_BY_SIDE:
+        for res in results:
+            try:
+                compare_three_way(res["project"], res["mode"])
+            except Exception as e:
+                print("[3-way] the side-by-side for %s failed (%s)" % (res["project"], e))
 
     # ---- THE EXISTING MACHINES AT THE FEEDERS, edited or off ---------------
     # Both cases again, into their own _egf / _egfoff folders; then every pair

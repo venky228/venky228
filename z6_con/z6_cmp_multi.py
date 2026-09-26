@@ -91,6 +91,12 @@ FAST_COMPARE = True      # True = quick: no re-merge from parts\, no measurement
 FAST_PARALLEL = 4        # FAST_COMPARE: projects compared at once, each in its own process (1 = one at a time)
 # ============================================================================
 
+import os as _os_env
+# THE PANEL'S OWN SIDE-BY-SIDE (compare_three_way in z6_main.py) asks for the
+# full comparison -- every measured value read -- whatever FAST_COMPARE says.
+if (_os_env.environ.get("CMP_MULTI_FULL") or "").strip() == "1":
+    FAST_COMPARE = False
+
 
 def _here():
     try:
