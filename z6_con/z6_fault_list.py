@@ -98,8 +98,8 @@ KEEP_OLD_IDS = False                         # False = F01.. numbered outward fr
 # GEN-2026-SR1/SR11 count). P1 <= 3 / P4 <= 1 with the P4 limits and the
 # impact screen below: ~70-180 events per project (~90-270 without the
 # screen); P1 <= 2 ~55-150. Each level more roughly doubles the list.
-SPP_LEVELS_BY_EVENT = {"P1": 3, "P4": 1, "P6": 1}     # events from the DISIS sheet
-CASE_LEVELS_BY_EVENT = {"P1": 3, "P4": 1, "P6": 1}    # events built from the power-flow case
+SPP_LEVELS_BY_EVENT = {"P1": 4, "P4": 2, "P6": 1}     # events from the DISIS sheet
+CASE_LEVELS_BY_EVENT = {"P1": 4, "P4": 2, "P6": 1}    # events built from the power-flow case
 KV_MIN = 100.0                               # network circuits at / above this kV
 SUBT_KV_MIN = 69                             # also P1 on lines down to this kV (None = off) ...
 SUBT_P1_LEVEL = 1                            # ... faulted at a bus within this level (SPP 115 kV POI reports)
