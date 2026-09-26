@@ -20671,11 +20671,14 @@ def _gt_write_all(projs):
                 continue
             x, bx = _gt_score(m, fs), _gt_score(b["m"], fs)
             lab = _gt_label(g)
-            L.append("  %-18s %-52s %6s %6d->%-6d %7.3f->%-7.3f %5d->%-6d %4d->%-4d" % (
+            # NO BUS VOLTAGE READ (the study's transient-voltage row not judged
+            # or missing): '-', never 0.000, and never a candidate for BEST
+            _pk = lambda v: "%.3f" % v if v else "-"
+            L.append("  %-18s %-52s %6s %6d->%-6d %7s->%-7s %5d->%-6d %4d->%-4d" % (
                 r["sc"][0], lab[:52], "%d/%d" % (len(fs), len(faults)), bx[2], x[2],
-                bx[3] or 0.0, x[3] or 0.0, bx[1], x[1], bx[0], x[0]))
+                _pk(bx[3]), _pk(x[3]), bx[1], x[1], bx[0], x[0]))
             rows_csv.append([pj, r["sc"][0], lab, len(fs), len(faults), bx[2], x[2],
-                             "%.3f" % (bx[3] or 0.0), "%.3f" % (x[3] or 0.0), bx[1], x[1],
+                             _pk(bx[3]), _pk(x[3]), bx[1], x[1],
                              bx[0], x[0]])
             _nf = _gt_newfails(m, b["m"], fs, _gt_ign(bl, r, fs))
             _fl = _gt_flags(m, b["m"], fs)
@@ -20684,9 +20687,10 @@ def _gt_write_all(projs):
             if _nf:
                 L.append("  %-18s   -> NOT RECOMMENDED: new FAIL (%s)" % ("", ", ".join(_nf)))
                 continue
-            if g.get("base_off"):
-                # measured against the POI-off run, not against all in service:
-                # listed above, but not a candidate for the project's BEST
+            if g.get("base_off") or not x[3] or not bx[3]:
+                # measured against the POI-off run, not against all in service,
+                # or no bus voltage read: listed above, but not a candidate for
+                # the project's BEST
                 continue
             cand.append((x[0] - bx[0], bx[2] - x[2], (bx[3] or 0.0) - (x[3] or 0.0),
                          len(fs) == len(faults), r["sc"][0], lab, x, bx, fs))
