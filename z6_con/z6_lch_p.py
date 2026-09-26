@@ -2416,16 +2416,22 @@ def _report_tag():
     return "_SELECTED" if (REPORT_FAULTS or ONLY_EVENTS) else ""
 
 
+SHARED_FAULTS_CSV = r"{root}\FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"  # as z6_main.py / z6_fault_list.py
+                                             #   (old: r"{root}\SPP_FAULTS_CON_{project}.csv")
+
+
 def _shared_fault_list_path():
     """This project's shared fault list, beside the case folders. "" if unknown.
 
-       {root}\SPP_FAULTS_CON_{project}.csv -- the DISIS list z4_disis_con.py wrote,
-       same one z6_main.py builds in phase 0."""
+       The path z6_main.py sends as SPP_FAULTS_CSV (its SHARED_FAULTS_CSV), else
+       SHARED_FAULTS_CSV above -- the same file the study engine reads.
+       {root} = the folder the case folders sit in, {project} = this project."""
     try:
         root = os.path.dirname(os.path.normpath(STUDY_DIR))
         if not (root and _CUR_PROJECT):
             return ""
-        return os.path.join(root, "SPP_FAULTS_CON_%s.csv" % _CUR_PROJECT)
+        t = (os.environ.get("SPP_FAULTS_CSV") or SHARED_FAULTS_CSV).strip()
+        return os.path.normpath(t.replace("{root}", root).replace("{project}", _CUR_PROJECT))
     except Exception:
         return ""
 
