@@ -31,6 +31,13 @@ if HERE not in sys.path:
 
 import z6_main as M
 
+if not all(hasattr(M, a) for a in ("_run_group", "_is_proj_box", "tidy_results")):
+    print("")
+    print("[tidy] *** %s is an OLDER z6_main.py -- it does not know the new layout." % M.__file__)
+    print("[tidy]     Replace it (and z6_lch_b/p, z6_spp_b/p, z6_gt_report) with the new")
+    print("[tidy]     versions, then run this again. Nothing was moved. ***")
+    sys.exit(2)
+
 
 def _plan():
     """[(from, to)] for every run folder not yet where the new layout puts it."""
