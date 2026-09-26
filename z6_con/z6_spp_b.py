@@ -1668,6 +1668,15 @@ def _env_bool(name, default):
     return v in ("1", "true", "yes", "on")
 
 
+
+# A monitored bus below this for the whole post-clearing record was isolated by
+# the event's trips (e.g. a P4 opening every branch into a radial pocket) and is
+# listed, not scored, for voltage. 0 = score every bus as before.
+DEAD_BUS_PU = 0.02
+DEAD_BUS_PU = float(_env_num("SPP_DEAD_BUS_PU", DEAD_BUS_PU))
+DEAD_BUS_AFTER_S = 0.5    # start of that window, seconds after clearing
+DEAD_BUS_AFTER_S = float(_env_num("SPP_DEAD_BUS_AFTER_S", DEAD_BUS_AFTER_S))
+
 def _env_list(name, default):
     v = (os.environ.get(name) or "").strip()
     if not v:
@@ -20648,6 +20657,16 @@ def evaluate_case(path, kind, tclear, kb):
         _isl = _build_island_notes().get(str(case).strip().upper())
     except Exception:
         _isl = None
+    try:
+        _isl_part = (None if _isl else
+                     (_ISLAND_NOTES.get("partial") or {}).get(str(case).strip().upper()))
+    except Exception:
+        _isl_part = None
+    if _isl_part:
+        add("*** THIS SCENARIO DISCONNECTS PART OF THE PROJECT ***", None,
+            "%s. Units behind the opened tie(s) read as tripped because the "
+            "event removes them -- check them against this note before "
+            "treating them as a generator-tripping finding." % _isl_part)
     if _isl:
         add("*** THIS SCENARIO DISCONNECTS THE PROJECT FROM THE POI ***", None,
             "%s. The criteria below therefore measure the SYSTEM WITHOUT THE "
@@ -20786,6 +20805,36 @@ def evaluate_case(path, kind, tclear, kb):
         print("  [spp] %d bus voltage channel(s) duplicate a bus already "
               "monitored -- counted once." % (len(volts) - len(_dedup_v)))
     volts = _dedup_v
+
+    # BUSES THE EVENT DE-ENERGISES ARE NOT VOLTAGE VIOLATIONS. A P4 (or any
+    # multi-element) trip that opens every branch into a radial pocket leaves
+    # those buses at 0 pu from clearing to the end of the run. That is the
+    # consequence of the planned outage, not a recovery or steady-state
+    # failure, and scoring it put the same "0.000 pu" rows in every scenario.
+    # A bus counts as de-energised only if it stays below DEAD_BUS_PU from
+    # DEAD_BUS_AFTER_S after clearing to the end of the run -- a connected bus,
+    # even in a collapse, does not hold ~0 for the rest of the record. They are listed (INFO), not hidden.
+    if kind != "flat" and DEAD_BUS_PU > 0:
+        _live_v, _dead_v = [], []
+        _i_dead = idx_after(t, tclear + DEAD_BUS_AFTER_S)
+        _i_dead = i_clr if _i_dead is None else _i_dead
+        for _ti, _v in volts:
+            try:
+                _tail = [abs(float(_x)) for _x in _v[_i_dead:]]
+            except Exception:
+                _tail = []
+            if _tail and max(_tail) < DEAD_BUS_PU:
+                _dead_v.append(chan_label(_ti))
+            else:
+                _live_v.append((_ti, _v))
+        if _dead_v:
+            add("Buses de-energised by the event (not scored)", None,
+                "%d bus(es) below %.2f pu from %.1f s after clearing to the end "
+                "-- isolated by the tripped elements: %s"
+                % (len(_dead_v), DEAD_BUS_PU, DEAD_BUS_AFTER_S, ", ".join(_dead_v)))
+            print("  [spp] %d bus(es) de-energised by the event, not scored "
+                  "for voltage: %s" % (len(_dead_v), ", ".join(_dead_v)))
+            volts = _live_v
 
     # EVERY MEASURED BUS, WHETHER OR NOT IT VIOLATES.
     # One row per bus per scenario: the recovery minimum, the post-clearing
@@ -21217,8 +21266,13 @@ def evaluate_case(path, kind, tclear, kb):
     # the event takes them -- SPP's criterion is about units that trip in
     # RESPONSE. They are listed on their own INFO row, never dropped silently.
     _evd = set() if kind == "flat" else _event_dropped_buses(case)
+    try:
+        _gone_part = set() if (_isl or kind == "flat") else set(
+            (_ISLAND_NOTES.get("gone") or {}).get(str(case).strip().upper()) or ())
+    except Exception:
+        _gone_part = set()
     _ev_out = []
-    if _evd or _isl:
+    if _evd or _isl or _gone_part:
         def _bus_of(_s):
             _mb = re.search(r"\d{3,}", _s.split("(")[0])
             return int(_mb.group(0)) if _mb else None
@@ -21228,6 +21282,29 @@ def evaluate_case(path, kind, tclear, kb):
         # say WHICH unit it is, so it is matched on the bus, as before.
         _ids_named = any(_chan_unit(_t) for _t, _v in (pelecs + eterms))
 
+        # THE PROJECT'S OWN BUSES: when the event disconnects the project from
+        # the POI every project unit goes with it -- in the machine list as
+        # well as the PROJ list, or the same unit is excused on one and failed
+        # on the other.
+        _pbus = set()
+        if _isl:
+            _pbus = set(_bus_of(x) for x in proj_trips) - set([None])
+            try:
+                _pbus |= set(int(_g[0]) for _g in PROJECT_GENS)
+            except Exception:
+                pass
+        # PART OF THE PROJECT: only the side whose ties the event opened.
+        if "existing" in _gone_part:
+            try:
+                _pbus |= set(int(_b) for _b in _existing_plant_buses())
+            except Exception:
+                pass
+        if "new" in _gone_part:
+            try:
+                _pbus |= set(int(_g[0]) for _g in PROJECT_GENS)
+            except Exception:
+                pass
+
         def _dropped(_s):
             # THE UNIT, NOT THE BUS: the event dropping unit 2 of a bus does not
             # excuse unit 1 of the same bus tripping.
@@ -21235,6 +21312,8 @@ def evaluate_case(path, kind, tclear, kb):
             if not _mm:
                 return False
             _b, _u = int(_mm.group(1)), (_mm.group(2) or "")
+            if _b in _pbus:
+                return True
             _lbl = _s.split("(")[0].strip().upper()
             if _evu and _u == "" and (not _ids_named or _lbl.startswith(("NEW", "PROJ"))):
                 return _b in _evd
@@ -21243,7 +21322,7 @@ def evaluate_case(path, kind, tclear, kb):
             return _b in _evd
         _ev_out = [x for x in trips if _dropped(x)]
         trips = [x for x in trips if not _dropped(x)]
-        _ev_p = [x for x in proj_trips if _isl or _bus_of(x) in _evd]
+        _ev_p = [x for x in proj_trips if _isl or _bus_of(x) in _evd or _bus_of(x) in _pbus]
         proj_trips = [x for x in proj_trips if x not in _ev_p]
         _ev_out += _ev_p
         # THE VIOLATIONS LIST MUST AGREE WITH THE VERDICT: units the event takes
@@ -21255,7 +21334,8 @@ def evaluate_case(path, kind, tclear, kb):
         add("Generator tripping: units the EVENT removes (not judged)", None,
             "%d unit(s) go offline because the event takes them (%s): %s"
             % (len(_ev_out), "drop_machines of the fault" if _evd and not _isl else
-               "the event disconnects the project from the POI" if not _evd else
+               "the event disconnects the project from the POI" if (not _evd and _isl) else
+               "the event disconnects part of the project" if not _evd else
                "drop_machines / project disconnected", ", ".join(_ev_out[:VIOLATION_LIST_MAX])
                + _more(_ev_out)))
     # THE RULE IT WAS JUDGED BY, in the row: the gen test reads it back, so a
@@ -24348,6 +24428,15 @@ def _build_island_notes():
             for (a, b, tck) in ties:
                 if tck == ck and set((x, y)) == set((a, b)):
                     hit.add((a, b, ck))
+        if hit and len(hit) < len(ties):
+            _ISLAND_NOTES.setdefault("partial", {})[str(f["id"]).strip().upper()] = (
+                "%s -- opens %d of %d project interconnection tie(s) (%s); "
+                "project units behind %s are disconnected by the event, the "
+                "rest stay connected to POI %s"
+                % (f.get("planning_event") or f.get("type") or "fault",
+                   len(hit), len(ties),
+                   ", ".join("%d-%d ckt %s" % h for h in sorted(hit)),
+                   "it" if len(hit) == 1 else "them", POI_BUS))
         if hit and len(hit) >= len(ties):
             _ISLAND_NOTES["by_case"][str(f["id"]).strip().upper()] = (
                 "%s -- %d of %d interconnection tie(s) opened (%s), so the "

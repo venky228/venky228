@@ -8011,8 +8011,28 @@ def _poi_note(rows):
        never reached, the POI ripple, and P / Q / V still moving at the end.
        '' when there is nothing to say; 'not recorded' when the case was scored
        before these rows existed."""
-    d, seen = {}, False
+    d, seen, ev = {}, False, []
     for crit, _res, det in rows or ():
+        # WHAT THE EVENT ITSELF DISCONNECTS -- said first, because it changes
+        # how everything else on the row is read.
+        if crit.startswith("*** THIS SCENARIO DISCONNECTS THE PROJECT"):
+            ev.insert(0, "PROJECT DISCONNECTED FROM THE POI BY THIS FAULT -- "
+                         "project results are the system without the project")
+        elif crit.startswith("*** THIS SCENARIO DISCONNECTS PART OF THE PROJECT"):
+            _m = re.match(r"(.*?)\. Units behind", det or "")
+            ev.insert(0, "PART OF THE PROJECT DISCONNECTED BY THIS FAULT: %s"
+                         % (_m.group(1) if _m else (det or "")[:200]))
+        elif crit.startswith("Generator tripping: units the EVENT removes"):
+            _m = re.search(r":\s*(.*)$", det or "")
+            _u = _m.group(1) if _m else ""
+            if re.search(r"\b(PROJ|NEW|NPGEN)", _u):
+                ev.append("PROJECT generation disconnected by the event: %s" % _u)
+            elif _u:
+                ev.append("units disconnected by the event: %s" % _u)
+        elif crit.startswith("Buses de-energised by the event"):
+            _m = re.search(r"(\d+) bus\(es\).*?:\s*(.*)$", det or "")
+            ev.append("%s bus(es) de-energised by the event, not scored for voltage%s"
+                      % ((_m.group(1), ": " + _m.group(2)) if _m else ("some", "")))
         if crit.startswith("POI active power recovery"):
             _gt_prec_parse(d, det)
             d["_p_end"] = re.search(r"ends at ([-\d.]+) MW", det)
@@ -8023,8 +8043,10 @@ def _poi_note(rows):
         elif crit.startswith("Settled at the end"):
             _gt_settled_parse(d, det)
     if not seen:
+        if ev:
+            return "; ".join(ev)
         return "not recorded (scored before the power recovery / ripple rows)" if rows else ""
-    out = []
+    out = list(ev)
     if d.get("p_state") == "not held":
         out.append("POI power recovers to %d%% but is NOT HELD%s" % (
             _GT_PREC_PCT, (" (ends %s MW)" % d["_p_end"].group(1)) if d.get("_p_end") else ""))
