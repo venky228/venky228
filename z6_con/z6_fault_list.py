@@ -94,17 +94,19 @@ KEEP_OLD_IDS = False                         # False = F01.. numbered outward fr
 # LEVEL OF THE FAULTED BUS: substations from the POI to it, the bus itself
 # included, the POI excluded (minus one when the POI is a tap, so the tapped
 # circuit's ends are 0). Measured the same way for both sources.
-# P1 <= 3 / P4 <= 1 with the P4 limits and the impact screen below: ~140-310
-# events per project, SPP's surplus-report events (GEN-2026-SR1/SR10/SR11/
-# SR12/SR14) reproduced as well as with no screen. Each level more roughly
-# doubles the list in a meshed 115/138 kV area.
+# Every substation is a step (HUB_MIN_CIRCUITS = 2, as SPP's Aneden reports
+# GEN-2026-SR1/SR11 count). P1 <= 3 / P4 <= 1 with the P4 limits and the
+# impact screen below: ~70-180 events per project (~90-270 without the
+# screen); P1 <= 2 ~55-150. Each level more roughly doubles the list.
 SPP_LEVELS_BY_EVENT = {"P1": 3, "P4": 1, "P6": 1}     # events from the DISIS sheet
 CASE_LEVELS_BY_EVENT = {"P1": 3, "P4": 1, "P6": 1}    # events built from the power-flow case
 KV_MIN = 100.0                               # network circuits at / above this kV
 SUBT_KV_MIN = 69                             # also P1 on lines down to this kV (None = off) ...
 SUBT_P1_LEVEL = 1                            # ... faulted at a bus within this level (SPP 115 kV POI reports)
 XFMR_LV_KV_MIN = 60.0                        # P1.3: transformer second winding at / above this kV
-HUB_MIN_CIRCUITS = 3                         # a substation is a level node with this many circuits
+HUB_MIN_CIRCUITS = 2                         # a substation is a level node with this many circuits:
+                                             #   2 = every substation is a step (SPP's Aneden reports)
+                                             #   3 = only switching stations (BPM text, MEPPI reports)
 JUMPER_X_PU = 0.0005                         # |X| below this = bus tie (same substation)
 EVENTS = {"P1.2": True, "P1.3": True, "P4": True}   # built from the case (False = that kind not built)
 INCLUDE_RADIAL_P1 = True                     # True = P1 also on radial lines (other plants' gen ties,
@@ -523,8 +525,10 @@ class Levels(object):
         core = dict((s, set(t for t in v if t not in removed))
                     for s, v in nb.items() if s not in removed)
         self.hub = set(s for s, v in core.items() if len(v) >= HUB_MIN_CIRCUITS)
-        # ---- level 0
-        if poi_st in self.hub:
+        # ---- level 0 (BPM: a POI on a tapped line -- 2 network circuits -- is
+        #      not a level of its own; the substations at the tapped circuit's
+        #      ends are 0, whatever HUB_MIN_CIRCUITS says)
+        if len(core.get(poi_st, ())) >= 3 and poi_st in self.hub:
             l0 = set([poi_st])
         else:
             l0, seen, todo = set(), set([poi_st]), [poi_st]
@@ -582,9 +586,7 @@ class Levels(object):
             lv = min([L.get(h, BIG) for h in bord] or [BIG]) + 1
             for s in mem:
                 slev[s] = min(lv, BIG)
-        slev[poi_st] = 0 if poi_st in l0 or poi_st not in self.hub else slev[poi_st]
-        if poi_st not in self.hub:
-            slev[poi_st] = 0
+        slev[poi_st] = 0
 
         def rlev(s, depth=0):
             if s in slev:
@@ -1535,7 +1537,7 @@ def make_project(proj, net, disis, rep):
       % (lim("P1", "DISIS"), lim("P4", "DISIS"), lim("P6", "DISIS"), lim("P1"), lim("P4"),
          lim("P6"), KV_MIN, HUB_MIN_CIRCUITS))
     W("POI substation is %s. Level 0: %s"
-      % ("a level node" if lev.st[poi] in lev.hub else "a tap (not a level node)",
+      % ("a level node" if lev.st[poi] in lev.l0 else "a tap (not a level node)",
          ", ".join("%d %s" % (s, net.name.get(s, "")) for s in sorted(lev.l0))))
     W("Plant (excluded from events, protected in P4): %d bus(es)" % len(lev.plant))
     for k in range(0, max(list(SPP_LEVELS_BY_EVENT.values()) + list(CASE_LEVELS_BY_EVENT.values())) + 1):
