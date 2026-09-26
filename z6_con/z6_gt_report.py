@@ -3,7 +3,7 @@
 
    Simulates nothing and touches no run folder, so it is safe to start while
    the gen test itself is running: it reads every finished run in
-   <Base>\\results_base\\<project>_<mode>_gt_* and writes
+   <Base>\\results_base\\<project>\\gen_test\\...\\<project>_<mode>_gt_* and writes
 
        comparison_scenarios\\<project>\\BASE_CASE\\gen_test\\
            GEN_TEST_<project>.txt/.csv, GEN_TEST_BEST_<project>.txt,

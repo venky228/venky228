@@ -405,7 +405,9 @@ CMP_FOLDER = "comparison"                    # comparison output folder (base vs
 SCEN_CMP_FOLDER = "comparison_scenarios"     # scenario comparisons + gen test, per project, kept apart
 TIDY_RESULTS = True                          # True = at launch, every run folder lying loose in results_base\ / results_proj\
                                              #   is moved into its project's folder (results_base\SantaFe\...), names
-                                             #   unchanged, nothing re-run. False while another launch is still running.
+                                             #   unchanged, nothing re-run; its gen-test runs sorted into
+                                             #   <project>\gen_test\POI_ON|POI_OFF\00_REFERENCE|00_POIGENOFF|GEN_OFF|
+                                             #   LINE_OFF|CAPS_OFF|MODEL_EDIT. False while another launch is still running.
 BASE_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"  # base .sav (in BASE_FOLDER)
 BASE_DYR = "2020MDWG-25S-DIS2201.dyr"
 PROJ_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"  # project .sav (in PROJ_FOLDER)
@@ -2134,7 +2136,7 @@ def _res_root(case):
 # results_proj\<project>\), under its own unchanged name:
 #
 #     Base\results_base\SantaFe\SantaFe_spp\
-#     Base\results_base\SantaFe\SantaFe_spp_gt_s0_asis_off531603_1\
+#     Base\results_base\SantaFe\gen_test\POI_ON\GEN_OFF\SantaFe_spp_gt_s0_asis_off531603_1\
 #
 # DECIDED PER PROJECT, FROM THE DISK, by the same rule in the engines and the
 # launchers: the project's folder is used when it exists, or when the project
@@ -2145,11 +2147,78 @@ def _res_root(case):
 
 def _is_proj_box(d):
     """A project's folder (results_base\\SantaFe), not a run folder: it holds
-       no outs\\ of its own and at least one '<name>_...' run folder."""
+       no outs\\ of its own and at least one '<name>_...' run folder, or the
+       gen_test\\ folder its gen-test runs are sorted into."""
     if not os.path.isdir(d) or os.path.isdir(os.path.join(d, "outs")):
         return False
     nm = os.path.basename(os.path.normpath(d))
-    return any(os.path.isdir(x) for x in glob.glob(os.path.join(d, glob.escape(nm) + "_*")))
+    return os.path.isdir(os.path.join(d, GT_SORT_DIR)) or \
+        any(os.path.isdir(x) for x in glob.glob(os.path.join(d, glob.escape(nm) + "_*")))
+
+
+# ---- GEN-TEST RUNS SORTED BY KIND inside the project's folder -----------------
+# Decided from the run folder's NAME alone (unchanged), by the same function in
+# the engines and the launchers:
+#
+#     results_base\EmpirePrairie\gen_test\POI_ON\00_REFERENCE\   all in service
+#                                        \POI_ON\GEN_OFF\        one machine / the HOPS group off
+#                                        \POI_ON\LINE_OFF\       a line / transformer opened
+#                                        \POI_ON\CAPS_OFF\       caps off
+#                                        \POI_ON\MODEL_EDIT\     EGF_EDITS runs
+#                                        \POI_OFF\00_POIGENOFF\  the POI plants off
+#                                        \POI_OFF\GEN_OFF\ ...   the same with the POI plants off
+#
+# A run still at the top of the project's folder is used where it is until
+# TIDY_RESULTS moves it (at launch), so nothing is ever looked for in two places.
+GT_SORT_DIR = "gen_test"
+_GT_NAME_RX = re.compile(r"^.+?_gt_(?P<sc>.+?)(?P<poi>_poioff)?"
+                         r"(?:_off(?P<bus>\d+)_(?P<id>[A-Za-z0-9]+))?$")
+# what the study / the launcher append when they set a folder aside
+_GT_ASIDE_RX = re.compile(r"(_prev_\d.*|_before_fixed_.*|__run\d+|\.[^.]*\.old)$")
+
+
+def _run_group(name):
+    """gen_test\\POI_ON|POI_OFF\\<kind> for a gen-test run folder name, "" for
+       any other run (those stay at the top of the project's folder)."""
+    m = _GT_NAME_RX.match(_GT_ASIDE_RX.sub("", str(name)))
+    if not m:
+        return ""
+    i = m.group("id") or ""
+    if not i:
+        return os.path.join(GT_SORT_DIR, "POI_ON", "00_REFERENCE")
+    if i == "POIALL" and not m.group("poi"):
+        return os.path.join(GT_SORT_DIR, "POI_OFF", "00_POIGENOFF")
+    side = "POI_OFF" if m.group("poi") else "POI_ON"
+    kind = ("MODEL_EDIT" if i.startswith("EGF") else
+            "CAPS_OFF" if i.startswith("CAP") else
+            "LINE_OFF" if re.match(r"BR\d+(T\d+)?C", i) else
+            "GEN_OFF")
+    return os.path.join(GT_SORT_DIR, side, kind)
+
+
+def _place_run(base, name):
+    """base\\<group>\\name for a sorted run, base\\name for any other -- or
+       base\\name while the run still sits there unsorted."""
+    grp = _run_group(name)
+    if not grp:
+        return os.path.join(base, name)
+    new, old = os.path.join(base, grp, name), os.path.join(base, name)
+    # a path that would leave under ~90 characters for the files inside
+    # (Windows allows 260) stays unsorted -- same answer in every script
+    if len(os.path.abspath(new)) + 90 > 250:
+        return old
+    return old if (os.path.isdir(old) and not os.path.isdir(new)) else new
+
+
+def _run_path(case_or_root, proj, name):
+    """The folder of run 'name' of this project (see ONE FOLDER PER PROJECT and
+       GEN-TEST RUNS SORTED BY KIND). A project still laid out flat keeps its
+       runs flat."""
+    base = _proj_root(case_or_root, proj)
+    root = case_or_root if isinstance(case_or_root, str) else _res_root(case_or_root)
+    if not proj or os.path.normcase(os.path.abspath(base)) == os.path.normcase(os.path.abspath(root)):
+        return os.path.join(base, name)
+    return _place_run(base, name)
 
 
 def _loose_runs(root, proj):
@@ -2179,7 +2248,58 @@ def _run_glob(root, pat):
         par = os.path.basename(os.path.dirname(d))
         if os.path.basename(d).startswith(par + "_") and _is_proj_box(os.path.dirname(d)):
             out.append(d)
+    # sorted gen-test runs: root\<proj>\gen_test\<side>\<kind>\<run>
+    for d in glob.glob(os.path.join(root, "*", GT_SORT_DIR, "*", "*", pat)):
+        box = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(d))))
+        if os.path.basename(d).startswith(os.path.basename(box) + "_") and os.path.isdir(d):
+            out.append(d)
     return sorted(out)
+
+
+_PATH_MAX = 250      # Windows' 260, less a margin for files PSS/E adds later
+
+
+def _too_long(src, dest):
+    """True (and said) when a file inside src would pass _PATH_MAX at dest --
+       that run is then left where it is, still found and used there."""
+    longest = 0
+    for dp, _dn, fn in os.walk(src):
+        for f in fn:
+            longest = max(longest, len(os.path.relpath(os.path.join(dp, f), src)))
+    if len(os.path.abspath(dest)) + 1 + longest > _PATH_MAX:
+        print("[tidy]   %s stays where it is: sorted, a file path in it would be %d "
+              "characters (Windows allows 260)" % (os.path.basename(src),
+                                                    len(os.path.abspath(dest)) + 1 + longest))
+        return True
+    return False
+
+
+def _sort_box(box):
+    """Gen-test runs at the top of a project's folder -> their gen_test\\...
+       folder. (moved, stuck)."""
+    moved = stuck = 0
+    for d in sorted(glob.glob(os.path.join(box, "*"))):
+        nm = os.path.basename(d)
+        grp = _run_group(nm)
+        if not grp or not os.path.isdir(d):
+            continue
+        dest = os.path.join(box, grp, nm)
+        if os.path.exists(dest):
+            print("[tidy]   *** %s is already in %s -- left where it is ***" % (nm, grp))
+            stuck += 1
+            continue
+        if len(os.path.abspath(dest)) + 90 > _PATH_MAX or _too_long(d, dest):
+            continue
+        try:
+            if not os.path.isdir(os.path.dirname(dest)):
+                os.makedirs(os.path.dirname(dest))
+            os.rename(d, dest)
+            moved += 1
+        except Exception as e:
+            print("[tidy]   *** could not move %s (%s) -- close anything open in it "
+                  "and run again ***" % (nm, e))
+            stuck += 1
+    return moved, stuck
 
 
 def tidy_results():
@@ -2206,7 +2326,7 @@ def tidy_results():
                 except Exception:
                     pass
     names = sorted((n for n in names if n), key=len, reverse=True)
-    moved = stuck = nlog = 0
+    moved = stuck = nlog = sorted_n = 0
     for case in (CASE_BASE, CASE_TEST):
         root = _res_root(case)
         if not os.path.isdir(root):
@@ -2220,14 +2340,16 @@ def tidy_results():
             if not proj:
                 continue
             box = os.path.join(root, proj)
-            dest = os.path.join(box, nm)
-            if os.path.exists(dest):
+            dest = os.path.join(box, _run_group(nm), nm)
+            if _run_group(nm) and (len(os.path.abspath(dest)) + 90 > _PATH_MAX or _too_long(d, dest)):
+                dest = os.path.join(box, nm)
+            if os.path.exists(dest) or os.path.exists(os.path.join(box, nm)):
                 print("[tidy]   *** %s is already in %s -- left where it is ***" % (nm, proj))
                 stuck += 1
                 continue
             try:
-                if not os.path.isdir(box):
-                    os.makedirs(box)
+                if not os.path.isdir(os.path.dirname(dest)):
+                    os.makedirs(os.path.dirname(dest))
                 os.rename(d, dest)
                 moved += 1
             except Exception as e:
@@ -2253,20 +2375,36 @@ def tidy_results():
                     nlog += 1
             except Exception:
                 pass
-        for box in sorted(glob.glob(os.path.join(root, "*"))) if (moved or stuck) else []:
+        # GEN-TEST RUNS -> gen_test\POI_ON|POI_OFF\<kind> inside each project's folder
+        for box in sorted(glob.glob(os.path.join(root, "*"))):
             if _is_proj_box(box):
-                print("[tidy]   %-16s %d run folder(s)" % (os.path.basename(box),
-                      len([x for x in os.listdir(box) if os.path.isdir(os.path.join(box, x))])))
+                _m, _s = _sort_box(box)
+                sorted_n += _m
+                stuck += _s
+        for box in sorted(glob.glob(os.path.join(root, "*"))) if (moved or stuck or sorted_n) else []:
+            if _is_proj_box(box):
+                _top = len([x for x in os.listdir(box) if os.path.isdir(os.path.join(box, x))
+                            and x not in (GT_SORT_DIR, "logs")])
+                _gt = {}
+                for x in glob.glob(os.path.join(box, GT_SORT_DIR, "*", "*", "*")):
+                    if os.path.isdir(x):
+                        k = os.path.relpath(os.path.dirname(x), os.path.join(box, GT_SORT_DIR))
+                        _gt[k] = _gt.get(k, 0) + 1
+                print("[tidy]   %-16s %d run folder(s) at the top%s" % (
+                    os.path.basename(box), _top,
+                    ("; gen_test: " + ", ".join("%s %d" % (k.replace(os.sep, "\\"), n)
+                                                for k, n in sorted(_gt.items()))) if _gt else ""))
     if nlog:
         print("[tidy] %d plotter log(s) moved into their project's logs\\ folder" % nlog)
-    if moved or stuck:
-        print("[tidy] %d folder(s) moved into their project's folder, %d left where they were"
-              % (moved, stuck))
+    if moved or stuck or sorted_n:
+        print("[tidy] %d folder(s) moved into their project's folder, %d gen-test run(s) sorted "
+              "into gen_test\\POI_ON|POI_OFF\\<kind>, %d left where they were"
+              % (moved, sorted_n, stuck))
     return 0 if not stuck else 1
 
 
 def results_dir(case, proj, mode):
-    return os.path.join(_proj_root(case, proj), "%s_%s" % (proj, mode))
+    return _run_path(case, proj, "%s_%s" % (proj, mode))
 
 
 def discover_projects(mode):
@@ -9253,7 +9391,7 @@ def run_capacity_sweep(proj, mode):
         if rc not in (0, None):
             print("[capacity] the %s%% run ended with rc=%s -- reading whatever it scored"
                   % (tag, rc))
-        rdir = os.path.join(_proj_root(CASE_TEST, proj),
+        rdir = _run_path(CASE_TEST, proj,
                             "%s_%s_cap%s" % (proj, mode, tag))
         ct, _src = read_criteria(rdir, proj)
         if not ct:
@@ -9417,7 +9555,7 @@ def run_poi_p_sweep(proj, mode):
         if rc not in (0, None):
             print("[poi-p] the %.0f MW run ended with rc=%s -- reading whatever it scored"
                   % (mw, rc))
-        rdir = os.path.join(_proj_root(CASE_TEST, proj),
+        rdir = _run_path(CASE_TEST, proj,
                             "%s_%s_%s" % (proj, mode, tag))
         ct, _src = read_criteria(rdir, proj)
         if not os.path.isdir(rdir):
@@ -9495,7 +9633,7 @@ def run_project_mw_sweep(proj, mode):
         if rc not in (0, None):
             print("[mw] the %.0f MW run ended with rc=%s -- reading whatever it scored"
                   % (mw, rc))
-        rdir = os.path.join(_proj_root(CASE_TEST, proj),
+        rdir = _run_path(CASE_TEST, proj,
                             "%s_%s_%s" % (proj, mode, tag))
         ct, _src = read_criteria(rdir, proj)
         if not os.path.isdir(rdir):
@@ -10096,7 +10234,7 @@ def _dyr_sweep_dir(proj, mode, tag, cap_tag=""):
        SPP_RUN_TAG, so it has to be _cap50_dyr_Kqv2 and never the reverse. A
        path assembled the other way round here would look perfectly reasonable
        and point at a folder nothing ever writes."""
-    return os.path.join(_proj_root(CASE_TEST, proj),
+    return _run_path(CASE_TEST, proj,
                         "%s_%s%s_%s" % (proj, mode, _cap_suffix(cap_tag), tag))
 
 
@@ -10302,7 +10440,7 @@ def _dyr_variants_on_disk(proj, mode):
             continue
         cap = m.group(1) or ""
         tag = "dyr_" + m.group(2)
-        d = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, sfx))
+        d = _run_path(CASE_TEST, proj, "%s_%s%s" % (proj, mode, sfx))
         by.setdefault(cap, []).append((tag, _edits_from_folder(d, m.group(2))))
     return sorted(by.items(), key=lambda kv: -(int(kv[0]) if kv[0] else 10 ** 6))
 
@@ -10499,7 +10637,7 @@ def write_dyr_sweep_workbook(found):
     rows2 = []
     for (proj, mode), lst in runs_by.items():
         for sfx, lbl, res in lst:
-            d = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, sfx))
+            d = _run_path(CASE_TEST, proj, "%s_%s%s" % (proj, mode, sfx))
             rr = [r for r in ((res or {}).get("rows") or []) if not _is_flat(r)]
             t = _tally(rr) if rr else {}
             rows2.append([proj, lbl, _v(_dyr_of(d)), len(rr),
@@ -11425,7 +11563,7 @@ NEW_PLANT_TAG = "newplant"
 
 
 def _new_plant_dir(proj, mode):
-    return os.path.join(_proj_root(CASE_TEST, proj),
+    return _run_path(CASE_TEST, proj,
                         "%s_%s_%s" % (proj, mode, NEW_PLANT_TAG))
 
 
@@ -11599,7 +11737,7 @@ PROJECT_OFF_TAG = "proj_off"
 
 
 def _project_off_dir(proj, mode):
-    return os.path.join(_proj_root(CASE_TEST, proj),
+    return _run_path(CASE_TEST, proj,
                         "%s_%s_%s" % (proj, mode, PROJECT_OFF_TAG))
 
 
@@ -11784,7 +11922,7 @@ def _run_suffixes(proj, mode):
        "" is the run just finished; "__run3" an archived earlier one; "_cap50"
        a capacity level. All three are ordinary results folders differing only
        in name, which is what makes one table over all of them possible."""
-    base = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s" % (proj, mode))
+    base = _run_path(CASE_TEST, proj, "%s_%s" % (proj, mode))
     out = []
     for d in glob.glob(base + "*"):
         if not os.path.isdir(d):
@@ -11995,8 +12133,8 @@ def write_run_vs_run(proj, mode):
         print("[runs] COMPARE_RUNS must be two folder suffixes, e.g. (\"__run1\", \"\")")
         return ""
     a_sfx, b_sfx = (a_sfx or ""), (b_sfx or "")
-    da = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, a_sfx))
-    db = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, b_sfx))
+    da = _run_path(CASE_TEST, proj, "%s_%s%s" % (proj, mode, a_sfx))
+    db = _run_path(CASE_TEST, proj, "%s_%s%s" % (proj, mode, b_sfx))
     for d, sfx in ((da, a_sfx), (db, b_sfx)):
         if not os.path.isdir(d):
             print("[runs] COMPARE_RUNS: no results at %r (%s)" % (sfx or "(this run)", d))
@@ -12898,7 +13036,7 @@ def _plan_expected(d, proj=None):
 
 def _plan_state(proj, mode, sfx):
     """What is on disk for one run: state, scenario counts, verdicts."""
-    d = os.path.join(_proj_root(CASE_TEST, proj),
+    d = _run_path(CASE_TEST, proj,
                      "%s_%s%s" % (proj, mode, sfx))
     if not os.path.isdir(d):
         return {"dir": d, "state": "TO RUN", "n_out": 0, "n_scored": 0,
@@ -13075,7 +13213,7 @@ def _plan_scenario_matrix(rows):
         mode = prows[0][1]
         # base first, then every project-side run in campaign order.
         cols = []
-        _bdir = os.path.join(_proj_root(CASE_BASE, p), "%s_%s" % (p, mode))
+        _bdir = _run_path(CASE_BASE, p, "%s_%s" % (p, mode))
         cols.append(("base", _plan_scn_states(_bdir, p)))
         for (_p, _m, _lbl, _sfx, st) in prows:
             cols.append((_plan_col_label(p, mode, os.path.basename(st["dir"])),
@@ -13251,7 +13389,7 @@ def _plan_base_counts(proj, mode, sfx):
        base study that never ran, or stopped half way, was invisible in it. A
        comparison needs BOTH sides of every fault, so a project whose base case
        is missing is as unfinished as one whose project case is."""
-    d = os.path.join(_proj_root(CASE_BASE, proj), "%s_%s%s" % (proj, mode, sfx))
+    d = _run_path(CASE_BASE, proj, "%s_%s%s" % (proj, mode, sfx))
     n_out = n_want = 0
     try:
         n_out = len(glob.glob(os.path.join(d, "outs", "*.out")))
@@ -13433,7 +13571,7 @@ def write_all_runs_comparison(results):
             continue
         rows = []
         for sfx in sfxs:
-            d = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, sfx))
+            d = _run_path(CASE_TEST, proj, "%s_%s%s" % (proj, mode, sfx))
             try:
                 r = res if not sfx else compare_project(proj, mode, test_suffix=sfx)
             except Exception as e:
@@ -18563,7 +18701,7 @@ def _gt_add_hops_group(gens):
 
 
 def _gt_rdir(tag):
-    return results_dir(_gt_case(), GEN_TEST_PROJECT, GEN_TEST_MODE) + "_" + tag
+    return _run_path(_gt_case(), GEN_TEST_PROJECT, "%s_%s_%s" % (GEN_TEST_PROJECT, GEN_TEST_MODE, tag))
 
 
 def _gt_match(key, fault):
@@ -22464,7 +22602,7 @@ def main():
                 with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
                     write_sweep_overvoltage(
                         res["project"], res["mode"],
-                        [(_poi_tag(mw), os.path.join(_proj_root(CASE_TEST, res["project"]), "%s_%s_%s"
+                        [(_poi_tag(mw), _run_path(CASE_TEST, res["project"], "%s_%s_%s"
                             % (res["project"], res["mode"], _poi_tag(mw))))
                          for mw in levels],
                         "POI_P_MEASURED", "TOTAL P AT THE POI",

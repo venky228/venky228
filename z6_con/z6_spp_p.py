@@ -139,7 +139,8 @@ def _is_proj_box(d):
     if not os.path.isdir(d) or os.path.isdir(os.path.join(d, "outs")):
         return False
     nm = os.path.basename(os.path.normpath(d))
-    return any(os.path.isdir(x) for x in glob.glob(os.path.join(d, glob.escape(nm) + "_*")))
+    return os.path.isdir(os.path.join(d, "gen_test")) or \
+        any(os.path.isdir(x) for x in glob.glob(os.path.join(d, glob.escape(nm) + "_*")))
 
 
 def _proj_root(root, proj):
@@ -153,8 +154,51 @@ def _proj_root(root, proj):
         return root
     return box
 
-RESULTS_DIR = os.path.join(
-    _proj_root(_results_root(), _PROJ_TAG),
+# ---- GEN-TEST RUNS SORTED BY KIND (the same rule as z6_main.py) -------------
+# <project>\gen_test\POI_ON|POI_OFF\<kind>\<run>, decided from the run
+# folder's unchanged name; a run still at the top of the project's folder is
+# used there until z6_main.py's TIDY_RESULTS moves it.
+GT_SORT_DIR = "gen_test"
+_GT_NAME_RX = re.compile(r"^.+?_gt_(?P<sc>.+?)(?P<poi>_poioff)?"
+                         r"(?:_off(?P<bus>\d+)_(?P<id>[A-Za-z0-9]+))?$")
+_GT_ASIDE_RX = re.compile(r"(_prev_\d.*|_before_fixed_.*|__run\d+|\.[^.]*\.old)$")
+
+
+def _run_group(name):
+    m = _GT_NAME_RX.match(_GT_ASIDE_RX.sub("", str(name)))
+    if not m:
+        return ""
+    i = m.group("id") or ""
+    if not i:
+        return os.path.join(GT_SORT_DIR, "POI_ON", "00_REFERENCE")
+    if i == "POIALL" and not m.group("poi"):
+        return os.path.join(GT_SORT_DIR, "POI_OFF", "00_POIGENOFF")
+    side = "POI_OFF" if m.group("poi") else "POI_ON"
+    kind = ("MODEL_EDIT" if i.startswith("EGF") else
+            "CAPS_OFF" if i.startswith("CAP") else
+            "LINE_OFF" if re.match(r"BR\d+(T\d+)?C", i) else
+            "GEN_OFF")
+    return os.path.join(GT_SORT_DIR, side, kind)
+
+
+def _run_path(root, proj, name):
+    """The run folder: <project folder>\\[<group>\\]name, or root\\name for a
+       project still laid out flat."""
+    base = _proj_root(root, proj)
+    if not proj or os.path.normcase(os.path.abspath(base)) == os.path.normcase(os.path.abspath(root)):
+        return os.path.join(base, name)
+    grp = _run_group(name)
+    if not grp:
+        return os.path.join(base, name)
+    new, old = os.path.join(base, grp, name), os.path.join(base, name)
+    # a path that would leave under ~90 characters for the files inside
+    # (Windows allows 260) stays unsorted -- same answer in every script
+    if len(os.path.abspath(new)) + 90 > 250:
+        return old
+    return old if (os.path.isdir(old) and not os.path.isdir(new)) else new
+
+RESULTS_DIR = _run_path(
+    _results_root(), _PROJ_TAG,
     ("dynamics" if not _PROJ_TAG else
      ("%s_%s" % (_PROJ_TAG, _MODE_TAG if _MODE_TAG else "spp")))
     + (("_cap%s" % _CAP_TAG_DIR) if _CAP_TAG_DIR else "")
