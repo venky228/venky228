@@ -11815,7 +11815,7 @@ def _solve_to_mismatch_inner(tol=None, passes=None, tag="pre-save", abort=None):
         print("  [solve]   already within tolerance")
         _record_mismatch(tag, tol, True, m0)
         return True, m0
-    best = m0
+    best, best_how, k = m0, None, 0
     for k in range(1, passes + 1):
         try:
             if k % 2:
@@ -11836,7 +11836,7 @@ def _solve_to_mismatch_inner(tol=None, passes=None, tag="pre-save", abort=None):
             _record_mismatch(tag, tol, True, m)
             return True, m
         if m < best - 1e-9:
-            best = m
+            best, best_how = m, how
         elif k >= 4 and m >= best * 0.999:
             # Not improving. More passes of the same thing will not help, and
             # saying so is more use than twenty identical lines.
@@ -11844,8 +11844,30 @@ def _solve_to_mismatch_inner(tol=None, passes=None, tag="pre-save", abort=None):
                   "pass %d" % (best, k))
             break
     m = _system_mismatch_mva()
-    print("  [solve]   *** did NOT reach %.3f MVA; best was %.4f MVA ***"
-          % (tol, m if m is not None else -1))
+    # BACK TO THE BEST STATE. The passes alternate, so the loop can stop right
+    # after the solver that makes it worse (an FDNS that hunts on the tight
+    # TOLN: 0.125 MVA -> 27 MVA) and the case would be judged, and saved, in
+    # that state. The solver that reached the best mismatch is run again.
+    if m is not None and best_how and m > best * 1.001 + 1e-6:
+        for _k in range(2):
+            try:
+                (psspy.fnsl if best_how == "FNSL" else psspy.fdns)([0, 0, 0, 1, 1, 0, 0, 0])
+            except Exception as e:
+                print("  [solve]   %s back to the best state raised: %s" % (best_how, e))
+                break
+            m2 = _system_mismatch_mva()
+            if m2 is None:
+                break
+            print("  [solve]   %s again (back to the best state) -> %.4f MVA" % (best_how, m2))
+            m = m2
+            if m <= tol:
+                print("  [solve]   reached %.4f MVA <= %.3f" % (m, tol))
+                _record_mismatch(tag, tol, True, m)
+                return True, m
+            if m <= best * 1.001 + 1e-6:
+                break
+    print("  [solve]   *** did NOT reach %.3f MVA; ends at %.4f MVA (best %.4f) ***"
+          % (tol, m if m is not None else -1, best))
     print("  [solve]       That residual would be frozen into the .cnv and the")
     print("  [solve]       snapshot, and would reappear as initial-condition error")
     print("  [solve]       in every dynamic run built from them -- showing up as")
@@ -11858,12 +11880,12 @@ def _solve_to_mismatch_inner(tol=None, passes=None, tag="pre-save", abort=None):
         _mx = getattr(psspy, "maxmsm", None)
         _r = _mx() if _mx else None
         if isinstance(_r, (list, tuple)) and len(_r) >= 2:
-            _v = _r[1]
-            try:
-                _v = abs(complex(_v))
-            except Exception:
-                _v = float(_v)
-            _bus = _r[2] if len(_r) > 2 else "?"
+            # maxmsm() -> (ierr, bus, complex mismatch) on PSS/E 34; the
+            # complex value is the mismatch, the other the bus number
+            _c = [x for x in _r[1:] if isinstance(x, complex)]
+            _o = [x for x in _r[1:] if not isinstance(x, complex)]
+            _v = abs(_c[0]) if _c else abs(complex(_r[1]))
+            _bus = (int(_o[0]) if _c and _o else _r[2] if len(_r) > 2 else "?")
             print("  [solve]       largest bus mismatch %.4f MVA at bus %s" % (_v, _bus))
     except Exception:
         pass
@@ -11892,7 +11914,7 @@ def _solve_to_mismatch_inner(tol=None, passes=None, tag="pre-save", abort=None):
             "system mismatch %.4f MVA exceeds SAVE_MISMATCH_MVA=%.3f after %d pass(es) "
             "-- the case is not in balance and everything built from it would inherit "
             "that (set ABORT_ON_MISMATCH=False to save it anyway)"
-            % (m if m is not None else -1, tol, passes))
+            % (m if m is not None else -1, tol, k))
     print("  [solve]       ABORT_ON_MISMATCH=False -- saving it as it is.")
     return False, m
 
