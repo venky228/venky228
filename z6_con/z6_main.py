@@ -326,14 +326,14 @@ GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = True                   # all machines within GEN_TEST_HOPS off together
 GEN_TEST_POI_OFF_BASE = True                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
                                              #   compared with the POIGENOFF run; same reports, rows "POI OFF + ..."
-GEN_TEST_HOPS = 7                           # gens: "near" = within this many buses of the POI
+GEN_TEST_HOPS = 5                           # gens: "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
 GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus, id)]
 # -- 3d. cap and line runs (solver scenario s0_asis only)
 GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together
 GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own
 GEN_TEST_LINES_EACH = True                    # each nearby line / transformer opened on its own
-GEN_TEST_LINES_HOPS = 3                      # lines: both ends within this many buses of the POI
+GEN_TEST_LINES_HOPS = 2                      # lines: both ends within this many buses of the POI
 # -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
@@ -18361,7 +18361,15 @@ def _gt_add_group(gens, net, excl, found=None):
         mem = _gt_poi_members(net, excl)
     else:
         return gens
-    if len(mem) < 2:
+    # ONE POI MACHINE: its own one-at-a-time run covers it -- unless
+    # GEN_TEST_EXCLUDE_POI_GENS left it out of those runs, or
+    # GEN_TEST_POI_OFF_BASE needs the POIALL run as its base
+    single = set((int(g["bus"]), str(g["id"]).strip()) for g in gens if not g.get("group"))
+    if not mem:
+        print("[gen-test] POI group skipped: no machine found at POI %s" % GEN_TEST_POI)
+        return gens
+    if len(mem) == 1 and not GEN_TEST_POI_OFF_BASE and \
+       (int(mem[0][0]), str(mem[0][1]).strip()) in single:
         print("[gen-test] POI group skipped: %d machine(s) found at POI %s -- the one-at-a-time "
               "runs already cover it" % (len(mem), GEN_TEST_POI))
         return gens
