@@ -278,7 +278,7 @@ GEN_TEST_BY_PROJECT = {
             # REGCA1 Rrpwr = ramp rate of the active current after a fault (pu/s),
             # at its maximum: the fastest P recovery. Deck values otherwise, so the
             # run reads against 'all in service' -- does the recovery improve?
-            "RRPWR10":  [("REGCA1", {"Rrpwr": 1.0})],
+            "RRPWR1":   [("REGCA1", {"Rrpwr": 1.0})],
         },
     },
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
@@ -296,7 +296,7 @@ GEN_TEST_BY_PROJECT = {
             "V110_K2_KQV4": [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
                              ("REECAU1", {"con1": 0.90, "con2": 1.10, "con6": 4.0})],
             # REGCAU1 Rrpwr = ramp rate of the active current after a fault (pu/s)
-            "RRPWR10":  [("REGCAU1", {"Rrpwr": 1.0})],
+            "RRPWR1":   [("REGCAU1", {"Rrpwr": 1.0})],
         },
     },
     "EmpirePrairie": {
@@ -313,7 +313,7 @@ GEN_TEST_BY_PROJECT = {
             # REGCA1 Rrpwr = ramp rate of the active current after a fault (pu/s),
             # at its maximum: the fastest P recovery. Deck values otherwise, so the
             # run reads against 'all in service' -- does the recovery improve?
-            "RRPWR10":  [("REGCA1", {"Rrpwr": 1.0})],
+            "RRPWR1":   [("REGCA1", {"Rrpwr": 1.0})],
         },
     },
 }
