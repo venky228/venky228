@@ -286,15 +286,15 @@ GEN_TEST_BY_PROJECT = {
         "POI": 531623,
         "EXTRA_GENS": [],
         "EGF_EDITS": {                               # deck: REGCAU1 (Volim 1.2 / Khv 0.2 / Accel 0.7) + REECAU1
-            # (above Vup it ABSORBS). REECAU1 = REECA1's layout: Kqv is its CON 6 (by number --
-            # the name is not in this deck). Deck Vdip -99 / Vup 99: the dip logic never
-            # starts, so Kqv may change nothing here.
+            # (above Vup it ABSORBS). REECAU1 = REECA1's layout, by number (the names are not
+            # in this deck): Vdip = CON 1, Vup = CON 2, Kqv = CON 6. Deck Vdip -99 / Vup 99
+            # never starts the dip logic, so Kqv did nothing -- 0.90 / 1.10 switch it on.
             "V110_K2_KQV0": [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECAU1", {"con6": 0.0})],                              # no Iq injection: is Kqv the driver?
+                             ("REECAU1", {"con1": 0.90, "con2": 1.10, "con6": 0.0})],                              # no Iq injection: is Kqv the driver?
             "V110_K2_KQV2": [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECAU1", {"con6": 2.0})],
+                             ("REECAU1", {"con1": 0.90, "con2": 1.10, "con6": 2.0})],
             "V110_K2_KQV4": [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECAU1", {"con6": 4.0})],
+                             ("REECAU1", {"con1": 0.90, "con2": 1.10, "con6": 4.0})],
             # REGCAU1 Rrpwr = ramp rate of the active current after a fault (pu/s)
             "RRPWR10":  [("REGCAU1", {"Rrpwr": 1.0})],
         },
