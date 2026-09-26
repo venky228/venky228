@@ -9269,7 +9269,10 @@ def surplus_scenarios():
 def _surplus_env(sc):
     """The environment one scenario is run under."""
     env = {"SPP_RUN_TAG": sc["tag"],
-           "SPP_EGF_OFF": "1" if sc["egf_off"] else "0"}
+           "SPP_EGF_OFF": "1" if sc["egf_off"] else "0",
+           # ITS OWN REPORT, at the end of its own run: the panel's scoring
+           # pass has already run by the time the surplus runs start.
+           "SPP_DEFER_REPORTS": "0"}
     if sc.get("poi_mw") is not None:
         env["SPP_POI_P_TARGET"] = repr(float(sc["poi_mw"]))
     return env
@@ -9290,6 +9293,11 @@ def run_surplus_scenarios(proj, mode):
         _banner("SURPLUS SCENARIO %s -- %s" % (sc["tag"], sc["label"]))
         env = _surplus_env(sc)
         env.update(_sweep_resume_env())
+        if FRESH_START:
+            # A FRESH START IS FRESH FOR THE SCENARIOS TOO (their old folders
+            # were set aside by archive_previous_runs).
+            env["SPP_FRESH_START"] = "1"
+            env["SPP_SKIP_DONE"] = "0"
         print("[surplus] %s" % "  ".join("%s=%s" % kv for kv in sorted(env.items())
                                          if kv[0].startswith("SPP_")))
         rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
@@ -12366,6 +12374,13 @@ def _folder_time(d):
         return "?"
 
 
+def _split_run_folder(d):
+    """(project, mode, tag) of a results folder <project>_<mode>[_<tag>]."""
+    name = re.split(r"[\\/]", str(d).rstrip("\\/"))[-1]
+    m = re.match(r"^(.+?)_(%s)(?:_(.+))?$" % "|".join(re.escape(x) for x in (MODES or ["spp"])), name)
+    return (m.group(1), m.group(2), m.group(3) or "") if m else ("", "", "")
+
+
 def archive_previous_runs():
     """Rename each project results folder out of the way before a new run.
 
@@ -12381,10 +12396,14 @@ def archive_previous_runs():
         return []
     moved = []
     for mode in MODES:
-        for d in _run_glob(_res_root(CASE_TEST), "*_%s" % mode):
+        # THE SURPLUS SCENARIO FOLDERS TOO (<proj>_<mode>_s1_egfoff): left in
+        # place they are RESUMED -- the old run's results beside a fresh base
+        # and GIA, with nothing to say so.
+        _pats = ["*_%s" % mode] + ["*_%s_%s" % (mode, sc["tag"]) for sc in surplus_scenarios()]
+        for d in [x for _pt in _pats for x in _run_glob(_res_root(CASE_TEST), _pt)]:
             if not os.path.isdir(d):
                 continue
-            proj = _proj_of_results_dir(d)
+            proj = _split_run_folder(d)[0] or _proj_of_results_dir(d)
             if proj in _EGF_SKIP:
                 continue                    # EGF_ONLY: its as-is results are the reference
             if _panel_projects() and proj not in _panel_projects():
@@ -17349,10 +17368,17 @@ def _merge_one_folder(case, rdir):
     # folder (dynamics\), finds no parts there and rebuilds nothing -- a
     # traceback on every run and an auto-merge that never merged. The folder
     # being merged is <project>_<mode>, the same split inventory() reads.
-    _proj = os.path.basename(os.path.normpath(rdir)).rpartition("_")[0]
+    _proj, _mode, _tag = _split_run_folder(rdir)
+    if not _proj:
+        _proj = os.path.basename(os.path.normpath(rdir)).rpartition("_")[0]
     if _proj:
         env["SPP_PROJECT"] = _proj
         env["SPP_RUN_PROJECTS"] = _proj
+    if _mode:
+        env["SPP_FAULT_MODE"] = _mode
+    _sc = [x for x in surplus_scenarios() if x["tag"] == _tag] if _tag else []
+    if _sc:
+        env.update(_surplus_env(_sc[0]))       # SPP_RUN_TAG / SPP_EGF_OFF of that scenario
     try:
         rc = subprocess.call([sys.executable, os.path.abspath(spp)],
                              cwd=rdir, env=env)

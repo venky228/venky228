@@ -13242,6 +13242,12 @@ def apply_poi_p_metered(project, target_mw):
             _rate = float(target_mw)
         if _rate is not None and _sgf_only_mode(target_mw, _poi_rate) == "split":
             _rate = float(target_mw) / 2.0      # SGF delivers half, the EGF the rest
+        # EGF OFF: NOBODY ELSE TO TAKE THE ERROR. Whatever the switched-off
+        # plant's collector, GSUs or station load still draw at the POI would
+        # leave it short of the SGF rating for good (and POI_P_STRICT stops the
+        # build), so the SGF is moved by the WHOLE POI error.
+        if not exist and POI_P_EXISTING_OFF and proj_pairs:
+            _rate = bess_mw + err
         # CAN THE BESS's OWN SHARE ACTUALLY BE MEASURED?
         #
         # THIS IS WHAT PUT A BESS AT -124 MW. bess_mw is what crosses _bess_cut
