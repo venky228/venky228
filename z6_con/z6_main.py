@@ -2205,7 +2205,7 @@ def tidy_results():
                 except Exception:
                     pass
     names = sorted((n for n in names if n), key=len, reverse=True)
-    moved = stuck = 0
+    moved = stuck = nlog = 0
     for case in (CASE_BASE, CASE_TEST):
         root = _res_root(case)
         if not os.path.isdir(root):
@@ -2233,10 +2233,31 @@ def tidy_results():
                 print("[tidy]   *** could not move %s (%s) -- close anything open in it "
                       "and run again ***" % (nm, e))
                 stuck += 1
+        # PLOTTER LOGS lying loose (PLOTTER_BASE_SantaFe_113.log in the project
+        # folder or the root, from before they had a logs\ folder) -> the
+        # project's logs\. Files only; one that will not move is left.
+        for f in glob.glob(os.path.join(root, "PLOTTER_*.log")) + \
+                glob.glob(os.path.join(root, "*", "PLOTTER_*.log")):
+            par = os.path.dirname(f)
+            proj = (os.path.basename(par) if par != root else
+                    next((p for p in names if ("_%s_" % p) in os.path.basename(f)), None))
+            if not proj or not os.path.isdir(os.path.join(root, proj)):
+                continue
+            ld = os.path.join(root, proj, "logs")
+            try:
+                if not os.path.isdir(ld):
+                    os.makedirs(ld)
+                if not os.path.exists(os.path.join(ld, os.path.basename(f))):
+                    os.rename(f, os.path.join(ld, os.path.basename(f)))
+                    nlog += 1
+            except Exception:
+                pass
         for box in sorted(glob.glob(os.path.join(root, "*"))) if (moved or stuck) else []:
             if _is_proj_box(box):
                 print("[tidy]   %-16s %d run folder(s)" % (os.path.basename(box),
                       len([x for x in os.listdir(box) if os.path.isdir(os.path.join(box, x))])))
+    if nlog:
+        print("[tidy] %d plotter log(s) moved into their project's logs\\ folder" % nlog)
     if moved or stuck:
         print("[tidy] %d folder(s) moved into their project's folder, %d left where they were"
               % (moved, stuck))
@@ -14361,7 +14382,7 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False,
     if background:
         # Its own log file: several of these run at once and interleaving them
         # onto this console would make all of them unreadable.
-        _ld = _res_root(case)
+        _ld = _plot_log_dir(case, projects[0] if projects and len(projects) == 1 else None)
         try:
             os.makedirs(_ld)
         except Exception:
@@ -15569,10 +15590,16 @@ PLOT_NOGAIN_MAX    = 2      # launches on one folder that draw nothing before th
 PLOT_QUICK_PAUSE_S = 5      # seconds between those retries
 
 
+def _plot_log_dir(case, proj):
+    """Plotter console logs: <project folder>\\logs\\ (results root\\logs\\
+       when no single project) -- the one place they are written AND read."""
+    return os.path.join(_proj_root(case, proj) if proj else _res_root(case), "logs")
+
+
 def _plotter_log_tail(sl, n=12):
     """Print the last n lines of a plotter slot's log, so a quick death says why."""
     try:
-        p = os.path.join(_res_root(sl["case"]), "logs",
+        p = os.path.join(_plot_log_dir(sl["case"], sl["proj"]),
                          "PLOTTER_%s_%s_%s.log" % (sl["case"].get("key", "x"), sl["proj"] or "x", sl["slot"]))
         if not os.path.isfile(p):
             return
@@ -15671,7 +15698,7 @@ def _start_plotter(case, proj, mode, slot, rdir=None, extra_env=None):
     env["SPP_FRESH_START"] = "0"
     if extra_env:
         env.update(extra_env)
-    ld = _res_root(case)
+    ld = _plot_log_dir(case, proj)
     try:
         os.makedirs(ld)
     except Exception:
