@@ -18853,6 +18853,13 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
     for _k2, (_t2, _v2) in ch.items():
         if categorize(_t2) != "PELEC" or not _v2:
             continue
+        # A MACHINE's output only. The POI power (the total and each tie,
+        # "POI POWR 761383 ...") is also PELEC; it falls to ~0 when the plant
+        # behind it trips, and that put the POI BUS on the tripped list -- so
+        # the tie P/Q panels and the POI bus VOLTAGE angle were framed
+        # "TRIPPED -- ETERM collapsed" as if the POI were a machine.
+        if _panel_tier(_t2) == -1:
+            continue
         try:
             _p0, _p1 = abs(float(_v2[0])), abs(float(_v2[-1]))
             if (_p0 > TRIP_PGEN_MIN_MW and _p1 < TRIP_PGEN_DEAD_MW
@@ -19088,8 +19095,12 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                     except Exception:
                         pass
                 _mb = re.search(r"\d{3,}", chan_core(title))
+                # a MACHINE's panels only: not the POI power / tie panels and
+                # not a bus voltage angle, which share the bus number
                 if (_mb and int(_mb.group(0)) in _dead_buses
-                        and c in ("ANGLE", "ETERM", "PELEC", "QELEC", "SPEED")):
+                        and c in ("ANGLE", "ETERM", "PELEC", "QELEC", "SPEED")
+                        and _panel_tier(title) != -1
+                        and not (c == "ANGLE" and not _is_machine_angle(title))):
                     ptitle += ("   %s TRIPPED -- ETERM collapsed to ~0; the "
                                "machine disconnected during the run"
                                % PLOT_VIOLATION_TAG)
