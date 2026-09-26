@@ -89,12 +89,12 @@ KEEP_OLD_IDS = False                         # False = F01.. numbered outward fr
 # LEVEL OF THE FAULTED BUS: substations from the POI to it, the bus itself
 # included, the POI excluded (minus one when the POI is a tap, so the tapped
 # circuit's ends are 0). Measured the same way for both sources.
-# P1 <= 2 / P4 <= 1 is what SPP's surplus reports use (GEN-2026-SR1/SR10/SR11/
-# SR12/SR14: ~75-100 events, 80-99 % of them reproduced). Each level more
-# roughly doubles the list in a meshed 115/138 kV area: 3/2 ~ 200-800 events,
-# 4/3 ~ 340-1400.
-SPP_LEVELS_BY_EVENT = {"P1": 2, "P4": 1, "P6": 1}     # events from the DISIS sheet
-CASE_LEVELS_BY_EVENT = {"P1": 2, "P4": 1, "P6": 1}    # events built from the power-flow case
+# P1 <= 3 / P4 <= 2 (set): ~280-660 events per project. P1 <= 2 / P4 <= 1 is
+# what SPP's surplus reports use (GEN-2026-SR1/SR10/SR11/SR12/SR14: ~75-100
+# events, 73-99 % of them reproduced) and gives ~110-300. Each level more
+# roughly doubles the list in a meshed 115/138 kV area.
+SPP_LEVELS_BY_EVENT = {"P1": 3, "P4": 2, "P6": 2}     # events from the DISIS sheet
+CASE_LEVELS_BY_EVENT = {"P1": 3, "P4": 2, "P6": 2}    # events built from the power-flow case
 KV_MIN = 100.0                               # network circuits at / above this kV
 SUBT_KV_MIN = 69                             # also P1 on lines down to this kV (None = off) ...
 SUBT_P1_LEVEL = 1                            # ... faulted at a bus within this level (SPP 115 kV POI reports)
