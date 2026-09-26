@@ -4599,7 +4599,9 @@ if _NP_ON and not CASE_TAG.endswith("_NEWPLANT"):
 # and results are one named set. Costs one case + snapshot per level on disk.
 _LEVEL_SUF = ((("_cap%s" % _CAP_TAG_DIR) if _CAP_TAG_DIR else "")
               + (("_%s" % _RUN_TAG_DIR) if _RUN_TAG_DIR else ""))
-if _LEVEL_SUF and not CASE_TAG.endswith(_LEVEL_SUF):
+# ONCE. The variant block above already put the tag in, before _NEWPLANT, so
+# "_s1_egfoff" was added a second time: ..._s1_egfoff_NEWPLANT_s1_egfoff.sav.
+if _LEVEL_SUF and _LEVEL_SUF not in CASE_TAG:
     CASE_TAG += _LEVEL_SUF
     print("[case] level %s -- its own build files: %s.sav/.cnv/.snp/.cnl"
           % (_LEVEL_SUF.lstrip("_"), CASE_TAG))

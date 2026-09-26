@@ -221,6 +221,7 @@ RUN_MISSING = False                          # old setting -- same as PIPELINE =
 SAV_FIRST = True                             # True = build every .sav first: base, GIA, each SURPLUS scenario, all projects
 SAV_FIRST_STOP = True                        # True = stop after them to check | False = go straight on to the runs
 SAV_FIRST_WORKERS = 6                        # .sav builds at once (one PSS/E each)
+SAV_FIRST_BASE = False                       # True = also save the solved base case (deck + removals) per project
 SURPLUS_SIDE_BY_SIDE = True                  # True = one workbook per project: BASE | GIA | each SURPLUS scenario
 
 # ---- 2. WORKERS, CORES AND SIMULATION TIME -------------------------------------
@@ -15071,7 +15072,7 @@ def _sav_runs():
     out = []
     cases = _cases_to_run()
     for proj in (_panel_projects() or compare_projects()):
-        if any(c is CASE_BASE for c in cases):
+        if SAV_FIRST_BASE and any(c is CASE_BASE for c in cases):
             out.append((CASE_BASE, proj, "", "BASE", {}))
         if any(c is CASE_TEST for c in cases):
             out.append((CASE_TEST, proj, "", "GIA (SGF + EGF)", {}))
