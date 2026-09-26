@@ -15099,9 +15099,12 @@ def build_all_savs():
     for _case in (CASE_BASE, CASE_TEST):
         if not any(r[0] is _case for r in runs):
             continue
-        _sp = os.path.join(_case["dir"], _case["script"])
-        if not os.path.isfile(_sp):
-            print("[sav] *** %s not found ***" % _sp)
+        # THE STUDY SCRIPT, NOT THE LAUNCHER (case["script"]): the launcher
+        # runs a whole study -- every project, workers, report.
+        _sp = _study_script_for(_case)
+        if not _sp:
+            print("[sav] *** the study script for %s is not in %s ***"
+                  % (_case["key"], _case["dir"]))
             return False
     logdir = os.path.join(STUDY_ROOT, "sav_check")
     if not os.path.isdir(logdir):
@@ -15113,7 +15116,7 @@ def build_all_savs():
     todo = list(runs)
 
     def _one(case, proj, tag, label, extra):
-        sp = os.path.join(case["dir"], case["script"])
+        sp = _study_script_for(case)
         env = dict(os.environ)
         _push_records(env)
         _push_settings(env, case)
@@ -15129,13 +15132,15 @@ def build_all_savs():
         env["SPP_WORKER"] = "0"
         env["SPP_FRESH_START"] = "0"
         env["SPP_SAV_ONLY"] = "1"
+        env["SPP_RUN_PROJECTS"] = proj
+        env["SPP_RUN_MODES"] = MODES[0]
         name = "%s_%s%s" % (proj, "base" if case is CASE_BASE else "proj", ("_" + tag) if tag else "")
         log = os.path.join(logdir, name + ".log")
         t0 = time.time()
         with open(log, "w") as fh:
             rc = subprocess.call([PYTHON, "-u", sp], cwd=case["dir"], env=env,
                                  stdout=fh, stderr=subprocess.STDOUT)
-        keep, sav = [], None
+        keep, sav, why = [], None, ""
         try:
             with open(log, errors="replace") as fh:
                 for ln in fh:
@@ -15143,6 +15148,8 @@ def build_all_savs():
                         sav = ln.split("SAV:", 1)[1].strip()
                     if _SAV_KEEP.search(ln):
                         keep.append(ln.rstrip())
+                    if not why and re.search(r"build failed|Error:|\*\*\* .*(not|fail|refus)", ln, re.I):
+                        why = ln.strip()
         except Exception:
             pass
         ok = rc == 0 and bool(sav) and os.path.isfile(sav) and os.path.getmtime(sav) >= t0 - 1
@@ -15151,6 +15158,8 @@ def build_all_savs():
             print("[sav] %-4s %-15s %-4s %-12s %s"
                   % ("OK" if ok else "FAIL", proj, case["key"], tag or label.split()[0],
                      sav if ok else "rc=%s -- see %s" % (rc, log)))
+            if not ok and why:
+                print("[sav]      %s" % why[:220])
 
     def _worker():
         while True:
