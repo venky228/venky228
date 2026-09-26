@@ -12789,6 +12789,35 @@ def _poi_plant_tie_mw(poi):
     return tot, len(rows), rows
 
 
+_EGF_OFF_SAID = set()
+
+
+def _egf_off_target(project, target_mw):
+    """The POI total to hold when the EGF is OUT OF SERVICE (BP-7250 7.6, first
+       scenario): what the SGF alone delivers, i.e. its rating. The GIA total in
+       POI_P_TARGET_MW needs the EGF to make up the rest, which this run has
+       switched off -- holding it would leave the POI short and, under
+       POI_P_STRICT, stop the build. A total at or below the rating is kept."""
+    if target_mw is None or not POI_P_EXISTING_OFF or not project:
+        return target_mw
+    try:
+        _pairs, rate, _new = _poi_project_pairs(project)
+    except Exception:
+        return target_mw
+    if rate is None or not _pairs:
+        return target_mw
+    r = float(rate) * (float(CAP_SCALE) if CAP_SCALE is not None else 1.0)
+    if float(target_mw) <= r:
+        return target_mw
+    _k = str(project.get("name"))
+    if _k not in _EGF_OFF_SAID:
+        _EGF_OFF_SAID.add(_k)
+        print("  [poi-p] EGF OFF: %s's POI total %.1f MW needs the existing machines; "
+              "with them out of service the POI is held at the SGF rating, %.1f MW"
+              % (_k, float(target_mw), r))
+    return r
+
+
 def _poi_target_verify(project, target_mw):
     """The last word on the POI total: what the plant DELIVERS into the POI on
        the solved case, against what was asked for. Prints it always; stops the
@@ -16020,7 +16049,7 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
             for _mr, _mmw in _bess_members_first():
                 with _member_scope(_mr, _mmw):
                     if POI_P_TARGET_MW is not None:
-                        apply_poi_p_target(_mr, POI_P_TARGET_MW)
+                        apply_poi_p_target(_mr, _egf_off_target(_mr, POI_P_TARGET_MW))
         # 1a) remove broken machines (garbage dynamic states crash the swing-capture
         #     writer at the first disturbance -- see REMOVE_MACHINES comment)
         _rm_list = REMOVE_MACHINES if APPLY_REMOVE_MACHINES else []
@@ -16075,7 +16104,7 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
                 if PROJECT_OFF:
                     _switch_project_off()
                 elif POI_P_TARGET_MW is not None:
-                    apply_poi_p_target(_mr, POI_P_TARGET_MW)
+                    apply_poi_p_target(_mr, _egf_off_target(_mr, POI_P_TARGET_MW))
                 _solve_staged(_mr)
         # 3a) SURPLUS BESS: gross up the gen dispatch so the POI meter delivers the target
         #     P/Q despite intertie losses (solve/measure/adjust loop).
@@ -16108,7 +16137,7 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
                 with _member_scope(_mr, _mmw):
                     if (POI_P_TARGET_MW is not None
                             and (POI_P_MEASURE or "metered").strip().lower() == "metered"):
-                        apply_poi_p_metered(_mr, POI_P_TARGET_MW)
+                        apply_poi_p_metered(_mr, _egf_off_target(_mr, POI_P_TARGET_MW))
         if _any_poi_target() and POI_HOLD_AREA_MW:
             for _hr in _hold_rows():
                 _poi_hold_area_after_solve(_hr)
@@ -16127,7 +16156,7 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         for _mr, _mmw in _mm:
             with _member_scope(_mr, _mmw):
                 if POI_P_TARGET_MW is not None:
-                    _poi_target_verify(_mr, POI_P_TARGET_MW)
+                    _poi_target_verify(_mr, _egf_off_target(_mr, POI_P_TARGET_MW))
         # 3a2) SURPLUS BESS: hand the machines their full 0.95-pf reactive RANGE back.
         #      The tuning loop pinned QT=QB=QG so the POI Q landed on target; saving the
         #      case that way would leave every inverter with no reactive capability.
@@ -19891,6 +19920,9 @@ def _study_parameter_lines():
         tgt = tgt.get(proj)
     if tgt:
         L.append("  POI total asked for  %s MW" % tgt)
+        if _g("POI_P_EXISTING_OFF"):
+            L.append("  EGF OFF              existing machines out of service -- the POI is")
+            L.append("                       held at the SGF rating when that is below it")
         L.append("  project held at      %s" % _g("POI_P_PROJECT_AT", "-"))
         L.append("  remainder shared by  %s" % _g("POI_P_SHARE", "-"))
         try:
