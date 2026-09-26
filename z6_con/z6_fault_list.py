@@ -122,6 +122,8 @@ MAX_EVENTS = 400                             # cap per project (None = no cap): 
 # (P4 <= 1 above), a few stuck-breaker events per bus (SR1 15 at 5 buses, SR11
 # 22 at 7). Kept per bus: SPP's own first, then the most elements / MW out.
 P4_MAX_PER_BUS = 3                           # None = every P4 at the bus
+P4_LABEL = "P4"                              # planning_event written for every P4 ("P4" -- no
+                                             #   P4.2 / P4.3 / P4.5); None = keep the sub-category
 P4_MAX_TOTAL = 50                            # P4 per project (SPP reports: 4-22); nearest the POI kept
 # IMPACT SCREEN -- P1 only; every P4 stays as SPP defines it. A P1 faulted at
 # or beyond SCREEN_FROM_LEVEL is left out when BOTH hold: the POI keeps at
@@ -1278,7 +1280,8 @@ def to_row(lev, e):
             "fault_type": e["type"], "clear_cycles": cyc,
             "trip_from": first[0], "trip_to": first[1],
             "trip_kv": ("%.0f" % first[2]) if first[2] else "", "trip_ckt": first[3],
-            "planning_event": e["ev"], "trip_elements": _els(tl),
+            "planning_event": (P4_LABEL if P4_LABEL and ev_class(e["ev"]) == "P4" else e["ev"]),
+            "trip_elements": _els(tl),
             "pre_outage": _els([enc_elem(net, k) for k in e["pre"]]),
             "reclose": "1" if e["reclose"] else "0",
             "reclose_wait": (("%g" % float(e["wait"])) if e["reclose"] and e["wait"] != "" else ""),
@@ -1600,8 +1603,26 @@ def make_project(proj, net, disis, rep):
             best[k] = e
         else:
             dups.append((e, best[k]))
-    # ---- P4 per bus as SPP's reports: the few most severe at each bus
+    # ---- the same stuck breaker written twice: same bus, same elements out,
+    #      same clearing -- only the units / loads dropped differ. The one
+    #      that drops the most is kept (a unit on a cleared bus trips anyway).
     pool = list(best.values())
+    same_brk = []
+    grp = {}
+    for e in pool:
+        if ev_class(e["ev"]) == "P4":
+            k = (e["fbus"], tuple(sorted(set(e["trips"]))), float(e["cycles"] or 0))
+            grp.setdefault(k, []).append(e)
+    cut_ids = set()
+    for k, es in grp.items():
+        if len(es) > 1:
+            es.sort(key=lambda e: (-(len(e["drop_m"]) + len(e["drop_l"]) + len(e["drop_s"])),
+                                   0 if e["src"] == "DISIS" else 1, e["con_id"]))
+            for e in es[1:]:
+                same_brk.append((e, es[0]))
+                cut_ids.add(id(e))
+    pool = [e for e in pool if id(e) not in cut_ids]
+    # ---- P4 per bus as SPP's reports: the few most severe at each bus
     p4_trim = []
     if P4_MAX_PER_BUS:
         byb = {}
@@ -1711,6 +1732,13 @@ def make_project(proj, net, disis, rep):
         W("  %d event(s) identical to the old list keep their F-number (their runs are used)"
           % reused)
     W("")
+    odd = [e for e in final if ev_class(e["ev"]) == "P4" and float(e["cycles"] or 0) != STUCK_CYCLES]
+    if odd:
+        W("P4 CLEARING OTHER THAN %d CYCLES -- as SPP's sheet writes it (a utility's own breaker-"
+          "failure time), kept:" % STUCK_CYCLES)
+        for e in odd:
+            W("  %-30s bus %-7d %s cycles" % (e["con_id"], e["fbus"], e["cycles"]))
+        W("")
     W("EXECUTION CHECK -- every element resolved the way the study opens it: %s"
       % ("all %d event(s) OK" % len(final) if not xbad else "%d event(s) NEED A LOOK" % len(xbad)))
     for e, b_ in xbad:
@@ -1726,6 +1754,13 @@ def make_project(proj, net, disis, rep):
         W("  %-6s %-30s bus %-7d %s" % (e["src"], e["con_id"] or "(generated)", e["fbus"],
                                        ", ".join(_desc(net, k) for k in e["trips"][:4])))
     W("")
+    if same_brk:
+        W("P4 SAME BREAKER TWICE (%d) -- same bus, elements and clearing; the one dropping the "
+          "most units / loads kept:" % len(same_brk))
+        for lost, won in same_brk:
+            W("  %-6s %-30s @%-7d -> kept %-30s" % (lost["src"], lost["con_id"] or "(generated)",
+                                                  lost["fbus"], won["con_id"] or "(generated)"))
+        W("")
     if p4_trim:
         W("P4 OVER P4_MAX_PER_BUS = %s at a bus / P4_MAX_TOTAL = %s (%d left out; at each bus "
           "the most severe kept, then the nearest the POI):"
