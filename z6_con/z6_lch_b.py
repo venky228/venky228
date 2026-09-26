@@ -2205,6 +2205,63 @@ def _done_sig(path):
     return ""
 
 
+def _timing_changed(out_dir, sid):
+    """Why <sid>'s result on disk was run with DIFFERENT TIMES than this launch
+       (PRE_FAULT_S / SIM_END_S from z6_main.py), or "".
+
+       Its marker records the clearing instant (first line) and the last
+       simulated second (tend=). A result from an 8 s run with the fault at
+       3 s, kept under RUN_ONLY_MISSING_OUT beside 25.2 s runs with the fault
+       at 5 s, would be scored against windows that belong to the other
+       timing -- and compared as if it were the same study. Never deletes:
+       the caller moves it aside and re-runs it."""
+    def _f(k):
+        try:
+            v = float(os.environ.get(k) or "")
+            return v if v == v and v > 0 else None
+        except ValueError:
+            return None
+    if str(sid).upper().startswith("FLAT"):
+        # the no-fault run has its own length, FLAT_RUN_S, and no fault
+        fl = _f("SPP_FLAT_RUN_S")
+        mp = os.path.join(out_dir, "%s.done" % sid)
+        if fl is not None and os.path.isfile(mp):
+            try:
+                for ln in open(mp).read().splitlines():
+                    if ln.startswith("tend=") and abs(float(ln[5:]) - fl) > 0.11:
+                        return "ran to %.2f s -- FLAT_RUN_S is now %.2f s" % (float(ln[5:]), fl)
+            except Exception:
+                pass
+        return ""
+    pre, end = _f("SPP_PRE_FAULT_S"), _f("SPP_SIM_END_S")
+    if pre is None and end is None:
+        return ""
+    for ext in ("done", "partial"):
+        mp = os.path.join(out_dir, "%s.%s" % (sid, ext))
+        if not os.path.isfile(mp):
+            continue
+        tclear = tend = None
+        try:
+            with open(mp) as fh:
+                lines = fh.read().splitlines()
+            if lines and lines[0].strip():
+                try:
+                    tclear = float(lines[0].strip())
+                except ValueError:
+                    tclear = None
+            for ln in lines:
+                if ln.startswith("tend="):
+                    tend = float(ln[5:].strip())
+        except Exception:
+            continue
+        if pre is not None and tclear is not None and not (pre < tclear <= pre + 1.0):
+            return ("cleared at %.3f s -- the fault is now applied at %.2f s (PRE_FAULT_S)"
+                    % (tclear, pre))
+        if ext == "done" and end is not None and tend is not None and abs(tend - end) > 0.11:
+            return "ran to %.2f s -- SIM_END_S is now %.2f s" % (tend, end)
+    return ""
+
+
 def _stale_aside(out_dir, sid, why):
     """Move <sid>.out / .done aside as *.stale_<stamp> -- never deleted."""
     import time as _t
@@ -2285,8 +2342,15 @@ def _apply_skip_done(selected):
         if sigs:
             break
     todo, done, gave_up, stale, empty, partial, have_out = [], [], [], [], [], [], []
+    retimed = []
     for sid in ids:
         _op = os.path.join(OUT_DIR, "%s.out" % sid)
+        # RUN WITH OTHER TIMES: set aside and run again, even under
+        # RUN_ONLY_MISSING_OUT -- see _timing_changed.
+        _why_t = _timing_changed(OUT_DIR, sid)
+        if _why_t:
+            _stale_aside(OUT_DIR, sid, "timing")
+            retimed.append((sid, _why_t))
         # A SCORABLE PARTIAL RUN IS KEPT, NOT RE-RUN. Re-running writes over
         # the only copy of a run that reached most of SIM_END_S and is already
         # scored and compared, and the attempts left to it are the ones that
@@ -2340,6 +2404,11 @@ def _apply_skip_done(selected):
         st = (prog.get(sid) or ("",))[0]
         if st in ("GAVE-UP", "ERROR", "FAILED"):
             gave_up.append(sid)
+    if retimed:
+        print("[parallel] %d scenario(s) on disk were run with DIFFERENT TIMES than this launch -- "
+              "moved aside as .stale and re-run: %s%s"
+              % (len(retimed), ", ".join("%s (%s)" % x for x in retimed[:4]),
+                 " ..." if len(retimed) > 4 else ""))
     if empty:
         print("[parallel] SKIP_DONE: %d scenario(s) carried a .done marker but their .out holds NO DATA"
               " (under %d KB) -- the run wrote nothing; moved aside as .stale and re-run: %s%s"
@@ -5482,6 +5551,10 @@ def _run_one_study():
     # A selective run reuses the snapshot the earlier build already made, so the build
     # phase is skipped when the flat run is done AND the fault file exists. If either is
     # missing the build still runs -- that is what regenerates the fault definition file.
+    _why_f = _timing_changed(OUT_DIR, "FLAT_RUN")
+    if _why_f:
+        _stale_aside(OUT_DIR, "FLAT_RUN", "timing")
+        print("[parallel] the no-fault run on disk %s -- moved aside and run again" % _why_f)
     _flat_done = os.path.isfile(os.path.join(OUT_DIR, "FLAT_RUN.done"))
     _skip_build = bool(selected) and _flat_done and _have_fault_file()
     if _skip_build:

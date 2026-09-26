@@ -202,12 +202,12 @@ def _print_phase_times(total):
 # ============================================================================
 
 # ---- 1. WHAT TO RUN ------------------------------------------------------------
-PROJECTS = ["SantaFe"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
+PROJECTS = ["SantaFe", "IronStar","EmpirePrairie","EastFork"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
 MODES = ["spp"]                              # fault set: spp | con | table | custom | manual
 PIPELINE = "all"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
 RUN_CASES = "both"                           # "both" | "base" | "proj" -- which case to simulate
-ONLY_FAULTS = ["F01-F04"]                    # [] = every fault | e.g. ["F01-F04"]
+ONLY_FAULTS = []                    # [] = every fault | e.g. ["F01-F04"]
 ONLY_EVENTS = []                             # [] = every event
 FRESH_START = False                          # True = start over (clears .done markers) -- set back to False after
 SKIP_DONE = True                             # True = skip scenarios that already have .done + .out
@@ -235,9 +235,9 @@ PLOT_INRUN = 1                               # plotters per running folder
 PLOT_WORKERS = 2                             # plotters per case
 PLOT_TOTAL_MAX = 4                           # cap on plotters
 # simulation time
-FLAT_RUN_S = 5                               # s, no-fault run
-PRE_FAULT_S = 3                              # s before the fault
-SIM_END_S = 8                               # s per fault
+FLAT_RUN_S = 25                               # s, no-fault run
+PRE_FAULT_S = 5                              # s before the fault
+SIM_END_S = 25.2                               # s per fault
 RUN_NPLT = 2                                 # write every N steps (1 = every step, huge)
 
 # ---- 3. GEN / CAP / LINE TEST --------------------------------------------------
@@ -246,7 +246,7 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 # Live, every project on one page: comparison_scenarios\GEN_TEST_STATUS_ALL.txt
 # Preview the plan without simulating:  python z6_gt_report.py
 # -- 3a. on / off, projects, faults
-GEN_TEST = True                              # True = run this test only | False = normal study
+GEN_TEST = False                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
 GEN_TEST_REPORT_ONLY = False                 # True = rewrite every gen-test report from the runs on disk, simulate nothing
 GEN_TEST_RESCORE_MISSING = True              # True = a finished run scored before the POI power-recovery row existed is
