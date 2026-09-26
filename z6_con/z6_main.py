@@ -525,8 +525,9 @@ EGF_DYR_RUN = False                          # True = run BOTH cases with those 
 EGF_OFF_RUN = False                          # True = run BOTH cases with every existing machine OFF (_egfoff) and compare
 EGF_PROJECTS = []                            # [] = every project of the launch (EGF_DYR_RUN: those with edits)
 EGF_FAULTS = "same"                          # "same" = ONLY_FAULTS | "all" | ["F01-F04"]
-EGF_ONLY = False                             # True = simulate ONLY the EGF runs above: the as-is studies are
-                                             #   not run (their results on disk are the reference), nor any other extra run
+EGF_ONLY = True                              # True = a project WITH edits above runs ONLY its edited run (its as-is study
+                                             #   is not simulated -- the results on disk are the reference, and none of its
+                                             #   other extra runs); a project with no edits runs the normal way
 ABORT_ON_MODEL_NOT_ACCESSIBLE = True         # stop on 'MODEL NOT ACCESSIBLE'
 INIT_NAN_ABORT = False                       # stop on NaN after init
 ADJUSTMENTS_REPORT = True                    # list every non-project change in SYSTEM_ADJUSTMENTS.txt
@@ -9142,6 +9143,19 @@ EGF_TAG = "egf"
 EGF_OFF_TAG = "egfoff"
 
 
+_EGF_SKIP = []          # projects whose as-is study this launch does NOT simulate (EGF_ONLY)
+
+
+def _egf_only_projects(projects):
+    """EGF_ONLY: of `projects`, those with EGF_DYR_EDITS_BY_PROJECT values (and
+       in EGF_PROJECTS, when that is set) -- each runs only its edited run."""
+    if not (EGF_ONLY and EGF_DYR_RUN):
+        return []
+    return [p for p in projects
+            if (EGF_DYR_EDITS_BY_PROJECT or {}).get(p)
+            and (not EGF_PROJECTS or p in EGF_PROJECTS)]
+
+
 def _egf_edits_for(proj):
     """[[model, {con: value}], ...] for one project, checked. [] = none."""
     out = []
@@ -12096,6 +12110,8 @@ def archive_previous_runs():
             if not os.path.isdir(d):
                 continue
             proj = _proj_of_results_dir(d)
+            if proj in _EGF_SKIP:
+                continue                    # EGF_ONLY: its as-is results are the reference
             if _panel_projects() and proj not in _panel_projects():
                 continue
             # Nothing worth keeping: an empty folder, or one a previous run
@@ -21714,19 +21730,17 @@ def main():
         "missing": "simulate only what is missing, then compare",
         "all":     "simulate BOTH cases, report both, then compare",
     }[pipeline])
-    # EGF_ONLY: the as-is studies are the reference and are NOT simulated --
-    # their folders on disk are scored and compared as with "compare"; only the
-    # _egf / _egfoff runs simulate.
-    _egf_only = bool(EGF_ONLY and (EGF_DYR_RUN or EGF_OFF_RUN) and pipeline != "compare")
-    if EGF_ONLY and not _egf_only:
-        print("[egf] EGF_ONLY is on but %s -- ignored" % (
-            "PIPELINE is \"compare\"" if pipeline == "compare"
-            else "EGF_DYR_RUN and EGF_OFF_RUN are both off"))
-    if _egf_only:
-        print("[egf] EGF_ONLY: the as-is studies are NOT simulated (their results on disk")
-        print("[egf]           are the reference); only the %s run(s) simulate, and no"
-              % " / ".join(t for t, on in (("_egf", EGF_DYR_RUN), ("_egfoff", EGF_OFF_RUN)) if on))
-        print("[egf]           other extra run (sweeps, surplus, capacity, new plant, project off).")
+    # EGF_ONLY, PER PROJECT: a project with edits runs only its edited run --
+    # its as-is study is not simulated (its results on disk are the reference)
+    # and none of its other extra runs; every other project runs as normal.
+    _egf_skip = _egf_only_projects(list(_panel_projects() or [])) if pipeline != "compare" else []
+    _EGF_SKIP[:] = _egf_skip
+    if _egf_skip:
+        print("[egf] EGF_ONLY: %s run ONLY the edited run (own values each); the as-is"
+              % ", ".join(_egf_skip))
+        print("[egf]           study of %s is not simulated -- read from disk. Every other"
+              % ("it" if len(_egf_skip) == 1 else "them"))
+        print("[egf]           project runs the normal way.")
     # THE SETTINGS THAT MAKE THIS RUN POINTLESS, CHECKED FIRST.
     #
     # This test used to sit in PHASE 0, several hundred lines below -- and
@@ -22021,7 +22035,7 @@ def main():
     # "base" would otherwise report the project case as having failed when it
     # was deliberately left alone.
     rb = rt = None
-    if pipeline == "all" and not _egf_only:
+    if pipeline == "all":
         # BEFORE ANY SIMULATION. The studies write into the same folders as
         # last time, so this is the only moment the previous run can be kept.
         # ONLY WHEN THIS LAUNCH STARTS OVER. KEEP_PREVIOUS_RUNS renamed the
@@ -22076,13 +22090,20 @@ def main():
         # and nothing downstream would say so -- every unmatched project would
         # read as "scored on one side only" as if it had crashed.
         pjs = _panel_projects() or None
-        if pjs:
+        if pjs and _egf_skip:
+            pjs = [x for x in pjs if x not in _egf_skip]
+        _no_main = bool(_egf_skip) and not pjs
+        if _no_main:
+            print("[compare] every project has EGF edits -- no as-is study is simulated")
+        elif pjs:
             print("[compare] both cases will run: %s" % ", ".join(pjs))
         else:
             print("[compare] each launcher uses its own RUN_PROJECTS. If those differ the")
             print("[compare] two studies are not comparable -- set PROJECTS here to force")
             print("[compare] the same list on both sides.")
-        if RUN_IN_PARALLEL:
+        if _no_main:
+            pass
+        elif RUN_IN_PARALLEL:
             # SAY THE SESSION COUNT OUT LOUD. Two studies at N_WORKERS each is
             # twice the PSS/E sessions of a single run, and the failure when
             # there are not enough licences arrives minutes in, as a worker that
@@ -22184,7 +22205,7 @@ def main():
     # one of its faults comes out "scored on one side only", which is true and
     # useless. This runs exactly the side that is missing, for exactly the
     # projects that are missing it, and nothing else.
-    if pipeline == "missing" and not _egf_only:
+    if pipeline == "missing":
         # WHAT "MISSING" MEANS. It used to mean "a project that has a results
         # folder on one side and not the other" -- so a project with no folder
         # on EITHER side (IronStar, EmpirePrairie, never started) was not
@@ -22202,6 +22223,7 @@ def main():
         for mode in (list(MODES) or ["spp"]):
             _c, ob, ot = discover_projects(mode)
             _cands = sorted(set(_pj_all) | set(_c) | set(ob) | set(ot), key=str)
+            _cands = [x for x in _cands if x not in _egf_skip]
             for key, case in (("BASE", CASE_BASE), ("PROJ", CASE_TEST)):
                 for pj in _cands:
                     rdir = results_dir(case, pj, mode)
@@ -22501,6 +22523,7 @@ def main():
         if int(FAST_COMPARE_PARALLEL or 1) > 1 and len(_fp) > 1:
             return _fast_compare_parallel(_fp)
     results, all_only_b, all_only_t = compare_now(quiet=False)
+    _res_n = [r for r in results if r["project"] not in _egf_skip]     # EGF_ONLY projects: no other extra run
     all_only_b, all_only_t = set(all_only_b), set(all_only_t)
     if _fast:
         # THE COMPARISON IS WRITTEN. The sweep / capacity / surplus / overvoltage
@@ -22526,9 +22549,9 @@ def main():
     # comes before the sweep: it answers a question about the ARRANGEMENT, and
     # the answer decides whether tuning constants on the existing arrangement
     # is the right thing to spend studies on.
-    if results and NEW_PLANT_RUN and pipeline != "compare" and not _egf_only:
-        _np_pj = _new_plant_projects([r["project"] for r in results])
-        for res in [r for r in results if r["project"] in _np_pj]:
+    if _res_n and NEW_PLANT_RUN and pipeline != "compare":
+        _np_pj = _new_plant_projects([r["project"] for r in _res_n])
+        for res in [r for r in _res_n if r["project"] in _np_pj]:
             try:
                 rows = run_new_plant(res["project"], res["mode"])
                 with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
@@ -22539,9 +22562,9 @@ def main():
                 print("[newplant] the new-plant run failed (%s) -- the comparison "
                       "above is unaffected" % e)
 
-    if results and PROJECT_OFF_RUN and pipeline != "compare" and not _egf_only:
-        _off_pj = _project_off_projects([r["project"] for r in results])
-        for res in [r for r in results if r["project"] in _off_pj]:
+    if _res_n and PROJECT_OFF_RUN and pipeline != "compare":
+        _off_pj = _project_off_projects([r["project"] for r in _res_n])
+        for res in [r for r in _res_n if r["project"] in _off_pj]:
             try:
                 rows = run_project_off(res["project"], res["mode"])
                 with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
@@ -22556,8 +22579,8 @@ def main():
     # Same placement and the same reason as the capacity sweep below: it runs
     # full studies, so it belongs to the one-shot path in main() and not to
     # compare_now(), which the live-refresh thread calls on a timer.
-    if results and (DYR_SWEEP or DYR_SWEEP_BY_PROJECT) and pipeline != "compare" and not _egf_only:
-        _sweep_pj = _dyr_sweep_projects([r["project"] for r in results])
+    if _res_n and (DYR_SWEEP or DYR_SWEEP_BY_PROJECT) and pipeline != "compare":
+        _sweep_pj = _dyr_sweep_projects([r["project"] for r in _res_n])
         # ONE PASS PER CAPACITY LEVEL. ("", None) first, so the ordinary
         # full-output sweep is complete and written before a single reduced-
         # output study starts -- an extra level that fails must not cost the
@@ -22566,7 +22589,7 @@ def main():
             if _ctag:
                 _banner("REPEATING THE .dyr SWEEP AT %s PROJECT OUTPUT"
                         % _cap_label(_ctag))
-            for res in [r for r in results if r["project"] in _sweep_pj]:
+            for res in [r for r in _res_n if r["project"] in _sweep_pj]:
                 try:
                     rows, variants = run_dyr_sweep(res["project"], res["mode"],
                                                    cap_tag=_ctag, cap_scale=_cscale)
@@ -22615,8 +22638,8 @@ def main():
                     print("[mw] the per-size comparisons failed (%s)" % e)
 
     # ---- TOTAL P AT THE POI, one complete study per level --------------------
-    if results and (POI_P_LEVELS or POI_P_LEVELS_PCT) and pipeline != "compare" and not _egf_only:
-        for res in results:
+    if _res_n and (POI_P_LEVELS or POI_P_LEVELS_PCT) and pipeline != "compare":
+        for res in _res_n:
             try:
                 rows, levels = run_poi_p_sweep(res["project"], res["mode"])
                 with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
@@ -22685,8 +22708,8 @@ def main():
     # deliberately its own step: these are not a sweep of one study, they are
     # the two systems BP-7250 7.6 defines, and each is compared against the
     # base on its own terms.
-    if results and SURPLUS_SCENARIOS and pipeline != "compare" and not _egf_only:
-        for res in results:
+    if _res_n and SURPLUS_SCENARIOS and pipeline != "compare":
+        for res in _res_n:
             try:
                 run_surplus_scenarios(res["project"], res["mode"])
             except Exception as e:
@@ -22703,22 +22726,29 @@ def main():
     # Both cases again, into their own _egf / _egfoff folders; then every pair
     # compared. The comparisons are rebuilt from disk on any launch, so a
     # variant already run (or since switched off) keeps its workbooks.
-    if results and (EGF_DYR_RUN or EGF_OFF_RUN) and pipeline != "compare":
-        for res in results:
+    # EVERY PROJECT COMPARED, plus an EGF_ONLY project whose as-is study is not
+    # on disk in both cases -- its edited run is what this launch is for.
+    _egf_pm = [(r["project"], r["mode"]) for r in results]
+    for _p in _egf_skip:
+        for _m in (list(MODES) or ["spp"]):
+            if (_p, _m) not in _egf_pm:
+                _egf_pm.append((_p, _m))
+    if _egf_pm and (EGF_DYR_RUN or EGF_OFF_RUN) and pipeline != "compare":
+        for _p, _m in _egf_pm:
             try:
-                run_egf_variants(res["project"], res["mode"])
+                run_egf_variants(_p, _m)
             except Exception as e:
                 print("[egf] the existing-machine runs failed (%s) -- the comparison "
                       "above is unaffected" % e)
-    if results:
-        for res in results:
+    if _egf_pm:
+        for _p, _m in _egf_pm:
             try:
-                compare_egf_variants(res["project"], res["mode"])
+                compare_egf_variants(_p, _m)
             except Exception as e:
                 print("[egf] the existing-machine comparisons failed (%s)" % e)
 
-    if results and CAPACITY_LEVELS and pipeline != "compare" and not _egf_only:
-        for res in results:
+    if _res_n and CAPACITY_LEVELS and pipeline != "compare":
+        for res in _res_n:
             try:
                 rows = run_capacity_sweep(res["project"], res["mode"])
                 with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
