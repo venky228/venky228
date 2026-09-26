@@ -104,6 +104,10 @@ KV_MIN = 100.0                               # network circuits at / above this 
 SUBT_KV_MIN = 69                             # also P1 on lines down to this kV (None = off) ...
 SUBT_P1_LEVEL = 1                            # ... faulted at a bus within this level (SPP 115 kV POI reports)
 XFMR_LV_KV_MIN = 60.0                        # P1.3: transformer second winding at / above this kV
+P1_FAULT_AT_POI_END = True                   # True = every two-ended fault (P1.2 line, P1.3 transformer,
+                                             #   P6 faulted element; SPP's or the script's) is at its end
+                                             #   NEAREST THE POI -- MINGO 115 kV, not COLBY or the 345 kV
+                                             #   side | False = where SPP put it. P4 stays at its bus.
 HUB_MIN_CIRCUITS = 2                         # a substation is a level node with this many circuits:
                                              #   2 = every substation is a step (SPP's Aneden reports)
                                              #   3 = only switching stations (BPM text, MEPPI reports)
@@ -933,6 +937,47 @@ def event_from_disis(net, d):
     return e, ""
 
 
+def poi_end(lev, e):
+    """P1_FAULT_AT_POI_END: move a P1.2 / P1.3 fault to the end of what it
+       trips that is nearest the POI (fewest nodes, then the higher kV).
+       SPP's sheet may fault a circuit at its far end (COLBY for MINGO-COLBY)
+       or a transformer on its 345 kV side; the POI side is the harder case
+       for the plant. A tapped junction, a plant bus or a transformer winding
+       below XFMR_LV_KV_MIN is never chosen, and a tie stays where it was.
+       The clearing follows the new bus's kV (NORMAL_CLEAR)."""
+    # EVERY two-ended fault: P1.2 / P1.3, and P6 (the element faulted after the
+    # prior outage; the outage itself stays as it is). Not P4: a stuck breaker
+    # IS a bus -- the elements it clears are the ones at that bus -- so there
+    # is no other end to move it to. Not P1.1 / P1.4: a unit or a shunt has
+    # one bus.
+    if not P1_FAULT_AT_POI_END or not str(e["ev"]).startswith(("P1.2", "P1.3", "P6")):
+        return e
+    if not e["trips"] or e["rm_bus"]:
+        return e
+    net = lev.net
+    buses = elem_buses(net, e["trips"])
+    if e["fbus"] not in buses:
+        return e
+    xf = all(net.elem[k]["kind"] in ("xf2", "xf3") for k in e["trips"])
+    cands = [b for b in buses
+             if b not in lev.plant and not pure_tap(net, b)
+             and (not xf or net.kv.get(b, 0) >= XFMR_LV_KV_MIN)]
+    if not cands:
+        return e
+    key = lambda b: (lev.hop.get(b, 999), -net.kv.get(b, 0), b)
+    nb = min(cands, key=key)
+    if key(nb)[0] >= key(e["fbus"])[0]:
+        return e                                  # already at the POI side (or a tie)
+    old, okv, nkv = e["fbus"], net.kv.get(e["fbus"], 0), net.kv.get(nb, 0)
+    e["fbus"] = nb
+    e["fkv"] = nkv
+    if abs(float(okv or 0) - float(nkv or 0)) > 0.5 or e["src"] != "DISIS":
+        e["cycles"] = clear_cycles(nkv)
+    e["notes"].append("faulted at the POI side %d (%s put it at %d)"
+                      % (nb, "SPP" if e["src"] == "DISIS" else "the far end", old))
+    return e
+
+
 def elem_buses(net, keys):
     s = set()
     for k in keys:
@@ -1095,6 +1140,9 @@ def build_generated(lev, disis_kept):
                 continue
             e = new_event("SCRIPT", "", "P1.3", "3PH", hv, clear_cycles(net.kv.get(hv)))
             e["trips"], e["sub"] = [k], "transformer"
+            e = poi_end(lev, e)
+            if lev.bus_level(e["fbus"]) > lim("P1"):
+                continue
             out.append(finish(e))
 
     # ---- what a breaker at bus b clears for each element there
@@ -1172,6 +1220,7 @@ def build_generated(lev, disis_kept):
                 e["pre"], e["trips"], e["sub"] = list(x), list(y), "prior_outage"
                 if net.elem[y[0]]["kind"] == "line":
                     e["reclose"], e["wait"] = True, RECLOSE_WAIT
+                e = poi_end(lev, e)
                 out.append(finish(e))
     return out
 
@@ -1549,6 +1598,8 @@ def make_project(proj, net, disis, rep):
     near_drops = []
     for d in disis:
         e, why = event_from_disis(net, d)
+        if e is not None:
+            e = poi_end(lev, e)
         if e is None:
             drop[why.split(":")[0]] = drop.get(why.split(":")[0], 0) + 1
             if d["id"] and _T_TOK.search(d["text"]):
