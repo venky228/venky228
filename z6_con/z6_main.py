@@ -285,18 +285,18 @@ GEN_TEST_BY_PROJECT = {
     "EastFork": {
         "POI": 531623,
         "EXTRA_GENS": [],
-        "EGF_EDITS": {                               # deck REGCAU1 (not REGCA1): Volim 1.2 / Khv 0.2 / Accel 0.7
-            # (above Vup it ABSORBS)
-            "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECA1", {"Kqv": 0.0})],                                # no Iq injection: is Kqv the driver?
-            "V110_K2_KQV2": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECA1", {"Kqv": 2.0})],
-            "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECA1", {"Kqv": 4.0})],
-            # REGCA1 Rrpwr = ramp rate of the active current after a fault (pu/s),
-            # at its maximum: the fastest P recovery. Deck values otherwise, so the
-            # run reads against 'all in service' -- does the recovery improve?
-            "RRPWR10":  [("REGCA1", {"Rrpwr": 1.0})],
+        "EGF_EDITS": {                               # deck: REGCAU1 (Volim 1.2 / Khv 0.2 / Accel 0.7) + REECAU1
+            # (above Vup it ABSORBS). REECAU1 = REECA1's layout: Kqv is its CON 6 (by number --
+            # the name is not in this deck). Deck Vdip -99 / Vup 99: the dip logic never
+            # starts, so Kqv may change nothing here.
+            "V110_K2_KQV0": [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECAU1", {"con6": 0.0})],                              # no Iq injection: is Kqv the driver?
+            "V110_K2_KQV2": [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECAU1", {"con6": 2.0})],
+            "V110_K2_KQV4": [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECAU1", {"con6": 4.0})],
+            # REGCAU1 Rrpwr = ramp rate of the active current after a fault (pu/s)
+            "RRPWR10":  [("REGCAU1", {"Rrpwr": 1.0})],
         },
     },
     "EmpirePrairie": {
