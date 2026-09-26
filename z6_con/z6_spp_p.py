@@ -22906,6 +22906,11 @@ def _violation_index_rows(panels, per_page, first_panel_page):
         # "ANGL 640015   [NO swing channe", which reads as part of the name.
         elem = elem.split("  ")[0].split("[")[0].strip() or elem.strip()
         quan = bits[1] if len(bits) > 1 else ""
+        # THE POI POWER IS A BRANCH FLOW, not a machine's output: its panels
+        # are filed as PELEC / QELEC for their axis, and the index then read
+        # "PELEC  POI 761383 ONE TIE" as though the POI were a generator.
+        if bits and bits[0].upper().startswith("POI POWER"):
+            quan = {"PELEC": "POI MW", "QELEC": "POI MVAR"}.get(quan.upper(), quan)
         rows.append((first_panel_page + (i // per_page), quan, elem,
                      " ".join(why.split())))
     return rows
