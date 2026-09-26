@@ -600,8 +600,8 @@ NEW_PLANT = {
 # ---- 15. EXTRA STUDIES ---------------------------------------------------------
 # SURPLUS_SCENARIOS: BP-7250 7.6 SGF/EGF runs (see NOTES)
 SURPLUS_SCENARIOS = [
-    # {"tag": "s1_egfoff", "label": "SGF 100 %, EGF off",
-    #  "egf_off": True,  "poi_mw": None},
+     {"tag": "s1_egfoff", "label": "SGF 100 %, EGF off",
+      "egf_off": True,  "poi_mw": None},
     # {"tag": "s2_poi_is", "label": "SGF 100 %, EGF set so POI = IS (600 MW)",
     #  "egf_off": False, "poi_mw": 600.0},
 ]
