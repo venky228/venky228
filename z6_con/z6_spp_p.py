@@ -7890,8 +7890,10 @@ def add_channels():
                 pass
             _idsx = {}
             try:
-                _e1, _mbx = psspy.amachint(-1, 4, ["NUMBER"])
-                _e2, _mcx = psspy.amachchar(-1, 4, ["ID"])
+                # IN SERVICE ONLY (flag 1): a unit switched off for this run
+                # (EGF OFF) would channel as a flat zero that plots as a trace.
+                _e1, _mbx = psspy.amachint(-1, 1, ["NUMBER"])
+                _e2, _mcx = psspy.amachchar(-1, 1, ["ID"])
                 for _b2, _m2 in zip(_mbx[0], _mcx[0]):
                     _idsx.setdefault(int(_b2), []).append(str(_m2).strip())
             except Exception as _ex:
@@ -11476,7 +11478,11 @@ if _egfj:
 
 
 def _egf_buses():
-    return [int(b) for b in ((_RUN_PROJ or {}).get("feeders") or [])]
+    """The EXISTING machines' buses. NEW_PLANT points "feeders" at the new
+       BESS buses once it has built them and keeps the originals in
+       "feeders_original" -- the existing machines are on those."""
+    r = _RUN_PROJ or {}
+    return [int(b) for b in (r.get("feeders_original") or r.get("feeders") or [])]
 
 
 def egf_dyr_with_edits(src):
@@ -13637,7 +13643,7 @@ def apply_poi_p_target(project, target_mw):
                  ", ".join("%d '%s'" % (b, m) for b, m in proj_pairs) or "(none)"))
         print("  [poi-p] EGF (existing)              : %s"
               % (", ".join("%d '%s'" % (r[0], r[1]) for r in exist) or "(none)"))
-        if not _pm_new:
+        if not _pm_new and exist:
             print("  [poi-p] *** EGF OFF REFUSED: no machine was found in the %s* "
                   "block, so the" % NEW_GEN_BUS_PREFIX)
             print("  [poi-p]     surplus facility could not be identified and "
@@ -13650,10 +13656,14 @@ def apply_poi_p_target(project, target_mw):
             print("  [poi-p]     Build the BESS into the %s* block, or run this "
                   "scenario with" % NEW_GEN_BUS_PREFIX)
             print("  [poi-p]     ENABLE_BESS on. ***")
+            raise RuntimeError("SPP_EGF_OFF: the surplus facility (%s* block) was not "
+                               "found, so the existing machines cannot be told apart "
+                               "and this run would not be the EGF-off scenario"
+                               % NEW_GEN_BUS_PREFIX)
         elif not exist:
-            print("  [poi-p] *** EGF OFF: there are no existing machines at this "
-                  "plant to switch off. The POI already carries the surplus "
-                  "facility alone. ***")
+            print("  [poi-p] EGF OFF: no existing machine is in service at this "
+                  "plant (already switched off) -- the POI carries the surplus "
+                  "facility alone")
     if egf_off and exist and _pm_new:
         print("  [poi-p] EGF OFF (BP-7250 7.6, first scenario): taking the "
               "plant's %d existing machine(s) OUT OF SERVICE" % len(exist))
@@ -13683,7 +13693,13 @@ def apply_poi_p_target(project, target_mw):
         exist = []
 
     want = float(target_mw) - proj_mw
-    if not exist:
+    if not exist and egf_off:
+        # NOTHING TO PLACE: the target is the SGF's own delivery (see
+        # _egf_off_target), so there is no remainder for missing machines.
+        print("  [poi-p] EGF OFF: POI carries the SGF alone, %.1f MW (target %.1f)"
+              % (proj_mw, float(target_mw)))
+        placed = 0.0
+    elif not exist:
         # NOT A RETURN. The project machines have just been put on their rating,
         # so the area total has risen by the project whether or not the
         # remainder could be placed -- and leaving before step 3 would leave the

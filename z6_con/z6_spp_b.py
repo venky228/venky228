@@ -6884,8 +6884,10 @@ def add_channels():
                 pass
             _idsx = {}
             try:
-                _e1, _mbx = psspy.amachint(-1, 4, ["NUMBER"])
-                _e2, _mcx = psspy.amachchar(-1, 4, ["ID"])
+                # IN SERVICE ONLY (flag 1): a unit switched off for this run
+                # (EGF OFF) would channel as a flat zero that plots as a trace.
+                _e1, _mbx = psspy.amachint(-1, 1, ["NUMBER"])
+                _e2, _mcx = psspy.amachchar(-1, 1, ["ID"])
                 for _b2, _m2 in zip(_mbx[0], _mcx[0]):
                     _idsx.setdefault(int(_b2), []).append(str(_m2).strip())
             except Exception as _ex:
@@ -10216,7 +10218,11 @@ if _egfj:
 
 
 def _egf_buses():
-    return [int(b) for b in ((_RUN_PROJ or {}).get("feeders") or [])]
+    """The EXISTING machines' buses. NEW_PLANT points "feeders" at the new
+       BESS buses once it has built them and keeps the originals in
+       "feeders_original" -- the existing machines are on those."""
+    r = _RUN_PROJ or {}
+    return [int(b) for b in (r.get("feeders_original") or r.get("feeders") or [])]
 
 
 def egf_dyr_with_edits(src):
