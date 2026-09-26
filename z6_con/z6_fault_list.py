@@ -41,8 +41,10 @@ DISIS sheet, one radius for both, no duplicates, ordered outward from the POI.
             P6    GENERATE_P6: a line out beforehand, 3PH on another element
      Not in the list: anything faulted in the plant or switching a plant gen
      tie; a P4 that leaves the plant no path to the grid (e.g. every branch
-     at the POI out). Duplicates (same elements out) are kept once -- the one
-     faulted nearest the POI, on a tie SPP's. Ordered outward from the POI.
+     at the POI out). Duplicates (same elements out) are kept once -- SPP's
+     (DISIS) over the script's, then the one faulted nearest the POI; a
+     script P1 on a circuit SPP already has a P1 for is not made. Order: all
+     P1 outward from the POI, then all P4, then P6.
      Every event is checked the way the study opens elements (EXECUTION CHECK
      in the report); a 3-winding twin is written by a winding pair that
      names it alone.
@@ -87,13 +89,24 @@ KEEP_OLD_IDS = False                         # False = F01.. numbered outward fr
 # LEVEL OF THE FAULTED BUS: substations from the POI to it, the bus itself
 # included, the POI excluded (minus one when the POI is a tap, so the tapped
 # circuit's ends are 0). Measured the same way for both sources.
-SPP_LEVELS_BY_EVENT = {"P1": 3, "P4": 2, "P6": 2}     # events from the DISIS sheet
-CASE_LEVELS_BY_EVENT = {"P1": 4, "P4": 3, "P6": 3}    # events built from the power-flow case
+# P1 <= 2 / P4 <= 1 is what SPP's surplus reports use (GEN-2026-SR1/SR10/SR11/
+# SR12/SR14: ~75-100 events, 80-99 % of them reproduced). Each level more
+# roughly doubles the list in a meshed 115/138 kV area: 3/2 ~ 200-800 events,
+# 4/3 ~ 340-1400.
+SPP_LEVELS_BY_EVENT = {"P1": 2, "P4": 1, "P6": 1}     # events from the DISIS sheet
+CASE_LEVELS_BY_EVENT = {"P1": 2, "P4": 1, "P6": 1}    # events built from the power-flow case
 KV_MIN = 100.0                               # network circuits at / above this kV
+SUBT_KV_MIN = 69                             # also P1 on lines down to this kV (None = off) ...
+SUBT_P1_LEVEL = 1                            # ... faulted at a bus within this level (SPP 115 kV POI reports)
 XFMR_LV_KV_MIN = 60.0                        # P1.3: transformer second winding at / above this kV
 HUB_MIN_CIRCUITS = 3                         # a substation is a level node with this many circuits
 JUMPER_X_PU = 0.0005                         # |X| below this = bus tie (same substation)
 EVENTS = {"P1.2": True, "P1.3": True, "P4": True}   # built from the case (False = that kind not built)
+INCLUDE_RADIAL_P1 = True                     # True = P1 also on radial lines (other plants' gen ties,
+                                             #   radial loads) -- their units dropped, no reclose (SPP reports)
+P4_PROXY = "proxy"                           # P4 where the DISIS sheet has none: "proxy" = SPP's two
+                                             #   (whole busbar + two highest-loaded branches) | "pairs" =
+                                             #   whole busbar + every pair of elements at the bus
 GENERATE_P6 = False                          # True = also build P6 (prior outage + 3PH) from the case
 P6_MAX_PER_BUS = 2                           # P6 pairs per bus (highest-loaded first)
 P4_SKIP_IF_PLANT_ISLANDED = True             # no P4 that cuts the plant off the grid
@@ -933,9 +946,15 @@ def build_generated(lev, disis_kept):
     p1_sets = [set(e["trips"]) for e in disis_kept if e["ev"].startswith("P1")]
     p4_bus = set(e["fbus"] for e in disis_kept if e["ev"].startswith("P4"))
 
+    p1_all = set()
+    for t in p1_sets:
+        p1_all |= t
+
     def covered(trips):
-        s = set(trips)
-        return any(s < t for t in p1_sets)          # a DISIS P1 removes more, incl. this
+        """SPP already has a P1 on this circuit -- on any piece of it (SPP
+           may fault a tapped line piece by piece, or only the pieces within
+           its own levels). SPP's definition of the circuit stands."""
+        return bool(set(trips) & p1_all)
 
     def near_end(bs):
         return min(bs, key=lambda b: (lev.hop.get(b, 999), -net.kv.get(b, 0), b))
@@ -963,13 +982,30 @@ def build_generated(lev, disis_kept):
     done = set()
     segs = []
     for k, el in sorted(net.elem.items()):
-        if el["kind"] != "line" or k in done or not is_net(k):
+        if el["kind"] != "line" or k in done:
+            continue
+        if not (is_net(k) or (INCLUDE_RADIAL_P1 and not any(b in lev.plant
+                                                              for b in el["buses"]))):
             continue
         if not all(b in lev.N for b in el["buses"]):
             continue
         sg, ends = segment(net, k)
         done |= set(sg)
         segs.append((sg, ends))
+    # sub-transmission lines (SUBT_KV_MIN .. KV_MIN) close to the POI
+    if SUBT_KV_MIN:
+        for k, el in sorted(net.elem.items()):
+            if el["kind"] != "line" or k in done:
+                continue
+            bs = el["buses"]
+            if any(b in lev.plant for b in bs) or all(b in lev.N for b in bs):
+                continue
+            if min(net.kv.get(b, 0) for b in bs) < SUBT_KV_MIN:
+                continue
+            sg, ends = segment(net, k)
+            done |= set(sg)
+            if min(lev.bus_level(b) for b in ends) <= SUBT_P1_LEVEL:
+                segs.append((sg, ends))
     if EVENTS.get("P1.2"):
         for sg, ends in segs:
             fb = near_end(ends)
@@ -1030,10 +1066,19 @@ def build_generated(lev, disis_kept):
             whole["drop_l"] = [(b, m) for m in net.load.get(b, ())]
             whole["drop_s"] = [(b, m) for m in net.fsh.get(b, []) + net.ssh.get(b, [])]
             cands = [whole]
-            top2 = sorted(netg, key=lambda g: -mva(g))[:2]
-            if len(top2) == 2 and len(grp) > 2:
+            if (P4_PROXY or "proxy").lower() == "pairs":
+                # every pair of elements at the bus -- one per breaker pair, the
+                # shape SPP's consultants write (ring / breaker-and-a-half)
+                pairs = [(netg[i], netg[j]) for i in range(len(netg))
+                         for j in range(i + 1, len(netg))]
+            else:
+                top2 = sorted(netg, key=lambda g: -mva(g))[:2]
+                pairs = [tuple(top2)] if len(top2) == 2 else []
+            for g1, g2 in pairs:
+                if len(grp) <= 2:
+                    break                        # the pair IS the whole bus
                 two = new_event("SCRIPT", "", "P4.2", "SLG", b, STUCK_CYCLES)
-                two["trips"] = top2[0] + top2[1]
+                two["trips"] = list(g1) + list(g2)
                 if all(net.elem[k]["kind"] != "line" for k in two["trips"]):
                     two["ev"] = "P4.3"
                 cands.append(two)
@@ -1083,8 +1128,9 @@ def dedupe_key(e):
 
 
 def rank(lev, e):
-    """Smaller = kept: nearest the POI, then SPP's own, then the longer clearing."""
-    return (e["level"], lev.hop.get(e["fbus"], 999), 0 if e["src"] == "DISIS" else 1,
+    """Smaller = kept: SPP's own (DISIS) over the script's, then nearest the
+       POI, then the longer clearing."""
+    return (0 if e["src"] == "DISIS" else 1, e["level"], lev.hop.get(e["fbus"], 999),
             -float(e["cycles"] or 0), e["con_id"])
 
 
@@ -1302,9 +1348,10 @@ def make_project(proj, net, disis, rep):
             best[k] = e
         else:
             dups.append((e, best[k]))
+    # every P1 first, nearest the POI first; then every P4; then P6
     final = sorted(best.values(), key=lambda e: (
-        lev.hop.get(e["fbus"], 999), e["level"], -lev.net.kv.get(e["fbus"], 0), e["fbus"],
-        {"P1": 0, "P4": 1, "P6": 2}.get(ev_class(e["ev"]), 3), e["ev"],
+        {"P1": 0, "P4": 1, "P6": 2}.get(ev_class(e["ev"]), 3),
+        lev.hop.get(e["fbus"], 999), e["level"], -lev.net.kv.get(e["fbus"], 0), e["fbus"], e["ev"],
         0 if e["src"] == "DISIS" else 1, e["con_id"], str(dedupe_key(e))))
     # ---- ids
     old_rows = []
@@ -1372,7 +1419,8 @@ def make_project(proj, net, disis, rep):
         W("  %-6s %-30s bus %-7d %s" % (e["src"], e["con_id"] or "(generated)", e["fbus"],
                                        ", ".join(_desc(net, k) for k in e["trips"][:4])))
     W("")
-    W("DUPLICATES REMOVED (%d) -- same elements out; the event nearer the POI kept:" % len(dups))
+    W("DUPLICATES REMOVED (%d) -- same elements out; DISIS kept over script, then the one "
+      "nearer the POI:" % len(dups))
     for lost, won in dups:
         W("  %-6s %-30s @%-7d -> kept %-6s %-30s @%d"
           % (lost["src"], lost["con_id"] or "(generated %s)" % lost["ev"], lost["fbus"],
