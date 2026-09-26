@@ -23225,6 +23225,15 @@ def main():
                 compare_three_way(res["project"], res["mode"])
             except Exception as e:
                 print("[3-way] the side-by-side for %s failed (%s)" % (res["project"], e))
+    # THE ALL-VARIANTS TABLE AGAIN, now the surplus runs are on disk: written
+    # above before they ran, its scenario columns were empty.
+    if results and SURPLUS_SCENARIOS:
+        for res in results:
+            try:
+                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_all_variants_overvoltage(res["project"], res["mode"])
+            except Exception as e:
+                print("[variants] the all-variants table failed (%s)" % e)
 
     # ---- THE EXISTING MACHINES AT THE FEEDERS, edited or off ---------------
     # Both cases again, into their own _egf / _egfoff folders; then every pair

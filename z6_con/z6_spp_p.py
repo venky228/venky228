@@ -18361,7 +18361,7 @@ def _fast_find_time_column(bts, tvals):
     return None
 
 
-def _locate_channel(bts, nw, pk, n_s, base, stride, first_words):
+def _locate_channel(bts, nw, pk, n_s, base, stride, first_words, used=None):
     """The word offset of one channel at the discovered stride, or None.
 
        The candidates come from first_words -- every position within four
@@ -18387,7 +18387,9 @@ def _locate_channel(bts, nw, pk, n_s, base, stride, first_words):
     cands = list(first_words.get(w0, ()))
     if _w32_nonfinite(w0):
         cands = list(first_words.get("nonfinite", ())) + cands
-    for cand in cands:
+    for cand in sorted(set(cands)):
+        if used is not None and cand in used:
+            continue                  # ONE COLUMN PER CHANNEL -- see _fast_calibrate
         if cand + (n_s - 1) * stride >= nw:
             continue
         if not _col_bits_match(bts, cand, stride, pk, quick):
@@ -18428,18 +18430,30 @@ def _fast_calibrate(path, cid, cd):
         if len(w) == 4 and _w32_nonfinite(w):
             first_words.setdefault("nonfinite", []).append(cand)
     offs = {"time": base}
-    for k in cid:
-        if k == "time":
-            continue
+    # ONE COLUMN PER CHANNEL, IN CHANNEL ORDER. Two channels whose samples are
+    # identical in this file (parallel units, a flat run) both matched the
+    # FIRST such column, and every later file then read one channel's data for
+    # both -- a healthy bus reported at 0.000 pu. The .out stores channels in
+    # index order, so they are placed in that order, each on a column no other
+    # channel has taken.
+    _used = set([base])
+
+    def _ck(x):
+        try:
+            return (0, int(x))
+        except Exception:
+            return (1, str(x))
+    for k in sorted((x for x in cid if x != "time"), key=_ck):
         v = cd[k]
         pk = _pack_f32(v)
-        found = _locate_channel(bts, nw, pk, len(v), base, stride, first_words)
+        found = _locate_channel(bts, nw, pk, len(v), base, stride, first_words, _used)
         if found is None:
             print("  [fast] %s could not be located at the discovered stride -- "
                   "the packed reader stays OFF (nothing partial is used)"
                   % str(cid[k]).strip())
             return None
         offs[k] = found
+        _used.add(found)
     n_samples = len(cd["time"])
     tt = _fast_find_titles(bts, min(offs.values()), cid)
     if not tt:
@@ -24702,6 +24716,11 @@ def evaluate_case(path, kind, tclear, kb):
         _ev_p = [x for x in proj_trips if _isl or _bus_of(x) in _evd]
         proj_trips = [x for x in proj_trips if x not in _ev_p]
         _ev_out += _ev_p
+        # THE VIOLATIONS LIST MUST AGREE WITH THE VERDICT: units the event takes
+        # are excused above, and were still listed in 02_VIOLATIONS and every
+        # comparison as generator-tripping failures.
+        _kept = set(x.split("(")[0].strip() for x in (trips + proj_trips))
+        trip_all = [r for r in trip_all if str(r[0]).strip() in _kept]
     if _ev_out:
         add("Generator tripping: units the EVENT removes (not judged)", None,
             "%d unit(s) go offline because the event takes them (%s): %s"
