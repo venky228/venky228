@@ -6598,13 +6598,16 @@ def _poi_power_channels():
         except Exception:
             _w3 = None
         if _w3:
-            _oth = [int(x) for x in _w3 if int(x) != b]
+            # METERED AT THE POI WINDING (a), as the POI meter reads it: the
+            # flow leaving the POI into the plant, 'p' in the name -- load_out()
+            # turns it round to "delivered INTO the POI" (see _poi_end_flows).
+            _oth = [int(x) for x in _w3 if int(x) != a]
             _f3 = getattr(psspy, "three_wnd_winding_p_and_q_channel", None)
             if _f3 is not None and len(_oth) == 2:
-                rc = chk(_f3([-1, -1, -1, b, _oth[0], _oth[1]], str(ck).strip() or "1",
-                             ["POI POWR %d MW f%d%s" % (a, b, sfx),
-                              "POI VARS %d MVAR f%d%s" % (a, b, sfx)]),
-                         "POI P/Q %d->%d ck %s (3-winding)" % (b, a, ck))
+                rc = chk(_f3([-1, -1, -1, a, _oth[0], _oth[1]], str(ck).strip() or "1",
+                             ["POI POWR %d MW p%d%s" % (a, b, sfx),
+                              "POI VARS %d MVAR p%d%s" % (a, b, sfx)]),
+                         "POI P/Q at %d (to %d) ck %s (3-winding)" % (a, b, ck))
             elif _f3 is None:
                 # SAID OUT LOUD. This branch used to set rc = 1 and print
                 # nothing, so a run whose only POI ties are three-winding
@@ -6612,8 +6615,8 @@ def _poi_power_channels():
                 # line in between saying why -- EastFork's base run.
                 _f3p = getattr(psspy, "three_wnd_winding_p_channel", None)
                 if _f3p is not None:
-                    rc = chk(_f3p([-1, -1, -1, b, _oth[0], _oth[1]], str(ck).strip() or "1",
-                                  "POI POWR %d MW f%d%s" % (a, b, sfx)),
+                    rc = chk(_f3p([-1, -1, -1, a, _oth[0], _oth[1]], str(ck).strip() or "1",
+                                  "POI POWR %d MW p%d%s" % (a, b, sfx)),
                              "POI P %d->%d ck %s (3-winding, MW only -- no P-and-Q "
                              "channel API in this psspy)" % (b, a, ck))
                 else:
@@ -6629,14 +6632,18 @@ def _poi_power_channels():
                          "/".join(str(x) for x in _oth)))
                 rc = 1
         else:
-            rc = chk(psspy.branch_p_and_q_channel([-1, -1, -1, b, a], str(ck).strip() or "1",
-                                                  ["POI POWR %d MW f%d%s" % (a, b, sfx),
-                                                   "POI VARS %d MVAR f%d%s" % (a, b, sfx)]),
-                     "POI P/Q %d->%d ck %s" % (b, a, ck))
+            # METERED AT THE POI BUS (from-bus a), not at the plant end: the
+            # number the POI sees, after the lead line's losses (316.3 MW at
+            # 761383, not the 317.9 MW leaving 761376). Recorded as the flow
+            # LEAVING the POI ('p' in the name); load_out() turns it round.
+            rc = chk(psspy.branch_p_and_q_channel([-1, -1, -1, a, b], str(ck).strip() or "1",
+                                                  ["POI POWR %d MW p%d%s" % (a, b, sfx),
+                                                   "POI VARS %d MVAR p%d%s" % (a, b, sfx)]),
+                     "POI P/Q at %d (to %d) ck %s" % (a, b, ck))
         if (rc[0] if isinstance(rc, (list, tuple)) else rc) in (0, None):
             n_ok += 1
     print("  monitor [poi-pow ] %d of %d tie(s) channelled: MW / MVAR delivered into "
-          "the POI (plant side -> POI; positive = delivering)%s"
+          "the POI, metered AT the POI bus (positive = delivering)%s"
           % (n_ok, len(ties), " -- the plot adds their TOTAL as the first panel" if n_ok > 1 else ""))
     for (a, b, ck) in ties[:12]:
         print("  monitor [poi-pow ]   %s -> %s ck %s   (%s)" % (b, a, ck, _how.get((a, b, ck), "")))
@@ -15918,9 +15925,35 @@ def load_out(p, cache=True):
         _t, _c = out
         _c, _n = _nan_unsentinel(_c)
         out = (_t, _c)
+    out = _poi_end_flows(out)
     if cache:
         _OUT_CACHE["path"] = p; _OUT_CACHE["data"] = out
     return out
+
+
+_RX_POI_END = re.compile(r"^(\s*POI (?:POWR|VARS) \d+ (?:MW|MVAR)) p(\d+)", re.I)
+
+
+def _poi_end_flows(out):
+    """POI tie channels metered AT THE POI ("POI POWR <poi> MW p<plant>") hold
+       the flow LEAVING the POI toward the plant. Turned round here, once, into
+       what every reader expects -- MW / MVAr DELIVERED INTO the POI, titled
+       "... f<plant>" -- so the total, the recovery test, the ripple check and
+       the plots need no second convention. An .out recorded before the change
+       (plant-end, 'f') passes through untouched."""
+    try:
+        t, ch = out
+    except Exception:
+        return out
+    hit = [k for k, (ti, _v) in ch.items() if _RX_POI_END.match(str(ti))]
+    if not hit:
+        return out
+    ch = dict(ch)
+    for k in hit:
+        ti, v = ch[k]
+        ti = _RX_POI_END.sub(lambda m: "%s f%s" % (m.group(1), m.group(2)), str(ti), 1)
+        ch[k] = (ti, [-x for x in v])
+    return (t, ch)
 
 def _plot_stride(n):
     """Sampling stride so a length-n series is drawn with <= PLOT_MAX_POINTS points.
@@ -16577,8 +16610,9 @@ def _panel_style(cat, ptitle):
     _mb = re.search(r"\b(\d{3,})\b", lbl)
     bus = _mb.group(1) if _mb else ""
     if re.match(r"POI \d+ TOTAL", L):
-        q = "POI %s TOTAL %s" % (bus, q)
-        yl = "POI total " + yl
+        # THE POI P / POI Q: every tie into the POI summed (or the only one)
+        q = "POI %s %s" % (bus, q)
+        yl = "POI " + yl
     elif re.match(r"POI \d+ ONE TIE", L):
         # ONE TIE READS AS THE FLOW IT IS: "POWER 765930 TO 765911"
         _fb = re.search(r"ONE TIE, FROM BUS (\d+)", L)
@@ -18983,6 +19017,12 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
         _pw = [str(_ti) for _k0, (_ti, _v0) in ch.items()
                if re.search(r"POI POWR \d+ MW", str(_ti).upper())]
         _pw_tag = ([x for x in _pw if "TOTAL" in x.upper()] or (_pw if len(_pw) == 1 else []))[:1]
+        # ... and its MVAr twin. These two are THE POI P and THE POI Q: the total
+        # of every tie into the POI (the new plant and the existing units
+        # together), or the one tie when there is only one.
+        _pq = [str(_ti) for _k0, (_ti, _v0) in ch.items()
+               if re.search(r"POI VARS \d+ MVAR", str(_ti).upper())]
+        _pq_tag = ([x for x in _pq if "TOTAL" in x.upper()] or (_pq if len(_pq) == 1 else []))[:1]
         indiv = []                                 # (sortkey, panel)
         for c in order:
             for lbl, v, title, _sev in grouped[c]:
@@ -19052,6 +19092,15 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                         head, c, lbl,
                         "   [NO swing channel -- ABSOLUTE angle]"
                         if _is_machine_angle(title) else "")
+                # THE POI P / POI Q HEADLINE reads as the POI's, not as "POWER
+                # 761376 TO 761383": with one tie that tie IS the POI power.
+                _poi_head = str(title) in _pw_tag or str(title) in _pq_tag
+                if _poi_head:
+                    ptitle = re.sub(r"POI (\d+) ONE TIE(?:, from bus (\d+)| \(the only tie\))",
+                                    lambda m: ("POI %s TOTAL = the only tie%s"
+                                               % (m.group(1), (", from bus %s" % m.group(2))
+                                                  if m.group(2) else "")),
+                                    ptitle, 1)
                 # ---- POI POWER RECOVERY / RIPPLE on the POI panels -- the
                 # same numbers as the report's INFO rows (_poi_prec, _ripple_pp)
                 if tclear is not None and _t_axis is not None:
@@ -19139,16 +19188,26 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                 # (_dedupe_same_trace), so that page still leads.
                 _tier = _panel_tier(title)
                 _sub = 0 if c == "VOLT" else 1 if (c == "ANGLE" and _is_machine_angle(title)) else 2
+                # NOW (asked for in these words): faulted bus V, POI V, POI P,
+                # POI Q -- then the order above: project machines, the rest of
+                # the POI block (each tie of a multi-tie POI, the POI angle),
+                # the violations worst first, everything else.
                 if c == "VOLT" and _is_fault_bus_v(title, lbl, fault_bus):
                     _blk, _sub, _rank = 0, 0, 0.0
-                elif _tier == 0:
+                elif c == "VOLT" and _tier == 1:
                     _blk, _sub, _rank = 1, 0, 0.0
-                elif _tier in (-1, 1):
+                elif str(title) in _pw_tag:
                     _blk, _sub, _rank = 2, 0, 0.0
+                elif str(title) in _pq_tag:
+                    _blk, _sub, _rank = 3, 0, 0.0
+                elif _tier == 0:
+                    _blk, _sub, _rank = 4, 0, 0.0
+                elif _tier in (-1, 1):
+                    _blk, _sub, _rank = 5, 0, 0.0
                 elif _vio_panel:
-                    _blk, _rank = 3, (-_sev if _sev is not None else 0.0)
+                    _blk, _rank = 6, (-_sev if _sev is not None else 0.0)
                 else:
-                    _blk, _rank = 4, (-_panel_size(ser, _sub) if _sub < 2 else 0.0)
+                    _blk, _rank = 7, (-_panel_size(ser, _sub) if _sub < 2 else 0.0)
                 indiv.append(((_blk, _sub, _rank)
                               + _panel_sort_key(c, title),
                               (c, ptitle, ser), _vio_panel))
@@ -19169,7 +19228,7 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
             # panel, and then the rest in order up to the cap.
             _kept, _rest = [], []
             for _k, _pnl, _vv in indiv:
-                (_kept if (_vv or _k[0] <= 2) else _rest).append((_pnl, _vv))
+                (_kept if (_vv or _k[0] <= 5) else _rest).append((_pnl, _vv))
             _room = max(0, int(PLOT_MAX_PANELS) - len(_kept))
             _n_lead = sum(1 for _p2, _v2 in _kept if not _v2)
             print("  [plot] %d individual panels -> drawing %d (all %d project "
