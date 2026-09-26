@@ -41,7 +41,7 @@ NEW_BUILDS = [
     ("GEN-2023-034", 130, "Solar", "Clear Water-Waco 138 kV", [533036, 533071, 533072, 533073]),
     ("GEN-2023-033", 200, "Battery", "Liberty South 161 kV", [541248]),
 ]
-NEAR_NODES = 5         # flagged NEAR when within this many nodes (= GEN_TEST_HOPS)
+NEAR_NODES = 6         # flagged NEAR when within this many nodes (GEN_TEST_HOPS = 5)
 # ---------------------------------------------------------------------------
 
 HERE = os.path.dirname(os.path.abspath(__file__))
