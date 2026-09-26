@@ -322,6 +322,7 @@ GEN_TEST_EGF_RUN = False                     # True = run the EGF_EDITS above | 
 GEN_TEST_REFERENCE_RUNS = True               # all in service (needed to compare; finished ones are reused)
 GEN_TEST_EACH_GEN = False                      # each machine within GEN_TEST_HOPS off on its own
 GEN_TEST_EXCLUDE_POI_GENS = True             # True = POI plants left out of the one-at-a-time runs and the HOPS group
+                                             #   (False: the group run is ALL<n>BUSPOI -- neighbours AND POI plants off)
 GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = True                   # all machines within GEN_TEST_HOPS off together
 GEN_TEST_POI_OFF_BASE = False                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
@@ -18691,15 +18692,26 @@ def _gt_add_hops_group(gens):
         return gens
     one = [g for g in gens if not g.get("group")]
     known = all(g["mw"] is not None for g in one)
-    grp = {"bus": int(GEN_TEST_POI), "id": "ALL%dBUS" % int(GEN_TEST_HOPS), "group": mem,
+    # THE NAME IS THE RUN FOLDER, so the group WITH the POI plants in it gets its
+    # own (ALL5BUSPOI): under ALL5BUS it would be handed the finished run of the
+    # group without them and reported as if the POI plants had been off too.
+    _wp = not GEN_TEST_EXCLUDE_POI_GENS
+    grp = {"bus": int(GEN_TEST_POI), "id": _gt_hops_id(_wp), "group": mem,
            "hops": "", "z": None,
            "mw": sum(g["mw"] for g in one) if known else None,
            "mvar": sum(g["mvar"] or 0.0 for g in one) if known else None,
-           "kind": "GROUP of %d" % len(mem), "name": "ALL GENS OFF %s BUSES" % GEN_TEST_HOPS,
+           "kind": "GROUP of %d" % len(mem),
+           "name": "ALL GENS OFF %s BUSES%s" % (GEN_TEST_HOPS, " + POI" if _wp else ""),
            "models": ["%d:%s" % k for k in mem]}
     print("[gen-test] NODES group: %d machine(s) within %s buses of POI %s switched off TOGETHER: %s"
           % (len(mem), GEN_TEST_HOPS, GEN_TEST_POI, ", ".join("%d '%s'" % k for k in mem)))
     return [grp] + list(gens)
+
+
+def _gt_hops_id(with_poi):
+    """Run id of the all-gens-within-GEN_TEST_HOPS group: ALL5BUS, or ALL5BUSPOI
+       when the POI plants are in it (GEN_TEST_EXCLUDE_POI_GENS = False)."""
+    return "ALL%dBUS%s" % (int(GEN_TEST_HOPS), "POI" if with_poi else "")
 
 
 def _gt_rdir(tag):
@@ -19733,7 +19745,7 @@ def _gt_label(g):
     if g.get("group") and str(g.get("id")) == "POIALL":
         # the POI gens by bus number -- the folder keeps the short id POIALL
         return "%s %s" % (g["name"], ",".join(str(b) for b, _i in g["group"]))
-    if g.get("group") and str(g.get("id")) == "ALL%dBUS" % int(GEN_TEST_HOPS):
+    if g.get("group") and str(g.get("id")) in (_gt_hops_id(False), _gt_hops_id(True)):
         return g["name"]            # "ALL GENS OFF 7 BUSES" (id ALL7BUS stays the folder name; buses in GEN_TEST_RUN.txt)
     return "OFF %d '%s' %s" % (g["bus"], g["id"], g["name"])
 
