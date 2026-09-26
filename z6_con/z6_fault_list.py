@@ -110,6 +110,9 @@ P4_PROXY = "proxy"                           # P4 where the DISIS sheet has none
 GENERATE_P6 = False                          # True = also build P6 (prior outage + 3PH) from the case
 P6_MAX_PER_BUS = 2                           # P6 pairs per bus (highest-loaded first)
 P4_SKIP_IF_PLANT_ISLANDED = True             # no P4 that cuts the plant off the grid
+MAX_EVENTS = 400                             # cap per project (None = no cap): whole levels are kept
+                                             #   outward from the POI; the level that overflows is filled
+                                             #   DISIS first, then nearest the POI, then highest kV
 NORMAL_CLEAR = [(345.0, 6), (0.0, 7)]        # cycles by kV (SPP: 6 at 345 kV, 7 below)
 STUCK_CYCLES = 16                            # P4 stuck-breaker clearing (SPP 16)
 RECLOSE_WAIT = 20                            # P1.2 / P6 reclose wait (cycles)
@@ -1351,8 +1354,18 @@ def make_project(proj, net, disis, rep):
             best[k] = e
         else:
             dups.append((e, best[k]))
+    # ---- cap: level by level outward; the level that overflows is filled
+    #      SPP's own (DISIS) first, then nearest the POI, then highest kV
+    capped = []
+    pool = list(best.values())
+    if MAX_EVENTS and len(pool) > MAX_EVENTS:
+        pool.sort(key=lambda e: (e["level"], 0 if e["src"] == "DISIS" else 1,
+                                 lev.hop.get(e["fbus"], 999), -lev.net.kv.get(e["fbus"], 0),
+                                 {"P1": 0, "P4": 1, "P6": 2}.get(ev_class(e["ev"]), 3),
+                                 e["fbus"], e["con_id"], str(dedupe_key(e))))
+        pool, capped = pool[:MAX_EVENTS], pool[MAX_EVENTS:]
     # every P1 first, nearest the POI first; then every P4; then P6
-    final = sorted(best.values(), key=lambda e: (
+    final = sorted(pool, key=lambda e: (
         {"P1": 0, "P4": 1, "P6": 2}.get(ev_class(e["ev"]), 3),
         lev.hop.get(e["fbus"], 999), e["level"], -lev.net.kv.get(e["fbus"], 0), e["fbus"], e["ev"],
         0 if e["src"] == "DISIS" else 1, e["con_id"], str(dedupe_key(e))))
@@ -1400,7 +1413,8 @@ def make_project(proj, net, disis, rep):
         k = (e["ev"], e["src"])
         cnt[k] = cnt.get(k, 0) + 1
     W("")
-    W("FINAL LIST: %d event(s)" % len(final))
+    W("FINAL LIST: %d event(s)%s" % (len(final), " (capped at MAX_EVENTS; %d left out, listed "
+                                              "below)" % len(capped) if capped else ""))
     for k in sorted(cnt):
         W("  %-5s %-6s %4d" % (k[0], k[1], cnt[k]))
     if KEEP_OLD_IDS:
@@ -1422,6 +1436,15 @@ def make_project(proj, net, disis, rep):
         W("  %-6s %-30s bus %-7d %s" % (e["src"], e["con_id"] or "(generated)", e["fbus"],
                                        ", ".join(_desc(net, k) for k in e["trips"][:4])))
     W("")
+    if capped:
+        cut = min(c["level"] for c in capped)
+        W("OVER MAX_EVENTS = %d -- %d event(s) left out, farthest first to go (levels 0..%d "
+          "complete; level %d partly kept):" % (MAX_EVENTS, len(capped), cut - 1, cut))
+        for e in capped:
+            W("  %-6s %-5s L%d %-30s bus %-7d %s"
+              % (e["src"], e["ev"], e["level"], e["con_id"] or "(generated)", e["fbus"],
+                 ", ".join(_desc(net, k) for k in e["trips"][:4])))
+        W("")
     W("DUPLICATES REMOVED (%d) -- same elements out; DISIS kept over script, then the one "
       "nearer the POI:" % len(dups))
     for lost, won in dups:
