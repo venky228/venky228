@@ -38,6 +38,11 @@ DISIS sheet, one radius for both, no duplicates, ordered outward from the POI.
             P1.3  each 2- and 3-winding network transformer (no reclose)
             P4    SPP's proxy at each bus the sheet has no P4 for:
                   (a) the whole busbar  (b) the two highest-loaded branches
+            P4 is limited as SPP's reports do: P4_MAX_PER_BUS most severe at
+            a bus, P4_MAX_TOTAL per project, nearest the POI first
+            IMPACT_SCREEN: a P1 at level >= SCREEN_FROM_LEVEL is left out when
+            the POI stays >= SCREEN_POI_V_PU during it and nothing it trips
+            carries SCREEN_DF_MIN of the project's MW
             P6    GENERATE_P6: a line out beforehand, 3PH on another element
      Not in the list: anything faulted in the plant or switching a plant gen
      tie; a P4 that leaves the plant no path to the grid (e.g. every branch
@@ -89,12 +94,12 @@ KEEP_OLD_IDS = False                         # False = F01.. numbered outward fr
 # LEVEL OF THE FAULTED BUS: substations from the POI to it, the bus itself
 # included, the POI excluded (minus one when the POI is a tap, so the tapped
 # circuit's ends are 0). Measured the same way for both sources.
-# P1 <= 3 / P4 <= 2 (set): ~280-660 events per project. P1 <= 2 / P4 <= 1 is
-# what SPP's surplus reports use (GEN-2026-SR1/SR10/SR11/SR12/SR14: ~75-100
-# events, 73-99 % of them reproduced) and gives ~110-300. Each level more
-# roughly doubles the list in a meshed 115/138 kV area.
-SPP_LEVELS_BY_EVENT = {"P1": 3, "P4": 2, "P6": 2}     # events from the DISIS sheet
-CASE_LEVELS_BY_EVENT = {"P1": 3, "P4": 2, "P6": 2}    # events built from the power-flow case
+# P1 <= 3 / P4 <= 1 with the P4 limits and the impact screen below: ~140-310
+# events per project, SPP's surplus-report events (GEN-2026-SR1/SR10/SR11/
+# SR12/SR14) reproduced as well as with no screen. Each level more roughly
+# doubles the list in a meshed 115/138 kV area.
+SPP_LEVELS_BY_EVENT = {"P1": 3, "P4": 1, "P6": 1}     # events from the DISIS sheet
+CASE_LEVELS_BY_EVENT = {"P1": 3, "P4": 1, "P6": 1}    # events built from the power-flow case
 KV_MIN = 100.0                               # network circuits at / above this kV
 SUBT_KV_MIN = 69                             # also P1 on lines down to this kV (None = off) ...
 SUBT_P1_LEVEL = 1                            # ... faulted at a bus within this level (SPP 115 kV POI reports)
@@ -113,6 +118,21 @@ P4_SKIP_IF_PLANT_ISLANDED = True             # no P4 that cuts the plant off the
 MAX_EVENTS = 400                             # cap per project (None = no cap): whole levels are kept
                                              #   outward from the POI; the level that overflows is filled
                                              #   DISIS first, then nearest the POI, then highest kV
+# P4 AS SPP'S REPORTS DO IT: at the POI substation and its level-1 neighbours
+# (P4 <= 1 above), a few stuck-breaker events per bus (SR1 15 at 5 buses, SR11
+# 22 at 7). Kept per bus: SPP's own first, then the most elements / MW out.
+P4_MAX_PER_BUS = 3                           # None = every P4 at the bus
+P4_MAX_TOTAL = 50                            # P4 per project (SPP reports: 4-22); nearest the POI kept
+# IMPACT SCREEN -- P1 only; every P4 stays as SPP defines it. A P1 faulted at
+# or beyond SCREEN_FROM_LEVEL is left out when BOTH hold: the POI keeps at
+# least SCREEN_POI_V_PU during the fault (bolted 3PH, case impedances and
+# machine source impedances), and no element it trips carries SCREEN_DF_MIN of
+# the project's MW (DC flow, POI to swing). A P1 that drops units is kept.
+# Every event left out is listed in the report with both numbers.
+IMPACT_SCREEN = True
+SCREEN_FROM_LEVEL = 3                        # levels 0-2 always kept (the depth SPP reports cover)
+SCREEN_POI_V_PU = 0.85
+SCREEN_DF_MIN = 0.03
 NORMAL_CLEAR = [(345.0, 6), (0.0, 7)]        # cycles by kV (SPP: 6 at 345 kV, 7 below)
 STUCK_CYCLES = 16                            # P4 stuck-breaker clearing (SPP 16)
 RECLOSE_WAIT = 20                            # P1.2 / P6 reclose wait (cycles)
@@ -265,6 +285,10 @@ class Net(object):
         self.swing = []
         self.t3_all = []                  # [((w1, w2, w3), ckt)] incl. out of service
         self._t3_first = None
+        self.z = {}                       # key -> R+jX (pu, system base); a 3W -> star (z1, z2, z3)
+        self.zsrc = []                    # [(bus, R+jX)] machine source impedances (system base)
+        self.zdefault = {}                # what had no impedance in the case -> count
+        self._screen = None
 
     def study_resolves(self, a, b, ck):
         """The element the study (z6_spp_b _switch_branch) opens for "a-b ck":
@@ -336,10 +360,14 @@ def load_net(case_path):
         x = abs(complex(lx[0][i]).imag) if lx else None
         n.add_elem(("L", min(a, b), max(a, b), ck), "line", (a, b), ck,
                    lm[0][i] if lm else 0.0, x)
+        if lx:
+            n.z.setdefault(("L", min(a, b), max(a, b), ck), complex(lx[0][i]))
     # two-winding transformers
     ti = _arr(psspy.atrnint, -1, 1, 1, 1, 1, ["FROMNUMBER", "TONUMBER"])
     tc = _arr(psspy.atrnchar, -1, 1, 1, 1, 1, ["ID"])
     tm = _arr(psspy.atrnreal, -1, 1, 1, 1, 1, ["MVA"])
+    tz = _arr(getattr(psspy, "atrncplx", None), -1, 1, 1, 1, 1, ["RXACT"]) \
+        or _arr(getattr(psspy, "atrncplx", None), -1, 1, 1, 1, 1, ["RXNOM"])
     for i, a in enumerate(ti[0] if ti else []):
         a, b = int(a), int(ti[1][i])
         if a not in n.kv or b not in n.kv:
@@ -347,17 +375,28 @@ def load_net(case_path):
         ck = _ck(tc[0][i]) if tc else "1"
         n.add_elem(("X", min(a, b), max(a, b), ck), "xf2", (a, b), ck,
                    tm[0][i] if tm else 0.0)
+        if tz:
+            n.z.setdefault(("X", min(a, b), max(a, b), ck), complex(tz[0][i]))
     # three-winding transformers (status 0 = all windings out)
     wi = _arr(psspy.atr3int, -1, 1, 1, 2, 1,
               ["WIND1NUMBER", "WIND2NUMBER", "WIND3NUMBER", "STATUS"])
     wc = _arr(psspy.atr3char, -1, 1, 1, 2, 1, ["ID"])
+    wz = []
+    for names in (["RX1-2ACT", "RX2-3ACT", "RX3-1ACT"], ["RX1-2NOM", "RX2-3NOM", "RX3-1NOM"]):
+        wz = _arr(getattr(psspy, "atr3cplx", None), -1, 1, 1, 2, 1, names)
+        if len(wz) == 3:
+            break
     for i, a in enumerate(wi[0] if wi else []):
         w = (int(a), int(wi[1][i]), int(wi[2][i]))
         ck = _ck(wc[0][i]) if wc else "1"
         n.t3_all.append((w, ck))          # every one, in the case's order: the study's lookup
         if int(wi[3][i]) == 0 or any(x not in n.kv for x in w):
             continue
-        n.add_elem(("T",) + tuple(sorted(w)) + (ck,), "xf3", w, ck, 0.0)
+        k3 = ("T",) + tuple(sorted(w)) + (ck,)
+        n.add_elem(k3, "xf3", w, ck, 0.0)
+        if len(wz) == 3 and k3 not in n.z:
+            z12, z23, z31 = complex(wz[0][i]), complex(wz[1][i]), complex(wz[2][i])
+            n.z[k3] = ((z12 + z31 - z23) / 2, (z12 + z23 - z31) / 2, (z23 + z31 - z12) / 2)
     for (fi, fc, dst) in ((psspy.amachint, psspy.amachchar, n.mach),
                           (psspy.aloadint, psspy.aloadchar, n.load),
                           (psspy.afxshuntint, psspy.afxshuntchar, n.fsh)):
@@ -365,6 +404,22 @@ def load_net(case_path):
         cc = _arr(fc, -1, 1, ["ID"])
         for i, b in enumerate(bb[0] if bb else []):
             dst.setdefault(int(b), []).append(str(cc[0][i]).strip() if cc else "1")
+    # machine source impedances (ZSORCE on MBASE) for the impact screen
+    try:
+        sbase = float(psspy.sysmva())
+    except Exception:
+        sbase = 100.0
+    mb = _arr(psspy.amachint, -1, 1, ["NUMBER"])
+    mz = _arr(getattr(psspy, "amachcplx", None), -1, 1, ["ZSORCE"])
+    mm = _arr(getattr(psspy, "amachreal", None), -1, 1, ["MBASE"])
+    for i, b in enumerate(mb[0] if mb else []):
+        base = float(mm[0][i]) if mm and float(mm[0][i]) > 0 else sbase
+        z = complex(mz[0][i]) if mz else 0j
+        if abs(z) < 1e-4:
+            z = complex(0.0, 0.25)
+            n.zdefault["machine source impedance"] = n.zdefault.get("machine source impedance", 0) + 1
+        if abs(z) < 50.0:                 # 9999 = no source (inverter), left out
+            n.zsrc.append((int(b), z * sbase / base))
     bb = _arr(psspy.aswshint, -1, 1, ["NUMBER"])
     cc = _arr(getattr(psspy, "aswshchar", lambda *a: None), -1, 1, ["ID"])
     for i, b in enumerate(bb[0] if bb else []):
@@ -1271,6 +1326,197 @@ def phys_sig(r):
                      _pr(r.get("drop_shunts")), _el(r.get("pre_outage"))])
 
 
+# ============================================================================
+# IMPACT SCREEN (P1): POI voltage during the fault, project share on the trips
+# ============================================================================
+def _ldl(n, adj, dg):
+    """Sparse LDL' of a symmetric matrix (nodes 0..n-1, off-diagonals in adj,
+       diagonal in dg), minimum-degree order. Returns (L, D, order, pos)."""
+    import heapq
+    hp = [(len(adj[v]), v) for v in range(n)]
+    heapq.heapify(hp)
+    alive = [True] * n
+    L, D, order = {}, {}, []
+    while hp:
+        deg, v = heapq.heappop(hp)
+        if not alive[v]:
+            continue
+        if deg != len(adj[v]):
+            heapq.heappush(hp, (len(adj[v]), v))
+            continue
+        d = dg[v]
+        if abs(d) < 1e-12:
+            d = 1e-12
+        row = adj[v]
+        adj[v] = {}
+        alive[v] = False
+        items = list(row.items())
+        for u, _a in items:
+            del adj[u][v]
+        for i, (u, au) in enumerate(items):
+            lu = au / d
+            dg[u] -= lu * au
+            Au = adj[u]
+            for w, aw in items[i + 1:]:
+                t = lu * aw
+                if w in Au:
+                    Au[w] -= t
+                    adj[w][u] -= t
+                else:
+                    Au[w] = -t
+                    adj[w][u] = -t
+        for u, _a in items:
+            heapq.heappush(hp, (len(adj[u]), u))
+        L[v] = dict((u, au / d) for u, au in items)
+        D[v] = d
+        order.append(v)
+    pos = [0] * n
+    for i, v in enumerate(order):
+        pos[v] = i
+    return L, D, order, pos
+
+
+def _ldl_solve(F, b):
+    L, D, order, _pos = F
+    y = dict(b)
+    for v in order:
+        yv = y.get(v)
+        if yv:
+            for u, l in L[v].items():
+                y[u] = y.get(u, 0) - l * yv
+    x = {}
+    for v in reversed(order):
+        s = y.get(v, 0) / D[v]
+        for u, l in L[v].items():
+            xu = x.get(u)
+            if xu:
+                s -= l * xu
+        if s:
+            x[v] = s
+    return x
+
+
+def _ldl_diag(F, k):
+    """(A^-1)[k, k] from one sparse forward pass: y = L^-1 e_k, sum y^2 / D."""
+    import heapq
+    L, D, order, pos = F
+    y, hp, seen, s = {k: 1.0}, [pos[k]], set([k]), 0
+    while hp:
+        v = order[heapq.heappop(hp)]
+        yv = y[v]
+        s += yv * yv / D[v]
+        for u, l in L[v].items():
+            y[u] = y.get(u, 0) - l * yv
+            if u not in seen:
+                seen.add(u)
+                heapq.heappush(hp, pos[u])
+    return s
+
+
+class Screen(object):
+    """Factored once per case: the positive-sequence network (branches +
+       machine source impedances) for fault voltages, and the DC network (X
+       only, swing grounded) for the project's flow share."""
+    ZMIN = 1e-4
+
+    def __init__(self, net):
+        t0 = time.time()
+        self.net = net
+        idx = {}
+        for b in sorted(net.kv):
+            idx[b] = len(idx)
+        branches = []                    # (i, j, z) incl. 3W star legs
+        self.legs = {}                   # element key -> [(i, j, z)]
+        miss = 0
+        for k, el in sorted(net.elem.items()):
+            z = net.z.get(k)
+            if el["kind"] == "xf3":
+                if z is None:
+                    miss += 1
+                    z = (complex(0, 0.05),) * 3
+                s = len(idx)
+                idx[("S",) + k] = s
+                lg = [(idx[b], s, zz) for b, zz in zip(el["buses"], z)]
+            else:
+                if z is None:
+                    miss += 1
+                    z = complex(0, 0.02 if el["kind"] == "line" else 0.1)
+                lg = [(idx[el["buses"][0]], idx[el["buses"][1]], z)]
+            self.legs[k] = lg
+            branches.extend(lg)
+        if miss:
+            net.zdefault["branch impedance"] = net.zdefault.get("branch impedance", 0) + miss
+        if miss > 0.10 * max(1, len(net.elem)):
+            raise RuntimeError("%d of %d branch impedances not readable from the case"
+                               % (miss, len(net.elem)))
+        n = len(idx)
+        self.idx = idx
+        # ---- positive sequence Y
+        adj = [dict() for _ in range(n)]
+        dg = [complex(1e-6, 0)] * n
+        for i, j, z in branches:
+            if i == j:
+                continue
+            if abs(z) < self.ZMIN:
+                z = complex(0, self.ZMIN)
+            y = 1.0 / z
+            adj[i][j] = adj[i].get(j, 0) - y
+            adj[j][i] = adj[j].get(i, 0) - y
+            dg[i] += y
+            dg[j] += y
+        for b, z in net.zsrc:
+            if b in idx:
+                dg[idx[b]] += 1.0 / (z if abs(z) >= self.ZMIN else complex(0, self.ZMIN))
+        self.fy = _ldl(n, adj, dg)
+        # ---- DC B (swing grounded)
+        adj = [dict() for _ in range(n)]
+        dg = [1e-6] * n
+        for i, j, z in branches:
+            if i == j:
+                continue
+            y = 1.0 / max(abs(z.imag), self.ZMIN)
+            adj[i][j] = adj[i].get(j, 0) - y
+            adj[j][i] = adj[j].get(i, 0) - y
+            dg[i] += y
+            dg[j] += y
+        for b in net.swing:
+            if b in idx:
+                dg[idx[b]] += 1e6
+        self.fb = _ldl(n, adj, dg)
+        self._poi = None
+        print("[screen] network factored: %d nodes in %.0f s" % (n, time.time() - t0))
+
+    def set_poi(self, poi):
+        if poi == self._poi:
+            return
+        p = self.idx[poi]
+        self.zp = _ldl_solve(self.fy, {p: complex(1, 0)})    # Z[k, poi]
+        self.th = _ldl_solve(self.fb, {p: 1.0})              # angles for 1 pu at the POI
+        self._poi = poi
+        self._vcache = {}
+
+    def poi_v(self, bus):
+        """|V| at the POI (pu) with a bolted 3PH fault at bus."""
+        if bus == self._poi:
+            return 0.0
+        if bus not in self._vcache:
+            k = self.idx.get(bus)
+            if k is None:
+                return 0.0
+            zkk = _ldl_diag(self.fy, k)
+            self._vcache[bus] = abs(1 - self.zp.get(k, 0) / zkk) if abs(zkk) > 0 else 1.0
+        return self._vcache[bus]
+
+    def share(self, keys):
+        """Largest share of the project's MW on any element in keys (DC)."""
+        best = 0.0
+        for k in keys:
+            for i, j, z in self.legs.get(k, ()):
+                f = abs(self.th.get(i, 0) - self.th.get(j, 0)) / max(abs(z.imag), self.ZMIN)
+                best = max(best, f)
+        return best
+
+
 def make_project(proj, net, disis, rep):
     pb = PROJECT_BUSES[proj]
     poi = int(pb["poi"])
@@ -1354,10 +1600,54 @@ def make_project(proj, net, disis, rep):
             best[k] = e
         else:
             dups.append((e, best[k]))
+    # ---- P4 per bus as SPP's reports: the few most severe at each bus
+    pool = list(best.values())
+    p4_trim = []
+    if P4_MAX_PER_BUS:
+        byb = {}
+        for e in pool:
+            if ev_class(e["ev"]) == "P4":
+                byb.setdefault(e["fbus"], []).append(e)
+        for b, es in byb.items():
+            es.sort(key=lambda e: (0 if e["src"] == "DISIS" else 1, -len(e["trips"]),
+                                   -sum(abs(net.elem[k]["mva"]) for k in e["trips"] if k in net.elem),
+                                   e["con_id"], str(dedupe_key(e))))
+            p4_trim.extend(es[P4_MAX_PER_BUS:])
+        cut_ids = set(id(e) for e in p4_trim)
+        pool = [e for e in pool if id(e) not in cut_ids]
+    if P4_MAX_TOTAL:
+        p4s = sorted([e for e in pool if ev_class(e["ev"]) == "P4"], key=lambda e: (
+            e["level"], lev.hop.get(e["fbus"], 999), 0 if e["src"] == "DISIS" else 1,
+            -net.kv.get(e["fbus"], 0), e["fbus"], -len(e["trips"]), e["con_id"], str(dedupe_key(e))))
+        extra = p4s[P4_MAX_TOTAL:]
+        p4_trim.extend(extra)
+        cut_ids = set(id(e) for e in extra)
+        pool = [e for e in pool if id(e) not in cut_ids]
+    # ---- impact screen: a remote P1 the project cannot see is left out
+    screened, scr_note, n_cand = [], "", 0
+    if IMPACT_SCREEN:
+        try:
+            if net._screen is None:
+                net._screen = Screen(net)
+            sc = net._screen
+            sc.set_poi(poi)
+            keep = []
+            for e in pool:
+                if ev_class(e["ev"]) == "P1" and e["level"] >= SCREEN_FROM_LEVEL \
+                        and not e["drop_m"]:
+                    n_cand += 1
+                    e["scr"] = (sc.poi_v(e["fbus"]), sc.share(e["trips"]))
+                    if e["scr"][0] >= SCREEN_POI_V_PU and e["scr"][1] < SCREEN_DF_MIN:
+                        screened.append(e)
+                        continue
+                keep.append(e)
+            pool = keep
+        except Exception as ex:
+            scr_note = "NOT APPLIED -- %s: %s (every event kept)" % (type(ex).__name__, ex)
+            print("[screen] %s: %s" % (proj, scr_note))
     # ---- cap: level by level outward; the level that overflows is filled
     #      SPP's own (DISIS) first, then nearest the POI, then highest kV
     capped = []
-    pool = list(best.values())
     if MAX_EVENTS and len(pool) > MAX_EVENTS:
         pool.sort(key=lambda e: (e["level"], 0 if e["src"] == "DISIS" else 1,
                                  lev.hop.get(e["fbus"], 999), -lev.net.kv.get(e["fbus"], 0),
@@ -1436,6 +1726,28 @@ def make_project(proj, net, disis, rep):
         W("  %-6s %-30s bus %-7d %s" % (e["src"], e["con_id"] or "(generated)", e["fbus"],
                                        ", ".join(_desc(net, k) for k in e["trips"][:4])))
     W("")
+    if p4_trim:
+        W("P4 OVER P4_MAX_PER_BUS = %s at a bus / P4_MAX_TOTAL = %s (%d left out; at each bus "
+          "the most severe kept, then the nearest the POI):"
+          % (P4_MAX_PER_BUS, P4_MAX_TOTAL, len(p4_trim)))
+        for e in sorted(p4_trim, key=lambda e: (e["level"], e["fbus"])):
+            W("  %-6s %-5s L%d %-30s bus %-7d %d element(s)"
+              % (e["src"], e["ev"], e["level"], e["con_id"] or "(generated)", e["fbus"],
+                 len(e["trips"])))
+        W("")
+    if IMPACT_SCREEN:
+        W("IMPACT SCREEN (P1 faulted at level >= %d; P4 not screened): %s"
+          % (SCREEN_FROM_LEVEL, scr_note or "%d of %d left out -- POI stays >= %.2f pu during "
+             "the fault AND no tripped element carries >= %.0f %% of the project's MW"
+             % (len(screened), n_cand, SCREEN_POI_V_PU, 100 * SCREEN_DF_MIN)))
+        if net.zdefault:
+            W("  not in the case, a typical value used: %s" % ", ".join(
+                "%s x%d" % (k, v) for k, v in sorted(net.zdefault.items())))
+        for e in sorted(screened, key=lambda e: (e["level"], -e["scr"][0], e["fbus"])):
+            W("  %-6s %-5s L%d %-30s bus %-7d POI %.2f pu  share %4.1f %%  %s"
+              % (e["src"], e["ev"], e["level"], e["con_id"] or "(generated)", e["fbus"],
+                 e["scr"][0], 100 * e["scr"][1], ", ".join(_desc(net, k) for k in e["trips"][:3])))
+        W("")
     if capped:
         cut = min(c["level"] for c in capped)
         W("OVER MAX_EVENTS = %d -- %d event(s) left out, farthest first to go (levels 0..%d "
