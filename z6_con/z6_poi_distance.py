@@ -90,7 +90,7 @@ def main():
 
     def bname(b):
         i = B.get(b)
-        return ("%s %.0f kV" % (i["name"], i["kv"])) if i else "NOT IN CASE"
+        return ("%s %.0f kV area %s" % (i["name"], i["kv"], i["area"])) if i else "NOT IN CASE"
 
     rows, lines = [], []
     lines.append("POI DISTANCE -- %s   case %s" % (time.strftime("%Y-%m-%d %H:%M"), os.path.basename(sav or "")))
@@ -117,13 +117,13 @@ def main():
             h, z, b = min(cand, key=lambda c: (c[1], c[0]))
             res.append((h, z, gen, mw, typ, sub, b, "NEAR" if h <= NEAR_NODES else ""))
         res.sort(key=lambda r: (r[1], r[0]))
-        lines.append("  %-13s %5s  %-8s %-24s %-8s %-26s %6s %9s  %s"
+        lines.append("  %-13s %5s  %-8s %-24s %-8s %-34s %6s %9s  %s"
                      % ("GEN", "MW", "type", "substation", "POI bus", "bus name", "nodes", "|Z| pu", ""))
         for h, z, gen, mw, typ, sub, b, flag in res:
             hs = "-" if h >= 1e9 else "%d" % h
             zs = "-" if z >= 1e9 else "%.4f" % z
-            lines.append("  %-13s %5d  %-8s %-24s %-8d %-26s %6s %9s  %s"
-                         % (gen, mw, typ, sub[:24], b, bname(b)[:26], hs, zs, flag))
+            lines.append("  %-13s %5d  %-8s %-24s %-8d %-34s %6s %9s  %s"
+                         % (gen, mw, typ, sub[:24], b, bname(b)[:34], hs, zs, flag))
             rows.append((proj, poi, gen, mw, typ, sub, b, bname(b), hs, zs, flag))
     txt = "\n".join(lines)
     print(txt)
