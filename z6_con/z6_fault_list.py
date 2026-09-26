@@ -1018,7 +1018,10 @@ def build_generated(lev, disis_kept):
     # ---- P1.3 every transformer
     if EVENTS.get("P1.3"):
         for k, el in sorted(net.elem.items()):
-            if el["kind"] not in ("xf2", "xf3") or not is_net(k):
+            if el["kind"] not in ("xf2", "xf3"):
+                continue
+            if not (is_net(k) or (INCLUDE_RADIAL_P1 and not any(b in lev.plant
+                                                                for b in el["buses"]))):
                 continue
             kvs = sorted([net.kv.get(b, 0) for b in el["buses"]], reverse=True)
             if kvs[0] < KV_MIN or kvs[1] < XFMR_LV_KV_MIN:
