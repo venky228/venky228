@@ -24716,6 +24716,12 @@ def load_faults_csv(path):
             _FAULT_SIG[f["id"]] = _fault_row_sig(r)
             if (r.get("planning_event") or "").strip():
                 f["planning_event"] = r["planning_event"].strip()
+                # a list written before P1 transformers were told apart: every
+                # element tripped is a three-winding transformer -> P1.3
+                _t3 = [x for x in (r.get("trip_3wind") or "").split(";") if x.strip()]
+                if f["planning_event"] == "P1.2" and _t3 and len(_t3) >= len(tl) \
+                        and not _dec_elems(r.get("pre_outage")):
+                    f["planning_event"] = "P1.3"
                 n_rich += 1
                 # SUBTYPE IS NOT A COLUMN -- it is implied by the planning event,
                 # and without it a reloaded P4 stuck-breaker is described as a
@@ -24768,6 +24774,8 @@ def load_faults_csv(path):
                 f["con_id"] = r["con_id"].strip()
             if (r.get("subtype") or "").strip():
                 f["subtype"] = r["subtype"].strip()
+            if f.get("planning_event") == "P1.3" and f.get("subtype") == "line":
+                f["subtype"] = "transformer"        # relabelled above
             out.append(f)
     if out and not n_rich:
         print("[faults] NOTE: %s carries only the original nine columns, so every "
@@ -28757,8 +28765,19 @@ def sf_con_to_faults(cons, poi_bus):
             _drop("more than %d element(s)" % CON_MAX_ELEMENTS)
             continue
 
+        # A BARE "P1" THAT TRIPS ONLY TRANSFORMERS IS P1.3. SPP's DISIS labels
+        # write every single-contingency fault as "P1", and it was read as P1.2
+        # (a line) -- so GROUP3_P1_LOCAL_FAULT_1573, the ST JOE 7 three-winding
+        # transformer, was listed and described as a line fault. NERC TPL-001
+        # Table 1: P1.2 = transmission circuit, P1.3 = transformer. Same fault
+        # type and clearing either way; the F-numbers keep the order they had.
+        _ev_sort = ev
+        if (ev == "P1.2" and c["elements"] and not c["buses"]
+                and re.match(r"(?i)^\*?\s*P1(?![.\d])", (c["label"] or "").strip().strip("'\""))
+                and all(len(e) > 3 or _sf_is_xfmr(e[0], e[1], e[2]) for e in c["elements"])):
+            ev = "P1.3"
         ftype, sub = _CON_KIND.get(ev, ("3PH", "line"))
-        f = {"planning_event": ev, "subtype": sub, "fault_bus": fb,
+        f = {"planning_event": ev, "_ev_sort": _ev_sort, "subtype": sub, "fault_bus": fb,
              "fault_to": (trips[0][1] if trips else fb),
              "kv": kv, "type": ftype, "cycles": sf_event_cycles(ev, kv),
              "ckt": (trips[0][3] if trips else "1"),
@@ -28782,7 +28801,7 @@ def sf_con_to_faults(cons, poi_bus):
 
     # ---- number them POI-outward, exactly as the generated list does --------
     kept.sort(key=lambda f: (hopmap.get(int(f["fault_bus"]), 10 ** 6),
-                             str(f.get("planning_event")), str(f.get("con_id"))))
+                             str(f.get("_ev_sort") or f.get("planning_event")), str(f.get("con_id"))))
     if SPP_MAX_FAULTS and len(kept) > SPP_MAX_FAULTS:
         print("[con] %d event(s) near the POI -> keeping the %d nearest "
               "(SPP_MAX_FAULTS)" % (len(kept), SPP_MAX_FAULTS))
@@ -29133,10 +29152,18 @@ def sf_table_to_faults(rows, poi_bus):
                                   for t in trips):
                     trips.append((int(x[0]), int(x[1]), x[2], str(x[3])))
 
-        sub = {"P4.2": "slg", "P1.2": "line", "P2.1": "open"}.get(ev, "line")
+        # SPP's sheet writes every single-contingency fault as a bare "P1";
+        # one that trips only transformers is P1.3 (NERC TPL-001 Table 1), not
+        # P1.2 (a line). Same fault and clearing; F-numbers keep their order.
+        _ev_sort = ev
+        if (ev == "P1.2" and cat == "P1" and trips and not p["buses"]
+                and all(_sf_is_xfmr(t[0], t[1], t[3]) for t in trips)):
+            ev = "P1.3"
+        sub = {"P4.2": "slg", "P1.2": "line", "P1.3": "transformer",
+               "P2.1": "open"}.get(ev, "line")
         if p["machines"] and not trips:
             sub = "gen"
-        f = {"planning_event": ev, "subtype": sub,
+        f = {"planning_event": ev, "_ev_sort": _ev_sort, "subtype": sub,
              "fault_bus": p["fault_bus"], "kv": p["kv"], "type": p["type"],
              "cycles": p["cycles"], "ckt": (trips[0][3] if trips else "1"),
              "fault_to": (trips[0][1] if trips else p["fault_bus"]),
@@ -29162,7 +29189,7 @@ def sf_table_to_faults(rows, poi_bus):
         kept.append(f)
 
     kept.sort(key=lambda f: (hopmap.get(int(f["fault_bus"]), 10 ** 6),
-                             str(f.get("planning_event")), str(f.get("con_id"))))
+                             str(f.get("_ev_sort") or f.get("planning_event")), str(f.get("con_id"))))
     if SPP_MAX_FAULTS and len(kept) > SPP_MAX_FAULTS:
         print("[table] %d event(s) near the POI -> keeping the %d nearest "
               "(SPP_MAX_FAULTS)" % (len(kept), SPP_MAX_FAULTS))
