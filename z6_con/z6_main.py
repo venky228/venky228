@@ -525,6 +525,8 @@ EGF_DYR_RUN = False                          # True = run BOTH cases with those 
 EGF_OFF_RUN = False                          # True = run BOTH cases with every existing machine OFF (_egfoff) and compare
 EGF_PROJECTS = []                            # [] = every project of the launch (EGF_DYR_RUN: those with edits)
 EGF_FAULTS = "same"                          # "same" = ONLY_FAULTS | "all" | ["F01-F04"]
+EGF_ONLY = False                             # True = simulate ONLY the EGF runs above: the as-is studies are
+                                             #   not run (their results on disk are the reference), nor any other extra run
 ABORT_ON_MODEL_NOT_ACCESSIBLE = True         # stop on 'MODEL NOT ACCESSIBLE'
 INIT_NAN_ABORT = False                       # stop on NaN after init
 ADJUSTMENTS_REPORT = True                    # list every non-project change in SYSTEM_ADJUSTMENTS.txt
@@ -21712,6 +21714,19 @@ def main():
         "missing": "simulate only what is missing, then compare",
         "all":     "simulate BOTH cases, report both, then compare",
     }[pipeline])
+    # EGF_ONLY: the as-is studies are the reference and are NOT simulated --
+    # their folders on disk are scored and compared as with "compare"; only the
+    # _egf / _egfoff runs simulate.
+    _egf_only = bool(EGF_ONLY and (EGF_DYR_RUN or EGF_OFF_RUN) and pipeline != "compare")
+    if EGF_ONLY and not _egf_only:
+        print("[egf] EGF_ONLY is on but %s -- ignored" % (
+            "PIPELINE is \"compare\"" if pipeline == "compare"
+            else "EGF_DYR_RUN and EGF_OFF_RUN are both off"))
+    if _egf_only:
+        print("[egf] EGF_ONLY: the as-is studies are NOT simulated (their results on disk")
+        print("[egf]           are the reference); only the %s run(s) simulate, and no"
+              % " / ".join(t for t, on in (("_egf", EGF_DYR_RUN), ("_egfoff", EGF_OFF_RUN)) if on))
+        print("[egf]           other extra run (sweeps, surplus, capacity, new plant, project off).")
     # THE SETTINGS THAT MAKE THIS RUN POINTLESS, CHECKED FIRST.
     #
     # This test used to sit in PHASE 0, several hundred lines below -- and
@@ -22006,7 +22021,7 @@ def main():
     # "base" would otherwise report the project case as having failed when it
     # was deliberately left alone.
     rb = rt = None
-    if pipeline == "all":
+    if pipeline == "all" and not _egf_only:
         # BEFORE ANY SIMULATION. The studies write into the same folders as
         # last time, so this is the only moment the previous run can be kept.
         # ONLY WHEN THIS LAUNCH STARTS OVER. KEEP_PREVIOUS_RUNS renamed the
@@ -22169,7 +22184,7 @@ def main():
     # one of its faults comes out "scored on one side only", which is true and
     # useless. This runs exactly the side that is missing, for exactly the
     # projects that are missing it, and nothing else.
-    if pipeline == "missing":
+    if pipeline == "missing" and not _egf_only:
         # WHAT "MISSING" MEANS. It used to mean "a project that has a results
         # folder on one side and not the other" -- so a project with no folder
         # on EITHER side (IronStar, EmpirePrairie, never started) was not
@@ -22511,7 +22526,7 @@ def main():
     # comes before the sweep: it answers a question about the ARRANGEMENT, and
     # the answer decides whether tuning constants on the existing arrangement
     # is the right thing to spend studies on.
-    if results and NEW_PLANT_RUN and pipeline != "compare":
+    if results and NEW_PLANT_RUN and pipeline != "compare" and not _egf_only:
         _np_pj = _new_plant_projects([r["project"] for r in results])
         for res in [r for r in results if r["project"] in _np_pj]:
             try:
@@ -22524,7 +22539,7 @@ def main():
                 print("[newplant] the new-plant run failed (%s) -- the comparison "
                       "above is unaffected" % e)
 
-    if results and PROJECT_OFF_RUN and pipeline != "compare":
+    if results and PROJECT_OFF_RUN and pipeline != "compare" and not _egf_only:
         _off_pj = _project_off_projects([r["project"] for r in results])
         for res in [r for r in results if r["project"] in _off_pj]:
             try:
@@ -22541,7 +22556,7 @@ def main():
     # Same placement and the same reason as the capacity sweep below: it runs
     # full studies, so it belongs to the one-shot path in main() and not to
     # compare_now(), which the live-refresh thread calls on a timer.
-    if results and (DYR_SWEEP or DYR_SWEEP_BY_PROJECT) and pipeline != "compare":
+    if results and (DYR_SWEEP or DYR_SWEEP_BY_PROJECT) and pipeline != "compare" and not _egf_only:
         _sweep_pj = _dyr_sweep_projects([r["project"] for r in results])
         # ONE PASS PER CAPACITY LEVEL. ("", None) first, so the ordinary
         # full-output sweep is complete and written before a single reduced-
@@ -22600,7 +22615,7 @@ def main():
                     print("[mw] the per-size comparisons failed (%s)" % e)
 
     # ---- TOTAL P AT THE POI, one complete study per level --------------------
-    if results and (POI_P_LEVELS or POI_P_LEVELS_PCT) and pipeline != "compare":
+    if results and (POI_P_LEVELS or POI_P_LEVELS_PCT) and pipeline != "compare" and not _egf_only:
         for res in results:
             try:
                 rows, levels = run_poi_p_sweep(res["project"], res["mode"])
@@ -22670,7 +22685,7 @@ def main():
     # deliberately its own step: these are not a sweep of one study, they are
     # the two systems BP-7250 7.6 defines, and each is compared against the
     # base on its own terms.
-    if results and SURPLUS_SCENARIOS and pipeline != "compare":
+    if results and SURPLUS_SCENARIOS and pipeline != "compare" and not _egf_only:
         for res in results:
             try:
                 run_surplus_scenarios(res["project"], res["mode"])
@@ -22702,7 +22717,7 @@ def main():
             except Exception as e:
                 print("[egf] the existing-machine comparisons failed (%s)" % e)
 
-    if results and CAPACITY_LEVELS and pipeline != "compare":
+    if results and CAPACITY_LEVELS and pipeline != "compare" and not _egf_only:
         for res in results:
             try:
                 rows = run_capacity_sweep(res["project"], res["mode"])
