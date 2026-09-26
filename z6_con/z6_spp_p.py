@@ -24673,6 +24673,10 @@ def evaluate_case(path, kind, tclear, kb):
             _mb = re.search(r"\d{3,}", _s.split("(")[0])
             return int(_mb.group(0)) if _mb else None
         _evu = _event_dropped_units(case)
+        # CHANNELS WITHOUT MACHINE IDS (a .out recorded before the ids went into
+        # the names, or new-plant NPGEN/PROJ channels): a unit-less label cannot
+        # say WHICH unit it is, so it is matched on the bus, as before.
+        _ids_named = any(_chan_unit(_t) for _t, _v in (pelecs + eterms))
 
         def _dropped(_s):
             # THE UNIT, NOT THE BUS: the event dropping unit 2 of a bus does not
@@ -24681,6 +24685,9 @@ def evaluate_case(path, kind, tclear, kb):
             if not _mm:
                 return False
             _b, _u = int(_mm.group(1)), (_mm.group(2) or "")
+            _lbl = _s.split("(")[0].strip().upper()
+            if _evu and _u == "" and (not _ids_named or _lbl.startswith(("NEW", "PROJ"))):
+                return _b in _evd
             if _evu:
                 return (_b, _u) in _evu or (_b, "*") in _evu
             return _b in _evd
@@ -28829,9 +28836,12 @@ def _tclear_from_faultlist(scen_id):
                             if _mb:
                                 _dm.add(int(_mb.group(1)))
                                 _mu = re.match(r"\s*\d+\s*-\s*(\S+)", _x)
+                                # AS THE LOADER TRIPS THEM: "bus-*" is every unit on
+                                # the bus, a bare bus is unit '1' ('' here).
+                                _idu = _mu.group(1).strip() if _mu else "1"
                                 _FAULT_CYCLES_CACHE["drop_u"].setdefault(_fid, set()).add(
                                     (int(_mb.group(1)),
-                                     _mach_tag(0, _mu.group(1)).partition("_")[2] if _mu else "*"))
+                                     "*" if _idu in ("*", "") else _mach_tag(0, _idu).partition("_")[2]))
                         if _dm:
                             _FAULT_CYCLES_CACHE["drop"][_fid] = _dm
                         # UNSUCCESSFUL RECLOSE: the fault is cleared a SECOND
@@ -35028,7 +35038,8 @@ def main():
             print("[sav-only] *** build failed: %s ***" % _e)
             traceback.print_exc()
             sys.exit(1)
-        if not ENABLE_BESS or not os.path.isfile(MOD_SAV):
+        if (not ENABLE_BESS or not os.path.isfile(MOD_SAV)
+                or os.path.getmtime(MOD_SAV) < _t0 - 1):
             print("[sav-only] *** no modified .sav was written (ENABLE_BESS = %s) ***" % ENABLE_BESS)
             sys.exit(1)
         # THE RUN MUST BUILD THIS CASE, NOT REUSE AN OLDER SNAPSHOT: a resumed
