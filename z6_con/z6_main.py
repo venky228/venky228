@@ -6205,7 +6205,7 @@ _D_BUSVAL = re.compile(r"(?<![\d.])(\d{3,})\s*=\s*(-?\d+\.\d+)")
 # extreme bus, which is all a PASS wording gives
 _D_WORST = re.compile(r"(?:worst|is)\s+(-?\d+\.\d+)\s*pu\s*\(\s*(\d{3,})")
 # "PROJ 765912(1->0 MW)" / "640014(120.0->0 MW)" -- what a machine was and became
-_D_TRIP = re.compile(r"(\d{3,})(?:-[A-Z0-9]{1,2})?\s*\(\s*(-?\d+(?:\.\d+)?)\s*->\s*(-?\d+(?:\.\d+)?)\s*MW")
+_D_TRIP = re.compile(r"(\d{3,}(?:-[A-Z0-9]{1,2})?)\s*\(\s*(-?\d+(?:\.\d+)?)\s*->\s*(-?\d+(?:\.\d+)?)\s*MW")
 
 
 def _volt_elements_from_detail(detail):
@@ -11748,6 +11748,8 @@ def write_all_variants_overvoltage(proj, mode):
         lbl = n[len(base_name) + 1:]
         if not lbl:
             continue
+        if not glob.glob(os.path.join(rdir, "outs", "*.out")):
+            continue                      # .sav-only / failed run: nothing to show
         cols.append((lbl, rdir))
         notes.append((lbl, _variant_note(lbl)))
     if not cols:
