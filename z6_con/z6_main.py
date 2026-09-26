@@ -267,11 +267,7 @@ GEN_TEST_BY_PROJECT = {
         "POI": 765911,
         "EXTRA_GENS": [],
         "EGF_EDITS": {
-            # REGCA1 around V110_K2 -- ONE NAME PER SET OF VALUES (a name is its run folder)
-            "V110_K2_A05":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],   # Accel sensitivity
-            "V110_K2_A10":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
-            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],  # more absorb headroom
-            # REECA1 Kqv on top of V110_K2: reactive current per pu outside Vdip..Vup
+           
             # (above Vup it ABSORBS)
             "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
                              ("REECA1", {"Kqv": 0.0})],                                # no Iq injection: is Kqv the driver?
@@ -282,7 +278,7 @@ GEN_TEST_BY_PROJECT = {
             # REGCA1 Rrpwr = ramp rate of the active current after a fault (pu/s),
             # at its maximum: the fastest P recovery. Deck values otherwise, so the
             # run reads against 'all in service' -- does the recovery improve?
-            "RRPWR10":  [("REGCA1", {"Rrpwr": 10.0})],
+            "RRPWR10":  [("REGCA1", {"Rrpwr": 1.0})],
         },
     },
     "IronStar":      {"POI": 560080, "EXTRA_GENS": [], "EGF_EDITS": {}},   # existing gens: NXK8BJ (vendor model, no REGCA1)
@@ -290,24 +286,9 @@ GEN_TEST_BY_PROJECT = {
         "POI": 531623,
         "EXTRA_GENS": [],
         "EGF_EDITS": {                               # deck REGCAU1 (not REGCA1): Volim 1.2 / Khv 0.2 / Accel 0.7
-            "V110_K2_A05":  [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],
-            "V110_K2_A10":  [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
-            "V110_K2_IO15": [("REGCAU1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],
-            # Kqv runs need the name of EastFork's electrical model (REECAU1 / REECCU1 ...)
-            "RRPWR10":      [("REGCAU1", {"Rrpwr": 10.0})],
-        },
-    },
-    "EmpirePrairie": {
-        "POI": 761383,
-        "EXTRA_GENS": [],
-        "EGF_EDITS": {                               # deck REGCA1: Volim 1.2 / Khv 0.2 / Accel 0.7
-            "V110_K2":      [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7})],   # base of the rest
-            "V110_K2_A05":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.5})],
-            "V110_K2_A10":  [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 1.0})],
-            "V110_K2_IO15": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7, "Iolim": -1.5})],
-            # needs REECA1 at the feeders -- a model not there stops only that run (listed in its log)
+            # (above Vup it ABSORBS)
             "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
-                             ("REECA1", {"Kqv": 0.0})],
+                             ("REECA1", {"Kqv": 0.0})],                                # no Iq injection: is Kqv the driver?
             "V110_K2_KQV2": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
                              ("REECA1", {"Kqv": 2.0})],
             "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
@@ -315,17 +296,35 @@ GEN_TEST_BY_PROJECT = {
             # REGCA1 Rrpwr = ramp rate of the active current after a fault (pu/s),
             # at its maximum: the fastest P recovery. Deck values otherwise, so the
             # run reads against 'all in service' -- does the recovery improve?
-            "RRPWR10":  [("REGCA1", {"Rrpwr": 10.0})],
+            "RRPWR10":  [("REGCA1", {"Rrpwr": 1.0})],
+        },
+    },
+    "EmpirePrairie": {
+        "POI": 761383,
+        "EXTRA_GENS": [],
+        "EGF_EDITS": {                               # deck REGCA1: Volim 1.2 / Khv 0.2 / Accel 0.7
+            # (above Vup it ABSORBS)
+            "V110_K2_KQV0": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 0.0})],                                # no Iq injection: is Kqv the driver?
+            "V110_K2_KQV2": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 2.0})],
+            "V110_K2_KQV4": [("REGCA1", {"Volim": 1.10, "Khv": 2.0, "Accel": 0.7}),
+                             ("REECA1", {"Kqv": 4.0})],
+            # REGCA1 Rrpwr = ramp rate of the active current after a fault (pu/s),
+            # at its maximum: the fastest P recovery. Deck values otherwise, so the
+            # run reads against 'all in service' -- does the recovery improve?
+            "RRPWR10":  [("REGCA1", {"Rrpwr": 1.0})],
         },
     },
 }
 # -- 3c. machine runs (each one, and each EGF_EDITS run, is done in every GEN_TEST_GEN_SCENARIOS)
+GEN_TEST_EGF_RUN = False                     # True = run the EGF_EDITS above | False = skip them (entries kept)
 GEN_TEST_REFERENCE_RUNS = True               # all in service (needed to compare; finished ones are reused)
-GEN_TEST_EACH_GEN = True                      # each machine within GEN_TEST_HOPS off on its own
+GEN_TEST_EACH_GEN = False                      # each machine within GEN_TEST_HOPS off on its own
 GEN_TEST_EXCLUDE_POI_GENS = True             # True = POI plants left out of the one-at-a-time runs and the HOPS group
 GEN_TEST_POI_GROUP = True                    # all POI plants off together
 GEN_TEST_HOPS_GROUP = True                   # all machines within GEN_TEST_HOPS off together
-GEN_TEST_POI_OFF_BASE = True                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
+GEN_TEST_POI_OFF_BASE = False                 # True = ALSO every cap / line / gen run again with the POI plants OFF,
                                              #   compared with the POIGENOFF run; same reports, rows "POI OFF + ..."
 GEN_TEST_HOPS = 5                           # gens: "near" = within this many buses of the POI
 GEN_TEST_MIN_MW = 5.0                        # skip machines below this |MW| (SVC/STATCOM kept)
@@ -333,20 +332,20 @@ GEN_TEST_EXCLUDE = []                        # machines never switched off [(bus
 # -- 3d. cap and line runs (solver scenario s0_asis only)
 GEN_TEST_CAPS_OFF = True                     # all caps near the POI off together
 GEN_TEST_CAPS_EACH = False                   # each cap bank off on its own
-GEN_TEST_LINES_EACH = True                    # each nearby line / transformer opened on its own
+GEN_TEST_LINES_EACH = False                    # each nearby line / transformer opened on its own
 GEN_TEST_LINES_HOPS = 2                      # lines: both ends within this many buses of the POI
 # -- 3e. solver scenarios: (tag, DELT_CYCLES, MAXITER, ACCEL, TOL); None = study value
 GEN_TEST_SCENARIOS = [
     ("s0_asis",              None, None, None, None),     # as SPP runs it
     ("s1_it400_a010",        None, 400,  0.10, None),     # 400 iterations, acceleration 0.10
-    ("s2_it300_a020",        None, 300,  0.20, None),     # 300 iterations, acceleration 0.20
-    ("s3_it250_a030",        None, 250,  0.30, None),     # 250 iterations, acceleration 0.30
-    ("s4_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
+    # ("s2_it300_a020",        None, 300,  0.20, None),     # 300 iterations, acceleration 0.20
+    # ("s3_it250_a030",        None, 250,  0.30, None),     # 250 iterations, acceleration 0.30
+    # ("s4_it100_a080",        None, 100,  0.80, None),     # 100 iterations, acceleration 0.80, time step as SPP
 ]
-GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s2_it300_a020"]  # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
-GEN_TEST_POIGENOFF_SCENARIOS = "all"          # all POI gens off (POIGENOFF): "all" | [...] | None = as GEN_TEST_GEN_SCENARIOS
-GEN_TEST_LINES_SCENARIOS = ["s0_asis", "s2_it300_a020"]  # each line / transformer opened (and its POI-off run)
-GEN_TEST_CAPS_SCENARIOS = ["s0_asis", "s2_it300_a020"]   # caps off (and its POI-off run)
+GEN_TEST_GEN_SCENARIOS = ["s0_asis", "s1_it400_a010"]  # "all" | "best2" | [...] -- for the 3c runs (a tag is its run folder: renaming one re-runs it)
+GEN_TEST_POIGENOFF_SCENARIOS = None           # all POI gens off (POIGENOFF): "all" | [...] | None = as GEN_TEST_GEN_SCENARIOS
+GEN_TEST_LINES_SCENARIOS = ["s0_asis", "s1_it400_a010"]  # each line / transformer opened (and its POI-off run)
+GEN_TEST_CAPS_SCENARIOS = ["s0_asis", "s1_it400_a010"]   # caps off (and its POI-off run)
 GEN_TEST_BORDERLINE_REF = 0.5                # a 'new FAIL' that more than this share of the element runs of one
                                              #   fault + scenario get (4+ runs) = the REFERENCE is borderline on it:
                                              #   noted, not held against any element (None = off). Reports only.
@@ -18197,6 +18196,8 @@ def _gt_egf_entries():
     """GEN_TEST_EGF_EDITS: one element run per entry -- the existing machines
        at GEN_TEST_PROJECT's feeders with the listed model constants changed."""
     out = []
+    if not GEN_TEST_EGF_RUN:
+        return out
     for name, rows in sorted((GEN_TEST_EGF_EDITS or {}).items()):
         edits = []
         for e in rows or []:
