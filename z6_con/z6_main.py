@@ -402,6 +402,9 @@ BASE_FOLDER = "Base"                         # base case folder (no projects)
 PROJ_FOLDER = "Projects"                     # case folder with the projects
 CMP_FOLDER = "comparison"                    # comparison output folder (base vs project)
 SCEN_CMP_FOLDER = "comparison_scenarios"     # scenario comparisons + gen test, per project, kept apart
+TIDY_RESULTS = True                          # True = at launch, every run folder lying loose in results_base\ / results_proj\
+                                             #   is moved into its project's folder (results_base\SantaFe\...), names
+                                             #   unchanged, nothing re-run. False while another launch is still running.
 BASE_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"  # base .sav (in BASE_FOLDER)
 BASE_DYR = "2020MDWG-25S-DIS2201.dyr"
 PROJ_SAV = "DIS2201-25SP-G03-CQ_Mitigated.sav"  # project .sav (in PROJ_FOLDER)
@@ -2125,8 +2128,123 @@ def _res_root(case):
     return _old
 
 
+# ---- ONE FOLDER PER PROJECT -------------------------------------------------
+# Every run folder of a project sits in results_base\<project>\ (and
+# results_proj\<project>\), under its own unchanged name:
+#
+#     Base\results_base\SantaFe\SantaFe_spp\
+#     Base\results_base\SantaFe\SantaFe_spp_gt_s0_asis_off531603_1\
+#
+# DECIDED PER PROJECT, FROM THE DISK, by the same rule in the engines and the
+# launchers: the project's folder is used when it exists, or when the project
+# has no run folder loose in results_base\ yet; a project still laid out flat
+# stays flat until TIDY_RESULTS moves it. So a study half-way through is never
+# split between two places.
+
+
+def _is_proj_box(d):
+    """A project's folder (results_base\\SantaFe), not a run folder: it holds
+       no outs\\ of its own and at least one '<name>_...' run folder."""
+    if not os.path.isdir(d) or os.path.isdir(os.path.join(d, "outs")):
+        return False
+    nm = os.path.basename(os.path.normpath(d))
+    return any(os.path.isdir(x) for x in glob.glob(os.path.join(d, glob.escape(nm) + "_*")))
+
+
+def _loose_runs(root, proj):
+    """Run folders of this project lying directly in root (the flat layout)."""
+    return [d for d in glob.glob(os.path.join(root, glob.escape(proj) + "_*"))
+            if os.path.isdir(d) and not _is_proj_box(d)]
+
+
+def _proj_root(case_or_root, proj):
+    """Where this project's run folders are: <root>\\<proj>, or <root> itself
+       for a project still laid out flat (see ONE FOLDER PER PROJECT)."""
+    root = case_or_root if isinstance(case_or_root, str) else _res_root(case_or_root)
+    if not proj:
+        return root
+    box = os.path.join(root, proj)
+    if os.path.isdir(box) or not _loose_runs(root, proj):
+        return box
+    return root
+
+
+def _run_glob(root, pat):
+    """glob of run folders in BOTH layouts: <root>\\<pat> (flat, project
+       folders themselves left out) and <root>\\<proj>\\<pat> (one level down,
+       only names that start with that folder's '<proj>_')."""
+    out = [d for d in glob.glob(os.path.join(root, pat)) if not _is_proj_box(d)]
+    for d in glob.glob(os.path.join(root, "*", pat)):
+        par = os.path.basename(os.path.dirname(d))
+        if os.path.basename(d).startswith(par + "_") and _is_proj_box(os.path.dirname(d)):
+            out.append(d)
+    return sorted(out)
+
+
+def tidy_results():
+    """TIDY_RESULTS: every loose run folder -> its project's folder, in both
+       cases. Names unchanged, nothing re-run; a folder that cannot be moved
+       (open in Explorer, a file held) is named and left where it is."""
+    names = set(_panel_projects() or []) | set(PROJECTS or []) | set(GEN_TEST_PROJECTS or [])
+    if GEN_TEST_PROJECT:
+        names.add(GEN_TEST_PROJECT)
+    # every project the study scripts know (BESS_PROJECTS), read, not imported
+    for case in (CASE_BASE, CASE_TEST):
+        spp = _study_script_for(case)
+        try:
+            with open(spp, errors="replace") as fh:
+                tree = ast.parse(fh.read())
+        except Exception:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "BESS_PROJECTS"
+                                                    for t in node.targets):
+                try:
+                    names |= set(str(r.get("name")) for r in ast.literal_eval(node.value)
+                                 if isinstance(r, dict) and r.get("name"))
+                except Exception:
+                    pass
+    names = sorted((n for n in names if n), key=len, reverse=True)
+    moved = stuck = 0
+    for case in (CASE_BASE, CASE_TEST):
+        root = _res_root(case)
+        if not os.path.isdir(root):
+            continue
+        for d in sorted(glob.glob(os.path.join(root, "*"))):
+            if not os.path.isdir(d) or _is_proj_box(d):
+                continue
+            nm = os.path.basename(d)
+            # the LONGEST project name that prefixes it (EastFork before East)
+            proj = next((p for p in names if nm.startswith(p + "_")), None)
+            if not proj:
+                continue
+            box = os.path.join(root, proj)
+            dest = os.path.join(box, nm)
+            if os.path.exists(dest):
+                print("[tidy]   *** %s is already in %s -- left where it is ***" % (nm, proj))
+                stuck += 1
+                continue
+            try:
+                if not os.path.isdir(box):
+                    os.makedirs(box)
+                os.rename(d, dest)
+                moved += 1
+            except Exception as e:
+                print("[tidy]   *** could not move %s (%s) -- close anything open in it "
+                      "and run again ***" % (nm, e))
+                stuck += 1
+        for box in sorted(glob.glob(os.path.join(root, "*"))) if (moved or stuck) else []:
+            if _is_proj_box(box):
+                print("[tidy]   %-16s %d run folder(s)" % (os.path.basename(box),
+                      len([x for x in os.listdir(box) if os.path.isdir(os.path.join(box, x))])))
+    if moved or stuck:
+        print("[tidy] %d folder(s) moved into their project's folder, %d left where they were"
+              % (moved, stuck))
+    return 0 if not stuck else 1
+
+
 def results_dir(case, proj, mode):
-    return os.path.join(_res_root(case), "%s_%s" % (proj, mode))
+    return os.path.join(_proj_root(case, proj), "%s_%s" % (proj, mode))
 
 
 def discover_projects(mode):
@@ -2137,7 +2255,7 @@ def discover_projects(mode):
        one-sided is named in the summary rather than ignored."""
     def _names(case):
         out = set()
-        for d in glob.glob(os.path.join(_res_root(case), "*_%s" % mode)):
+        for d in _run_glob(_res_root(case), "*_%s" % mode):
             if os.path.isdir(d):
                 nm = os.path.basename(d)
                 out.add(nm[:-(len(mode) + 1)])
@@ -2159,7 +2277,7 @@ def inventory(case):
     base = _res_root(case)
     if not os.path.isdir(base):
         return out
-    for d in sorted(glob.glob(os.path.join(base, "*"))):
+    for d in _run_glob(base, "*"):
         if not os.path.isdir(d):
             continue
         nm = os.path.basename(d)
@@ -9113,7 +9231,7 @@ def run_capacity_sweep(proj, mode):
         if rc not in (0, None):
             print("[capacity] the %s%% run ended with rc=%s -- reading whatever it scored"
                   % (tag, rc))
-        rdir = os.path.join(_res_root(CASE_TEST),
+        rdir = os.path.join(_proj_root(CASE_TEST, proj),
                             "%s_%s_cap%s" % (proj, mode, tag))
         ct, _src = read_criteria(rdir, proj)
         if not ct:
@@ -9277,7 +9395,7 @@ def run_poi_p_sweep(proj, mode):
         if rc not in (0, None):
             print("[poi-p] the %.0f MW run ended with rc=%s -- reading whatever it scored"
                   % (mw, rc))
-        rdir = os.path.join(_res_root(CASE_TEST),
+        rdir = os.path.join(_proj_root(CASE_TEST, proj),
                             "%s_%s_%s" % (proj, mode, tag))
         ct, _src = read_criteria(rdir, proj)
         if not os.path.isdir(rdir):
@@ -9355,7 +9473,7 @@ def run_project_mw_sweep(proj, mode):
         if rc not in (0, None):
             print("[mw] the %.0f MW run ended with rc=%s -- reading whatever it scored"
                   % (mw, rc))
-        rdir = os.path.join(_res_root(CASE_TEST),
+        rdir = os.path.join(_proj_root(CASE_TEST, proj),
                             "%s_%s_%s" % (proj, mode, tag))
         ct, _src = read_criteria(rdir, proj)
         if not os.path.isdir(rdir):
@@ -9956,7 +10074,7 @@ def _dyr_sweep_dir(proj, mode, tag, cap_tag=""):
        SPP_RUN_TAG, so it has to be _cap50_dyr_Kqv2 and never the reverse. A
        path assembled the other way round here would look perfectly reasonable
        and point at a folder nothing ever writes."""
-    return os.path.join(_res_root(CASE_TEST),
+    return os.path.join(_proj_root(CASE_TEST, proj),
                         "%s_%s%s_%s" % (proj, mode, _cap_suffix(cap_tag), tag))
 
 
@@ -10162,7 +10280,7 @@ def _dyr_variants_on_disk(proj, mode):
             continue
         cap = m.group(1) or ""
         tag = "dyr_" + m.group(2)
-        d = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, sfx))
+        d = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, sfx))
         by.setdefault(cap, []).append((tag, _edits_from_folder(d, m.group(2))))
     return sorted(by.items(), key=lambda kv: -(int(kv[0]) if kv[0] else 10 ** 6))
 
@@ -10359,7 +10477,7 @@ def write_dyr_sweep_workbook(found):
     rows2 = []
     for (proj, mode), lst in runs_by.items():
         for sfx, lbl, res in lst:
-            d = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, sfx))
+            d = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, sfx))
             rr = [r for r in ((res or {}).get("rows") or []) if not _is_flat(r)]
             t = _tally(rr) if rr else {}
             rows2.append([proj, lbl, _v(_dyr_of(d)), len(rr),
@@ -11285,7 +11403,7 @@ NEW_PLANT_TAG = "newplant"
 
 
 def _new_plant_dir(proj, mode):
-    return os.path.join(_res_root(CASE_TEST),
+    return os.path.join(_proj_root(CASE_TEST, proj),
                         "%s_%s_%s" % (proj, mode, NEW_PLANT_TAG))
 
 
@@ -11459,7 +11577,7 @@ PROJECT_OFF_TAG = "proj_off"
 
 
 def _project_off_dir(proj, mode):
-    return os.path.join(_res_root(CASE_TEST),
+    return os.path.join(_proj_root(CASE_TEST, proj),
                         "%s_%s_%s" % (proj, mode, PROJECT_OFF_TAG))
 
 
@@ -11644,7 +11762,7 @@ def _run_suffixes(proj, mode):
        "" is the run just finished; "__run3" an archived earlier one; "_cap50"
        a capacity level. All three are ordinary results folders differing only
        in name, which is what makes one table over all of them possible."""
-    base = os.path.join(_res_root(CASE_TEST), "%s_%s" % (proj, mode))
+    base = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s" % (proj, mode))
     out = []
     for d in glob.glob(base + "*"):
         if not os.path.isdir(d):
@@ -11811,8 +11929,7 @@ def archive_previous_runs():
         return []
     moved = []
     for mode in MODES:
-        pat = os.path.join(_res_root(CASE_TEST), "*_%s" % mode)
-        for d in sorted(glob.glob(pat)):
+        for d in _run_glob(_res_root(CASE_TEST), "*_%s" % mode):
             if not os.path.isdir(d):
                 continue
             proj = _proj_of_results_dir(d)
@@ -11856,8 +11973,8 @@ def write_run_vs_run(proj, mode):
         print("[runs] COMPARE_RUNS must be two folder suffixes, e.g. (\"__run1\", \"\")")
         return ""
     a_sfx, b_sfx = (a_sfx or ""), (b_sfx or "")
-    da = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, a_sfx))
-    db = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, b_sfx))
+    da = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, a_sfx))
+    db = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, b_sfx))
     for d, sfx in ((da, a_sfx), (db, b_sfx)):
         if not os.path.isdir(d):
             print("[runs] COMPARE_RUNS: no results at %r (%s)" % (sfx or "(this run)", d))
@@ -12759,7 +12876,7 @@ def _plan_expected(d, proj=None):
 
 def _plan_state(proj, mode, sfx):
     """What is on disk for one run: state, scenario counts, verdicts."""
-    d = os.path.join(_res_root(CASE_TEST),
+    d = os.path.join(_proj_root(CASE_TEST, proj),
                      "%s_%s%s" % (proj, mode, sfx))
     if not os.path.isdir(d):
         return {"dir": d, "state": "TO RUN", "n_out": 0, "n_scored": 0,
@@ -12936,7 +13053,7 @@ def _plan_scenario_matrix(rows):
         mode = prows[0][1]
         # base first, then every project-side run in campaign order.
         cols = []
-        _bdir = os.path.join(_res_root(CASE_BASE), "%s_%s" % (p, mode))
+        _bdir = os.path.join(_proj_root(CASE_BASE, p), "%s_%s" % (p, mode))
         cols.append(("base", _plan_scn_states(_bdir, p)))
         for (_p, _m, _lbl, _sfx, st) in prows:
             cols.append((_plan_col_label(p, mode, os.path.basename(st["dir"])),
@@ -13112,7 +13229,7 @@ def _plan_base_counts(proj, mode, sfx):
        base study that never ran, or stopped half way, was invisible in it. A
        comparison needs BOTH sides of every fault, so a project whose base case
        is missing is as unfinished as one whose project case is."""
-    d = os.path.join(_res_root(CASE_BASE), "%s_%s%s" % (proj, mode, sfx))
+    d = os.path.join(_proj_root(CASE_BASE, proj), "%s_%s%s" % (proj, mode, sfx))
     n_out = n_want = 0
     try:
         n_out = len(glob.glob(os.path.join(d, "outs", "*.out")))
@@ -13294,7 +13411,7 @@ def write_all_runs_comparison(results):
             continue
         rows = []
         for sfx in sfxs:
-            d = os.path.join(_res_root(CASE_TEST), "%s_%s%s" % (proj, mode, sfx))
+            d = os.path.join(_proj_root(CASE_TEST, proj), "%s_%s%s" % (proj, mode, sfx))
             try:
                 r = res if not sfx else compare_project(proj, mode, test_suffix=sfx)
             except Exception as e:
@@ -14517,7 +14634,7 @@ def stale_results(shared):
         base = _res_root(case)
         if not os.path.isdir(base):
             continue
-        for d in sorted(glob.glob(os.path.join(base, "*_*"))):
+        for d in _run_glob(base, "*_*"):
             if not os.path.isdir(d) or d.endswith(".old") or _side_folder(d):
                 continue
             if not glob.glob(os.path.join(d, "outs", "*.out")):
@@ -14623,7 +14740,7 @@ def retire_old_results():
         base = _res_root(case)
         if not os.path.isdir(base):
             continue
-        for d in sorted(glob.glob(os.path.join(base, "*_*"))):
+        for d in _run_glob(base, "*_*"):
             if not os.path.isdir(d) or d.endswith(".old"):
                 continue
             if not (glob.glob(os.path.join(d, "outs", "*.out"))
@@ -16543,7 +16660,7 @@ def _result_folders_for(case, proj, mode):
        and they all go stale the same way, so a check that only looked at the
        plain folder would miss exactly the sweep folders a mitigation study
        spends its time in."""
-    base = _res_root(case)
+    base = _proj_root(case, proj)
     pref = "%s_%s" % (proj, mode)
     out = []
     try:
@@ -21275,6 +21392,13 @@ def main():
     if not os.path.isdir(COMPARE_DIR):
         os.makedirs(COMPARE_DIR)
 
+    # ONE FOLDER PER PROJECT, before anything reads or writes a run folder. A
+    # project left half moved would have its loose folders missed, so a
+    # folder that could not be moved stops the launch here.
+    if TIDY_RESULTS and tidy_results():
+        print("[tidy] *** some run folders could not be moved -- see above; nothing else was started ***")
+        return 2
+
     if FIXED_SOLVER:
         if not _fixed_solver_apply():
             return 2
@@ -22211,7 +22335,7 @@ def main():
                 with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
                     write_sweep_overvoltage(
                         res["project"], res["mode"],
-                        [(_poi_tag(mw), os.path.join(_res_root(CASE_TEST), "%s_%s_%s"
+                        [(_poi_tag(mw), os.path.join(_proj_root(CASE_TEST, res["project"]), "%s_%s_%s"
                             % (res["project"], res["mode"], _poi_tag(mw))))
                          for mw in levels],
                         "POI_P_MEASURED", "TOTAL P AT THE POI",

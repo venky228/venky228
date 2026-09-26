@@ -128,8 +128,33 @@ def _results_root():
         return _new
     return _plain
 
+
+
+# ---- ONE FOLDER PER PROJECT (the same rule as z6_main.py and the launcher) --
+# A project's run folders sit in <results root>\<project>\ under their own
+# names -- used when that folder exists, or when the project has no run
+# folder loose in the results root yet; a project still laid out flat stays
+# flat until z6_main.py's TIDY_RESULTS moves it.
+def _is_proj_box(d):
+    if not os.path.isdir(d) or os.path.isdir(os.path.join(d, "outs")):
+        return False
+    nm = os.path.basename(os.path.normpath(d))
+    return any(os.path.isdir(x) for x in glob.glob(os.path.join(d, glob.escape(nm) + "_*")))
+
+
+def _proj_root(root, proj):
+    if not proj:
+        return root
+    box = os.path.join(root, proj)
+    if os.path.isdir(box):
+        return box
+    if any(os.path.isdir(d) and not _is_proj_box(d)
+           for d in glob.glob(os.path.join(root, glob.escape(proj) + "_*"))):
+        return root
+    return box
+
 RESULTS_DIR = os.path.join(
-    _results_root(),
+    _proj_root(_results_root(), _PROJ_TAG),
     ("dynamics" if not _PROJ_TAG else
      ("%s_%s" % (_PROJ_TAG, _MODE_TAG if _MODE_TAG else "spp")))
     + (("_cap%s" % _CAP_TAG_DIR) if _CAP_TAG_DIR else "")

@@ -1121,6 +1121,45 @@ def _results_root():
     return _plain
 
 
+# ---- ONE FOLDER PER PROJECT (the same rule as z6_main.py and the study) ----
+# A project's run folders sit in <results root>\<project>\ under their own
+# names -- used when that folder exists, or when the project has no run
+# folder loose in the results root yet; a project still laid out flat stays
+# flat until z6_main.py's TIDY_RESULTS moves it.
+def _is_proj_box(d):
+    """A project's folder, not a run folder: no outs\ of its own and at
+       least one '<name>_...' run folder inside."""
+    if not os.path.isdir(d) or os.path.isdir(os.path.join(d, "outs")):
+        return False
+    nm = os.path.basename(os.path.normpath(d))
+    return any(os.path.isdir(x) for x in glob.glob(os.path.join(d, glob.escape(nm) + "_*")))
+
+
+def _proj_root(root, proj):
+    """Where this project's run folders are: root\<proj>, or root itself for
+       a project still laid out flat."""
+    if not proj:
+        return root
+    box = os.path.join(root, proj)
+    if os.path.isdir(box):
+        return box
+    if any(os.path.isdir(d) and not _is_proj_box(d)
+           for d in glob.glob(os.path.join(root, glob.escape(proj) + "_*"))):
+        return root
+    return box
+
+
+def _run_glob(root, pat):
+    """Run folders matching pat in BOTH layouts: root\pat (project folders
+       left out) and root\<proj>\pat (names starting '<proj>_')."""
+    out = [d for d in glob.glob(os.path.join(root, pat)) if not _is_proj_box(d)]
+    for d in glob.glob(os.path.join(root, "*", pat)):
+        par = os.path.basename(os.path.dirname(d))
+        if os.path.basename(d).startswith(par + "_") and _is_proj_box(os.path.dirname(d)):
+            out.append(d)
+    return sorted(out)
+
+
 def _set_paths():
     """Recompute the results paths for the project/mode now being run.
 
@@ -1131,7 +1170,9 @@ def _set_paths():
     global RESULTS, OUT_DIR, LOGS_DIR, CONSOLE_LOG
 
 
-    RESULTS  = os.path.join(_results_root(), _study_results_subdir())
+    RESULTS  = os.path.join(_proj_root(_results_root(), _CUR_PROJECT)
+                            if (_CUR_PROJECT and RESULTS_SUBDIR == "auto") else _results_root(),
+                            _study_results_subdir())
     OUT_DIR  = os.path.join(RESULTS, "outs")
     LOGS_DIR = os.path.join(RESULTS, "logs")
     CONSOLE_LOG = os.path.join(LOGS_DIR, "parallel_console.log")
@@ -4546,7 +4587,7 @@ def _project_results_dir(proj, mode):
             sub += "_cap%s" % cap
         if run:
             sub += "_%s" % run
-    return os.path.join(_results_root(), sub)
+    return os.path.join(_proj_root(_results_root(), proj), sub)
 
 
 def _read_project_verdicts(rdir, proj=None):
@@ -4716,7 +4757,7 @@ def _write_all_projects_report(passes, done_so_far):
     # the name split below would read as another project)
     _own = set(os.path.normcase(os.path.normpath(_project_results_dir(p, m))) for p, m in passes)
     try:
-        for _d in sorted(glob.glob(os.path.join(_results_root(), "*_*"))):
+        for _d in _run_glob(_results_root(), "*_*"):
             if not os.path.isdir(_d):
                 continue
             if os.path.normcase(os.path.normpath(_d)) in _own:
@@ -4955,8 +4996,10 @@ def confirm_case():
         print("#  power flow  : %s%s" % (_base, _how))
     # How much finished work is here already -- the thing FRESH_START discards.
     try:
-        _outs = glob.glob(os.path.join(_results_root(), "*", "outs", "*.out"))
-        _done = glob.glob(os.path.join(_results_root(), "*", "outs", "*.done"))
+        _outs = [f for d in _run_glob(_results_root(), "*")
+                 for f in glob.glob(os.path.join(d, "outs", "*.out"))]
+        _done = [f for d in _run_glob(_results_root(), "*")
+                 for f in glob.glob(os.path.join(d, "outs", "*.done"))]
     except Exception:
         _outs = _done = []
     if _outs:
@@ -5147,7 +5190,7 @@ def main():
         for proj, mode, rc in results:
             print("  %-18s %-8s %-6s %s"
                   % (proj or "(default)", mode, rc,
-                     os.path.join(_results_root(),
+                     os.path.join(_proj_root(_results_root(), proj),
                                   ("%s_%s" % (proj, mode)) if proj else "dynamics")))
         # ANY PASS THE QUEUE NEVER REACHED. Without this a launcher that ended
         # early listed three studies and said nothing about the fourth.

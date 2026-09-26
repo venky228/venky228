@@ -305,6 +305,11 @@ def _folder_tag(folder):
     bits = []
     parts = [x for x in re.split(r"[\\/]+", str(folder).strip().strip('"')) if x]
     parent = parts[-2] if len(parts) >= 2 else ""
+    # results_base\SantaFe\SantaFe_spp: the project's own folder says nothing
+    # the name does not -- look one level further up for a dated parent
+    if _p and parent == _p:
+        parts = parts[:-1]
+        parent = parts[-2] if len(parts) >= 2 else ""
     if parent and parent.lower() not in _STD_PARENTS and not re.match(r"^[A-Za-z]:$", parent):
         bits.append(parent)
     # A BASE FOLDER IS A BASE. ...\results_base\BASE_CQ_F\SantaFe_spp is
@@ -336,10 +341,19 @@ def _all_references(z4):
     out = []
     root = os.path.join(z4.STUDY_ROOT, "Base", "results_base")
     for m in list(z4.MODES) or ["spp"]:
-        for d in sorted(glob.glob(os.path.join(root, "*_%s" % m))):
+        for d in _both_layouts(root, "*_%s" % m):
             if os.path.isdir(d) and _has_outs(d) and not _skip_dir(d):
                 out.append(_norm(d))
     return out
+
+
+def _both_layouts(root, pat):
+    """root\pat and root\<proj>\pat (one folder per project, names that
+       start with that folder's '<proj>_'), sorted by folder name."""
+    c = glob.glob(os.path.join(root, pat))
+    c += [x for x in glob.glob(os.path.join(root, "*", pat))
+          if _base(x).startswith(_base(os.path.dirname(x)) + "_")]
+    return sorted(set(c), key=lambda x: (_base(x), x))
 
 
 def _discover_scenarios(z4, ref):
@@ -425,6 +439,8 @@ def _rerun_lines(z4, tag, folder, proj):
     _root, kind = _case_root(folder)
     side = "proj" if kind == "p" else ("base" if kind == "b" else "?")
     parent = _base(os.path.dirname(_norm(folder))).lower()
+    if parent == str(proj or "").lower():          # results_base\<proj>\<folder>
+        parent = _base(os.path.dirname(os.path.dirname(_norm(folder)))).lower()
     L = ["%s   %s" % (tag, folder)]
     if not have_list:
         L.append("   (fault list %s not found -- faults never run cannot be listed)"
@@ -440,9 +456,9 @@ def _rerun_lines(z4, tag, folder, proj):
     L.append("   RUN_CASES   = \"%s\"" % side)
     L.append("   ONLY_FAULTS = [%s]" % ", ".join('"%s"' % x for x in both))
     if parent not in ("results_base", "results_proj"):
-        L.append("   NOTE: the panel writes to %s\\results_%s\\%s, not to this folder -- a "
+        L.append("   NOTE: the panel writes to %s\\results_%s\\%s\\%s, not to this folder -- a "
                  "re-run lands there." % ("Base" if side == "base" else "Projects",
-                                          "base" if side == "base" else "proj", _base(folder)))
+                                          "base" if side == "base" else "proj", proj, _base(folder)))
     return L, both
 
 
@@ -2066,7 +2082,7 @@ def _project_folders(z4, parent):
     if _has_outs(parent):
         return out
     for m in list(z4.MODES) or ["spp"]:
-        for d in sorted(glob.glob(os.path.join(parent, "*_%s*" % m))):
+        for d in _both_layouts(parent, "*_%s*" % m):
             if os.path.isdir(d) and _has_outs(d) and not _skip_dir(d):
                 out[_base(d)] = _norm(d)
     return out

@@ -138,7 +138,11 @@ def find_folders():
         sub, rnames, tag = KINDS[kind]
         seen = set()
         for rn in rnames:
-            for d in sorted(glob.glob(os.path.join(root, sub, rn, "*_spp*"))):
+            # both layouts: results_base\<proj>_spp* and results_base\<proj>\<proj>_spp*
+            _c = glob.glob(os.path.join(root, sub, rn, "*_spp*"))
+            _c += [x for x in glob.glob(os.path.join(root, sub, rn, "*", "*_spp*"))
+                   if os.path.basename(x).startswith(os.path.basename(os.path.dirname(x)) + "_")]
+            for d in sorted(_c, key=lambda x: (os.path.basename(x), x)):
                 if not os.path.isdir(d):
                     continue
                 proj = re.sub(r"_spp.*$", "", os.path.basename(d))

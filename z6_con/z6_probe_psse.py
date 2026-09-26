@@ -131,6 +131,7 @@ def main():
     if not path:
         c = sorted(glob.glob(os.path.join(HERE, "Base", "results_base", "*_spp", "outs", "*.out")))
         c += sorted(glob.glob(os.path.join(HERE, "Base", "results", "*_spp", "outs", "*.out")))
+        c += sorted(glob.glob(os.path.join(HERE, "Base", "results_base", "*", "*_spp", "outs", "*.out")))
         path = c[0] if c else ""
     P("out: %s" % path)
     dyn = S._dyntools()
