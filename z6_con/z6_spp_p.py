@@ -2015,6 +2015,8 @@ elif SPP_ROLE == "report" and N_WORKERS > 1:
     # interleaved nonsense and at worst a sharing violation that kills a shard.
     _WSUF = "_report_w%d" % WORKER_INDEX
 else:                    _WSUF = "_" + SPP_ROLE          # _build / _report / merge
+if (os.environ.get("SPP_SAV_ONLY") or "").strip().lower() in ("1", "true", "yes", "on"):
+    _WSUF = "_savonly"      # the .sav check never overwrites the real build's logs
 # THE PLOT PASS HAS ITS OWN LOG. It inherits whatever role its environment
 # carries -- "build", as it turned out -- and wrote over DYN_STUDY_build.log,
 # so the record of what the build did to the deck was gone by the time anyone
@@ -35029,6 +35031,18 @@ def main():
         if not ENABLE_BESS or not os.path.isfile(MOD_SAV):
             print("[sav-only] *** no modified .sav was written (ENABLE_BESS = %s) ***" % ENABLE_BESS)
             sys.exit(1)
+        # THE RUN MUST BUILD THIS CASE, NOT REUSE AN OLDER SNAPSHOT: a resumed
+        # launch (flat run done) keeps the .cnv/.snp it finds, which were built
+        # before this check. Removed, so the run rebuilds what was just checked.
+        for _stale in (SNP_FILE, CNV_CASE, CNL_CASE):
+            try:
+                if os.path.isfile(_stale):
+                    os.remove(_stale)
+                    print("[sav-only] removed %s -- the run rebuilds it from this case"
+                          % os.path.basename(_stale))
+            except Exception as _re:
+                print("[sav-only] *** could not remove %s (%s) -- set FORCE_REBUILD = True "
+                      "for the run ***" % (_stale, _re))
         print("[sav-only] SAV: %s" % MOD_SAV)
         print("[%s] RUN COMPLETE (sav only) -- took %s"
               % (_ts(), _fmt_hms(time.time() - _t0)))

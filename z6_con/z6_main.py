@@ -221,6 +221,7 @@ RUN_MISSING = False                          # old setting -- same as PIPELINE =
 SAV_FIRST = True                             # True = build every .sav first: base, GIA, each SURPLUS scenario, all projects
 SAV_FIRST_STOP = True                        # True = stop after them to check | False = go straight on to the runs
 SAV_FIRST_WORKERS = 6                        # .sav builds at once (one PSS/E each)
+SAV_FIRST_TIMEOUT_S = 3600                   # a .sav build silent this long is stopped
 SAV_FIRST_BASE = False                       # True = also save the solved base case (deck + removals) per project
 SURPLUS_SIDE_BY_SIDE = True                  # True = one workbook per project: BASE | GIA | each SURPLUS scenario
 
@@ -9310,10 +9311,11 @@ def compare_three_way(proj, mode):
     rb = results_dir(CASE_BASE, proj, mode)
     rt = results_dir(CASE_TEST, proj, mode)
     tests = [(rt, "GIA")] + [(rt + "_" + sc["tag"], sc["tag"]) for sc in surplus_scenarios()]
-    if not os.path.isdir(rb):
+    if not glob.glob(os.path.join(rb, "outs", "*.out")):
         print("[3-way] %s: no base folder (%s) -- no side-by-side" % (proj, rb))
         return False
-    tests = [(d, t) for d, t in tests if os.path.isdir(d)]
+    # RUN, NOT MERELY PRESENT: a .sav check leaves an empty folder behind.
+    tests = [(d, t) for d, t in tests if glob.glob(os.path.join(d, "outs", "*.out"))]
     if len(tests) < 2:
         print("[3-way] %s: fewer than two project runs on disk -- the base comparison "
               "above is the whole story" % proj)
@@ -9347,7 +9349,7 @@ def compare_surplus_scenarios(proj, mode):
     for sc in surplus_scenarios():
         suffix = "_%s" % sc["tag"]
         rt = results_dir(CASE_TEST, proj, mode) + suffix
-        if not os.path.isdir(rt):
+        if not glob.glob(os.path.join(rt, "outs", "*.out")):
             print("[surplus] no results for %s (%s) -- no comparison written"
                   % (sc["tag"], rt))
             continue
@@ -15139,8 +15141,16 @@ def build_all_savs():
         log = os.path.join(logdir, name + ".log")
         t0 = time.time()
         with open(log, "w") as fh:
-            rc = subprocess.call([PYTHON, "-u", sp], cwd=case["dir"], env=env,
-                                 stdout=fh, stderr=subprocess.STDOUT)
+            pr = subprocess.Popen([PYTHON, "-u", sp], cwd=case["dir"], env=env,
+                                  stdout=fh, stderr=subprocess.STDOUT)
+            # A BUILD THAT HANGS (licence, PSS/E dialog) IS STOPPED, not waited on.
+            while pr.poll() is None and time.time() - t0 < float(SAV_FIRST_TIMEOUT_S):
+                time.sleep(2)
+            if pr.poll() is None:
+                pr.kill()
+                fh.write("\n[sav] *** stopped after %d s -- no answer (SAV_FIRST_TIMEOUT_S) ***\n"
+                         % int(SAV_FIRST_TIMEOUT_S))
+            rc = pr.wait()
         keep, sav, why = [], None, ""
         try:
             with open(log, errors="replace") as fh:
@@ -15183,7 +15193,8 @@ def build_all_savs():
         if i + 1 < len(ths):
             time.sleep(float(LAUNCH_STAGGER_S or 0))     # licence start-up, as the runs do
     for t in ths:
-        t.join()
+        while t.is_alive():
+            t.join(5)
     rep = os.path.join(logdir, "SAV_CHECK.txt")
     with open(rep, "w") as fh:
         fh.write("SAV CHECK  %s\n\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -22465,13 +22476,14 @@ def main():
             print("[compare]     see afterwards than it is to fix now.")
             return 2
         # EVERY .sav FIRST (SAV_FIRST): base, GIA and each SURPLUS scenario, every project.
-        if SAV_FIRST:
+        if SAV_FIRST and _sav_runs():
             if not build_all_savs():
                 print("[compare] *** stopping: a .sav build failed -- see sav_check\\SAV_CHECK.txt ***")
                 return 2
             if SAV_FIRST_STOP:
                 print("[compare] every .sav is built. Check them, then set SAV_FIRST = False")
-                print("[compare] and launch again to run the studies (the runs rebuild the same case).")
+                print("[compare] and launch again to run the studies (the checked cases' old")
+                print("[compare] snapshots were removed, so every run rebuilds the case just checked).")
                 return 0
 
     # The live view starts BEFORE the studies do, so the first scenarios each
