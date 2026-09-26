@@ -243,6 +243,7 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 # ---- 3. GEN / CAP / LINE TEST --------------------------------------------------
 # GEN_TEST = True runs ONLY this test (normal study skipped).
 # Results: comparison_scenarios\<project>\BASE_CASE\gen_test\  (all projects: comparison_scenarios\GEN_TEST_ALL_PROJECTS.txt)
+# Live, every project on one page: comparison_scenarios\GEN_TEST_STATUS_ALL.txt
 # Preview the plan without simulating:  python z6_gt_report.py
 # -- 3a. on / off, projects, faults
 GEN_TEST = True                              # True = run this test only | False = normal study
@@ -20636,7 +20637,98 @@ def _gt_status_write(runs, faults, npar, t_start):
                 fh.write("\n".join(L) + "\n")
         except Exception:
             pass
+    try:
+        _gt_status_all()
+    except Exception:
+        pass
     return p
+
+
+_GT_LAUNCH = {"projs": [], "t0": None, "rc": {}}
+
+
+def _gt_atomic_write(p, text):
+    """Write via a .tmp and rename, so a reader never sees half a file; if an
+       editor holds it, write straight over it."""
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+        os.rename(tmp, p)
+    except Exception:
+        try:
+            with open(p, "w") as fh:
+                fh.write(text)
+        except Exception:
+            pass
+
+
+def _gt_status_all():
+    """comparison_scenarios\\GEN_TEST_STATUS_ALL.txt -- every project of this
+       launch on one page, live: finished / running / queued, the run counts,
+       what is running now and every run that did not finish. Built from each
+       project's own GEN_TEST_STATUS_<project>.txt, rewritten whenever one is."""
+    projs = _GT_LAUNCH["projs"] or [GEN_TEST_PROJECT]
+    t0 = _GT_LAUNCH["t0"] or _LAUNCH_T0
+    side = "PROJECT_CASE" if str(GEN_TEST_CASE).strip().lower().startswith("proj") else "BASE_CASE"
+    L = ["GEN TEST -- ALL PROJECTS, LIVE  (updated %s, launch started %s)"
+         % (time.strftime("%Y-%m-%d %H:%M:%S"), time.strftime("%Y-%m-%d %H:%M", time.localtime(t0))),
+         "one line per project; each project's full list: comparison_scenarios\\<project>\\%s\\gen_test\\"
+         "GEN_TEST_STATUS_<project>.txt" % side, "=" * 150]
+    body = []
+    for i, pj in enumerate(projs, 1):
+        f = os.path.join(SCEN_DIR, pj, side, "gen_test", "GEN_TEST_STATUS_%s.txt" % pj)
+        try:
+            with open(f, errors="replace") as fh:
+                txt = fh.read().splitlines()
+            mt = os.path.getmtime(f)
+        except Exception:
+            txt, mt = [], None
+        if pj in _GT_LAUNCH["rc"]:
+            rc = _GT_LAUNCH["rc"][pj]
+            state = "FINISHED" if rc in (0, None) else "STOPPED (code %s)" % rc
+        elif pj == GEN_TEST_PROJECT:
+            state = "RUNNING"
+        else:
+            state = "QUEUED"
+        fresh = mt is not None and mt >= t0 - 1
+        counts = next((x for x in txt if x.startswith("runs ")), "")
+        L.append("  %d/%d  %-15s %-18s %s%s" % (
+            i, len(projs), pj, state, counts or "(no status yet)",
+            "" if (fresh or not counts) else "   [from an earlier launch, %s]"
+            % time.strftime("%m-%d %H:%M", time.localtime(mt))))
+        if not txt or not fresh:
+            continue
+        # what is running now, and every run that did not finish
+        live, bad, blk = [], [], None
+        for x in txt:
+            if x.startswith("RUNNING NOW"):
+                blk = "live"
+                continue
+            if x.startswith("ALL RUNS"):
+                blk = "all"
+                continue
+            if blk == "live" and x.strip() and "(nothing)" not in x:
+                live.append(x)
+            elif blk == "all" and (" INCOMPLETE " in x or " NOT RUN " in x):
+                bad.append(x)
+        if live or bad:
+            body += ["", "-" * 150, "%s -- %s" % (pj, state)]
+            if live:
+                body += ["  running now:"] + ["  " + x for x in live]
+            if bad:
+                body += ["  did not finish (%d):" % len(bad)] + ["  " + x for x in bad]
+    d = SCEN_DIR
+    try:
+        os.makedirs(d)
+    except Exception:
+        pass
+    _gt_atomic_write(os.path.join(d, "GEN_TEST_STATUS_ALL.txt"), "\n".join(L + body) + "\n")
 
 
 def _gt_status_start(runs, faults, npar):
@@ -20898,6 +20990,7 @@ def run_gen_tests():
             names.add(nm)
     saved = dict((nm, g[nm]) for nm in names | set(["GEN_TEST_PROJECT"]))
     rcs = []
+    _GT_LAUNCH["projs"], _GT_LAUNCH["t0"], _GT_LAUNCH["rc"] = list(projs), time.time(), {}
     try:
         for i, pj in enumerate(projs, 1):
             for nm, v in saved.items():            # start every project from the panel values
@@ -20910,8 +21003,17 @@ def run_gen_tests():
             _GT_NET[0], _GT_NET[1] = None, False
             if len(projs) > 1:
                 _banner("GEN TEST %d/%d -- %s (POI %s)" % (i, len(projs), pj, GEN_TEST_POI))
+            try:
+                _gt_status_all()                   # this project RUNNING, the rest QUEUED
+            except Exception:
+                pass
             rc = run_gen_test()
             rcs.append((pj, rc))
+            _GT_LAUNCH["rc"][pj] = rc
+            try:
+                _gt_status_all()
+            except Exception:
+                pass
             if rc not in (0, None):
                 print("[gen-test] %s ended with code %s -- going on with the next project" % (pj, rc))
     finally:
