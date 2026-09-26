@@ -2180,6 +2180,10 @@ def _apply_only_events():
 # own list; slicing that list again by worker index keeps only the overlap,
 # which is about a third of it.
 ONLY_PRESLICED = (os.environ.get("SPP_ONLY_PRESLICED") or "").strip() in ("1", "true", "yes", "on")
+# .SAV ONLY (SAV_FIRST in z6_main.py): build the case up to the saved
+# modified .sav -- plant added, POI dispatched, EGF on or off -- and stop, so
+# every .sav can be checked before any dynamics is run.
+SAV_ONLY = (os.environ.get("SPP_SAV_ONLY") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _only_mode():
@@ -16219,6 +16223,10 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # harder to attribute. This one judges the ordinary solved case, which
         # is the one the collector change and the BESS dispatch actually alter.
         _solve_to_mismatch(tag="post-solve")
+        # .SAV ONLY: the modified case is on disk; nothing after it is needed
+        # to check it -- no GNET/CONL, no .cnv/.snp, no .dyr, no dynamics.
+        if SAV_ONLY and tag == "BUILD":
+            return "sav_only"
         # 4) GNET
         _apply_deck(GNET_IDV, required=True)
         # 5) CONL + save .cnl
@@ -34946,6 +34954,25 @@ def main():
             sys.exit(1)
         print("[faults-only] %d fault(s) -> %s" % (len(_fl), _dst))
         print("[%s] RUN COMPLETE (faults only) -- took %s"
+              % (_ts(), _fmt_hms(time.time() - _t0)))
+        return
+
+    # ---- BUILD THE MODIFIED .SAV AND STOP (SAV_FIRST in z6_main.py) --------
+    if SAV_ONLY:
+        print("")
+        print("[sav-only] building the modified power-flow case for THIS run and exiting.")
+        print("[sav-only] no .cnv/.snp, no initialisation, no dynamics.")
+        try:
+            build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD")
+        except Exception as _e:
+            print("[sav-only] *** build failed: %s ***" % _e)
+            traceback.print_exc()
+            sys.exit(1)
+        if not ENABLE_BESS or not os.path.isfile(MOD_SAV):
+            print("[sav-only] *** no modified .sav was written (ENABLE_BESS = %s) ***" % ENABLE_BESS)
+            sys.exit(1)
+        print("[sav-only] SAV: %s" % MOD_SAV)
+        print("[%s] RUN COMPLETE (sav only) -- took %s"
               % (_ts(), _fmt_hms(time.time() - _t0)))
         return
 

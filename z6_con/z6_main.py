@@ -218,6 +218,9 @@ MERGE_ONLY = False                           # True = only rebuild the reports f
 COMPARE_REQUIRE_COMPLETE = False             # True = no comparison if a project did not finish
 RUN_STUDIES = False                          # old setting -- PIPELINE wins
 RUN_MISSING = False                          # old setting -- same as PIPELINE = "missing"
+SAV_FIRST = True                             # True = build every .sav first (base, project, each SURPLUS scenario)
+SAV_FIRST_STOP = True                        # True = stop after them to check | False = go straight on to the runs
+SAV_FIRST_WORKERS = 6                        # .sav builds at once (one PSS/E each)
 
 # ---- 2. WORKERS, CORES AND SIMULATION TIME -------------------------------------
 RUN_IN_PARALLEL = True                       # True = base and project at once
@@ -15015,6 +15018,121 @@ def make_shared_fault_list(case, dest, proj=None):
     return True
 
 
+def _sav_runs():
+    """[(project, tag or '', label, extra env)] -- every project-case run whose
+       .sav SAV_FIRST builds: the main (GIA) run and each SURPLUS scenario."""
+    out = []
+    for proj in (_panel_projects() or compare_projects()):
+        out.append((proj, "", "GIA (SGF + EGF)", {}))
+        for sc in surplus_scenarios():
+            out.append((proj, sc["tag"], sc["label"], _surplus_env(sc)))
+    return out
+
+
+_SAV_KEEP = re.compile(r"\[sav-only\] SAV:|VERIFY |EGF OFF|CURTAILED|REFUSED|NOT MET|"
+                       r"\*\*\*|project machines set|POI total asked|Traceback|Error")
+
+
+def build_all_savs():
+    """SAV_FIRST: build the modified .sav of every project run -- GIA and each
+       SURPLUS scenario, every project -- before anything is simulated.
+
+       Each build is the study script's own build (the same settings the runs
+       get) stopped straight after the .sav is saved. Logs go to
+       <root>\\sav_check\\, and SAV_CHECK.txt beside them lists every .sav with
+       its POI check. Returns True when every build wrote its .sav."""
+    runs = _sav_runs()
+    if not runs:
+        print("[sav] no project runs to build")
+        return True
+    sp = os.path.join(CASE_TEST["dir"], CASE_TEST["script"])
+    if not os.path.isfile(sp):
+        print("[sav] *** %s not found ***" % sp)
+        return False
+    logdir = os.path.join(STUDY_ROOT, "sav_check")
+    if not os.path.isdir(logdir):
+        os.makedirs(logdir)
+    _banner("BUILDING EVERY .sav FIRST -- %d run(s), %d at a time"
+            % (len(runs), max(1, int(SAV_FIRST_WORKERS or 1))))
+    res = {}
+    lock = threading.Lock()
+    todo = list(runs)
+
+    def _one(proj, tag, label, extra):
+        env = dict(os.environ)
+        _push_records(env)
+        _push_settings(env, CASE_TEST)
+        env.pop("SPP_EGF_DYR_EDITS", None)
+        env.pop("SPP_EGF_OFF", None)
+        env.pop("SPP_RUN_TAG", None)
+        env.update(extra)
+        env["SPP_STUDY_DIR"] = CASE_TEST["dir"]
+        env["SPP_PROJECT"] = proj
+        env["SPP_FAULT_MODE"] = MODES[0]
+        env["SPP_ROLE"] = "build"
+        env["SPP_N_WORKERS"] = "1"
+        env["SPP_WORKER"] = "0"
+        env["SPP_FRESH_START"] = "0"
+        env["SPP_SAV_ONLY"] = "1"
+        name = proj + (("_" + tag) if tag else "")
+        log = os.path.join(logdir, name + ".log")
+        t0 = time.time()
+        with open(log, "w") as fh:
+            rc = subprocess.call([PYTHON, "-u", sp], cwd=CASE_TEST["dir"], env=env,
+                                 stdout=fh, stderr=subprocess.STDOUT)
+        keep, sav = [], None
+        try:
+            with open(log, errors="replace") as fh:
+                for ln in fh:
+                    if "[sav-only] SAV:" in ln:
+                        sav = ln.split("SAV:", 1)[1].strip()
+                    if _SAV_KEEP.search(ln):
+                        keep.append(ln.rstrip())
+        except Exception:
+            pass
+        ok = rc == 0 and bool(sav) and os.path.isfile(sav) and os.path.getmtime(sav) >= t0 - 1
+        with lock:
+            res[(proj, tag)] = (ok, rc, sav, log, label, keep)
+            print("[sav] %-4s %-15s %-12s %s" % ("OK" if ok else "FAIL", proj, tag or "GIA",
+                                                sav if ok else "rc=%s -- see %s" % (rc, log)))
+
+    def _worker():
+        while True:
+            with lock:
+                if not todo:
+                    return
+                r = todo.pop(0)
+            try:
+                _one(*r)
+            except Exception as e:
+                with lock:
+                    res[(r[0], r[1])] = (False, "error", None, "", r[2], [str(e)])
+                    print("[sav] FAIL %s %s: %s" % (r[0], r[1] or "GIA", e))
+
+    ths = [threading.Thread(target=_worker)
+           for _ in range(max(1, min(int(SAV_FIRST_WORKERS or 1), len(runs))))]
+    for i, t in enumerate(ths):
+        t.daemon = True
+        t.start()
+        if i + 1 < len(ths):
+            time.sleep(float(LAUNCH_STAGGER_S or 0))     # licence start-up, as the runs do
+    for t in ths:
+        t.join()
+    rep = os.path.join(logdir, "SAV_CHECK.txt")
+    with open(rep, "w") as fh:
+        fh.write("SAV CHECK  %s\n\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        for proj, tag, label, _e in runs:
+            ok, rc, sav, log, label, keep = res.get((proj, tag), (False, "?", None, "", label, []))
+            fh.write("=== %s  %s  (%s)  %s\n" % (proj, tag or "GIA", label, "OK" if ok else "FAIL rc=%s" % rc))
+            fh.write("    sav : %s\n    log : %s\n" % (sav or "-", log))
+            for ln in keep[-40:]:
+                fh.write("    | %s\n" % ln.strip()[:200])
+            fh.write("\n")
+    nbad = sum(1 for v in res.values() if not v[0])
+    print("[sav] %d of %d .sav built -- summary: %s" % (len(res) - nbad, len(runs), rep))
+    return nbad == 0
+
+
 def stale_results(shared):
     """Result folders produced with a DIFFERENT fault list than the current one.
 
@@ -22278,6 +22396,15 @@ def main():
             print("[compare]     no results at all on one side, which is much harder to")
             print("[compare]     see afterwards than it is to fix now.")
             return 2
+        # EVERY .sav FIRST (SAV_FIRST): GIA and each SURPLUS scenario, every project.
+        if SAV_FIRST and any(c is CASE_TEST for c in _cases_to_run()):
+            if not build_all_savs():
+                print("[compare] *** stopping: a .sav build failed -- see sav_check\\SAV_CHECK.txt ***")
+                return 2
+            if SAV_FIRST_STOP:
+                print("[compare] every .sav is built. Check them, then set SAV_FIRST = False")
+                print("[compare] and launch again to run the studies (the runs rebuild the same case).")
+                return 0
 
     # The live view starts BEFORE the studies do, so the first scenarios each
     # side finishes are compared as soon as both have one.
