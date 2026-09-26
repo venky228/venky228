@@ -22139,6 +22139,32 @@ def _poi_record_tag(v, t, tfc, is_power):
     return ("   [[%s]]" % "; ".join(tags)) if tags else ""
 
 
+def _is_fault_bus_v(title, lbl, fault_bus):
+    """The faulted bus's voltage: its FLT channel, or the bus channel of that
+       number when the .out has no FLT one."""
+    if _panel_tier(title) == 3:
+        return True
+    try:
+        fb = int(fault_bus) if fault_bus not in (None, "") else None
+    except (TypeError, ValueError):
+        fb = None
+    if fb is None:
+        return False
+    return _chan_bus(title) == fb and _panel_tier(title) >= 3
+
+
+def _panel_size(ser, sub):
+    """How big a panel's trace is, for 'highest first': a voltage's peak, a
+       rotor angle's swing (relative to the swing machine when drawn)."""
+    try:
+        v = [float(x) for x in ser[-1][1] if x == x and abs(float(x)) != float("inf")]
+        if not v:
+            return 0.0
+        return max(v) if sub == 0 else (max(v) - min(v))
+    except Exception:
+        return 0.0
+
+
 def _dedupe_same_trace(ordered, indiv):
     """ONE PANEL PER TRACE. When the faulted bus is the POI, the same voltage
        is recorded three times -- the POI channel, the faulted-bus channel and
@@ -22501,11 +22527,32 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                 # the violating panels follow immediately, worst first; the
                 # rest after. A violation on a PROJECT panel is simply both,
                 # and leads outright.
-                _lead = 0 if _panel_tier(title) <= 1 else 1
-                indiv.append(((_lead, 0 if _vio_panel else 1, _rank)
+                # THE READING ORDER OF EVERY PDF (asked for in these words):
+                #   1. the faulted bus voltage
+                #   2. the project's machines (P, Q, Eterm, angle, speed, own buses)
+                #   3. the POI power and POI voltage
+                #   4. every panel that BROKE A LIMIT -- voltages first, then rotor
+                #      angles, then the rest (trips ...) -- each worst first
+                #   5. everything else: voltages highest peak first, rotor angles
+                #      largest swing first, then the other quantities as before
+                # The survivor of a POI = faulted bus pair takes the first place
+                # (_dedupe_same_trace), so that page still leads.
+                _tier = _panel_tier(title)
+                _sub = 0 if c == "VOLT" else 1 if (c == "ANGLE" and _is_machine_angle(title)) else 2
+                if c == "VOLT" and _is_fault_bus_v(title, lbl, fault_bus):
+                    _blk, _sub, _rank = 0, 0, 0.0
+                elif _tier == 0:
+                    _blk, _sub, _rank = 1, 0, 0.0
+                elif _tier in (-1, 1):
+                    _blk, _sub, _rank = 2, 0, 0.0
+                elif _vio_panel:
+                    _blk, _rank = 3, (-_sev if _sev is not None else 0.0)
+                else:
+                    _blk, _rank = 4, (-_panel_size(ser, _sub) if _sub < 2 else 0.0)
+                indiv.append(((_blk, _sub, _rank)
                               + _panel_sort_key(c, title),
                               (c, ptitle, ser), _vio_panel))
-        indiv.sort(key=lambda kp: kp[0])           # violations, then PROJ/POI, then voltages
+        indiv.sort(key=lambda kp: kp[0])           # faulted bus V, PROJ, POI, violations worst first, the rest
         ordered = [p for _, p, _vv in indiv]
         _n_vio = sum(1 for _k, _p, _vv in indiv if _vv)
         if PLOT_MAX_PANELS and len(ordered) > PLOT_MAX_PANELS:
@@ -22522,7 +22569,7 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
             # panel, and then the rest in order up to the cap.
             _kept, _rest = [], []
             for _k, _pnl, _vv in indiv:
-                (_kept if (_vv or _k[0] == 0) else _rest).append((_pnl, _vv))
+                (_kept if (_vv or _k[0] <= 2) else _rest).append((_pnl, _vv))
             _room = max(0, int(PLOT_MAX_PANELS) - len(_kept))
             _n_lead = sum(1 for _p2, _v2 in _kept if not _v2)
             print("  [plot] %d individual panels -> drawing %d (all %d project "
