@@ -2106,12 +2106,24 @@ def _expand_parents(z4, pairs):
             continue
         if rp and tp:
             names = [n for n in rp if n in tp]
-            missing = sorted(set(rp) - set(tp)) + sorted(set(tp) - set(rp))
+            # A SCENARIO RUN (SantaFe_spp_s1_egfoff, _egf, _poi502 ...) has no
+            # folder of its own name on the reference side: it is compared
+            # against its project's reference, SantaFe_spp.
+            extra = []
+            for n in sorted(set(tp) - set(rp)):
+                _p, _m, _sfx = _split_name(n, z4.MODES)
+                _k = "%s_%s" % (_p, _m) if (_p and _m) else None
+                if _sfx and _k in rp:
+                    extra.append((_k, n))
+            _used = set(n for _k, n in extra)
+            missing = sorted(set(rp) - set(tp)) + sorted(set(tp) - set(rp) - _used)
             if missing:
                 print("[pair] %s vs %s: no match for %s -- skipped"
                       % (_base(ref), _base(test), ", ".join(missing)))
             for n in names:
                 out.append((rp[n], tp[n], ("%s_%s" % (label, n.split("_")[0])) if label else None))
+            for _k, n in extra:
+                out.append((rp[_k], tp[n], ("%s_%s" % (label, n)) if label else None))
         elif rp:
             n = _base(test)
             if n in rp:
