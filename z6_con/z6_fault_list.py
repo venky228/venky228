@@ -956,8 +956,9 @@ def poi_end(lev, e):
         return e
     net = lev.net
     buses = elem_buses(net, e["trips"])
-    if e["fbus"] not in buses:
-        return e
+    # SPP sometimes faults a bus OFF the element it trips (541414 for
+    # 541201-541500, joined by a Z1 jumper): it still moves to the element's
+    # POI-side end, when that end is nearer than SPP's bus
     xf = all(net.elem[k]["kind"] in ("xf2", "xf3") for k in e["trips"])
     cands = [b for b in buses
              if b not in lev.plant and not pure_tap(net, b)
