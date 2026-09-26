@@ -1884,7 +1884,10 @@ def main():
         with open(os.path.join(out, "FAULT_LIST_BPM_%s.txt" % proj), "w") as fh:
             fh.write("\n".join(rep) + "\n")
         print("[faults] %-14s %4d event(s) -> %s" % (proj, len(rows), p_csv))
-        if INSTALL:
+        if INSTALL and os.path.normcase(os.path.abspath(_shared_csv(proj))) \
+                == os.path.normcase(os.path.abspath(p_csv)):
+            print("[faults]   the study already reads this file (z6_main SHARED_FAULTS_CSV)")
+        elif INSTALL:
             dst = _shared_csv(proj)
             if os.path.isfile(dst):
                 shutil.copy2(dst, dst + ".bak_%s" % time.strftime("%Y%m%d_%H%M%S"))

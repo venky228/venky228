@@ -468,7 +468,8 @@ MAKE_FAULT_LIST = False                      # False: never build/copy a list he
 REGEN_FAULTS = None                          # "if-missing" | "always" | "never"
 NEW_FAULT_LIST = False                       # True = brand-new list (renumbers, retires old results)
 FAULT_LIST_FROM = "BASE"                     # "BASE" | "TEST" topology
-SHARED_FAULTS_CSV = r"{root}\SPP_FAULTS_CON_{project}.csv"  # {root} = case folder, {project} = name
+SHARED_FAULTS_CSV = r"{root}\FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"  # the lists z6_fault_list.py writes
+                                             #   (old: r"{root}\SPP_FAULTS_CON_{project}.csv"); {root} = case folder
 SPP_FAULT_HOPS = None                        # levels out from the POI
 SPP_FAULT_KV_MIN = None                      # ignore below this kV
 SPP_MAX_FAULTS = None                        # keep N nearest (0 = all)

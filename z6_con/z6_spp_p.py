@@ -2555,7 +2555,7 @@ def _with_root(path):
     return str(path).replace("{root}", CASE_ROOT)
 
 
-FAULTS_CSV = r"{root}\SPP_FAULTS_CON_{project}.csv"
+FAULTS_CSV = r"{root}\FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"
 # Kept on ONE line above, literal and quoted, because z6_main.py reads this
 # setting out of the file with a regex to check that both studies point at the
 # same list. A path it cannot see is a check that cannot run.
