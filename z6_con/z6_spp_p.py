@@ -8521,6 +8521,16 @@ def _poi_tie_branches(feeders, poi):
                     _fh.write("%d,%d,%s\n" % (_a, _b, _ck))
     except Exception:
         pass
+    # The existing units' ties too, while the case is here to name them --
+    # the scoring pass has no case and can only read EGF_TIES.csv.
+    try:
+        if not globals().get("EGF_OFF"):
+            _x = _existing_plant_ties()
+            if _x and set(_x) != set(ties):
+                print("  [bess] existing units' POI tie(s): %s" % ", ".join(
+                    "%d-%d ckt %s" % t for t in sorted(_x)))
+    except Exception:
+        pass
     return ties
 
 
@@ -24811,6 +24821,12 @@ def evaluate_case(path, kind, tclear, kb):
                 _pbus |= set(int(_g[0]) for _g in PROJECT_GENS)
             except Exception:
                 pass
+            # Every tie open, the existing units' included (NEW_PLANT).
+            if not globals().get("EGF_OFF"):
+                try:
+                    _pbus |= set(int(_b) for _b in _existing_plant_buses())
+                except Exception:
+                    pass
         # PART OF THE PROJECT: only the side whose ties the event opened.
         if "existing" in _gone_part:
             try:
