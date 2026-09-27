@@ -22825,12 +22825,14 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                                                    % (PLOT_VIOLATION_TAG, _dev))
                                     else:
                                         ptitle += ("   %s rotor angle not damped -- "
-                                                   "deviation %.1f deg, SPPR1=%s, SPPR5=%s"
+                                                   "deviation %.1f deg, SPPR1=%s, SPPR5=%s%s"
                                                    % (PLOT_VIOLATION_TAG, _dev,
                                                       "n/a" if _infd.get("sppr1") is None
                                                       else "%.3f" % _infd["sppr1"],
                                                       "n/a" if _infd.get("sppr5") is None
-                                                      else "%.3f" % _infd["sppr5"]))
+                                                      else "%.3f" % _infd["sppr5"],
+                                                      " -- the angle SETTLES: evaluate "
+                                                      "individually" if _converges(_seg) else ""))
                                     _vio_panel = True
                                     _sev = float(_dev) - float(ANGLE_DEV_DEG)
                     except Exception:
@@ -25173,10 +25175,25 @@ def evaluate_case(path, kind, tclear, kb):
                                        "settling value]", dev))
                     n_floor += 1
                 else:
-                    undamped.append("%s(%.0fdeg %s %s; %s)"
+                    # FAILS ON THE RATIOS, BUT THE ANGLE SETTLES. SPPR is two
+                    # peaks against the run minimum, and a single swing that
+                    # comes back and settles can still read > 0.95 (a bump at
+                    # the clearing instant taken as the 1st peak, the fault
+                    # excursion as the minimum). The verdict stays FAIL, as the
+                    # ratios say; the machine is ALSO named for individual
+                    # evaluation, so a reviewer looks at the waveform.
+                    _settles = _converges(seg)
+                    undamped.append("%s(%.0fdeg %s %s; %s%s)"
                                 % (chan_label(ti), dev, r1, r5,
-                                   _envelope_text(info)))
+                                   _envelope_text(info),
+                                   "; SETTLES -- evaluate individually" if _settles else ""))
                     undamped_all.append((chan_label(ti), dev, info["sppr1"], info["sppr5"]))
+                    if _settles:
+                        review.append("%s(%.0fdeg %s -- SPPR not met but the angle "
+                                      "settles: evaluate individually)"
+                                      % (chan_label(ti), dev, r1))
+                        review_all.append((chan_label(ti) + " [SPPR not met, angle "
+                                           "settles -- evaluate individually]", dev))
         else:
             _ok2, _i2 = spp_damping(seg)
             _sp2 = _i2.get("sppr") or {}
@@ -25241,8 +25258,9 @@ def evaluate_case(path, kind, tclear, kb):
         if not undamped else
         ("%d undamped of %d judged: " % (len(undamped), n_eval) + ", ".join(undamped[:VIOLATION_LIST_MAX]) + _more(undamped)))
     if review:
-        add("Evaluate individually (SPP: below %d deg without convergence, or "
-            "SPPR floor-limited)" % int(ANGLE_DEV_DEG), None,
+        add("Evaluate individually (SPP: below %d deg without convergence, "
+            "SPPR floor-limited, or SPPR not met but the angle settles)"
+            % int(ANGLE_DEV_DEG), None,
             "%d machine(s) for individual review: %s"
             % (len(review), ", ".join(review[:8])))
 
