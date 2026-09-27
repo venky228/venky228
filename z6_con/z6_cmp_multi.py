@@ -1882,6 +1882,7 @@ def _write_workbook_streamed(z4, path, specs, csv_dir, csv_lab, legend=None, tit
         for i, (name, stem, build) in enumerate(specs, start=1):
             try:
                 header, rows, widths, style_of = build()
+                header = z4._disp_hdr(header) if hasattr(z4, "_disp_hdr") else header
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -1892,7 +1893,7 @@ def _write_workbook_streamed(z4, path, specs, csv_dir, csv_lab, legend=None, tit
             try:
                 cfh = open(cp, "w", newline="", errors="replace")
                 cw = csv.writer(cfh)
-                cw.writerow(header)
+                cw.writerow([{"hops_from_fault": "nodes_from_fault", "hops_from_poi": "nodes_from_poi"}.get(c, c) for c in header])
             except Exception as e:
                 print("[pair] could not write %s: %s" % (cp, e))
                 cfh, cw = None, None

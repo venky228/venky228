@@ -11501,6 +11501,7 @@ def write_xlsx_multi(path, sheets, legend=None, title_rows=None):
     try:
         for i, sh in enumerate(sheets):
             name, header, rows, widths, style_of = (list(sh) + [None, None])[:5]
+            header = [{"hops_from_fault": "nodes_from_fault", "hops_from_poi": "nodes_from_poi", "hops_from_POI": "nodes_from_POI"}.get(c, c) if isinstance(c, str) else c for c in (header or [])]
             _fp = os.path.join(_tmpdir, "sheet%d.xml" % (i + 1))
             _xl_sheet_to_file(_fp, header, rows, widths, style_of, first=(i == 0))
             parts.append((_xl_sheet_name(name), ("file", _fp)))
@@ -25024,7 +25025,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                         "value", "unit", "time_s",
                         # WHERE IT IS -- the two columns that turn a list of bus
                         # numbers into something you can sort and act on.
-                        "area", "area_name", "hops_from_fault", "fault_bus",
+                        "area", "area_name", "nodes_from_fault", "fault_bus",
                         "note",
                         # OVERSHOOT ONLY: seconds above the limit. Last, so
                         # every positional reader of the first twelve columns

@@ -1913,10 +1913,24 @@ def _u(x):
     return x if isinstance(x, str) or not PY2 else x
 
 
+# "hops" are shown as "nodes" in every report the reader opens. Only an exact
+# header cell is renamed; the names the scripts use internally are unchanged.
+_NODES_HDR = {"hops_from_fault": "nodes_from_fault", "hops_from_poi": "nodes_from_poi",
+              "hops_from_POI": "nodes_from_POI"}
+
+
+def _disp_hdr(row):
+    try:
+        return [_NODES_HDR.get(c, c) if isinstance(c, str) else c for c in row]
+    except Exception:
+        return row
+
+
 def _csv_row(row):
     """py2's csv module cannot write unicode -- encode each field. py3 passes
        straight through. Without this a report carrying one replacement
        character takes the CSV down with it."""
+    row = _disp_hdr(row)
     if not PY2:
         return row
     out = []
@@ -2867,6 +2881,8 @@ def read_violations(rdir, proj):
                     # THE STUDY'S WORDS FOR "UNKNOWN" (no blank cells in its CSV)
                     # read back as unknown -- never as an area or a hop count
                     _unk = ("not in case", "no path", "no name", "not on record")
+                    if "hops_from_fault" not in r and "nodes_from_fault" in r:
+                        r["hops_from_fault"] = r.get("nodes_from_fault")
                     for _uk in ("area", "area_name", "hops_from_fault", "fault_bus"):
                         if (r.get(_uk) or "").strip().lower() in _unk:
                             r[_uk] = ""
@@ -6574,6 +6590,7 @@ def write_xlsx_multi(path, sheets, legend=None, title_rows=None):
     parts = []
     for i, sh in enumerate(sheets):
         name, header, rows, widths, style_of = (list(sh) + [None, None])[:5]
+        header = _disp_hdr(header or [])
         parts.append((_xl_sheet_name(name),
                       _xl_sheet_xml(header, rows, widths, style_of, first=(i == 0))))
     parts.append(("Key", _xl_legend_sheet(legend or [], title_rows or [])))
@@ -22875,6 +22892,7 @@ def main():
     # COMPARE_REQUIRE_COMPLETE a launch that SIMULATED stops rather than compare
     # an unfinished set. PIPELINE = "compare" is exempt: comparing what is
     # already on disk is exactly what it is for.
+    _stop_after_scoring = False
     if pipeline != "compare":
         try:
             _short = []
@@ -22924,8 +22942,11 @@ def main():
                     print("[compare]     run again and the finished scenarios are skipped, so")
                     print("[compare]     only the missing work is done. Set")
                     print("[compare]     COMPARE_REQUIRE_COMPLETE = False to compare anyway.")
+                    print("[compare]     Every result that IS on disk is still scored first.")
                     print("[compare] " + "=" * 70)
-                    return 2
+                    # SCORE FIRST, THEN STOP. Returning here skipped phase 2, so
+                    # one fault that gave up left EVERY project unscored.
+                    _stop_after_scoring = True
                 print("[compare]     Comparing anyway (COMPARE_REQUIRE_COMPLETE = False):")
                 print("[compare]     their scenarios show as scored on one side only.")
             print("[compare] " + "=" * 70)
@@ -22956,6 +22977,16 @@ def main():
         n = ensure_reports(MODES)
         if not n:
             print("[compare] every folder with .out files already has its criteria report.")
+    if _stop_after_scoring:
+        try:
+            auto_remerge_stale_reports()
+        except Exception as _e:
+            print("[auto-merge] the staleness check failed (%s)" % _e)
+        print("[compare] Scoring done; comparison NOT written because a run did not")
+        print("[compare] finish (see above). Re-run the missing faults, then compare.")
+        if _live_stop:
+            _live_stop()
+        return 2
 
     if _live_stop:
         _live_stop()            # phase 3 writes the final one; no double writer
