@@ -719,10 +719,74 @@ def _charge_hang(sid):
             n = 0
         with open(p, "w") as fh:
             fh.write(str(n + extra))
+        try:
+            with open(os.path.join(OUT_DIR, "%s.hangs" % sid), "a") as fh:
+                fh.write("%s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
         print("[parallel] %s: the kill counts as %d attempt(s) (HANG_ATTEMPTS) -- now %d"
               % (sid, int(HANG_ATTEMPTS), n + extra))
     except Exception as e:
         print("[parallel] %s: could not charge the hang (%s)" % (sid, e))
+
+
+# ---- SHARING THE MACHINE WITH SCORING THAT RUNS WHILE THIS SIMULATES --------
+# z6_main.py scores a project as soon as both cases have finished simulating
+# it, on the cores the workers are not using (SCORE_WHILE_SIMULATING) -- so a
+# straggler holding one worker no longer leaves 21 cores idle. Three files
+# beside the cases keep the two from overrunning CORES_MAX:
+#   SPP_ALIVE_FILE        this launcher writes how many workers are alive
+#   SPP_SCORING_BUSY_FILE the panel writes how many scoring shards it runs
+#   SPP_CORES_CEILING     the total both may use together
+# A new project starts, and a handover grows, only into what is left. When the
+# scoring ends the workers grow back (see _maybe_grow). No file = no limit.
+_ALIVE_FILE   = (os.environ.get("SPP_ALIVE_FILE") or "").strip()
+_BUSY_FILE    = (os.environ.get("SPP_SCORING_BUSY_FILE") or "").strip()
+try:
+    _CORES_CEILING = int(float((os.environ.get("SPP_CORES_CEILING") or "0").strip() or "0"))
+except Exception:
+    _CORES_CEILING = 0
+_SHARE_FRESH_S = 150.0          # a file not rewritten for this long is ignored
+_ALIVE_LAST = [0.0, -1]
+
+
+def _write_alive(k, force=False):
+    """Tell the panel how many workers this launcher has alive."""
+    if not _ALIVE_FILE:
+        return
+    now = time.time()
+    if not force and k == _ALIVE_LAST[1] and now - _ALIVE_LAST[0] < 20.0:
+        return
+    try:
+        with open(_ALIVE_FILE, "w") as fh:
+            fh.write("%d\n" % int(k))
+        _ALIVE_LAST[0], _ALIVE_LAST[1] = now, k
+    except Exception:
+        pass
+
+
+def _read_count(p):
+    """An int from a share file that is still being kept up; 0 otherwise."""
+    try:
+        if p and os.path.isfile(p) and time.time() - os.path.getmtime(p) < _SHARE_FRESH_S:
+            with open(p) as fh:
+                return max(0, int((fh.read() or "0").strip() or "0"))
+    except Exception:
+        pass
+    return 0
+
+
+def _sim_allowed():
+    """How many workers this launcher may have alive now; None = no limit."""
+    if not _CORES_CEILING or not _BUSY_FILE:
+        return None
+    busy = _read_count(_BUSY_FILE)
+    other = 0
+    if _ALIVE_FILE:
+        for p in glob.glob(os.path.join(os.path.dirname(_ALIVE_FILE), ".spp_alive_*.txt")):
+            if os.path.normcase(os.path.abspath(p)) != os.path.normcase(os.path.abspath(_ALIVE_FILE)):
+                other += _read_count(p)
+    return max(1, _CORES_CEILING - busy - other)
 
 # ---- A LICENCE OUTAGE MAY NOT RETIRE A WORKER SLOT ---------------------------
 # _schedule() used to do done.add(i) once a worker had passed MAX_LICENCE_FAILS,
@@ -2006,7 +2070,7 @@ def _reset_attempts(ids, why):
        claim, so a worker can take them again."""
     n = 0
     for sid in ids:
-        for ext in ("attempts", "claim"):
+        for ext in ("attempts", "claim", "hangs"):
             p = os.path.join(OUT_DIR, "%s.%s" % (sid, ext))
             if os.path.isfile(p) and _clear(p):
                 n += 1
@@ -2347,7 +2411,7 @@ def _stale_aside(out_dir, sid, why):
     # the fault list was renumbered comes back carrying the previous list's
     # attempts -- at the cap it is refused on sight and reported GAVE-UP
     # without ever being simulated.
-    for ext in ("out", "done", "attempts", "plotted", "readfail", "badout", "partial"):
+    for ext in ("out", "done", "attempts", "hangs", "plotted", "readfail", "badout", "partial"):
         p = os.path.join(out_dir, "%s.%s" % (sid, ext))
         if os.path.isfile(p):
             try:
@@ -4150,6 +4214,9 @@ def _run_report_sharded(n, selected=None):
     return rc == 0
 
 
+_WANT_N = [0]                   # the workers this project was sized for
+
+
 def _worker_slice(i, n, selected):
     """The ids worker i should run. None = the full fault set (the study decides);
        a list = what this worker is given.
@@ -4270,23 +4337,34 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
 
     def _maybe_grow():
         nonlocal n
-        if not _slots_file or _round or not DYNAMIC_WORK:
+        if _round or not DYNAMIC_WORK:
             return
         now = time.time()
         if now < _slots_next[0]:
             return
         _slots_next[0] = now + SLOTS_CHECK_S
+        target = 0
         try:
-            if not os.path.isfile(_slots_file) or os.path.getmtime(_slots_file) < _LAUNCHER_T0:
-                return
-            with open(_slots_file) as fh:
-                target = int((fh.read() or "0").strip() or "0")
+            if (_slots_file and os.path.isfile(_slots_file)
+                    and os.path.getmtime(_slots_file) >= _LAUNCHER_T0):
+                with open(_slots_file) as fh:
+                    target = int((fh.read() or "0").strip() or "0")
         except Exception:
-            return
+            target = 0
+        _why = "the other case has finished"
+        # WORKERS HELD BACK FOR SCORING COME BACK when it is done.
+        if _WANT_N[0] > max(target, n):
+            target = _WANT_N[0]
+            _why = "the scoring of another project has freed its cores"
+        # AND NEVER GROW INTO CORES THE SCORING IS USING.
+        _cap = _sim_allowed()
+        if _cap is not None:
+            _alive_now = len([k for k in range(n) if k not in done and k not in pending
+                              and k in procs and procs[k].poll() is None])
+            target = min(target, n + max(0, _cap - _alive_now))
         if target <= n:
             return
-        _banner("HANDOVER: the other case has finished -- growing from %d to %d worker(s) "
-                "(%s)" % (n, target, os.path.basename(_slots_file)))
+        _banner("HANDOVER: %s -- growing from %d to %d worker(s)" % (_why, n, target))
         # CAPPED, AND ONE AT A TIME.
         #
         # The file is written by the panel, but a stale or hand-edited value
@@ -4394,6 +4472,7 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                         kill(i)
                         continue
         alive = [i for i in range(n) if i not in done and i not in pending and procs[i].poll() is None]
+        _write_alive(len(alive) + len([i for i in pending if i not in done]))
         with _PRINT_LOCK:
             idles = {i: int(now - _LAST_ACTIVITY.get(i, now)) for i in alive}
             _pend = {i: int(pending[i] - now) for i in pending if i not in done}
@@ -5374,6 +5453,17 @@ def main():
                   % (i, len(passes), proj or "default", mode, type(_be).__name__))
             rc = 1
         results.append((proj, mode, rc))
+        # THE PANEL MAY SCORE THIS PROJECT NOW. Its simulation is over for this
+        # case; z6_main.py waits for this stamp from BOTH cases, then scores it
+        # on the idle cores while this launcher goes on to the next project.
+        _write_alive(0, force=True)
+        if not REPORT_ONLY:
+            try:
+                with open(os.path.join(_flags_dir(), "SIM_FINISHED.txt"), "w") as fh:
+                    fh.write("%s\trc=%s\tpid=%d\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                                     rc, os.getpid()))
+            except Exception:
+                pass
         if STOP_ON_FAILED_PROJECT and rc not in (0, None) and i < len(passes):
             print("")
             print("[parallel] *** project %s ended with rc=%s -- STOP_ON_FAILED_PROJECT: the remaining"
@@ -5596,6 +5686,7 @@ def _run_one_study():
         # the truth about it.
         for p in (glob.glob(os.path.join(OUT_DIR, "*.done")) +
                   glob.glob(os.path.join(OUT_DIR, "*.attempts")) +
+                  glob.glob(os.path.join(OUT_DIR, "*.hangs")) +
                   glob.glob(os.path.join(OUT_DIR, "*.requeued")) +
                   glob.glob(os.path.join(RESULTS, "SYSTEM_ADJUSTMENTS.txt")) +
                   _sentinels()):
@@ -5625,7 +5716,7 @@ def _run_one_study():
         # retried for ever across launches.
         #
         # SKIP_DONE_SELECTED already records which kind of selection this is.
-        _exts = ("done",) if SKIP_DONE_SELECTED else ("done", "attempts")
+        _exts = ("done",) if SKIP_DONE_SELECTED else ("done", "attempts", "hangs")
         for sid in selected:
             for ext in _exts:
                 p = os.path.join(OUT_DIR, "%s.%s" % (sid, ext))
@@ -5681,6 +5772,13 @@ def _run_one_study():
     if selected and n_work != N_WORKERS:
         print("[parallel] %d selected scenario(s) -> using %d worker(s) instead of %d"
               % (len(selected), n_work, N_WORKERS))
+    _WANT_N[0] = n_work
+    _cap = _sim_allowed()
+    if _cap is not None and _cap < n_work:
+        print("[parallel] %d core(s) are scoring other projects -- starting %d worker(s) "
+              "instead of %d; the rest join as the scoring finishes" % (
+                  _read_count(_BUSY_FILE), _cap, n_work))
+        n_work = _cap
     _announce_work(selected, n_work)
     ok = _run_workers(n_work, selected)
     if not ok:

@@ -29183,7 +29183,8 @@ def _reset_resume_state():
               in ("1", "true", "yes", "on"))
     if _fresh:
         _wipe = (glob.glob(os.path.join(OUT_DIR, "*.done"))
-                 + glob.glob(os.path.join(OUT_DIR, "*.attempts")))
+                 + glob.glob(os.path.join(OUT_DIR, "*.attempts"))
+                 + glob.glob(os.path.join(OUT_DIR, "*.hangs")))
     else:
         _wipe = []
         print("[resume] snapshot rebuild: %d .done marker(s) and the .attempts counters "
@@ -35616,7 +35617,18 @@ def main():
             print("  [resume]   skipped without counting another attempt")
             print("  [resume]   to give this ONE scenario a fresh budget, delete")
             print("  [resume]   %s" % _state_path(scen_id, "attempts"))
+            # A WATCHDOG KILL COUNTS DOUBLE (the launcher's HANG_ATTEMPTS), so
+            # "attempted 4 times" can mean two hangs. Say which.
+            _hangs = 0
+            try:
+                with open(_state_path(scen_id, "hangs")) as _hf:
+                    _hangs = len([_l for _l in _hf if _l.strip()])
+            except Exception:
+                _hangs = 0
             _progress_record(scen_id, "GAVE-UP", _attempts_so_far,
+                             ("hung %d time(s) -- killed by the watchdog, each kill "
+                              "counts double; %d >= MAX_SCENARIO_ATTEMPTS=%d"
+                              % (_hangs, _attempts_so_far, MAX_SCENARIO_ATTEMPTS)) if _hangs else
                              "attempted %d time(s) >= MAX_SCENARIO_ATTEMPTS=%d"
                              % (_attempts_so_far, MAX_SCENARIO_ATTEMPTS))
             # Given up for good: the claim STAYS, so no other worker spends

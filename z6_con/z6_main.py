@@ -638,6 +638,7 @@ RESCORE_STALE_REPORTS = True                 # re-score a report older than its 
 STALE_REPORT_TOL_S = 120
 REPORT_COVERAGE_MIN = 0.90                   # re-score a report covering less than this
 REPORTS_AFTER_ALL_PROJECTS = True            # True = score once at the end
+SCORE_WHILE_SIMULATING = True                # score a finished project on idle cores
 SCORE_NO_CASE = True                         # True = score without loading the case (keep)
 AUTO_REMERGE_STALE_PARTS = True
 VERIFY_SCORING_COVERAGE = True
@@ -14886,6 +14887,12 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False,
     env["SPP_STARTUP_SILENT_S"] = str(float(STARTUP_SILENT_MIN) * 60.0)
     env["SPP_RETRY_GAVE_UP_ROUNDS"] = str(int(RETRY_GAVE_UP_ROUNDS))
     env["SPP_DEFER_REPORTS"] = "1" if REPORTS_AFTER_ALL_PROJECTS else "0"
+    # THE CORES SHARED WITH SCORING THAT RUNS WHILE THIS SIMULATES -- see
+    # SCORE_WHILE_SIMULATING. The launcher reports its live workers and keeps
+    # out of the cores the scoring holds.
+    env["SPP_ALIVE_FILE"] = _alive_file_for(case["key"])
+    env["SPP_SCORING_BUSY_FILE"] = _busy_file()
+    env["SPP_CORES_CEILING"] = str(_cores_ceiling())
     # ALWAYS 1. This used to follow NEVER_KILL_WORKERS, but the two are different
     # questions: whether a watchdog may end a frozen process, and whether a worker
     # may take a scenario whose owner is still alive. The second is never yes.
@@ -16181,10 +16188,154 @@ def _slots_file_for(case_key):
 
 def _clear_slots_files():
     for c in (CASE_BASE, CASE_TEST):
+        for _p in (_slots_file_for(c["key"]), _alive_file_for(c["key"])):
+            try:
+                os.remove(_p)
+            except Exception:
+                pass
+    try:
+        os.remove(_busy_file())
+    except Exception:
+        pass
+
+
+# ---- SCORING WHILE THE OTHER PROJECTS SIMULATE -------------------------------
+# With REPORTS_AFTER_ALL_PROJECTS every project waited for the last fault of
+# the last project before a single one was scored. On 2026-09-27 that was one
+# hung EastFork fault holding 21 idle cores for over two hours while SantaFe
+# and IronStar sat at 6/180 and 88/167 scored.
+#
+# SCORE_WHILE_SIMULATING scores a project as soon as BOTH cases have finished
+# simulating it (each launcher writes flags\SIM_FINISHED.txt), on the cores
+# the workers are not using. The launchers publish their live worker counts
+# (.spp_alive_<case>.txt); the panel publishes the shards it is scoring with
+# (.spp_scoring_busy.txt), and a launcher starting its next project -- or
+# growing -- keeps out of those. The final scoring pass then finds these
+# projects already scored and skips them. The live comparison picks the new
+# verdicts up on its next refresh.
+_EARLY_MIN_CORES = 4            # fewer idle cores than this: wait
+
+
+def _alive_file_for(case_key):
+    return os.path.join(STUDY_ROOT, ".spp_alive_%s.txt" % str(case_key).upper())
+
+
+def _busy_file():
+    return os.path.join(STUDY_ROOT, ".spp_scoring_busy.txt")
+
+
+def _cores_ceiling():
+    """Every PSS/E session this launch may run at once, all kinds together."""
+    usable = max(1, _cpu_count() - max(0, int(CORES_SPARE)))
+    return min(usable, int(CORES_MAX)) if CORES_MAX else usable
+
+
+def _alive_sims():
+    """Simulation workers alive now, across the cases still simulating. A case
+       whose count is not being kept up (building its next case, starting) is
+       taken at its full share -- when unsure, assume the cores are in use."""
+    with _CASES_LIVE_LOCK:
+        live = sorted(_CASES_LIVE)
+    tot = 0
+    for k in live:
+        n = None
+        p = _alive_file_for(k)
         try:
-            os.remove(_slots_file_for(c["key"]))
+            if os.path.isfile(p) and time.time() - os.path.getmtime(p) < 150.0:
+                with open(p) as fh:
+                    n = int((fh.read() or "0").strip() or "0")
         except Exception:
-            pass
+            n = None
+        if n is None:
+            n = _workers_for(k, N_WORKERS, max(1, len(live)))
+        tot += max(0, n)
+    return tot
+
+
+def _sim_finished(proj, t_go):
+    """Both cases have finished simulating this project in this launch."""
+    for c in _cases_to_run():
+        for m in MODES:
+            st = os.path.join(results_dir(c, proj, m), "flags", "SIM_FINISHED.txt")
+            try:
+                if os.path.getmtime(st) < t_go:
+                    return False
+            except Exception:
+                return False
+    return True
+
+
+def _early_scorer_start(pjs, t_go):
+    """Start the background scorer. Returns a function that stops it and
+       WAITS for a project it is scoring -- the final pass must not score the
+       same folder at the same time."""
+    if not (SCORE_WHILE_SIMULATING and REPORTS_AFTER_ALL_PROJECTS and pjs):
+        return lambda: None
+    stop = threading.Event()
+    busy = [0]
+
+    def _beat():
+        # KEEPS THE BUSY FILE FRESH while a project is being scored; the
+        # launchers ignore a file older than 150 s, so a panel that died
+        # mid-score cannot hold their cores for ever.
+        while True:
+            if busy[0]:
+                try:
+                    with open(_busy_file(), "w") as fh:
+                        fh.write("%d\n" % busy[0])
+                except Exception:
+                    pass
+            elif stop.is_set():
+                return
+            time.sleep(30.0)
+
+    def _loop():
+        done = set()
+        while not stop.wait(30.0):
+            for proj in pjs:
+                if proj in done or stop.is_set():
+                    continue
+                if not _sim_finished(proj, t_go):
+                    continue
+                free = _cores_ceiling() - _alive_sims()
+                if free < _EARLY_MIN_CORES:
+                    break
+                done.add(proj)
+                busy[0] = free
+                try:
+                    with open(_busy_file(), "w") as fh:
+                        fh.write("%d\n" % free)
+                except Exception:
+                    pass
+                print("[early-score] %s has finished simulating in both cases -- scoring "
+                      "it now on %d idle core(s) while the rest simulate" % (proj, free))
+                try:
+                    ensure_reports(MODES, only_projects=[proj], shards=free, early=True)
+                except Exception as e:
+                    print("[early-score] %s could not be scored now (%s) -- the final "
+                          "pass will do it" % (proj, e))
+                finally:
+                    busy[0] = 0
+                    try:
+                        os.remove(_busy_file())
+                    except Exception:
+                        pass
+
+    th = threading.Thread(target=_loop)
+    th.daemon = True
+    th.start()
+    hb = threading.Thread(target=_beat)
+    hb.daemon = True
+    hb.start()
+    print("[early-score] on: each project is scored as soon as both cases have "
+          "simulated it, on the cores the workers leave idle")
+
+    def _stop():
+        stop.set()
+        if th.is_alive():
+            print("[early-score] waiting for the project being scored to finish ...")
+        th.join()
+    return _stop
 
 
 def _case_thread_begin(case_key):
@@ -18191,7 +18342,7 @@ def retire_truncated_done(quiet=False):
     return n_moved + n_back
 
 
-def ensure_reports(mode_list):
+def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
     """Give any case/project a criteria report it is missing -- and replace one
        that is OLDER than the .out files it describes.
 
@@ -18216,6 +18367,8 @@ def ensure_reports(mode_list):
             # every project ever run; with FORCE_RESCORE on, an EastFork launch
             # was re-scoring SantaFe and EmpirePrairie as well.
             if _panel_projects() and proj not in _panel_projects():
+                continue
+            if only_projects and proj not in only_projects:
                 continue
             # SCORE IT AGAIN WHATEVER ITS DATE -- see FORCE_RESCORE.
             #
@@ -18491,15 +18644,48 @@ def ensure_reports(mode_list):
     # THE SAME CONCURRENCY RULE AS PHASE 1. Scoring is the slow half of this
     # study -- minutes per .out -- so running the two cases one after the other
     # here would take as long as phase 1 did, on a machine sized for both.
-    def _run_case(c, runs):
+    def _run_case(c, runs, log_path=None, env_add=None):
         """Every pass this case needs, one after the other; the first non-zero
            exit code is the case's."""
         _rc = 0
         for _projs, _env in runs:
-            _r = run_study(c, projects=_projs, modes=mode_list, extra_env=_env)
+            if env_add:
+                _env = dict(_env)
+                _env.update(env_add)
+            _r = run_study(c, projects=_projs, modes=mode_list, extra_env=_env,
+                           log_path=log_path)
             if _r not in (0, None) and _rc in (0, None):
                 _rc = _r
         return _rc
+
+    if early:
+        # WHILE THE OTHER PROJECTS SIMULATE. One case after the other, on the
+        # shards the caller found idle, into the project's own log -- this
+        # console belongs to the running studies. The launcher is told not to
+        # touch the live status, the handover file or the worker count: those
+        # belong to the launchers that are simulating.
+        _add = {"SPP_LAUNCH_REPORT_WORKERS": str(max(1, int(shards or 1))),
+                "SPP_LIVE_STATUS_ALL": "", "SPP_SLOTS_FILE": "",
+                "SPP_ALIVE_FILE": ""}
+        for case, runs in jobs:
+            _lp = None
+            try:
+                _ld = os.path.join(results_dir(case, (only_projects or [""])[0],
+                                               mode_list[0]), "logs")
+                if not os.path.isdir(_ld):
+                    os.makedirs(_ld)
+                _lp = os.path.join(_ld, "SCORED_WHILE_SIMULATING.log")
+            except Exception:
+                _lp = None
+            t0 = time.time()
+            rc = _run_case(case, runs, log_path=_lp, env_add=_add)
+            print("[early-score] %s %s scored in %s with %d shard(s), rc=%s -> %s"
+                  % (case["key"], ", ".join(only_projects or []), _fmt_hms(time.time() - t0),
+                     int(shards or 1), rc, _lp or "(console)"))
+        _MEAS_CACHE.clear()
+        _SCEN_PART_CACHE.clear()
+        _OUT_SET_CACHE.clear()
+        return n
 
     global _SCORING_ALONE
     _SCORING_ALONE = True
@@ -22743,8 +22929,12 @@ def main():
                 th = threading.Thread(target=_go)
                 th.start()
                 ths.append(th)
-            for th in ths:
-                th.join()
+            _es_stop = _early_scorer_start(pjs, t_go)
+            try:
+                for th in ths:
+                    th.join()
+            finally:
+                _es_stop()
             rb, rt = res.get("BASE", 2), res.get("PROJ", 2)
         elif ONE_PROJECT_AT_A_TIME and pjs and len(pjs) > 1:
             # ONE PROJECT AT A TIME: its base study, then its project study,
