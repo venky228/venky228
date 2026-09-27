@@ -648,6 +648,82 @@ except Exception:
     pass
 SCENARIO_SCAN_EVERY_S = 30.0    # how often the PROGRESS rows are re-read for this
 
+# ---- A STRAGGLER THAT HAS RUN FAR LONGER THAN ANYTHING ELSE HERE -----------------
+# SCENARIO_MAX_S and HANG_TIMEOUT_S are fixed numbers sized for the slowest
+# scenario ever seen on the machine, so a hung PSS/E costs 45-75 min per attempt.
+# On 2026-09-27 BASE F124 hung three times running on EastFork -- 2h 20m with
+# one worker alive and 21 cores idle -- while the other 23 of its faults took
+# 3-8 min each (the PROJECT side ran F124 in 17 min).
+#
+# This one is measured, not fixed: a scenario that has been running AND silent
+# for longer than STRAGGLER_FACTOR x the slowest finished scenario in THIS
+# results folder (never under STRAGGLER_MIN_S) is killed and requeued. It needs
+# STRAGGLER_MIN_DONE finished scenarios before it acts, so a new folder with no
+# timings falls back to the fixed watchdogs. 0 turns it off.
+STRAGGLER_FACTOR   = 3.0
+STRAGGLER_MIN_S    = 1200.0     # 20 min floor, whatever the timings say
+STRAGGLER_MIN_DONE = 5
+# ---- A HANG IS NOT A CRASH: IT COUNTS DOUBLE -------------------------------------
+# A scenario the watchdog had to KILL (silent, overtime or straggler) is charged
+# this many attempts instead of one. A crash is often the worker's luck (licence,
+# memory); a hang on the same fault in the same case usually repeats -- F124
+# hung identically three times. With 2 and MAX_SCENARIO_ATTEMPTS = 3 a hung
+# scenario gets two tries, not three. 1 = the old behaviour.
+HANG_ATTEMPTS = 2
+for _nm, _ev in (("STRAGGLER_FACTOR", "SPP_STRAGGLER_FACTOR"),
+                 ("STRAGGLER_MIN_S", "SPP_STRAGGLER_MIN_S"),
+                 ("HANG_ATTEMPTS", "SPP_HANG_ATTEMPTS")):
+    try:
+        _v = (os.environ.get(_ev) or "").strip()
+        if _v:
+            globals()[_nm] = float(_v)
+    except Exception:
+        pass
+_STRAG = {"t": 0.0, "lim": 0.0}
+
+
+def _straggler_limit():
+    """Seconds a scenario may run silent before it is a straggler; 0 = no limit
+       yet (too few finished scenarios to measure, or switched off)."""
+    if not STRAGGLER_FACTOR or STRAGGLER_FACTOR <= 0 or not OUT_DIR:
+        return 0.0
+    now = time.time()
+    if now - _STRAG["t"] < 60.0:
+        return _STRAG["lim"]
+    _STRAG["t"] = now
+    try:
+        ids = [os.path.splitext(os.path.basename(p))[0]
+               for p in glob.glob(os.path.join(OUT_DIR, "*.secs"))]
+        secs = _scenario_secs(ids)
+    except Exception:
+        secs = []
+    if len(secs) < int(STRAGGLER_MIN_DONE):
+        _STRAG["lim"] = 0.0
+    else:
+        _STRAG["lim"] = max(float(STRAGGLER_MIN_S), float(STRAGGLER_FACTOR) * max(secs))
+    return _STRAG["lim"]
+
+
+def _charge_hang(sid):
+    """A killed hang costs HANG_ATTEMPTS attempts. The worker already counted
+       one when it claimed the scenario; add the rest to <sid>.attempts."""
+    extra = int(HANG_ATTEMPTS) - 1
+    if not sid or extra <= 0 or not OUT_DIR:
+        return
+    p = os.path.join(OUT_DIR, "%s.attempts" % sid)
+    try:
+        try:
+            with open(p) as fh:
+                n = int((fh.read() or "0").strip() or "0")
+        except Exception:
+            n = 0
+        with open(p, "w") as fh:
+            fh.write(str(n + extra))
+        print("[parallel] %s: the kill counts as %d attempt(s) (HANG_ATTEMPTS) -- now %d"
+              % (sid, int(HANG_ATTEMPTS), n + extra))
+    except Exception as e:
+        print("[parallel] %s: could not charge the hang (%s)" % (sid, e))
+
 # ---- A LICENCE OUTAGE MAY NOT RETIRE A WORKER SLOT ---------------------------
 # _schedule() used to do done.add(i) once a worker had passed MAX_LICENCE_FAILS,
 # which abandons that worker's share of the queue for the rest of the launch. On
@@ -4284,6 +4360,10 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                 if _quiet_watch("w%d" % i, "worker %d" % i, idle, HANG_TIMEOUT_S):
                     _banner("worker %d HUNG (no output for %ds > %ds) -- killing it"
                             % (i, int(idle), HANG_TIMEOUT_S))
+                    try:
+                        _charge_hang(_worker_scenario_age(i, launched_at.get(i, 0.0))[0])
+                    except Exception:
+                        pass
                     kill(i)
                     continue
             # --- A SCENARIO THAT HAS SIMPLY BEEN RUNNING TOO LONG. Not silence:
@@ -4297,8 +4377,22 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                             "scenario ever measured here took 24 min. Killing the worker; %s goes "
                             "back in the queue and this counts as one of its attempts."
                             % (i, _sid, _fmt_hms(_on), _fmt_hms(SCENARIO_MAX_S), _sid))
+                    _charge_hang(_sid)
                     kill(i)
                     continue
+            # --- A STRAGGLER: silent and running far past this folder's slowest.
+            if not NEVER_KILL_WORKERS:
+                _lim = _straggler_limit()
+                if _lim and idle > _lim:
+                    _sid, _on = _worker_scenario_age(i, launched_at.get(i, 0.0))
+                    if _sid and _on > _lim:
+                        _banner("worker %d: %s has run %s with no output -- past %s (%.0fx the "
+                                "slowest finished scenario here, STRAGGLER_FACTOR). It is hung, "
+                                "not slow: killing the worker; %s goes back in the queue."
+                                % (i, _sid, _fmt_hms(_on), _fmt_hms(_lim), STRAGGLER_FACTOR, _sid))
+                        _charge_hang(_sid)
+                        kill(i)
+                        continue
         alive = [i for i in range(n) if i not in done and i not in pending and procs[i].poll() is None]
         with _PRINT_LOCK:
             idles = {i: int(now - _LAST_ACTIVITY.get(i, now)) for i in alive}

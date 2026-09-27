@@ -1305,6 +1305,9 @@ def _split_sessions(total, n_cases):
 _SPLIT_ORDER = ["PROJ", "BASE"]
 
 
+_SCORING_ALONE = False          # set by ensure_reports() while it is the only work
+
+
 def _report_workers_for(case_key, n_cases, why=None):
     """How many scoring shards this case gets, and why that number.
 
@@ -1327,6 +1330,17 @@ def _report_workers_for(case_key, n_cases, why=None):
     _usable = max(1, _cpu_count() - max(0, int(CORES_SPARE)))
     if CORES_FOR_REPORTS:
         _pool = min(int(CORES_FOR_REPORTS), _usable)
+        # NOTHING IS SIMULATING: THE RESERVE IS NOT THE LIMIT. The end-of-run
+        # scoring pass (ensure_reports) ran on CORES_FOR_REPORTS = 6 -- 3
+        # shards a case -- while the other 16 of CORES_MAX sat idle, and
+        # scoring took longer than the simulations. The reserve exists to
+        # leave room for workers; with none running, scoring gets the whole
+        # ceiling.
+        if _SCORING_ALONE:
+            _pool = _usable
+            if why is not None:
+                why.append("nothing is simulating -- scoring uses the whole "
+                           "ceiling, not CORES_FOR_REPORTS")
         # CORES_MAX IS THE ABSOLUTE CEILING -- nothing runs more than this many
         # PSS/E processes at once, under any pipeline. (0 = no ceiling.)
         if CORES_MAX:
@@ -14840,7 +14854,19 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False,
         # this case was given, and not one more -- and it may not run while the
         # next project's workers are using them.
         env["SPP_LAUNCH_REPORT_BG"] = "0"
-    env["SPP_LAUNCH_REPORT_WORKERS"] = str(_report_workers_for(case["key"], _ncase))
+    # A LONE CASE SCORES ON THE WHOLE CEILING. With one case running and the
+    # report kept in the foreground (CORES_MAX_INCLUDES_REPORTS), its report
+    # starts only after its own workers have finished and nothing else is
+    # simulating -- the SGF-only runs, a single-case rerun. The 6-core
+    # reserve left 16 cores idle for the whole scoring pass.
+    global _SCORING_ALONE
+    _was_alone = _SCORING_ALONE
+    if _ncase <= 1 and CORES_MAX_INCLUDES_REPORTS:
+        _SCORING_ALONE = True
+    try:
+        env["SPP_LAUNCH_REPORT_WORKERS"] = str(_report_workers_for(case["key"], _ncase))
+    finally:
+        _SCORING_ALONE = _was_alone
     # ONE LIVE-STATUS FILE FOR THE WHOLE LAUNCH, in the study root beside this
     # script. Each case still writes its own in its results folder; this is the
     # one to keep open in a second window.
@@ -18475,6 +18501,26 @@ def ensure_reports(mode_list):
                 _rc = _r
         return _rc
 
+    global _SCORING_ALONE
+    _SCORING_ALONE = True
+    try:
+        _nsh = _report_workers_for(jobs[0][0]["key"],
+                                   len(jobs) if RUN_IN_PARALLEL else 1)
+        print("[compare] scoring with %d shard(s) per case -- no simulation is "
+              "running, so the whole core ceiling is used" % _nsh)
+        rcs = _ensure_reports_run(jobs, _run_case)
+    finally:
+        _SCORING_ALONE = False
+    for key, rc in rcs:
+        if rc not in (0, None):
+            print("[compare] *** the %s report pass ended rc=%s -- anything it did"
+                  % (key, rc))
+            print("[compare]     write is still used below. ***")
+    return n
+
+
+def _ensure_reports_run(jobs, _run_case):
+    """ensure_reports' scoring runs, both cases at once when allowed."""
     if RUN_IN_PARALLEL and len(jobs) > 1:
         print("[compare] scoring both cases at once -- REPORT_WORKERS shards each")
         res, ths = {}, []
@@ -18501,12 +18547,7 @@ def ensure_reports(mode_list):
     _MEAS_CACHE.clear()
     _SCEN_PART_CACHE.clear()
     _OUT_SET_CACHE.clear()
-    for key, rc in rcs:
-        if rc not in (0, None):
-            print("[compare] *** the %s report pass ended rc=%s -- anything it did"
-                  % (key, rc))
-            print("[compare]     write is still used below. ***")
-    return n
+    return rcs
 
 
 def _fast_compare(pipeline):
