@@ -218,8 +218,8 @@ MERGE_ONLY = False                           # True = only rebuild the reports f
 COMPARE_REQUIRE_COMPLETE = False             # True = no comparison if a project did not finish
 RUN_STUDIES = False                          # old setting -- PIPELINE wins
 RUN_MISSING = False                          # old setting -- same as PIPELINE = "missing"
-SAV_FIRST = True                             # True = build every .sav first: base, GIA, each SURPLUS scenario, all projects
-SAV_FIRST_STOP = True                        # True = stop after them to check | False = go straight on to the runs
+SAV_FIRST = False                              # True = build every .sav first: base, GIA, each SURPLUS scenario, all projects
+SAV_FIRST_STOP = False                        # True = stop after them to check | False = go straight on to the runs
 SAV_FIRST_WORKERS = 6                        # .sav builds at once (one PSS/E each)
 SAV_FIRST_TIMEOUT_S = 3600                   # a .sav build silent this long is stopped
 SAV_FIRST_BASE = False                       # True = also save the solved base case (deck + removals) per project
@@ -529,7 +529,7 @@ DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is s
 EGF_DYR_EDITS_BY_PROJECT = {}                # {"SantaFe": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}
 EGF_DYR_RUN = False                          # True = run BOTH cases with those edits (_egf) and compare
 EGF_OFF_RUN = False                          # True = run BOTH cases with every existing machine OFF (_egfoff) and compare
-EGF_OFF_BASE_RUN = False                     # True = run the BASE case ONLY with every existing machine OFF (_egfoff);
+EGF_OFF_BASE_RUN = True                     # True = run the BASE case ONLY with every existing machine OFF (_egfoff);
                                              #   the PROJECT side of its comparisons is the surplus run s1_egfoff
 EGF_PROJECTS = []                            # [] = every project of the launch (EGF_DYR_RUN: those with edits)
 EGF_FAULTS = "same"                          # "same" = ONLY_FAULTS | "all" | ["F01-F04"]
@@ -635,7 +635,7 @@ RESTORE_TRUNCATED_DONE = True
 OUT_EMPTY_BYTES = 1048576                    # .out under this = empty
 
 # ---- 17. SCORING ---------------------------------------------------------------
-FORCE_RESCORE = False                        # True = re-score everything every launch
+FORCE_RESCORE = True                        # True = re-score everything every launch
 RESCORE_STALE_REPORTS = True                 # re-score a report older than its .out
 STALE_REPORT_TOL_S = 120
 REPORT_COVERAGE_MIN = 0.90                   # re-score a report covering less than this
@@ -649,8 +649,8 @@ FAST_COMPARE_PARALLEL = 4                    # projects at once
 
 # ---- 18. PLOTS -----------------------------------------------------------------
 MAKE_PLOTS = None                            # None = draw | False = no PDFs (faster)
-PLOT_MISSING_OUTS = False                    # draw PDFs for .out files without one
-FORCE_REPLOT = False                         # True = redraw every PDF
+PLOT_MISSING_OUTS = True                    # draw PDFs for .out files without one
+FORCE_REPLOT = True                         # True = redraw every PDF
 PLOT_SCOPE = "compact"                       # "compact" | "full"
 PLOT_ONE_PROJECT_AT_A_TIME = True
 PLOT_SKIP_INCOMPLETE = True                  # True = do not draw a run that stopped early

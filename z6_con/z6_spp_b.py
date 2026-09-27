@@ -3804,6 +3804,11 @@ else:
 # and results are one named set. Costs one case + snapshot per level on disk.
 _LEVEL_SUF = ((("_cap%s" % _CAP_TAG_DIR) if _CAP_TAG_DIR else "")
               + (("_%s" % _RUN_TAG_DIR) if _RUN_TAG_DIR else ""))
+# A TAGGED BASE RUN IS ONE PROJECT'S (EGF off / edited: THAT project's feeder
+# machines), so its build files carry the project too -- one named set per
+# project, never one project's snapshot reused for the next.
+if _RUN_TAG_DIR and not ENABLE_BESS:
+    _LEVEL_SUF = "_%s%s" % (RUN_PROJECT, _LEVEL_SUF)
 if _LEVEL_SUF and not CASE_TAG.endswith(_LEVEL_SUF):
     CASE_TAG += _LEVEL_SUF
     print("[case] level %s -- its own build files: %s.sav/.cnv/.snp/.cnl"
@@ -12744,6 +12749,11 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         #     conversions, so it re-loads as a normal solved case. The ORIGINAL is untouched.
         if ENABLE_BESS:
             chk(psspy.save(MOD_SAV), "save modified .sav (%s)" % os.path.basename(MOD_SAV))
+        elif (_RUN_TAG_DIR and (EGF_OFF or EGF_DYR_EDITS)
+              and os.path.abspath(MOD_SAV) != os.path.abspath(SOURCE_CASE)):
+            # A TAGGED BASE RUN (EGF off / edited): its solved case under its
+            # own name, <deck>_<project>_<tag>.sav -- the deck is never touched.
+            chk(psspy.save(MOD_SAV), "save solved .sav (%s)" % os.path.basename(MOD_SAV))
         # THE SOLVED POWER FLOW, TO TOLERANCE, BEFORE ANY CONVERSION.
         # The existing check runs after CONL, just before the .cnl is saved --
         # by then the loads are converted and a mismatch is harder to read and
