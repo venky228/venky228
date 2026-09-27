@@ -16271,21 +16271,42 @@ def _early_scorer_start(pjs, t_go):
        same folder at the same time."""
     if not (SCORE_WHILE_SIMULATING and REPORTS_AFTER_ALL_PROJECTS and pjs):
         return lambda: None
+    if FORCE_RESCORE:
+        # The final pass rescores every project anyway -- scoring them here too
+        # would do each one twice.
+        print("[early-score] off for this launch: FORCE_RESCORE scores every project "
+              "in the final pass")
+        return lambda: None
     stop = threading.Event()
     busy = [0]
+    lock = threading.Lock()
+
+    def _set_busy(k):
+        with lock:
+            busy[0] = int(k)
+            try:
+                if k:
+                    with open(_busy_file(), "w") as fh:
+                        fh.write("%d\n" % int(k))
+                elif os.path.isfile(_busy_file()):
+                    os.remove(_busy_file())
+            except Exception:
+                pass
 
     def _beat():
         # KEEPS THE BUSY FILE FRESH while a project is being scored; the
         # launchers ignore a file older than 150 s, so a panel that died
         # mid-score cannot hold their cores for ever.
         while True:
-            if busy[0]:
-                try:
-                    with open(_busy_file(), "w") as fh:
-                        fh.write("%d\n" % busy[0])
-                except Exception:
-                    pass
-            elif stop.is_set():
+            with lock:
+                b = busy[0]
+                if b:
+                    try:
+                        with open(_busy_file(), "w") as fh:
+                            fh.write("%d\n" % b)
+                    except Exception:
+                        pass
+            if not b and stop.is_set():
                 return
             time.sleep(30.0)
 
@@ -16300,26 +16321,29 @@ def _early_scorer_start(pjs, t_go):
                 free = _cores_ceiling() - _alive_sims()
                 if free < _EARLY_MIN_CORES:
                     break
+                # CLAIM, THEN LOOK AGAIN. A launcher starting its next project
+                # writes its worker count and then reads this file; this side
+                # writes the file and then re-reads theirs. One of the two
+                # always sees the other, so the ceiling holds.
+                _set_busy(free)
+                time.sleep(3.0)
+                free = min(free, _cores_ceiling() - _alive_sims())
+                if free < _EARLY_MIN_CORES:
+                    _set_busy(0)
+                    break
+                _set_busy(free)
                 done.add(proj)
-                busy[0] = free
-                try:
-                    with open(_busy_file(), "w") as fh:
-                        fh.write("%d\n" % free)
-                except Exception:
-                    pass
                 print("[early-score] %s has finished simulating in both cases -- scoring "
                       "it now on %d idle core(s) while the rest simulate" % (proj, free))
                 try:
-                    ensure_reports(MODES, only_projects=[proj], shards=free, early=True)
+                    if not ensure_reports(MODES, only_projects=[proj], shards=free, early=True):
+                        print("[early-score] %s: already scored by the workers -- nothing "
+                              "to do" % proj)
                 except Exception as e:
                     print("[early-score] %s could not be scored now (%s) -- the final "
                           "pass will do it" % (proj, e))
                 finally:
-                    busy[0] = 0
-                    try:
-                        os.remove(_busy_file())
-                    except Exception:
-                        pass
+                    _set_busy(0)
 
     th = threading.Thread(target=_loop)
     th.daemon = True
@@ -16332,9 +16356,11 @@ def _early_scorer_start(pjs, t_go):
 
     def _stop():
         stop.set()
-        if th.is_alive():
+        if busy[0]:
             print("[early-score] waiting for the project being scored to finish ...")
-        th.join()
+        # TIMED, so Ctrl+C still reaches this process on Windows.
+        while th.is_alive():
+            th.join(1.0)
     return _stop
 
 

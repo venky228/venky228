@@ -5428,6 +5428,12 @@ def main():
         try:
             _CUR_PROJECT, _CUR_MODE = proj, mode
             _set_paths()
+            # THE BUILD AND THE START HOLD THIS CASE'S CORES TOO: say so, or the
+            # panel reads the 0 left by the last pass and scores into them.
+            try:
+                _write_alive(int(N_WORKERS), force=True)
+            except Exception:
+                pass
             if len(passes) > 1:
                 _banner("STUDY %d of %d -- project %s, %s faults%s   (started %s)"
                         % (i, len(passes), proj or "(default)", mode,
@@ -5456,7 +5462,8 @@ def main():
         # THE PANEL MAY SCORE THIS PROJECT NOW. Its simulation is over for this
         # case; z6_main.py waits for this stamp from BOTH cases, then scores it
         # on the idle cores while this launcher goes on to the next project.
-        _write_alive(0, force=True)
+        if i >= len(passes):
+            _write_alive(0, force=True)
         if not REPORT_ONLY:
             try:
                 with open(os.path.join(_flags_dir(), "SIM_FINISHED.txt"), "w") as fh:
@@ -5484,6 +5491,7 @@ def main():
         if len(passes) > 1 and i < len(passes):
             print("[parallel] --> starting study %d of %d next: %s / %s"
                   % (i + 1, len(passes), passes[i][0] or "default", passes[i][1]))
+    _write_alive(0, force=True)       # this launcher simulates nothing more
     # Every simulation is done; now wait for the criteria reports that were still
     # being produced in the background. This is the ONLY place the launcher blocks
     # on them, and by now they have had the whole of the following projects' run
@@ -5773,12 +5781,18 @@ def _run_one_study():
         print("[parallel] %d selected scenario(s) -> using %d worker(s) instead of %d"
               % (len(selected), n_work, N_WORKERS))
     _WANT_N[0] = n_work
+    # ANNOUNCE FIRST, THEN LOOK. The panel's scorer writes its shard count and
+    # then re-reads this file; this side writes its count and then reads the
+    # scorer's. Whichever order they land in, at least one of them sees the
+    # other, so the two can never both take the same cores.
+    _write_alive(n_work, force=True)
     _cap = _sim_allowed()
     if _cap is not None and _cap < n_work:
         print("[parallel] %d core(s) are scoring other projects -- starting %d worker(s) "
               "instead of %d; the rest join as the scoring finishes" % (
                   _read_count(_BUSY_FILE), _cap, n_work))
         n_work = _cap
+        _write_alive(n_work, force=True)
     _announce_work(selected, n_work)
     ok = _run_workers(n_work, selected)
     if not ok:

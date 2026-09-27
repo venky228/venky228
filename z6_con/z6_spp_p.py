@@ -8486,7 +8486,8 @@ def _poi_tie_branches(feeders, poi):
     poi = int(poi)
     side = _poi_side_buses(feeders, poi)
     ties, seen = [], set()
-    for x, y, ck in list(sf_all_branches()) + list(sf_all_transformers()):
+    _all_br = list(sf_all_branches()) + list(sf_all_transformers())
+    for x, y, ck in _all_br:
         x, y, ck = int(x), int(y), str(ck).strip()
         other = None
         if x == poi and y in side:
@@ -8504,6 +8505,24 @@ def _poi_tie_branches(feeders, poi):
     for (a, b, ck) in ties[:8]:
         print("  [bess]   tie  %d -- %d  ckt %s" % (a, b, ck))
     if not ties:
+        # NO CASE IN THIS PROCESS (a scoring shard): nothing to enumerate, and
+        # the ties are read from parts\POI_TIES.csv, saved by the build. Only a
+        # process that HAS the case and still finds none is worth a warning.
+        _saved = []
+        try:
+            if _all_br:
+                raise ValueError("a case is loaded -- its answer stands")
+            with open(os.path.join(PARTS_DIR, "POI_TIES.csv")) as _fh:
+                for _r in csv.DictReader(_fh):
+                    if int(_r["poi"]) == poi:
+                        _saved.append((poi, int(_r["other"]), str(_r["ckt"]).strip()))
+        except Exception:
+            _saved = []
+        if _saved:
+            print("  [bess]   no case loaded here -- %d tie(s) read from POI_TIES.csv"
+                  % len(_saved))
+            _POI_TIES = _saved
+            return _saved
         print("  [bess]   *** no tie branch found -- check that the feeders really connect "
               "to POI %d ***" % poi)
     _POI_TIES = ties
@@ -25261,6 +25280,25 @@ def evaluate_case(path, kind, tclear, kb):
                 _at = t[i_clr + list(seg).index(pk)] if i_clr + list(seg).index(pk) < len(t) else t[-1]
                 _e_hi.append((pk, chan_label(ti), _at, _n_over * _dt_e))
         _e_hi.sort(key=lambda r: -r[0])
+        # ONE LINE PER TERMINAL, NOT PER CHANNEL. Units sharing a bus -- and a
+        # terminal monitored twice -- read the same trace and were listed two
+        # or three times over ("765935=1.677 ... 765935=1.677 ..."). Identical
+        # entries are merged and the count said once.
+        _grp = {}
+        for pk, l, at, ms in _e_hi:
+            _k = (l, round(pk, 4), round(at, 4), round(ms, 4))
+            _grp[_k] = _grp.get(_k, 0) + 1
+        _e_hi = [(pk, ("%s (x%d)" % (l, _grp[(l, round(pk, 4), round(at, 4), round(ms, 4))])
+                       if _grp[(l, round(pk, 4), round(at, 4), round(ms, 4))] > 1 else l), at, ms)
+                 for (pk, l, at, ms) in _e_hi]
+        _seen_e, _u = set(), []
+        for r in _e_hi:
+            _k = (r[1], round(r[0], 4), round(r[2], 4), round(r[3], 4))
+            if _k in _seen_e:
+                continue
+            _seen_e.add(_k)
+            _u.append(r)
+        _e_hi = _u
         _scored = str(os.environ.get("SPP_ETERM_OVERSHOOT_SCORED") or "0").strip() == "1"
         add("Machine terminal voltage > %.2f pu after clearing (ETERM, existing units)" % V_OVERSHOOT_PU,
             (not _e_hi) if _scored else None,
