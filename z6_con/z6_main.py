@@ -6677,7 +6677,7 @@ def read_bus_distance(rdir):
                     try:
                         out[int(r["bus_number"])] = ((r.get("bus_name") or "").strip(),
                                                      (r.get("base_kV") or "").strip(),
-                                                     int(r["hops_from_POI"]))
+                                                     int(r.get("nodes_from_POI") or r["hops_from_POI"]))
                     except (KeyError, TypeError, ValueError):
                         continue
     except Exception as e:
@@ -6701,7 +6701,7 @@ def read_fault_distance(rdir):
                         fid = (r["fault_id"] or "").strip()
                         fb = int(r["fault_bus"])
                         b = int(r["bus_number"])
-                        h = int(r["hops_from_fault"])
+                        h = int(r.get("nodes_from_fault") or r["hops_from_fault"])
                     except (KeyError, TypeError, ValueError):
                         continue
                     if not fid:

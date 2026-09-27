@@ -31681,7 +31681,7 @@ def sf_write_bus_distance(base):
     rows = sorted(dist.items(), key=lambda kv: (kv[1], kv[0]))
     with open(base + ".csv", "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["bus_number", "bus_name", "base_kV", "hops_from_POI"])
+        w.writerow(["bus_number", "bus_name", "base_kV", "nodes_from_POI"])
         for b, d in rows:
             w.writerow([b, sf_nm(b), "%.2f" % sf_kv(b), d])
     print("  [write] %s.csv  (%d bus(es) within %d node(s) of the POI)"
@@ -31696,7 +31696,7 @@ def sf_write_fault_distance(faults, base):
     n = 0
     with open(base + ".csv", "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["fault_id", "fault_bus", "bus_number", "hops_from_fault"])
+        w.writerow(["fault_id", "fault_bus", "bus_number", "nodes_from_fault"])
         for f in faults:
             fb = _fault_bus_number(f)
             if not fb:
@@ -31726,7 +31726,7 @@ def sf_write_radius_buses(poi_bus, hops, base):
                   key=lambda r: (r[3], -r[2], r[0]))
     with open(base + ".csv", "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["bus_number", "bus_name", "base_kV", "hops_from_POI"])
+        w.writerow(["bus_number", "bus_name", "base_kV", "nodes_from_POI"])
         for b, nm, kv, d in rows:
             w.writerow([b, nm, ("%.2f" % kv), d])
     with open(base + ".txt", "w") as fout:
