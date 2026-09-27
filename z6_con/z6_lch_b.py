@@ -672,6 +672,7 @@ STRAGGLER_MIN_DONE = 5
 HANG_ATTEMPTS = 2
 for _nm, _ev in (("STRAGGLER_FACTOR", "SPP_STRAGGLER_FACTOR"),
                  ("STRAGGLER_MIN_S", "SPP_STRAGGLER_MIN_S"),
+                 ("STRAGGLER_MIN_DONE", "SPP_STRAGGLER_MIN_DONE"),
                  ("HANG_ATTEMPTS", "SPP_HANG_ATTEMPTS")):
     try:
         _v = (os.environ.get(_ev) or "").strip()
