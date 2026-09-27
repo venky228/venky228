@@ -529,6 +529,8 @@ DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is s
 EGF_DYR_EDITS_BY_PROJECT = {}                # {"SantaFe": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}
 EGF_DYR_RUN = False                          # True = run BOTH cases with those edits (_egf) and compare
 EGF_OFF_RUN = False                          # True = run BOTH cases with every existing machine OFF (_egfoff) and compare
+EGF_OFF_BASE_RUN = False                     # True = run the BASE case ONLY with every existing machine OFF (_egfoff);
+                                             #   the PROJECT side of its comparisons is the surplus run s1_egfoff
 EGF_PROJECTS = []                            # [] = every project of the launch (EGF_DYR_RUN: those with edits)
 EGF_FAULTS = "same"                          # "same" = ONLY_FAULTS | "all" | ["F01-F04"]
 EGF_ONLY = True                              # True = a project WITH edits above runs ONLY its edited run (its as-is study
@@ -9382,17 +9384,27 @@ def compare_three_way(proj, mode):
         print("[3-way] %s: fewer than two project runs on disk -- the base comparison "
               "above is the whole story" % proj)
         return False
+    # THE BASE WITH THE EXISTING MACHINES OFF (EGF_OFF_RUN / EGF_OFF_BASE_RUN),
+    # when it is on disk: one more column against the base as it is, and the
+    # project with the EGF off against it (both sides EGF off) as its own group.
+    pairs = [(rb, d, "%s_%s_vs_BASE" % (proj, t)) for d, t in tests]
+    rbo = rb + "_" + EGF_OFF_TAG
+    if glob.glob(os.path.join(rbo, "outs", "*.out")):
+        pairs.append((rb, rbo, "%s_BASE_%s_vs_BASE" % (proj, EGF_OFF_TAG)))
+        psfx = _egf_project_off_suffix(proj, mode)
+        if psfx:
+            pairs.append((rbo, rt + psfx, "%s_%s_vs_BASE_%s" % (proj, psfx.lstrip("_"), EGF_OFF_TAG)))
     import tempfile
     tmp = tempfile.mkdtemp(prefix="z6_3way_")
     pj, dj = os.path.join(tmp, "pairs.json"), os.path.join(tmp, "done.json")
     with open(pj, "w") as fh:
-        json.dump([[rb, d, re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_%s_vs_BASE" % (proj, t))]
-                   for d, t in tests], fh)
+        json.dump([[b, d, re.sub(r"[^A-Za-z0-9_.-]+", "_", nm)] for b, d, nm in pairs], fh)
     env = dict(os.environ)
     env["CMP_MULTI_PAIRS"] = pj
     env["CMP_MULTI_DONE"] = dj
     env["CMP_MULTI_FULL"] = "1"          # every value read, none left '-'
-    _banner("%s: BASE | %s -- SIDE BY SIDE" % (proj, " | ".join(t for _d, t in tests)))
+    _banner("%s: BASE | %s -- SIDE BY SIDE" % (proj, " | ".join(
+        [t for _d, t in tests] + [nm[len(proj) + 1:] for _b, _d, nm in pairs[len(tests):]])))
     p = subprocess.Popen([PYTHON, "-u", cm], cwd=os.path.dirname(cm), env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          universal_newlines=True, bufsize=1)
@@ -9506,7 +9518,7 @@ def _egf_variants(proj):
         elif not EGF_PROJECTS or proj in EGF_PROJECTS:
             print("[egf] %s: EGF_DYR_RUN is on but EGF_DYR_EDITS_BY_PROJECT has no "
                   "entry for it -- no edited run" % proj)
-    if EGF_OFF_RUN:
+    if EGF_OFF_RUN or EGF_OFF_BASE_RUN:
         out.append((EGF_OFF_TAG, "existing machines OFF", {"SPP_EGF_OFF": "1"}))
     return out
 
@@ -9531,13 +9543,36 @@ def _egf_fault_env():
     return {"SPP_ONLY_FAULTS": txt, "SPP_REPORT_FAULTS": txt}
 
 
+def _egf_cases(tag):
+    """The cases one EGF variant simulates: both, except the EGF-off run asked
+       for by EGF_OFF_BASE_RUN alone (base case only)."""
+    if tag == EGF_OFF_TAG and EGF_OFF_BASE_RUN and not EGF_OFF_RUN:
+        return [CASE_BASE]
+    return [CASE_BASE, CASE_TEST]
+
+
+def _egf_project_off_suffix(proj, mode):
+    """The PROJECT-case folder suffix standing in for "project, EGF off": its own
+       _egfoff run, else a SURPLUS scenario run with the EGF off at full SGF
+       (s1_egfoff) -- the same system. None when neither is on disk."""
+    rt = results_dir(CASE_TEST, proj, mode)
+    cands = ["_" + EGF_OFF_TAG] + ["_" + sc["tag"] for sc in surplus_scenarios()
+                                   if sc["egf_off"] and sc.get("poi_mw") is None]
+    for sfx in cands:
+        if glob.glob(os.path.join(rt + sfx, "outs", "*.out")):
+            return sfx
+    return None
+
+
 def run_egf_variants(proj, mode):
-    """Both cases once per EGF variant, each into its own tagged folder."""
+    """The case(s) of each EGF variant once, each into its own tagged folder."""
     for tag, label, venv in _egf_variants(proj):
-        for case in (CASE_BASE, CASE_TEST):
+        for case in _egf_cases(tag):
             _banner("EXISTING MACHINES -- %s -- %s case -- %s"
                     % (proj, case["key"].upper(), label))
-            env = {"SPP_RUN_TAG": tag}
+            # ITS OWN REPORT at the end of its own run, as the surplus runs do:
+            # the panel's scoring pass has already run by the time this starts.
+            env = {"SPP_RUN_TAG": tag, "SPP_DEFER_REPORTS": "0"}
             env.update(venv)
             env.update(_egf_fault_env())
             env.update(_sweep_resume_env())
@@ -9592,11 +9627,21 @@ def compare_egf_variants(proj, mode):
                       (EGF_OFF_TAG, "existing machines OFF")):
         sfx = "_" + tag
         db = results_dir(CASE_BASE, proj, mode) + sfx
-        dt = results_dir(CASE_TEST, proj, mode) + sfx
+        # THE PROJECT SIDE: its own run, or (EGF off, EGF_OFF_BASE_RUN) the
+        # surplus run with the EGF off -- the same system, already on disk.
+        psfx = sfx
+        if tag == EGF_OFF_TAG:
+            psfx = _egf_project_off_suffix(proj, mode) or sfx
+        dt = results_dir(CASE_TEST, proj, mode) + psfx
+        if psfx != sfx and not os.path.isdir(db):
+            continue                   # no EGF-off run at all: the surplus comparisons cover it
         if not (os.path.isdir(db) or os.path.isdir(dt)):
             continue
         done.append(tag)
         nm = "egf_edited" if tag == EGF_TAG else "egf_off"
+        if psfx != sfx:
+            print("[egf] %s: PROJECT with the EGF off = %s (no %s run in the project case)"
+                  % (proj, os.path.basename(dt), sfx))
         pairs = [
             ("BASE_CASE/%s_vs_as_is" % nm,
              "%s -- BASE with the change vs BASE as it is" % what,
@@ -9604,10 +9649,10 @@ def compare_egf_variants(proj, mode):
              (results_dir(CASE_BASE, proj, mode), db)),
             ("PROJECT_VS_BASE/%s" % nm,
              "%s -- PROJECT vs BASE, both with the change" % what,
-             dict(test_suffix=sfx, base_suffix=sfx), (db, dt)),
+             dict(test_suffix=psfx, base_suffix=sfx), (db, dt)),
             ("PROJECT_CASE/%s_vs_as_is" % nm,
              "%s -- PROJECT with the change vs PROJECT as it is" % what,
-             dict(test_suffix=sfx, base_case=CASE_TEST, base_suffix=""),
+             dict(test_suffix=psfx, base_case=CASE_TEST, base_suffix=""),
              (results_dir(CASE_TEST, proj, mode), dt))]
         for sub, label, kw, dirs in pairs:
             miss = [d for d in dirs if not os.path.isdir(d)]
@@ -9645,8 +9690,11 @@ def write_egf_table(proj, mode, tags):
             ("PROJECT as is", results_dir(CASE_TEST, proj, mode))]
     for tag in tags:
         nm = "EDITED" if tag == EGF_TAG else "EGF OFF"
+        psfx = "_" + tag
+        if tag == EGF_OFF_TAG:
+            psfx = _egf_project_off_suffix(proj, mode) or psfx
         cols += [("BASE %s" % nm, results_dir(CASE_BASE, proj, mode) + "_" + tag),
-                 ("PROJECT %s" % nm, results_dir(CASE_TEST, proj, mode) + "_" + tag)]
+                 ("PROJECT %s" % nm, results_dir(CASE_TEST, proj, mode) + psfx)]
     data = []
     for nm, d in cols:
         crit = {}
@@ -17003,7 +17051,11 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=No
         for _c in _plot_cases(pipeline):
             for _p in (list(only_projects or PROJECTS) or [""]):
                 for _m in (list(MODES) or ["spp"]):
-                    n += _count_unplotted(results_dir(_c, _p, _m))
+                    # EVERY FOLDER THE PROJECT OWNS (_egfoff, _s1_egfoff ...),
+                    # not only the plain one -- the same set the pass draws.
+                    for _rd in (_result_folders_for(_c, _p, _m)
+                                or [results_dir(_c, _p, _m)]):
+                        n += _count_unplotted(_rd)
         if not n:
             return 0
     cases = _plot_cases(pipeline)
@@ -23599,13 +23651,6 @@ def main():
                 compare_surplus_scenarios(res["project"], res["mode"])
             except Exception as e:
                 print("[surplus] the scenario comparisons failed (%s)" % e)
-    # BASE | GIA | EACH SURPLUS SCENARIO, side by side, one workbook per project.
-    if results and SURPLUS_SCENARIOS and SURPLUS_SIDE_BY_SIDE:
-        for res in results:
-            try:
-                compare_three_way(res["project"], res["mode"])
-            except Exception as e:
-                print("[3-way] the side-by-side for %s failed (%s)" % (res["project"], e))
     # THE ALL-VARIANTS TABLE AGAIN, now the surplus runs are on disk: written
     # above before they ran, its scenario columns were empty.
     if results and SURPLUS_SCENARIOS:
@@ -23627,7 +23672,7 @@ def main():
         for _m in (list(MODES) or ["spp"]):
             if (_p, _m) not in _egf_pm:
                 _egf_pm.append((_p, _m))
-    if _egf_pm and (EGF_DYR_RUN or EGF_OFF_RUN) and pipeline != "compare":
+    if _egf_pm and (EGF_DYR_RUN or EGF_OFF_RUN or EGF_OFF_BASE_RUN) and pipeline != "compare":
         for _p, _m in _egf_pm:
             try:
                 run_egf_variants(_p, _m)
@@ -23640,6 +23685,24 @@ def main():
                 compare_egf_variants(_p, _m)
             except Exception as e:
                 print("[egf] the existing-machine comparisons failed (%s)" % e)
+    # ---- PDFs FOR THE EXTRA RUNS (surplus, EGF off) ----------------------
+    # Their in-run plotter trails the workers; whatever it had not reached when
+    # they ended is drawn here. Nothing to do -> returns at once.
+    if pipeline in ("all", "missing") and _res_n and (
+            SURPLUS_SCENARIOS or EGF_DYR_RUN or EGF_OFF_RUN or EGF_OFF_BASE_RUN):
+        try:
+            plot_missing_everywhere(pipeline, after_runs=True)
+        except Exception as e:
+            print("[compare] the catch-up plot pass for the extra runs failed (%s)" % e)
+    # BASE | GIA | EACH SURPLUS SCENARIO | BASE EGF OFF, side by side, one
+    # workbook per project -- AFTER the EGF runs, so the base with the existing
+    # machines off is on disk when it is written.
+    if results and SURPLUS_SCENARIOS and SURPLUS_SIDE_BY_SIDE:
+        for res in results:
+            try:
+                compare_three_way(res["project"], res["mode"])
+            except Exception as e:
+                print("[3-way] the side-by-side for %s failed (%s)" % (res["project"], e))
 
     if _res_n and CAPACITY_LEVELS and pipeline != "compare":
         for res in _res_n:
