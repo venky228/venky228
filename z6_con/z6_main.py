@@ -16284,37 +16284,66 @@ def _early_scorer_start(pjs, t_go):
               "in the final pass")
         return lambda: None
     stop = threading.Event()
-    busy = [0]
+    busy = {"score": 0, "plot": 0}          # shards scoring + plotters drawing
     lock = threading.Lock()
+    plot_q = []                             # finished projects waiting for PDFs
 
-    def _set_busy(k):
+    def _write_busy():
+        # caller holds the lock
+        tot = int(busy["score"]) + int(busy["plot"])
+        try:
+            if tot:
+                with open(_busy_file(), "w") as fh:
+                    fh.write("%d\n" % tot)
+            elif os.path.isfile(_busy_file()):
+                os.remove(_busy_file())
+        except Exception:
+            pass
+        return tot
+
+    def _set_busy(k, what="score"):
         with lock:
-            busy[0] = int(k)
-            try:
-                if k:
-                    with open(_busy_file(), "w") as fh:
-                        fh.write("%d\n" % int(k))
-                elif os.path.isfile(_busy_file()):
-                    os.remove(_busy_file())
-            except Exception:
-                pass
+            busy[what] = int(k)
+            _write_busy()
 
     def _beat():
-        # KEEPS THE BUSY FILE FRESH while a project is being scored; the
-        # launchers ignore a file older than 150 s, so a panel that died
-        # mid-score cannot hold their cores for ever.
+        # KEEPS THE BUSY FILE FRESH while anything is running; the launchers
+        # ignore a file older than 150 s, so a panel that died mid-score
+        # cannot hold their cores for ever.
         while True:
             with lock:
-                b = busy[0]
-                if b:
-                    try:
-                        with open(_busy_file(), "w") as fh:
-                            fh.write("%d\n" % b)
-                    except Exception:
-                        pass
-            if not b and stop.is_set():
+                tot = _write_busy()
+            if not tot and stop.is_set() and not _plot_th.is_alive():
                 return
             time.sleep(30.0)
+
+    def _plot_loop():
+        # PLOTS IN THEIR OWN THREAD. Drawing a project's PDFs can take an hour;
+        # in the scorer's thread it held up the scoring of every project that
+        # finished after it, and the final pass behind that.
+        while True:
+            with lock:
+                proj = plot_q.pop(0) if plot_q else None
+            if proj is None:
+                if stop.is_set():
+                    return
+                time.sleep(15.0)
+                continue
+            if stop.is_set():
+                continue                  # the final catch-up pass draws it
+            _np = max(1, min(int(PLOT_TOTAL_MAX or 1),
+                             _cores_ceiling() - _alive_sims() - busy["score"]))
+            _set_busy(_np, "plot")
+            try:
+                print("[early-score] %s: drawing the PDFs still missing, %d plotter(s)"
+                      % (proj, _np))
+                plot_missing_everywhere("all", after_runs=True,
+                                        only_projects=[proj], cap=_np)
+            except Exception as e:
+                print("[early-score] %s: plotting now failed (%s) -- the final "
+                      "catch-up pass will do it" % (proj, e))
+            finally:
+                _set_busy(0, "plot")
 
     def _loop():
         done = set()
@@ -16324,7 +16353,7 @@ def _early_scorer_start(pjs, t_go):
                     continue
                 if not _sim_finished(proj, t_go):
                     continue
-                free = _cores_ceiling() - _alive_sims()
+                free = _cores_ceiling() - _alive_sims() - busy["plot"]
                 if free < _EARLY_MIN_CORES:
                     break
                 # CLAIM, THEN LOOK AGAIN. A launcher starting its next project
@@ -16332,43 +16361,41 @@ def _early_scorer_start(pjs, t_go):
                 # writes the file and then re-reads theirs. One of the two
                 # always sees the other, so the ceiling holds.
                 _set_busy(free)
-                time.sleep(3.0)
-                free = min(free, _cores_ceiling() - _alive_sims())
-                if free < _EARLY_MIN_CORES:
-                    _set_busy(0)
-                    break
-                _set_busy(free)
-                done.add(proj)
-                print("[early-score] %s has finished simulating in both cases -- scoring "
-                      "it now on %d idle core(s) while the rest simulate" % (proj, free))
                 try:
-                    if not ensure_reports(MODES, only_projects=[proj], shards=free, early=True):
-                        print("[early-score] %s: already scored by the workers -- nothing "
-                              "to do" % proj)
-                except Exception as e:
-                    print("[early-score] %s could not be scored now (%s) -- the final "
-                          "pass will do it" % (proj, e))
-                # AND ITS PLOTS, while the rest simulate. The in-run plotter is
-                # one process per folder trailing 22 workers; it falls behind,
-                # and SantaFe ended its simulations with 8 PDFs of 181. The
-                # catch-up pass for THIS project runs now, on the same cores,
-                # at most PLOT_TOTAL_MAX plotters (each holds ~550 MB).
-                if PLOT_MISSING_OUTS and MAKE_PLOTS is not False and not stop.is_set():
-                    _np = max(1, min(free, int(PLOT_TOTAL_MAX or free)))
-                    _set_busy(_np)
+                    time.sleep(3.0)
+                    free = min(free, _cores_ceiling() - _alive_sims() - busy["plot"])
+                    if free < _EARLY_MIN_CORES:
+                        break
+                    _set_busy(free)
+                    done.add(proj)
+                    print("[early-score] %s has finished simulating in both cases -- "
+                          "scoring it now on %d idle core(s) while the rest simulate"
+                          % (proj, free))
                     try:
-                        print("[early-score] %s: drawing the PDFs still missing, %d plotter(s)"
-                              % (proj, _np))
-                        plot_missing_everywhere("all", after_runs=True,
-                                                only_projects=[proj], cap=_np)
+                        if not ensure_reports(MODES, only_projects=[proj], shards=free,
+                                              early=True):
+                            print("[early-score] %s: already scored by the workers -- "
+                                  "nothing to do" % proj)
                     except Exception as e:
-                        print("[early-score] %s: plotting now failed (%s) -- the final "
-                              "catch-up pass will do it" % (proj, e))
-                _set_busy(0)
+                        print("[early-score] %s could not be scored now (%s) -- the "
+                              "final pass will do it" % (proj, e))
+                    # AND ITS PLOTS, while the rest simulate -- queued for the
+                    # plot thread. The in-run plotter trails 22 workers and
+                    # falls behind: SantaFe ended its simulations with 8 PDFs
+                    # of 181.
+                    if PLOT_MISSING_OUTS and MAKE_PLOTS is not False:
+                        with lock:
+                            plot_q.append(proj)
+                finally:
+                    _set_busy(0)
 
     th = threading.Thread(target=_loop)
     th.daemon = True
     th.start()
+    _plot_th = threading.Thread(target=_plot_loop)
+    _plot_th.daemon = True
+    _plot_th.start()
+    _EARLY_PLOT_THREADS.append(_plot_th)
     hb = threading.Thread(target=_beat)
     hb.daemon = True
     hb.start()
@@ -16377,12 +16404,27 @@ def _early_scorer_start(pjs, t_go):
 
     def _stop():
         stop.set()
-        if busy[0]:
+        if busy["score"]:
             print("[early-score] waiting for the project being scored to finish ...")
-        # TIMED, so Ctrl+C still reaches this process on Windows.
+        # TIMED, so Ctrl+C still reaches this process on Windows. The PLOT
+        # thread is not waited for here -- the final scoring does not need the
+        # PDFs; _early_plots_wait() holds the final catch-up plot pass instead.
         while th.is_alive():
             th.join(1.0)
     return _stop
+
+
+_EARLY_PLOT_THREADS = []
+
+
+def _early_plots_wait():
+    """Before the final catch-up plot pass: let the early plotter finish the
+       project it is drawing, so the two never draw the same folder."""
+    for t in _EARLY_PLOT_THREADS:
+        if t.is_alive():
+            print("[early-score] waiting for the early plotter to finish its project ...")
+        while t.is_alive():
+            t.join(1.0)
 
 
 def _case_thread_begin(case_key):
@@ -23531,6 +23573,7 @@ def main():
     # After the simulations and before the comparison, so the plots exist by the
     # time anyone opens the folder the comparison points at.
     if pipeline in ("all", "missing"):
+        _early_plots_wait()
         try:
             plot_missing_everywhere(pipeline, after_runs=True)
         except Exception as e:

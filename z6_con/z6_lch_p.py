@@ -698,7 +698,7 @@ def _straggler_limit():
         secs = _scenario_secs(ids)
     except Exception:
         secs = []
-    if len(secs) < int(STRAGGLER_MIN_DONE):
+    if not secs or len(secs) < max(1, int(STRAGGLER_MIN_DONE)):
         _STRAG["lim"] = 0.0
     else:
         _STRAG["lim"] = max(float(STRAGGLER_MIN_S), float(STRAGGLER_FACTOR) * max(secs))

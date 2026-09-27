@@ -5540,7 +5540,12 @@ def _bus_map_write():
     except Exception:
         pass
     try:
-        with open(p + ".tmp", "w") as fh:
+        # ONE TEMP FILE PER PROCESS. Every worker rebuilds this map on restore,
+        # and 22 of them writing the same ".tmp" on Windows collided: one
+        # replace failed, its fallback deleted the good map, and a plotter
+        # reading in that gap cached an empty one for the rest of its life.
+        _tmp = "%s.%d.tmp" % (p, os.getpid())
+        with open(_tmp, "w") as fh:
             fh.write("V,4\n")   # map version: 4 = three-winding legs + X/T3/M/S element rows
             for num, ar, name, base in zip(bi[0], bi[1],
                                            nm[0] if je == 0 else [""] * len(bi[0]),
@@ -5652,11 +5657,25 @@ def _bus_map_write():
                       "in the reports will be unavailable" % _e)
         # os.replace does not exist on Python 3.4's older builds' os for all
         # platforms? It does (3.3+). Atomic either way.
-        try:
-            os.replace(p + ".tmp", p)
-        except Exception:
-            os.remove(p)
-            os.rename(p + ".tmp", p)
+        # REPLACE, RETRIED -- never delete the good map first. A reader holding
+        # it open makes os.replace fail for a moment on Windows; waiting is
+        # right, removing it is not.
+        _done = False
+        for _k in range(20):
+            try:
+                os.replace(_tmp, p)
+                _done = True
+                break
+            except Exception:
+                time.sleep(0.25)
+        if not _done:
+            try:
+                os.remove(_tmp)
+            except Exception:
+                pass
+            print("  [busmap] %s is in use -- left as it is (another process "
+                  "wrote the same map)" % os.path.basename(p))
+            return
         print("  [busmap] %d bus(es), %d area name(s) -> %s"
               % (len(bi[0]), len(an), os.path.basename(p)))
     except Exception as e:
@@ -21638,11 +21657,14 @@ def evaluate_case(path, kind, tclear, kb):
                                    "; SETTLES -- evaluate individually" if _settles else ""))
                     undamped_all.append((chan_label(ti), dev, info["sppr1"], info["sppr5"]))
                     if _settles:
+                        # Named in the "Evaluate individually" line only. NOT
+                        # added to review_all: that list feeds the violations
+                        # report and the comparison as "below 16 deg / not
+                        # counted", and this machine IS a counted violation --
+                        # listing it there too made two rows for one machine.
                         review.append("%s(%.0fdeg %s -- SPPR not met but the angle "
                                       "settles: evaluate individually)"
                                       % (chan_label(ti), dev, r1))
-                        review_all.append((chan_label(ti) + " [SPPR not met, angle "
-                                           "settles -- evaluate individually]", dev))
         else:
             _ok2, _i2 = spp_damping(seg)
             _sp2 = _i2.get("sppr") or {}
@@ -28965,8 +28987,8 @@ def _sf_load_case_for_topology():
     _SF_ADJ = None
     _SF_NB_CACHE = None
     _SF_LINE_AT = None
-    # the distance graph was cached from whatever case came before
-    for _g in ("_DIST_ADJ", "_POI_HOPS"):
+    # the distance graph and bus index were cached from whatever case came before
+    for _g in ("_DIST_ADJ", "_POI_HOPS", "_BUSIDX"):
         if _g in globals():
             globals()[_g] = None
     try:
