@@ -16047,7 +16047,13 @@ def compare_now(quiet=True):
             continue
         only_b |= set(ob)
         only_t |= set(ot)
-        for proj in [p for p in common if (not _panel_projects() or p in _panel_projects())]:
+        # IN THE PANEL'S ORDER, not the alphabet's. discover_projects() sorts,
+        # so every per-project step after the simulations -- the SGF-only runs,
+        # the comparisons, the side-by-sides -- went EastFork, EmpirePrairie,
+        # IronStar, SantaFe whatever PROJECTS said.
+        _po = dict((p, i) for i, p in enumerate(_panel_projects() or []))
+        _common = sorted(common, key=lambda p: (_po.get(p, len(_po)), p))
+        for proj in [p for p in _common if (not _panel_projects() or p in _panel_projects())]:
             try:
                 res = compare_project(proj, mode)
             except Exception as e:
@@ -16342,8 +16348,23 @@ def _early_scorer_start(pjs, t_go):
                 except Exception as e:
                     print("[early-score] %s could not be scored now (%s) -- the final "
                           "pass will do it" % (proj, e))
-                finally:
-                    _set_busy(0)
+                # AND ITS PLOTS, while the rest simulate. The in-run plotter is
+                # one process per folder trailing 22 workers; it falls behind,
+                # and SantaFe ended its simulations with 8 PDFs of 181. The
+                # catch-up pass for THIS project runs now, on the same cores,
+                # at most PLOT_TOTAL_MAX plotters (each holds ~550 MB).
+                if PLOT_MISSING_OUTS and MAKE_PLOTS is not False and not stop.is_set():
+                    _np = max(1, min(free, int(PLOT_TOTAL_MAX or free)))
+                    _set_busy(_np)
+                    try:
+                        print("[early-score] %s: drawing the PDFs still missing, %d plotter(s)"
+                              % (proj, _np))
+                        plot_missing_everywhere("all", after_runs=True,
+                                                only_projects=[proj], cap=_np)
+                    except Exception as e:
+                        print("[early-score] %s: plotting now failed (%s) -- the final "
+                              "catch-up pass will do it" % (proj, e))
+                _set_busy(0)
 
     th = threading.Thread(target=_loop)
     th.daemon = True
@@ -16745,7 +16766,7 @@ def _plot_cases(pipeline):
     return cases or [CASE_BASE, CASE_TEST]
 
 
-def plot_missing_everywhere(pipeline, after_runs=False):
+def plot_missing_everywhere(pipeline, after_runs=False, only_projects=None, cap=None):
     """Draw every missing PDF, in ROUNDS, with fewer plotters each time.
 
        WHY ROUNDS. A plotter is a 32-bit process reading a ~113 MB .out into
@@ -16788,7 +16809,8 @@ def plot_missing_everywhere(pipeline, after_runs=False):
                   "are reading at once.")
             print("[compare] " + "=" * 70)
         before = left
-        left = _plot_missing_pass(pipeline, after_runs=after_runs, n_plot=n)
+        left = _plot_missing_pass(pipeline, after_runs=after_runs, n_plot=n,
+                                  only_projects=only_projects, cap=cap)
         if not left:
             return
         if before is not None and left >= before:
@@ -16899,7 +16921,7 @@ def clear_stale_plot_claims(jobs):
     return freed
 
 
-def _plot_missing_pass(pipeline, after_runs=False, n_plot=None):
+def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=None, cap=None):
     """Draw the PDFs for .out files that have none, in every results folder this
        run covers -- BOTH cases, every project, every mode.
 
@@ -16937,13 +16959,13 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None):
         # .out without a PDF" means exactly what it says.
         n = 0
         for _c in _plot_cases(pipeline):
-            for _p in (list(PROJECTS) or [""]):
+            for _p in (list(only_projects or PROJECTS) or [""]):
                 for _m in (list(MODES) or ["spp"]):
                     n += _count_unplotted(results_dir(_c, _p, _m))
         if not n:
             return 0
     cases = _plot_cases(pipeline)
-    projs = list(PROJECTS) or [""]
+    projs = list(only_projects or PROJECTS) or [""]
     modes = list(MODES) or ["spp"]
     print("")
     print("[compare] " + "=" * 70)
@@ -17050,7 +17072,7 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None):
     # THE PLOT FLEET COMES OUT OF THE SAME BUDGET AS THE SIMULATIONS.
     # PLOT_TOTAL_MAX used to sit outside CORES_MAX entirely, so the two pools
     # were sized independently and the machine carried both.
-    _cap = _plot_core_budget()
+    _cap = int(cap) if cap else _plot_core_budget()
     _cap = max(1, min(_cap, len(jobs) * n_plot))
     for case, proj, mode, rdir in jobs:
         print("[compare] %s / %s / %s  -- %d to draw"
