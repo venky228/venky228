@@ -12993,7 +12993,9 @@ def restore_and_init(snp=SNP_FILE, cnv=CNV_CASE):
         # P, Q, Eterm, angle or speed for the project's own machines, and the
         # .out then has nothing to plot for the plant the study is about.
         # The case is loaded by this point, so the ids can be resolved here.
-        _build_bus_index()
+        # force=True: the index (and flags\BUS_MAP.csv) may still describe a
+        # case this process loaded earlier -- the deck, before the plant.
+        _build_bus_index(force=True)
         _resolve_project_gens()
         add_channels()
         print("  [%s] channels done -- applying scan options" % _ts()); sys.stdout.flush()
@@ -28101,6 +28103,18 @@ def _dist_nbrs(bus):
             for x, y in _branches():
                 adj.setdefault(int(x), set()).add(int(y))
                 adj.setdefault(int(y), set()).add(int(x))
+            # TWO-WINDING TRANSFORMERS. _branches() is abrnint -- lines only --
+            # so every GSU and MPT was a dead end: the plant's own units read
+            # "more than 30 nodes" from a fault at its POI. The bus map adds
+            # these the same way (_bus_map_write).
+            try:
+                _ie, _a = psspy.atrnint(-1, 1, 3, 2, 1, ["FROMNUMBER", "TONUMBER"])
+                if _ie == 0 and _a and len(_a) >= 2:
+                    for x, y in zip(_a[0], _a[1]):
+                        adj.setdefault(int(x), set()).add(int(y))
+                        adj.setdefault(int(y), set()).add(int(x))
+            except Exception:
+                pass
             for _w1, _w2, _w3 in _three_wind_legs():      # three-winding legs too
                 for _a, _b in ((_w1, _w2), (_w1, _w3), (_w2, _w3)):
                     adj.setdefault(_a, set()).add(_b)
@@ -28901,7 +28915,16 @@ def _sf_load_case_for_topology():
        nothing -- which reads as "no faults near the POI" rather than as an
        error."""
     _sf_loaded = False
-    for _p in (SAV_CASE, CNV_CASE):
+    # CHOSEN NOW, NOT AT IMPORT. SAV_CASE switches to MOD_SAV only if MOD_SAV
+    # existed when this module was imported; a launch that builds it in this
+    # same process then enumerated the deck, without the project.
+    _cands = [SAV_CASE, CNV_CASE]
+    try:
+        if ENABLE_BESS and os.path.isfile(MOD_SAV):
+            _cands = [MOD_SAV] + [c for c in _cands if os.path.abspath(c) != os.path.abspath(MOD_SAV)]
+    except Exception:
+        pass
+    for _p in _cands:
         if os.path.isfile(_p):
             try:
                 ie = psspy.case(_p)
@@ -28924,6 +28947,14 @@ def _sf_load_case_for_topology():
     _SF_ADJ = None
     _SF_NB_CACHE = None
     _SF_LINE_AT = None
+    # the distance graph was cached from whatever case came before
+    for _g in ("_DIST_ADJ", "_POI_HOPS"):
+        if _g in globals():
+            globals()[_g] = None
+    try:
+        _HOPS_CACHE.clear()
+    except Exception:
+        pass
     _SF_LOAD_BUSES = None
     global _BR_SCAN
     _BR_SCAN = None
