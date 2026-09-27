@@ -18659,7 +18659,8 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             continue
         _banner("%s: %d project(s) need scoring -- .out with no report, or a report "
                 "older than them" % (case["label"], len(set(need))))
-        print("[compare] %s" % ", ".join(need))
+        _po0 = dict((p, i) for i, p in enumerate(_panel_projects() or []))
+        print("[compare] %s" % ", ".join(sorted(set(need), key=lambda p: (_po0.get(p, len(_po0)), p))))
         print("[compare] this reads .out files and runs NO simulation.")
         # WHAT EACH FOLDER GETS. A folder that needs scoring for any of the
         # older reasons (forced, stale, thin, no measurements) gets the full
@@ -18670,12 +18671,15 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
         # names that pass's own reports _SELECTED; the auto-merge that follows
         # rebuilds the full reports from every part, the new ones included.
         _gap_ids = dict(gaps)
+        # IN PROJECTS ORDER, so the first project on the panel is scored first.
+        _po = dict((p, i) for i, p in enumerate(_panel_projects() or []))
+        _pkey = lambda p: (_po.get(p, len(_po)), p)
         _full = sorted(set(p for p in need
-                           if p not in _gap_ids or need.count(p) > 1))
+                           if p not in _gap_ids or need.count(p) > 1), key=_pkey)
         _runs = []
         if _full:
             _runs.append((_full, dict(env_extra_base)))
-        for proj in sorted(_gap_ids):
+        for proj in sorted(_gap_ids, key=_pkey):
             if proj in _full:
                 continue
             _e = dict(env_extra_base)
