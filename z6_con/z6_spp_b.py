@@ -10163,6 +10163,43 @@ def _pssbin_dirs():
     return out
 
 
+def _env_manager_pythons():
+    """[(python.exe, where psse_env_manager is)] -- every Python on this
+       machine whose own folders hold PSS/E's psse_env_manager.
+
+       PSS/E's installer does not put it under the PSS/E folder: it goes into
+       the site-packages of the Python chosen at install time. cload4 works
+       only under that Python, so uninstalling it (or letting the .py
+       association move to another one) stops every link. The study's own
+       interpreter comes first when it has the module."""
+    import glob as _g
+    roots = []
+    exe0 = os.path.dirname(sys.executable or "")
+    if exe0:
+        roots.append(exe0)
+    pats = [r"C:\Python*", r"C:\Program Files\Python*", r"C:\Program Files (x86)\Python*"]
+    la = os.environ.get("LOCALAPPDATA") or ""
+    if la:
+        pats.append(os.path.join(la, "Programs", "Python", "Python*"))
+    for pat in pats:
+        roots += [d for d in sorted(_g.glob(pat)) if os.path.isdir(d)]
+    out, seen = [], set()
+    for r in roots:
+        key = os.path.normcase(os.path.normpath(r))
+        if key in seen:
+            continue
+        seen.add(key)
+        exe = os.path.join(r, "python.exe")
+        if not os.path.isfile(exe):
+            continue
+        for sub in (os.path.join("Lib", "site-packages"), "Lib", os.path.join("Lib", "site-packages", "psse")):
+            hit = _g.glob(os.path.join(r, sub, "psse_env_manager*"))
+            if hit:
+                out.append((exe, hit[0]))
+                break
+    return out
+
+
 def _compile_diag(env):
     """WHAT DECIDES WHICH PYTHON cload4 GETS -- printed before every link.
 
@@ -10200,6 +10237,10 @@ def _compile_diag(env):
         break
     print("  [dyr] psse_env_manager exists: %s"
           % ("; ".join(found[:8]) if found else "nowhere under the PSS/E folder"))
+    py_hits = _env_manager_pythons()
+    print("  [dyr] ... and in Pythons    : %s"
+          % ("; ".join(h for _e, h in py_hits[:6]) if py_hits else
+             "none of C:\\Python*, Program Files\\Python*, LOCALAPPDATA\\Programs\\Python"))
 
 
 def _cload4_shim():
@@ -10230,17 +10271,29 @@ def _cload4_shim():
             break
     if not c4 or not sys.executable:
         return "", ""
+    # THE PYTHON THAT HAS psse_env_manager, when that is not this one.
+    py = sys.executable
+    try:
+        hits = _env_manager_pythons()
+        if hits and not any(os.path.normcase(e) == os.path.normcase(sys.executable)
+                            for e, _h in hits):
+            py = hits[0][0]
+    except Exception:
+        pass
     try:
         with open(here, "w") as fh:
             fh.write("@echo off\n")
             fh.write("rem written by the study for one link and removed afterwards:\n")
             fh.write("rem PSS/E's cload4.py run by the study's own Python\n")
-            fh.write('"%s" "%s" %%*\n' % (sys.executable, c4))
+            if py != sys.executable:
+                # another Python version: not this one's PSSPY## folders
+                fh.write("set PYTHONPATH=\n")
+            fh.write('"%s" "%s" %%*\n' % (py, c4))
             fh.write("exit /b %errorlevel%\n")
     except Exception as e:
         return "", "could not write %s (%s) -- cload4 runs as Windows opens it" % (here, e)
     return here, "cload4 runs as: %s %s  (via %s, removed after the link)" % (
-        sys.executable, c4, here)
+        py, c4, here)
 
 
 def _dyr_compile_user_models(changed):
