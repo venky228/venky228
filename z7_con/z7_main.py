@@ -318,6 +318,12 @@ def _print_phase_times(total):
 #   None = leave the study scripts' own value. Values go to BOTH cases.
 # ============================================================================
 
+# ---- 0. QUICK .dyr TEST (project BESS) -- one project per launch ----------------
+# "EastFork" = run 1, "SantaFe" = run 2, None = normal study (every setting below as it was).
+# It sets PROJECTS, PIPELINE, RUN_CASES, ONLY_FAULTS, DYR_SHOW, DYR_SWEEP_BY_PROJECT /
+# _PROJECTS (see the end of section 12). New folders only: <proj>_spp_dyr_<tag>.
+QUICK_DYR_TEST = "EastFork"
+
 # ---- 1. WHAT TO RUN ------------------------------------------------------------
 PROJECTS = ["SantaFe", "IronStar","EmpirePrairie","EastFork"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
@@ -669,6 +675,28 @@ DYR_SWEEP_FAULTS = "all"                     # "all" | "failing" | "crashed"
 DYR_SWEEP_COMPARE = True                     # full comparison per value
 DYR_SWEEP_SKIP_DECK = True                   # skip a value the deck already has
 DYR_DECK_VALUES = {}                         # override the deck values read from the template
+
+# QUICK_DYR_TEST (section 0). Constant names as the project's BESS_MODEL_TEMPLATE
+# records name them (REECCU1 has no Thld -- that is REECA1). Deck: Kqv 0.5,
+# Volim 1.2, Khv 0.0, Vfrz 0.88. Every combination is one run.
+_QUICK_DYR = {
+    "EastFork": {"faults": ["F01", "F06", "F07", "F17", "F30"],   # 3 still failing + 2 the EGF-off run cleared
+                 "sweep": {"REECCU1": {"Kqv": [0.0, 1.0]}}},
+    "SantaFe":  {"faults": ["F03", "F07", "F12", "F17"],
+                 "sweep": {"REECCU1": {"Kqv": [0.0, 1.0]},
+                           "REGCAU1": {"Volim": [1.1], "Khv": [0.7]},
+                           "REPCAU1": {"Vfrz": [0.9]}}},
+}
+if QUICK_DYR_TEST:
+    PROJECTS = [QUICK_DYR_TEST]
+    PIPELINE = "missing"                     # the sweep does not run under "compare"
+    RUN_CASES = "proj"
+    ONLY_FAULTS = list(_QUICK_DYR[QUICK_DYR_TEST]["faults"])
+    SKIP_DONE = True
+    DYR_SHOW = ["REECCU1", "REGCAU1", "REPCAU1"]     # prints the current values -- check them first
+    DYR_SWEEP_BY_PROJECT = {QUICK_DYR_TEST: _QUICK_DYR[QUICK_DYR_TEST]["sweep"]}
+    DYR_SWEEP_PROJECTS = [QUICK_DYR_TEST]
+    DYR_SWEEP_FAULTS = "all"                 # "all" is cut down to ONLY_FAULTS
 
 # ---- 13. COLLECTOR SYSTEM ------------------------------------------------------
 COLLECTOR_ON = True                          # False = leave every collector alone
