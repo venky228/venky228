@@ -12,6 +12,12 @@ project EGF off, sweeps, ...):
     violations_export\\SUMMARY.txt               per scenario: faults, pass, fail, violations, source
     violations_export.zip                        all of the above, to hand over in one file
 
+BACKUP FOLDERS ARE LEFT OUT: any folder (or folder above it) whose name has
+backup / bak / old / prev / previous / archive / copy / before as a word, or
+ends __run<n> (a previous run set aside), _prev_<time> or _before_fixed_<time>.
+Each one skipped is listed on screen and in SUMMARY.txt. Add more words to
+SKIP_WORDS below.
+
 Where a folder's merged report is incomplete (a merge that did not finish),
 the faults it lacks are read from parts\\SCEN_<id>.csv -- the worker's own
 score -- exactly as the comparison does; the "source" column says which.
@@ -33,6 +39,18 @@ ROOT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] \
     else os.path.dirname(os.path.abspath(__file__))
 ONLY = [p.strip() for p in (sys.argv[2] if len(sys.argv) > 2 else "").split(",") if p.strip()]
 OUT = os.path.join(ROOT, "violations_export")
+
+SKIP_WORDS = ("backup", "backups", "bak", "old", "prev", "previous", "archive",
+              "archived", "copy", "before")
+SKIPPED = []
+
+
+def _is_backup(name):
+    """EastFork_spp__run2, IronStar_spp_prev_0927_1015, backup, 'X - Copy' ..."""
+    if re.search(r"__run\d+$", name):
+        return True
+    return any(w in SKIP_WORDS for w in re.split(r"[^a-z0-9]+", name.lower()))
+
 
 VIO_COLS = ["fault_id", "fault_result", "violation", "element", "value", "unit",
             "time_s", "area", "area_name", "nodes_from_fault", "fault_bus", "note",
@@ -62,6 +80,10 @@ def run_folders():
             continue
         for d, dirs, files in os.walk(top):
             dirs.sort()
+            if os.path.relpath(d, top) != "." and _is_backup(os.path.basename(d)):
+                SKIPPED.append(d)
+                dirs[:] = []
+                continue
             has_vio = any(f.upper().startswith("02_VIOLATIONS_") and f.lower().endswith(".csv")
                           for f in files)
             if not (has_vio or os.path.isdir(os.path.join(d, "parts"))
@@ -247,6 +269,9 @@ def main():
                  "from parts\\SCEN_<id>.csv (the worker's own score).\n\nFolders:\n")
         for s in summary:
             fh.write("  %-14s %-30s %s\n" % (s[0], s[1], s[9]))
+        fh.write("\nBackup folders left out (%d):\n" % len(SKIPPED))
+        for d in SKIPPED:
+            fh.write("  %s\n" % d)
     written.append("SUMMARY.txt")
     zp = OUT + ".zip"
     with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
