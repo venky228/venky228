@@ -1346,6 +1346,25 @@ def _el_rank(z4, cls):
     return 1
 
 
+def _cycles(fam, secs):
+    """Seconds above 1.20 pu as cycles (60 Hz), for an overvoltage row."""
+    if fam != "overshoot":
+        return "-"
+    if isinstance(secs, str) and ":" in secs:
+        return secs                     # comparisons disagree -- each named, as the value
+    v = _num(secs)
+    if v is None:
+        return secs if str(secs).strip() not in ("", "None") else "-"
+    return round(v * 60.0, 1)
+
+
+def _pu3(fam, v):
+    """A measured pu value to 3 decimals (1.073228359 -> 1.073); text as it is."""
+    if fam in ("overshoot", "recovery", "steady") and isinstance(v, float):
+        return round(v, 3)
+    return v
+
+
 def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
     """Sheet 2: one row per fault x criterion x ELEMENT (bus or machine) --
        the reference value and state, then each scenario's value, state and
@@ -1369,8 +1388,12 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
     # past-limit per comparison, then states; the element's particulars last.
     header = ["fault", "criterion", "element", "bus_number", "limit"]
     widths = [8, 22, 18, 10, 12]
+    # EACH VALUE WITH ITS TIME ABOVE 1.20 pu BESIDE IT, in cycles -- "1.24 pu,
+    # 3 cycles" read in one glance per scenario (transient overvoltage rows;
+    # '-' on every other criterion).
     for x in lay["refs"] + lay["tests"]:
         header.append("value | %s" % x); widths.append(_w["value"])
+        header.append("cycles_above_1.20 | %s" % x); widths.append(9)
     header.append("worst_across_scenarios"); widths.append(26)
     for nm in ("change", "class", "past_limit"):
         for t in tags:
@@ -1397,11 +1420,16 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
         limit = _merge_one(s, "limit")            # to judge with
         row = [fid, crit, ctx["label"].get(k, el), bus, _merge_get(s, "limit", z4)]
         got, own = {}, {}                         # comparison -> [value, state, class, change, past]
+        above = {}                                # comparison -> seconds above 1.20 pu
         worst, rank = "", -1
         for t in tags:
             r = ctx["det"][t].get(k)
             f = ctx["fills"].get((lay["tt_of"][t],) + k)
             own[t] = r is not None
+            a = r[RC["secs_above_1_20_project"]] if (r is not None and "secs_above_1_20_project" in RC) else None
+            if (a is None or _empty(z4, a)) and f:
+                a = f[2]
+            above[t] = a
             if r is None and not crit:
                 cells = ["-", "-", "-", "-", "-"]
                 cls = "-"
@@ -1430,9 +1458,12 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
             if rk2 > rank:
                 rank, worst = rk2, ("%s: %s" % (t, cls) if rk2 > 0 else cls)
         for b in bs:
-            row.append(_merge_get(b, "base_value", z4, default="-"))
+            row.append(_pu3(fam, _merge_get(b, "base_value", z4, default="-")))
+            row.append(_cycles(fam, _merge_get(b, "secs_above_1_20_base", z4, default="-")))
         for tt in lay["tests"]:
-            row.append(_per_test(z4, [(t, got[t][0], own[t]) for t in lay["of_test"][tt]]))
+            row.append(_pu3(fam, _per_test(z4, [(t, got[t][0], own[t]) for t in lay["of_test"][tt]])))
+            row.append(_cycles(fam, _per_test(z4, [(t, above[t], own[t])
+                                                   for t in lay["of_test"][tt]])))
         row.append(worst or "-")
         for ix in (3, 2, 4):                      # change, class, past_limit
             for t in tags:
