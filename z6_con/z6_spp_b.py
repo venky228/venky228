@@ -34631,6 +34631,11 @@ def plot_missing_outs():
             if os.name == "nt":
                 _kw["creationflags"] = 0x08000000            # CREATE_NO_WINDOW
             sys.stdout.flush()
+            # THE SUCCESSOR NEEDS THE FOLDER'S PLOTTER LOCK. This process draws
+            # nothing more; holding the lock while it waited made the successor
+            # find a live holder and exit at once, so a replot redrew one PDF
+            # per run folder.
+            _plotter_lock_release()
             _rc = _sp.call([sys.executable, "-u", os.path.abspath(__file__)], **_kw)
             print("[plot-missing] replot: the next plotter finished (rc %s)" % _rc)
         except Exception as _e:
