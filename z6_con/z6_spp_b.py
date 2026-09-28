@@ -10094,6 +10094,34 @@ def _snapshot_dll_matches():
     return bool(want) and want == have
 
 
+def _dll_is_snapshots_own():
+    """True when dsusr.dll is the build this snapshot was made with: both
+       records name the same conec/conet, the .dll is there, and it has not
+       been replaced since its record was written. Prints nothing.
+
+       WHAT A REUSED SNAPSHOT NEEDS. _user_models_are_current() compares the
+       .dll with the conec/conet ON DISK, and those are only what the last
+       dyre_new in this folder left -- the other case's, another project's, or
+       this deck's written again after the link. Measured against them, every
+       worker of a reused snapshot relinked a .dll that already matched it
+       (and stopped the run where the link could not be done), and a folder
+       whose conec/conet were another deck's would have linked the wrong one."""
+    dll = os.path.join(STUDY_DIR, "dsusr.dll")
+    rec = _flx_signature_file()
+    try:
+        with open(_snapshot_sig_file()) as fh:
+            want = fh.read().strip()
+        with open(rec) as fh:
+            have = fh.read().strip()
+        if not (want and want == have and os.path.isfile(dll)):
+            return False
+        # A .dll linked after its record (by hand, or by a build that died
+        # before writing one) is not the one the record describes.
+        return os.path.getmtime(dll) <= os.path.getmtime(rec) + 2.0
+    except Exception:
+        return False
+
+
 def _snapshot_sig_mark(snp=None):
     try:
         sig = _flx_signature()
@@ -32514,11 +32542,16 @@ def main():
         # dyre_new left are still on disk and are the whole of what the build
         # reads, so the build is RUN here rather than described.
         _dll_ok = False
+        _own = False
         try:
-            _dll_ok = _user_models_are_current()
+            _own = _dll_is_snapshots_own()
+            _dll_ok = _own or _user_models_are_current()
         except Exception:
             _dll_ok = False
-        if _dll_ok:
+        if _own:
+            _dll_stamp("(snapshot reused -- dsusr.dll is the build this snapshot "
+                       "was made with)")
+        elif _dll_ok:
             _dll_stamp("(snapshot reused -- dsusr.dll already matches this deck)")
         elif (os.path.isfile(_abspath(CONEC_FLX))
               and os.path.isfile(_abspath(CONET_FLX))):
