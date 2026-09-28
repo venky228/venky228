@@ -649,7 +649,7 @@ DYR_DISABLE_APPLY_TO = "both"                # "both" | "project" | "base"
 DYR_DISABLE_STRICT = True                    # True = stop if a disable matches nothing
 DYR_SHOW = []                                # print these models from the deck, e.g. ["REECAU1"]
 DYR_SCOPE = "project"                        # "project" machines only | "deck" everywhere
-DYR_COMPILE_WHEN = None                      # when to run the compile .bat files
+DYR_COMPILE_WHEN = "never"                   # no compile: use the dsusr.dll already in each folder (cload4 cannot run on this PC -- psse_env_manager missing)
 DYR_COMPILE_BATS = ["MyCompile34.bat", "MyCload41.bat"]
 DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is saved
 # EGF = the EXISTING machines at each project's feeder buses (not the BESS). Each run

@@ -325,10 +325,10 @@ def _print_phase_times(total):
 QUICK_DYR_TEST = None                  # "EastFork" / "SantaFe" = quick test (see z6_main1.py)
 
 # ---- 1. WHAT TO RUN ------------------------------------------------------------
-PROJECTS = ["SantaFe", "IronStar","EmpirePrairie","EastFork"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
+PROJECTS = ["EmpirePrairie"]        #["SantaFe", "IronStar","EmpirePrairie","EastFork"]   
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
 MODES = ["spp"]                              # fault set: spp | con | table | custom | manual
-PIPELINE = "compare"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
+PIPELINE = "all"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
 RUN_CASES = "both"                           # "both" | "base" | "proj" -- which case to simulate
 ONLY_FAULTS = []                    # [] = every fault | e.g. ["F01-F04"]
 ONLY_EVENTS = []                             # [] = every event
@@ -355,9 +355,9 @@ SKIP_DONE = True                             # True = skip scenarios that alread
 SWEEP_SKIP_DONE = True                       # True = swept runs resume
 RUN_ONLY_MISSING_OUT = True                  # True = simulate only faults with no .out
 MAX_SCENARIO_ATTEMPTS = 3                    # give up after this many crashes
-FORCE_RESCORE = False                        # True = re-score everything every launch
-PLOT_MISSING_OUTS = False                    # draw PDFs for .out files without one
-FORCE_REPLOT = False                         # True = redraw every PDF
+FORCE_RESCORE = True                         # FULL RESCORE this launch -- set back to False after
+PLOT_MISSING_OUTS = True                     # needed for the full redraw below
+FORCE_REPLOT = True                          # FULL REPLOT this launch -- set back to False after
 
 # ---- 2. WORKERS, CORES AND SIMULATION TIME -------------------------------------
 RUN_IN_PARALLEL = True                       # True = base and project at once
@@ -649,7 +649,7 @@ DYR_DISABLE_APPLY_TO = "both"                # "both" | "project" | "base"
 DYR_DISABLE_STRICT = True                    # True = stop if a disable matches nothing
 DYR_SHOW = []                                # print these models from the deck, e.g. ["REECAU1"]
 DYR_SCOPE = "project"                        # "project" machines only | "deck" everywhere
-DYR_COMPILE_WHEN = None                      # when to run the compile .bat files
+DYR_COMPILE_WHEN = "never"                   # no compile: use the dsusr.dll already in each folder (cload4 cannot run on this PC -- psse_env_manager missing)
 DYR_COMPILE_BATS = ["MyCompile34.bat", "MyCload41.bat"]
 DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is saved
 # EGF = the EXISTING machines at each project's feeder buses (not the BESS). Each run
