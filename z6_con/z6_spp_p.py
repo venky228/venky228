@@ -26700,6 +26700,9 @@ def merge_report_parts():
         _uniq.append(r)
     if len(_uniq) != len(all_rows):
         print("[merge] dropped %d duplicate criterion row(s)" % (len(all_rows) - len(_uniq)))
+    # ONE ORDER, WHATEVER ORDER THE SHARDS FINISHED IN: by scenario, each
+    # scenario's rows kept in the order it wrote them.
+    _uniq.sort(key=lambda r: _case_sort_key(r["Case"]))
     all_rows = _uniq
     for _c in SPP_VIOLATIONS:
         for _k in SPP_VIOLATIONS[_c]:
@@ -27269,6 +27272,14 @@ def write_unswitched_summary():
     return path
 
 
+def _case_sort_key(case):
+    """F2 before F10: the id's letters, then its number, then the rest."""
+    m = re.match(r"([A-Za-z_]*)(\d+)(.*)$", str(case))
+    if not m:
+        return (str(case), 0, "")
+    return (m.group(1).upper(), int(m.group(2)), m.group(3))
+
+
 def write_event_table(all_rows, verdicts):
     """SPP_EVENT_TABLE.csv/.txt -- the results appendix, one row per event."""
     cases = []
@@ -27276,10 +27287,11 @@ def write_event_table(all_rows, verdicts):
         if r["Case"] not in cases:
             cases.append(r["Case"])
     # descriptions and planning events come from the fault list this study ran
-    defs = {}
+    defs, _order = {}, []
     try:
         for f in load_faults_csv(os.path.join(FAULTS_DIR, "SPP_FAULTS.csv")):
             defs[f["id"]] = f
+            _order.append(f["id"])
     except Exception:
         pass
     hops = None
@@ -27290,6 +27302,12 @@ def write_event_table(all_rows, verdicts):
 
     head = ["Event ID", "SPP Fault ID", "SPP Event ID", "Event Description",
             "Event Category"]
+    # FAULT-LIST ORDER, NOT ARRIVAL ORDER. The rows reach this function in
+    # whatever order the shards finished, and the event number below counts
+    # along this loop -- so one fault could be GROUP1_P1_REMOTE_FAULT_002 in
+    # one run and _004 in the next. The list's own order fixes it.
+    _pos = dict((k, i) for i, k in enumerate(_order))    # a list: 3.4 dicts keep no order
+    cases.sort(key=lambda c: (_pos.get(c, len(_pos)), _case_sort_key(c)))
     body, n = [], 0
     for fid in cases:
         # FLAT_RUN IS NOT AN EVENT. It was walking into this loop, getting a

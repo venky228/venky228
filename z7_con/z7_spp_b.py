@@ -59,7 +59,7 @@ if os.name == "nt":
 # ============================================================================
 # >>>>>>>>>>>>>>>>>>>>>>  EDIT THESE  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 # ============================================================================
-# THE CASE FOLDER. z6_main.py sends it (SPP_STUDY_DIR) so one setting there
+# THE CASE FOLDER. z7_main.py sends it (SPP_STUDY_DIR) so one setting there
 # moves both cases; the literal below is what a standalone run of this file uses,
 # and is the only thing to edit if you run it on its own.
 #
@@ -69,7 +69,7 @@ if os.name == "nt":
 # empty" and then, truthfully, that it built 0 faults.
 def _script_dir():
     """The folder THIS FILE is in. Used when the study is run on its own; when
-       z6_main.py drives it, SPP_STUDY_DIR wins and points at the same place."""
+       z7_main.py drives it, SPP_STUDY_DIR wins and points at the same place."""
     try:
         return os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
     except NameError:
@@ -77,7 +77,7 @@ def _script_dir():
 
 
 # NO ABSOLUTE PATH. The case folder is wherever THIS FILE sits, unless
-# z6_main.py says otherwise -- so the whole study moves between machines
+# z7_main.py says otherwise -- so the whole study moves between machines
 # by copying the folder, with nothing to edit.
 STUDY_DIR   = os.environ.get("SPP_STUDY_DIR") or _script_dir()
 COMMON_BASE = "DIS2201-25SP-G03-CQ_Mitigated"          # base name of your case (NO extension)
@@ -104,7 +104,7 @@ _CAP_TAG_DIR = (os.environ.get("SPP_CAP_TAG") or "").strip()
 # SPP_CAP_TAG names a capacity level and is spelled "_cap75". A .dyr sweep needs
 # the same thing -- one folder per variant, so the runs do not overwrite each
 # other -- but "cap" would be a lie about what varied. SPP_RUN_TAG is the
-# general form: whatever z6_main.py sends becomes the suffix, and the folder
+# general form: whatever z7_main.py sends becomes the suffix, and the folder
 # says which run it is.
 _RUN_TAG_DIR = (os.environ.get("SPP_RUN_TAG") or "").strip()
 
@@ -142,11 +142,11 @@ def _results_root():
 
 
 
-# ---- ONE FOLDER PER PROJECT (the same rule as z6_main.py and the launcher) --
+# ---- ONE FOLDER PER PROJECT (the same rule as z7_main.py and the launcher) --
 # A project's run folders sit in <results root>\<project>\ under their own
 # names -- used when that folder exists, or when the project has no run
 # folder loose in the results root yet; a project still laid out flat stays
-# flat until z6_main.py's TIDY_RESULTS moves it.
+# flat until z7_main.py's TIDY_RESULTS moves it.
 def _is_proj_box(d):
     if not os.path.isdir(d) or os.path.isdir(os.path.join(d, "outs")):
         return False
@@ -166,10 +166,10 @@ def _proj_root(root, proj):
         return root
     return box
 
-# ---- GEN-TEST RUNS SORTED BY KIND (the same rule as z6_main.py) -------------
+# ---- GEN-TEST RUNS SORTED BY KIND (the same rule as z7_main.py) -------------
 # <project>\gen_test\POI_ON|POI_OFF\<kind>\<run>, decided from the run
 # folder's unchanged name; a run still at the top of the project's folder is
-# used there until z6_main.py's TIDY_RESULTS moves it.
+# used there until z7_main.py's TIDY_RESULTS moves it.
 GT_SORT_DIR = "gen_test"
 _GT_NAME_RX = re.compile(r"^.+?_gt_(?P<sc>.+?)(?P<poi>_poioff)?"
                          r"(?:_off(?P<bus>\d+)_(?P<id>[A-Za-z0-9]+))?$")
@@ -349,10 +349,10 @@ BESS_PROJECTS = [
 ]
 
 
-# ---- PROJECTS ADDED OR REDEFINED FROM z6_main.py -------------------------
+# ---- PROJECTS ADDED OR REDEFINED FROM z7_main.py -------------------------
 # A project lived only in the list above, so adding one -- or pointing an
 # existing one at different feeders -- meant editing BOTH study scripts and
-# keeping them in step. z6_main.py can send the definitions instead, which
+# keeping them in step. z7_main.py can send the definitions instead, which
 # is the same reason every other setting moved there: the two cases cannot
 # disagree about something they are both handed.
 #
@@ -400,7 +400,7 @@ if _bp_env:
               "this file is used as written" % _e)
 
 # ============================================================================
-# EVERY PROJECT AT ONCE   (z6_main.py: PROJECTS_RUN = "together" / "both")
+# EVERY PROJECT AT ONCE   (z7_main.py: PROJECTS_RUN = "together" / "both")
 # ============================================================================
 # SPP_TOGETHER = {"name": "AllProjects", "members": {"SantaFe": 502, ...}} makes
 # ONE project row out of several: every member's POI, feeders and machines
@@ -565,10 +565,10 @@ COLLECTOR_BRANCHES = {
 COLLECTOR_DEFAULT_CKT = "1"
 
 # ONE IMPEDANCE FOR EVERY COLLECTOR, every project: (R, X, B), or None per
-# quantity to leave that one alone. z6_main.py sets it for both cases.
+# quantity to leave that one alone. z7_main.py sets it for both cases.
 COLLECTOR_ALL = None
 
-# ONE IMPEDANCE PER PROJECT: {project: (R, X, B)}. z6_main.py sets it.
+# ONE IMPEDANCE PER PROJECT: {project: (R, X, B)}. z7_main.py sets it.
 COLLECTOR_BY_PROJECT = {}
 
 
@@ -1264,7 +1264,7 @@ MAX_SCENARIO_ATTEMPTS = 4       # give up on a scenario after this many crashes 
 # different number of tries means a fault can be scored in one and abandoned in
 # the other for no reason but the setting, and the comparison then reports it as
 # "scored on one side only" -- a statement about this file, not the system.
-# z6_main.py can set it for both at once (MAX_SCENARIO_ATTEMPTS in the panel).
+# z7_main.py can set it for both at once (MAX_SCENARIO_ATTEMPTS in the panel).
 # >>> DOES THE CAP ABOVE APPLY WHEN SPP_ONLY / RUN_ONLY_FAULTS IS SET? -----------
 # It used to NOT apply: the guard read "att > MAX_SCENARIO_ATTEMPTS and not
 # _only_mode()", so naming any scenario switched the cap off. With a selection as
@@ -1277,7 +1277,7 @@ MAX_SCENARIO_ATTEMPTS = 4       # give up on a scenario after this many crashes 
 # True = the old behaviour, unbounded retries whenever a selection is in force.
 ONLY_MODE_IGNORES_ATTEMPT_CAP = False
 ONLY_MODE_RERUNS_DONE         = False
-# ---- THE CASE FILES, WHEN z6_main.py NAMES THEM --------------------------
+# ---- THE CASE FILES, WHEN z7_main.py NAMES THEM --------------------------
 # SOURCE_CASE and DYR_FILE were editable only here, so studying a different
 # deck meant editing this file -- and, for a comparison, editing the other
 # study script to match. BASE_SAV/BASE_DYR and PROJ_SAV/PROJ_DYR in the driver
@@ -1310,7 +1310,7 @@ DYR_FILE    = _case_file("SPP_DYR_FILE", DYR_FILE)
 
 def _case_file_by_project(env_name, current):
     """A deck named for THIS project in a {project: file} table from
-       z6_main.py (BASE_SAV_BY_PROJECT and friends), else `current`."""
+       z7_main.py (BASE_SAV_BY_PROJECT and friends), else `current`."""
     raw = (os.environ.get(env_name) or "").strip()
     if not raw:
         return current
@@ -1336,15 +1336,15 @@ def _case_file_by_project(env_name, current):
 
 SOURCE_CASE = _case_file_by_project("SPP_SOURCE_CASE_BY_PROJECT", SOURCE_CASE)
 DYR_FILE    = _case_file_by_project("SPP_DYR_FILE_BY_PROJECT", DYR_FILE)
-# SAY IT, EVERY PROCESS, EVERY TIME -- see the same block in z6_spp_p.py.
+# SAY IT, EVERY PROCESS, EVERY TIME -- see the same block in z7_spp_p.py.
 print("[case] power flow : %s   (%s)"
       % (SOURCE_CASE,
-         "PROJ_SAV/BASE_SAV in z6_main.py" if os.environ.get("SPP_SOURCE_CASE")
-         else "this file -- z6_main.py did not name one"))
+         "PROJ_SAV/BASE_SAV in z7_main.py" if os.environ.get("SPP_SOURCE_CASE")
+         else "this file -- z7_main.py did not name one"))
 print("[case] dynamics   : %s   (%s)"
       % (DYR_FILE,
-         "PROJ_DYR/BASE_DYR in z6_main.py" if os.environ.get("SPP_DYR_FILE")
-         else "this file -- z6_main.py did not name one"))
+         "PROJ_DYR/BASE_DYR in z7_main.py" if os.environ.get("SPP_DYR_FILE")
+         else "this file -- z7_main.py did not name one"))
 
 
 
@@ -1611,7 +1611,7 @@ def _apply_only_events():
 # own list; slicing that list again by worker index keeps only the overlap,
 # which is about a third of it.
 ONLY_PRESLICED = (os.environ.get("SPP_ONLY_PRESLICED") or "").strip() in ("1", "true", "yes", "on")
-# .SAV ONLY (SAV_FIRST in z6_main.py): build the case up to the solved power
+# .SAV ONLY (SAV_FIRST in z7_main.py): build the case up to the solved power
 # flow the run converts, save it, and stop -- so it can be checked first.
 SAV_ONLY = (os.environ.get("SPP_SAV_ONLY") or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -1647,15 +1647,15 @@ ABORT_ON_PF_NONCONV = True
 FREQ_HZ     = 60.0
 FLAT_RUN_S  = 5         # >>> the PQ Run3 idv ends with "RUN,cm  20.1" -- match it
 
-# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_main.py sets the simulation
+# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z7_main.py sets the simulation
 # lengths for BOTH cases from one place. They have to match: a fault run to 10 s
 # in one case and 20 s in the other is not a comparison -- the longer run has
 # more time to recover, or to fall over, and nothing in the report would say the
 # two were judged over different windows.
 #     set SPP_FLAT_RUN_S=5
 #     set SPP_SIM_END_S=10
-# ---- SETTINGS THIS FILE ACCEPTS FROM z6_main.py ---------------------------
-# z6_main.py owns the settings that must be the SAME IN BOTH CASES, and sends
+# ---- SETTINGS THIS FILE ACCEPTS FROM z7_main.py ---------------------------
+# z7_main.py owns the settings that must be the SAME IN BOTH CASES, and sends
 # them in the environment. A variable that is not set leaves the value in this
 # file alone, so running a study directly still behaves exactly as written here.
 def _env_str(name, default):
@@ -1744,7 +1744,7 @@ RUN_NPLT = 2               # write channels every N steps. 1=every step (huge .o
 # writes 113 MB per scenario -- which then has to be read back and scored.
 # NPLT = 8 samples every 0.033 s (2 cycles), which is ample for voltage
 # recovery over 2.5 s and for rotor-angle swings, and makes it 28 MB.
-# Settable from z6_main.py so both cases get the same resolution.
+# Settable from z7_main.py so both cases get the same resolution.
                            # 2 halves the file with no visible loss for a 30 s plot.
 
 # >>> DIAGNOSTIC LOG FOR PSS/E SUPPORT ---------------------------------------
@@ -1792,7 +1792,7 @@ SOLV_ACCEL_INIT = 0.60      # INIT  network-solution acceleration (PQ Run3 idv: 
 SOLV_TOL        = 0.0001    # BUILD network-solution tolerance
 SOLV_TOL_INIT   = 0.0000095 # INIT  network-solution tolerance (Run3)
 SOLV_DELT       = 1.0 / (FREQ_HZ * 4.0)   # DELT = 1/4 cycle = 0.0041667 s
-# FROM THE PANEL: DELT_CYCLES in z6_main.py (4 = quarter cycle, the PQ idv
+# FROM THE PANEL: DELT_CYCLES in z7_main.py (4 = quarter cycle, the PQ idv
 # value; 8 = eighth cycle). A case whose network solution loses itself in the
 # fault -- NaN in the fault runs while the flat run is clean -- often holds at
 # the smaller step, at twice the run time. Applied at the build and at every
@@ -1801,7 +1801,7 @@ try:
     _dc = float(os.environ.get("SPP_DELT_CYCLES") or 0)
     if _dc > 0:
         SOLV_DELT = 1.0 / (FREQ_HZ * _dc)
-        print("[solver] DELT = 1/%g cycle = %.6f s (DELT_CYCLES from z6_main.py)" % (_dc, SOLV_DELT))
+        print("[solver] DELT = 1/%g cycle = %.6f s (DELT_CYCLES from z7_main.py)" % (_dc, SOLV_DELT))
 except (TypeError, ValueError):
     pass
 SOLV_FREQFILTER = 0.033333
@@ -1810,7 +1810,7 @@ SOLV_FREQFILTER = 0.033333
 _dtol = _env_num("SPP_DYN_TOL", 0)
 if _dtol and _dtol > 0:
     SOLV_TOL_INIT = float(_dtol)
-    print("[solver] TOL = %g (SPP_DYN_TOL from z6_main.py)" % SOLV_TOL_INIT)
+    print("[solver] TOL = %g (SPP_DYN_TOL from z7_main.py)" % SOLV_TOL_INIT)
 
 # >>> AUTO-RETRY A NON-CONVERGED SCENARIO WITH DIFFERENT SOLVER SETTINGS ---------
 # PSS/E prints, per non-converged step:
@@ -1839,7 +1839,7 @@ SOLVER_RETRY_RECIPES = [
 # SPP's fourth system adjustment is "acceleration factors of multiple faults
 # were adjusted", and this is the mechanism for it -- but adjusting the solver
 # under a scenario that will not converge is a decision about the study, not a
-# convenience, so it is OFF unless z6_main.py turns it on. A run that quietly
+# convenience, so it is OFF unless z7_main.py turns it on. A run that quietly
 # re-solved its hard events on different settings and reported them beside the
 # ones that converged first time would be presenting two different studies as
 # one.
@@ -1974,7 +1974,7 @@ FAULTS = [
 # both cases read them, and a file inside one case folder would be moved or
 # retired with that case's results.
 #
-# Written as a placeholder rather than computed so z6_main.py can still READ
+# Written as a placeholder rather than computed so z7_main.py can still READ
 # this setting out of the file with a regex -- it checks that both studies point
 # at the same list before anything is simulated, and a path it cannot see is a
 # check that cannot run.
@@ -1999,7 +1999,7 @@ def _with_root(path):
 
 
 FAULTS_CSV = r"{root}\FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"
-# Kept on ONE line above, literal and quoted, because z6_main.py reads this
+# Kept on ONE line above, literal and quoted, because z7_main.py reads this
 # setting out of the file with a regex to check that both studies point at the
 # same list. A path it cannot see is a check that cannot run.
 FAULTS_CSV = _with_root(
@@ -2128,7 +2128,7 @@ CUSTOM_INCLUDE_POI = True         # fault the POI bus itself as well
 AUTO_SPP_FAULTS    = False     # True -> generate SPP fault set from topology and run+plot it
 
 
-# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z6_main.py can generate the
+# >>> OVERRIDABLE FROM THE ENVIRONMENT, so z7_main.py can generate the
 # shared fault list once by running this script's BUILD role with the generator
 # turned on -- without editing this file and forgetting to put it back.
 #     set SPP_AUTO_FAULTS=1
@@ -2339,7 +2339,7 @@ SPP_P4_TAP_SEGMENTS = True
 
 P6_MAX_PER_BUS      = 6                      # cap on (pre-outage, fault) pairs per bus
 NORMAL_CLEAR_CYCLES = None                # None -> use SPP_CLEAR_BY_KV; a number -> uniform
-# ---- what z6_main.py sends (see _env_str/_env_num above) --------------------
+# ---- what z7_main.py sends (see _env_str/_env_num above) --------------------
 # Applied HERE, after every one of these settings has been given its value in
 # this file, so the override is the last word and there is one place to look
 # when a run does not do what the file says.
@@ -2351,7 +2351,7 @@ CON_EVENTS          = _env_list("SPP_CON_EVENTS", CON_EVENTS)
 TABLE_GROUPS        = _env_list("SPP_TABLE_GROUPS", TABLE_GROUPS)
 CON_MAX_ELEMENTS    = int(_env_num("SPP_CON_MAX_ELEMENTS", CON_MAX_ELEMENTS))
 SPP_FAULT_HOPS      = int(_env_num("SPP_FAULT_HOPS", SPP_FAULT_HOPS))
-# ---- the rest of what z6_main.py owns -----------------------------------
+# ---- the rest of what z7_main.py owns -----------------------------------
 AUTO_SPP_FAULTS     = _env_bool("SPP_AUTO_FAULTS", AUTO_SPP_FAULTS)
 CUSTOM_HOPS         = int(_env_num("SPP_CUSTOM_HOPS", CUSTOM_HOPS))
 RUN_NPLT            = max(1, int(_env_num("SPP_RUN_NPLT", RUN_NPLT)))
@@ -2359,7 +2359,7 @@ CUSTOM_KV_MIN       = float(_env_num("SPP_CUSTOM_KV_MIN", CUSTOM_KV_MIN))
 CUSTOM_MAX_BUSES    = int(_env_num("SPP_CUSTOM_MAX_BUSES", CUSTOM_MAX_BUSES))
 CUSTOM_INCLUDE_POI  = _env_bool("SPP_CUSTOM_INCLUDE_POI", CUSTOM_INCLUDE_POI)
 CUSTOM_TYPES        = [str(x).upper() for x in _env_list("SPP_CUSTOM_TYPES", CUSTOM_TYPES)]
-# A TABLE BY TYPE, OR A LIST. z6_main.py sends {"3PH": null, "SLG": 16} as
+# A TABLE BY TYPE, OR A LIST. z7_main.py sends {"3PH": null, "SLG": 16} as
 # JSON when CUSTOM_CYCLES is a dict there, so the clearing time can follow the
 # fault type -- SPP's kV rule for a three-phase fault, 16 cycles for the SLG
 # stuck-breaker case. A bare list is the older form and still means "these
@@ -2404,7 +2404,7 @@ if _sa:
     try:
         _sal = [int(x) for x in re.split(r"[,\s]+", _sa) if x.strip()]
         if _sal:
-            print("[mon] STUDY_AREAS from z6_main.py: %d area(s) -> %s"
+            print("[mon] STUDY_AREAS from z7_main.py: %d area(s) -> %s"
                   % (len(_sal), ", ".join(str(x) for x in _sal)))
             STUDY_AREAS = _sal
     except Exception:
@@ -2419,7 +2419,7 @@ if _evh:
         import json as _json
         for _k, _v in _json.loads(_evh).items():
             SPP_EVENT_HOPS[str(_k)] = int(_v)
-        print("[faults] event nodes from z6_main.py: %s"
+        print("[faults] event nodes from z7_main.py: %s"
               % ", ".join("%s=%d" % (k, SPP_EVENT_HOPS[k]) for k in sorted(SPP_EVENT_HOPS)))
     except Exception as _e:
         print("[faults] SPP_EVENT_HOPS could not be read (%s) -- using this file's table"
@@ -2428,7 +2428,7 @@ SPP_FAULT_KV_MIN    = float(_env_num("SPP_FAULT_KV_MIN", SPP_FAULT_KV_MIN))
 SPP_MAX_FAULTS      = int(_env_num("SPP_MAX_FAULTS", SPP_MAX_FAULTS))
 SPP_P4_TAP_SEGMENTS = _env_bool("SPP_P4_TAP_SEGMENTS", SPP_P4_TAP_SEGMENTS)
 SPP_P4_MODE         = (os.environ.get("SPP_P4_MODE") or SPP_P4_MODE).strip()
-# THE THREE RECLOSE SWITCHES, from z6_main.py. ENABLE_RECLOSE decides whether
+# THE THREE RECLOSE SWITCHES, from z7_main.py. ENABLE_RECLOSE decides whether
 # the step is described at all, SIMULATE_RECLOSE whether it is actually performed,
 # and RECLOSE_SKIP_IF_ISLANDS applies SPP's "removed if it would island a
 # generator" rule. Read here beside the other fault settings so one panel governs
@@ -2452,7 +2452,7 @@ if _ncc:
 # is turned OFF, so the setting says what the study runs rather than adding to
 # whatever was already on.
 
-# ---- COLLECTOR IMPEDANCE FROM z6_main.py ----------------------------------
+# ---- COLLECTOR IMPEDANCE FROM z7_main.py ----------------------------------
 # Sent as JSON so a table survives the trip through the environment intact. Not
 # set -> the table written in this file stands, and a standalone run behaves
 # exactly as it reads.
@@ -2484,7 +2484,7 @@ if _collb:
 _evon = _env_list("SPP_EVENTS_ON", None)
 if _evon:
     SPP_EVENTS = dict((k, (k in _evon)) for k in SPP_EVENTS)
-    print("[faults] planning events from z6_main.py: %s"
+    print("[faults] planning events from z7_main.py: %s"
           % ", ".join(sorted(k for k, v in SPP_EVENTS.items() if v)))
 
                                            # None because SPP_CLEAR_BY_KV IS the table SPP's
@@ -2538,7 +2538,7 @@ SS_WINDOW_S    = 1.0
 # 0 = off: the band alone decides.
 SS_PRE_RETURN_PU = 0.01
 ANGLE_DEV_DEG  = 16.0
-# ---- the limits, when z6_main.py sets them ------------------------------
+# ---- the limits, when z7_main.py sets them ------------------------------
 # Applied here, below the definitions. These decide PASS and FAIL, so they must
 # be identical in both cases -- two studies scored against different thresholds
 # produce a comparison whose differences ARE the thresholds, and nothing in the
@@ -2967,7 +2967,7 @@ THEVENIN_X_GUESS = 0.10    # assumed Thevenin reactance (pu) for sizing the reta
 # same file device is used, but the file is KEPT, one per scenario:
 #     results\<proj>_spp\logs\psse\<fault>.txt
 # Nothing extra reaches the terminal, and one file per scenario means parallel
-# workers never share one. z6_spike_find.py reads them into one
+# workers never share one. z7_spike_find.py reads them into one
 # SOLVER_LOG_<KIND>_<proj>.txt per project.
 PSSE_FAULT_LOG = _env_bool("SPP_PSSE_FAULT_LOG", False)
 _FAULT_LOG = {"path": None}
@@ -3247,7 +3247,7 @@ NEW_PLANT_MACHINE_KIND = "ASYNC"
 #
 # "" turns it off and leaves only the recorded plant buses. A different
 # numbering block is just a different prefix here.
-NEW_GEN_BUS_PREFIX = "9990"               # 999000..999099 -- the same block as z6_spp_p.py; "999" also caught other 999xxx buses (GI-86 at 999950..999954)
+NEW_GEN_BUS_PREFIX = "9990"               # 999000..999099 -- the same block as z7_spp_p.py; "999" also caught other 999xxx buses (GI-86 at 999950..999954)
 
 # >>> LAYOUT: how signals are laid out in the pure-Python PDF/SVG plots.
 #   PLOT_INDIVIDUAL = True  -> ONE panel per SIGNAL (each channel gets its own plot)
@@ -3310,7 +3310,7 @@ INDIVIDUAL_KEYWORDS = []   # [] = give EVERY monitored signal its own individual
 # FROM THE PANEL. This is the knob that decides whether a scenario's PDF is 650
 # pages or twenty, and with no matplotlib that is the difference between fifty
 # minutes and two. It had to be edited in BOTH study scripts by hand; it comes
-# from z6_main.py now, like everything else. "ALL" or an empty value means
+# from z7_main.py now, like everything else. "ALL" or an empty value means
 # every monitored signal, which is what [] means here.
 _ik = (os.environ.get("SPP_INDIVIDUAL_KEYWORDS") or "").strip()
 if _ik:
@@ -3338,7 +3338,7 @@ EXPORT_SVG = _env_bool("SPP_EXPORT_SVG", EXPORT_SVG)
 #     automatically-saved PDF on Python 3.4. Leave True.
 EXPORT_PDF_PUREPY = True
 # ---- THE PLOTTING THROTTLES, FROM THE PANEL -------------------------------
-# All of these already existed and none of them could be set from z6_main.py,
+# All of these already existed and none of them could be set from z7_main.py,
 # so throttling the plots meant editing two study scripts by hand and keeping
 # them in step. Without matplotlib they are the only thing standing between a
 # scenario and an hour of pure-Python drawing.
@@ -3777,14 +3777,14 @@ DISABLE_STDIN_REDIRECT = False
 
 CYC = 1.0 / FREQ_HZ
 # THE CASE ON DISK, FOLLOWING SOURCE_CASE -- not COMMON_BASE. See the same block
-# in z6_spp_p.py: SAV_CASE is loaded directly by the fault enumerators and by the
+# in z7_spp_p.py: SAV_CASE is loaded directly by the fault enumerators and by the
 # report process, and taken from COMMON_BASE it named the original deck however
 # BASE_SAV had pointed the run.
 if SOURCE_CASE.lower().endswith(".sav"):
     SAV_CASE = SOURCE_CASE
 else:
     SAV_CASE = os.path.join(STUDY_DIR, COMMON_BASE + ".sav")
-# THE TAG IS NEVER STRIPPED -- see the same block in z6_spp_p.py. Cutting a
+# THE TAG IS NEVER STRIPPED -- see the same block in z7_spp_p.py. Cutting a
 # trailing _BESS_<proj>_<MW> off the source name would, with ENABLE_BESS off,
 # make MOD_SAV the ORIGINAL deck and the build would write over it.
 _TAG_ROOT = os.path.splitext(os.path.basename(SAV_CASE))[0]
@@ -3828,7 +3828,7 @@ if _LEVEL_SUF and not CASE_TAG.endswith(_LEVEL_SUF):
 print("[case] build files: %s.cnv / .snp / .cnl   (from %s)"
       % (CASE_TAG, os.path.basename(SAV_CASE)))
 MOD_SAV  = os.path.join(STUDY_DIR, CASE_TAG + ".sav")   # MODIFIED case (BESS added)
-# WHEN THE SOURCE IS ALSO THE DESTINATION -- see z6_spp_p.py.
+# WHEN THE SOURCE IS ALSO THE DESTINATION -- see z7_spp_p.py.
 try:
     if os.path.abspath(MOD_SAV) == os.path.abspath(SOURCE_CASE):
         print("[case] NOTE: the build writes back to the case it read (%s)."
@@ -4830,7 +4830,7 @@ def _assert_init_ok(tag, rc):
         print("        and the worker dies on it -- which is what a scenario that")
         print("        GAVE-UP with no output looks like. If these are loads or")
         print("        machines nowhere near this project, take them out of the deck")
-        print("        in z6_main.py -- in BOTH cases, because the deck is shared:")
+        print("        in z7_main.py -- in BOTH cases, because the deck is shared:")
         _sug = ", ".join('("%s", %s)' % (m, b) for (m, b, _n, _w, _c) in nan[:6]
                          if m != "?" and str(b).isdigit())
         if _sug:
@@ -5901,7 +5901,7 @@ def fault_preflight(faults):
     if len(bad) > 20:
         print("        ... and %d more" % (len(bad) - 20))
     print("        The fault list is built from ONE case's topology (FAULT_LIST_FROM")
-    print("        in z6_main.py) and read by both, which is what makes the two")
+    print("        in z7_main.py) and read by both, which is what makes the two")
     print("        studies comparable -- but an event this case cannot place is not")
     print("        a result, it is a fault applied to a bus that is not there.")
     try:
@@ -6971,7 +6971,7 @@ def add_channels():
         print("  monitor [%-9s] codes=%s -> %s%s"
               % (spec["name"], spec["codes"], desc, _nm_txt))
     if MONITOR_PROJECT:
-        # THE STUDY MACHINES, IN FULL -- and the SAME set as z6_spp_p.py records.
+        # THE STUDY MACHINES, IN FULL -- and the SAME set as z7_spp_p.py records.
         #
         # Angle and speed were recorded for every other machine in the study area
         # and not for these. They are also what makes the two cases comparable:
@@ -7924,7 +7924,7 @@ def _strip_dyr_plant(text, feeders, valid_buses=None, min_bus=10000):
 # .DYR PARAMETER STUDY -- change a model constant and see what it does
 # ============================================================================
 # The question "how much does this parameter matter" is answered by running the
-# study twice and diffing, which the run-against-run comparison in z6_main.py
+# study twice and diffing, which the run-against-run comparison in z7_main.py
 # already does. What was missing is a way to CHANGE the parameter without
 # hand-editing a deck of thousands of records and losing track of which run had
 # which value.
@@ -7993,7 +7993,7 @@ DYR_EDITS = []
 # case too. Disabling a model in the project case only would remove its
 # oscillation from one side of the comparison and leave it in the other, and
 # the difference would be reported as something the project did. That is why
-# z6_main.py's DYR_DISABLE_APPLY_TO defaults to "both".
+# z7_main.py's DYR_DISABLE_APPLY_TO defaults to "both".
 DYR_DISABLE = []
 
 # Shorthand for the families that get disabled as a group. A relay model name
@@ -9550,7 +9550,7 @@ def dyr_verify_in_case(edits):
 # "on-edit"  run them only when this build changed the .dyr
 # "never"    do not run them
 #
-# THE DEFAULT IS "always" NOW -- see the same block in z6_spp_p.py. "on-edit"
+# THE DEFAULT IS "always" NOW -- see the same block in z7_spp_p.py. "on-edit"
 # kept finding defensible reasons not to run and the result was always the same:
 # a run on the PREVIOUS dsusr.dll, reported as a normal run.
 DYR_COMPILE_WHEN = "always"
@@ -9608,7 +9608,7 @@ def _dyr_stage_compile_bats():
        the PROJECT's model set, which is the one error this whole step exists to
        prevent."""
     # AN EXPLICIT LIST IS STILL A LIST OF FILES THAT HAVE TO BE IN THIS FOLDER.
-    # z6_main.py names both .bat files outright, and this returned on that --
+    # z7_main.py names both .bat files outright, and this returned on that --
     # so the one case that had neither of them stayed the case that had neither
     # of them, which is the whole failure this function exists to end.
     steps = ([(b,) for b in DYR_COMPILE_BATS] if DYR_COMPILE_BATS
@@ -10692,7 +10692,7 @@ SAVE_MISMATCH_PASSES = 20    # max solve passes spent trying to reach it
 # silently carried forward.
 ABORT_ON_MISMATCH = True
 
-# ---- what z6_main.py sends for these three -------------------------------
+# ---- what z7_main.py sends for these three -------------------------------
 # APPLIED HERE, immediately below the settings themselves -- not up in the main
 # environment block, which runs three thousand lines EARLIER than these are
 # defined and therefore cannot override them. An override that reads a name
@@ -10974,7 +10974,7 @@ CAP_TAG = (os.environ.get("SPP_CAP_TAG") or "").strip()
 # nothing else about the network moved between the two runs.
 PROJECT_OFF = _env_bool("SPP_PROJECT_OFF", False)
 
-# ---- ANY LISTED MACHINES OUT OF SERVICE (GEN_TEST in z6_main.py) -----
+# ---- ANY LISTED MACHINES OUT OF SERVICE (GEN_TEST in z7_main.py) -----
 # SPP_MACHINES_OFF = "765912:1;539670:1" -- each machine is set STATUS 0 before
 # the power flow, so the snapshot and every fault run are built without it.
 MACHINES_OFF = []
@@ -11409,7 +11409,7 @@ def _scale_project_output(scale):
 # ---------------------------------------------------------------------------
 # A .xlsx WRITER, SO THE STUDY CAN PRODUCE ONE WITHOUT A LIBRARY.
 #
-# Ported verbatim from z6_main.py. The measurement workbook is written where
+# Ported verbatim from z7_main.py. The measurement workbook is written where
 # the measurements are taken -- in the report phase of the study itself -- and
 # PSS/E 34's Python 3.4 has no openpyxl and no way to install one. A .xlsx is a
 # zip of XML parts, so writing it directly costs nothing but this block, and it
@@ -11729,7 +11729,7 @@ def _collector_rows():
     except Exception:
         print("  [coll] COLLECTOR_SCALE[%r] is not (r, x, b) -- ignored" % RUN_PROJECT)
         rmul = xmul = bmul = 1.0
-    # ONE VALUE FOR EVERY COLLECTOR, when z6_main.py asks for it. Applied to
+    # ONE VALUE FOR EVERY COLLECTOR, when z7_main.py asks for it. Applied to
     # every row of every project, over whatever the row says: "the same
     # impedance everywhere" and "this row is different" cannot both hold, and
     # silently honouring the row would make the setting a lie.
@@ -12060,7 +12060,7 @@ def fault_line_impedance_check(fault):
     return n_changed
 
 
-# ---- .dyr edits from z6_main.py -----------------------------------------
+# ---- .dyr edits from z7_main.py -----------------------------------------
 _dyrs = (os.environ.get("SPP_DYR_SHOW") or "").strip()
 if _dyrs:
     try:
@@ -12105,7 +12105,7 @@ if _dyrp:
         _mine = _json.loads(_dyrp).get(RUN_PROJECT) or []
         if _mine:
             DYR_EDITS = list(DYR_EDITS) + [tuple(e) for e in _mine]
-            print("[dyr] %d edit(s) for %s from z6_main.py" % (len(_mine), RUN_PROJECT))
+            print("[dyr] %d edit(s) for %s from z7_main.py" % (len(_mine), RUN_PROJECT))
     except Exception as _e:
         print("[dyr] SPP_DYR_EDITS_BY_PROJECT could not be read (%s) -- ignored" % _e)
 if DYR_EDITS:
@@ -13307,7 +13307,7 @@ def _run_to(t_end, total_end, label):
 # four workers appending to one file interleave their lines, and the timings
 # would be unreadable exactly when a run is slow enough to want them.
 #
-# The report phase gathers them into RUN_TIMES, and z6_main.py puts the
+# The report phase gathers them into RUN_TIMES, and z7_main.py puts the
 # two cases side by side -- which is the question worth asking, because "the
 # project case is slower" is a statement about the model and "both cases are
 # slower" is a statement about the machine.
@@ -17442,7 +17442,7 @@ def make_plots(path, is_flat, kb, tclear=None):
     # killed mid-draw (the stall timeout, an access violation, a reboot) leaves
     # a TRUNCATED .pdf on disk, and every "does this .out have a PDF?" test in
     # the toolchain -- _count_unplotted(), the had_pdf check above,
-    # z6_main.py's plot-missing scan -- is a file-exists test. The scenario
+    # z7_main.py's plot-missing scan -- is a file-exists test. The scenario
     # would count as drawn for good, and the pass would report success over a
     # PDF that cannot be opened.
     #
@@ -21767,7 +21767,7 @@ def evaluate_case(path, kind, tclear, kb):
                     # and well damped about its settling value, and is here only
                     # because SPPR is measured from the run minimum. Untagged,
                     # every downstream reader (and the comparison's roll-up at
-                    # z6_main.py:3369, which labels the whole bucket
+                    # z7_main.py:3369, which labels the whole bucket
                     # "machines below 16 deg needing individual review")
                     # described a healthy machine as an unresolved one -- and
                     # this one is not even below 16 deg.
@@ -22701,7 +22701,7 @@ def _scen_stale(f):
     """True when a per-scenario part (SCEN_<id>.csv or SCEN_<id>_MEAS.csv) is
        OLDER than its scenario's .out -- the scenario was simulated again after
        it was scored, so these rows describe the previous run. Same 2 s margin
-       z6_main uses for the same question."""
+       z7_main uses for the same question."""
     try:
         b = os.path.basename(f)
         sid = b[5:-9] if b.endswith("_MEAS.csv") else b[5:-4]
@@ -24833,7 +24833,7 @@ def _noelem_fail_reasons(rows, case):
 
 
 # WORDS FOR WHAT HAS NO NUMBER, so no cell of 02_VIOLATIONS.csv is blank. The
-# comparison (z6_main read_violations) reads these words back as "unknown".
+# comparison (z7_main read_violations) reads these words back as "unknown".
 VIO_UNKNOWN = ("not in case", "no path", "no name", "not on record")
 
 
@@ -25976,7 +25976,7 @@ def _reset_resume_state():
     # were finished was gone, and the next launch set out to simulate them all
     # again.
     #
-    # z6_main.py says what it wants in SPP_FRESH_START -- "1" when its
+    # z7_main.py says what it wants in SPP_FRESH_START -- "1" when its
     # FRESH_START is on, "0" otherwise -- and only that explicit "1" clears the
     # .done markers and .attempts counters here. The claims and .returns
     # counters are this process's bookkeeping and are cleared regardless.
@@ -28632,7 +28632,7 @@ QUEUE_MAX_RETURNS = 3
 # anything still free when it trips is picked up by the next launch.
 MAX_QUEUE_PASSES = 50
 
-# what z6_main.py sends, applied below the settings themselves
+# what z7_main.py sends, applied below the settings themselves
 DYNAMIC_WORK        = _env_bool("SPP_DYNAMIC_WORK", DYNAMIC_WORK)
 CLAIM_STALE_S       = float(_env_num("SPP_CLAIM_STALE_S", CLAIM_STALE_S))
 
@@ -30089,7 +30089,7 @@ def _imported_or_shared(make_list):
     # and no temp-and-rename, so a study process could also read a half-written
     # list and run a short fault set without complaint.
     #
-    # z6_main.py names the publisher with SPP_PUBLISH_SHARED, from its
+    # z7_main.py names the publisher with SPP_PUBLISH_SHARED, from its
     # FAULT_LIST_FROM setting. With nothing said -- a study run on its own,
     # outside the comparison -- the old rule applies and this case publishes.
     _may_publish = _env_bool("SPP_PUBLISH_SHARED",
@@ -30795,7 +30795,7 @@ def finalize_report(produced, part=None, claim=False):
                                     continue
                         _rows = []
                         # THE EXACT WORDING evaluate_case USES, character for
-                        # character. The comparison in z6_main.py pairs BASE
+                        # character. The comparison in z7_main.py pairs BASE
                         # against PROJ by matching the criterion STRING, so a
                         # divergence row phrased differently ("... of clearing",
                         # "... after clearing", "Rotor-angle damping (SPPR1 <=
@@ -31035,7 +31035,7 @@ def finalize_report(produced, part=None, claim=False):
             # you N reports each covering a sixth of the study.
             #
             # UNLESS THIS IS THE ONLY SHARD. The launcher refuses to merge for
-            # one (z6_lch_b.py: `if n <= 1: return True`), so returning here is
+            # one (z7_lch_b.py: `if n <= 1: return True`), so returning here is
             # how a pass that scored every scenario ends with no report on disk.
             # With one shard there is no "a sixth of the study" -- what it holds
             # IS the study -- so it falls through and writes the report itself.
@@ -32100,7 +32100,7 @@ def main():
             # SPP_CRITERIA_REPORT is ever written" this study has been seeing,
             # and it is a bug, not the cost of reading .out files.
             #
-            # The launcher refuses to merge for a single shard (z6_lch_b.py:
+            # The launcher refuses to merge for a single shard (z7_lch_b.py:
             # `if n <= 1: return True`), so this shard also writes the merged
             # report itself -- see the tail of finalize_report().
             finalize_report(produced, part=WORKER_INDEX)
@@ -32108,7 +32108,7 @@ def main():
         return
 
     # ---- GENERATE THE FAULT LIST AND STOP ----------------------------------
-    # z6_main.py's phase 0 needs one thing from this script: the fault
+    # z7_main.py's phase 0 needs one thing from this script: the fault
     # set for this case's topology. It used to get it by running the BUILD role,
     # which rebuilds the whole snapshot first -- loads the case, adds the plants,
     # solves, writes .cnv/.snp -- and only then reaches the generator. That is
@@ -32145,7 +32145,7 @@ def main():
               % (_ts(), _fmt_hms(time.time() - _t0)))
         return
 
-    # ---- BUILD THE SOLVED .SAV AND STOP (SAV_FIRST in z6_main.py) ----------
+    # ---- BUILD THE SOLVED .SAV AND STOP (SAV_FIRST in z7_main.py) ----------
     if SAV_ONLY:
         print("")
         print("[sav-only] building the solved power-flow case for THIS run and exiting.")
@@ -32247,7 +32247,7 @@ def main():
             print("[resume] reusing existing snapshot (flat already built it this session): %s" % SNP_FILE)
     finally:
         _lock_release(_blk)
-    # NO BUILD MEANS NO dyre_new, AND SO NO COMPILE -- see z6_spp_p.py. The
+    # NO BUILD MEANS NO dyre_new, AND SO NO COMPILE -- see z7_spp_p.py. The
     # quietest of the ways the .bat files come not to run: nothing is skipping
     # anything, the compile is simply never reached.
     if not _did_build:
@@ -32286,7 +32286,7 @@ def main():
         #
         # custom called the generator directly and never looked at FAULTS_CSV,
         # so every worker of BOTH cases built the list from its OWN deck's
-        # topology -- while z6_main.py printed "both studies read <shared>
+        # topology -- while z7_main.py printed "both studies read <shared>
         # ... same file, same events, so the comparison is like for like" about
         # the mode the panel actually selects. The two cases do not have the
         # same topology: the project buses exist on one side and not the other,
@@ -32756,7 +32756,7 @@ def main():
 # the simulation ran; the marker is bookkeeping, and a marker that is missing is
 # not a reason to withhold a plot from data that exists.
 #
-# Driven by SPP_PLOT_MISSING=1 (z6_main.py sets it for PIPELINE = "missing").
+# Driven by SPP_PLOT_MISSING=1 (z7_main.py sets it for PIPELINE = "missing").
 # It runs before anything else and then exits, so it never starts PSS/E, never
 # touches the queue and cannot disturb a study running in parallel with it.
 def _plotter_lock_path():
@@ -32946,7 +32946,7 @@ def _pdf_current(sid):
        A PDF drawn before its scenario was re-simulated shows the previous
        run. Existence alone kept such pages for ever; comparing the two
        timestamps replaces the label-guessing heuristic that used to move
-       whole groups of PDFs aside (RETIRE_STALE_PDFS in z6_main.py)."""
+       whole groups of PDFs aside (RETIRE_STALE_PDFS in z7_main.py)."""
     pdf = os.path.join(PLOT_DIR, "%s_plots.pdf" % sid)
     if not os.path.isfile(pdf):
         return False
@@ -32956,7 +32956,7 @@ def _pdf_current(sid):
             return False
     except Exception:
         pass
-    # FORCE_REPLOT (z6_main): a PDF drawn before this launch started is
+    # FORCE_REPLOT (z7_main): a PDF drawn before this launch started is
     # redrawn from its .out -- the plot layout changed, the .out did not.
     try:
         _rb = float(os.environ.get("SPP_REPLOT_BEFORE") or 0)
@@ -33465,7 +33465,7 @@ def plot_missing_outs():
     #
     # A plotter that finds its files condemned refuses them in a second or two
     # and exits 0, having done exactly what it should. The supervisor in
-    # z6_main.py saw only "exited after 5s" and announced "it is failing at
+    # z7_main.py saw only "exited after 5s" and announced "it is failing at
     # startup" -- which sent the reader to a log about a startup that was fine,
     # while the actual reason (a .badout marker, or three recorded read deaths)
     # sat in this process's own output and nowhere else.
@@ -33525,7 +33525,7 @@ def plot_missing_outs():
         # takes the file over.
         # ---- IS A PER-FILE CLAIM NEEDED AT ALL? ---------------------------
         #
-        # Only in FLEET mode. There, z6_main.py runs several plotters over
+        # Only in FLEET mode. There, z7_main.py runs several plotters over
         # one folder and the folder-level lock is deliberately off, so this
         # claim is the only thing keeping two of them off the same file.
         #
@@ -33993,7 +33993,7 @@ def plot_missing_outs():
         # is what the rounds do -- never addressed it.
         #
         # A fresh process has a fresh address space. So this draws ONE scenario
-        # and returns; _plot_missing_pass() in z6_main.py already refills a
+        # and returns; _plot_missing_pass() in z7_main.py already refills a
         # slot as soon as its plotter exits, so the next file starts clean and
         # the fleet size stays exactly what was asked for.
         #
@@ -34181,7 +34181,7 @@ def plot_missing_outs():
         except Exception as _e:
             print("[plot-missing] replot: could not start the next plotter (%s)" % _e)
     elif _relaunch_for_next and MAKE_PLOTS and _env_bool("SPP_PLOT_FLEET", False):
-        # UNDER THE PANEL'S FLEET the slot is refilled by z6_main.py the
+        # UNDER THE PANEL'S FLEET the slot is refilled by z7_main.py the
         # moment this process exits. Starting a successor here as well put a
         # second, unsupervised chain of plotters beside the fleet -- outside
         # PLOT_TOTAL_MAX, invisible to the progress line, and holding claims
@@ -34239,7 +34239,7 @@ if __name__ == "__main__":
     #
     #     MERGE_ONLY = True   in the settings above, or
     #     set SPP_MERGE_ONLY=1  in the environment
-    #     <python> z6_spp_p.py
+    #     <python> z7_spp_p.py
     #
     # Safe beside a live run: it only reads parts\ and writes reports\.
     if MERGE_ONLY:
