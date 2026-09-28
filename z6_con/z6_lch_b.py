@@ -5058,8 +5058,8 @@ def _write_all_projects_report(passes, done_so_far):
     lines.append("=" * 100)
     lines.append(" Criteria are applied to every scenario that COMPLETED, whatever fault set")
     lines.append(" produced it -- spp, custom or manual. Scenarios that crashed, gave up or")
-    lines.append(" returned NaN are NOT scored (they would score against garbage); they are")
-    lines.append(" listed per project below so nothing disappears silently.")
+    lines.append(" returned NaN are NOT scored (their values are not valid for scoring); they are")
+    lines.append(" listed per project below so that none is omitted.")
     lines.append("=" * 100)
     lines.append(" %-18s %-8s %-6s %-6s %-6s %-10s %s"
                  % ("project", "mode", "PASS", "FAIL", "scen", "crash+wait", "report"))

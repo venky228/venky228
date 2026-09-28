@@ -11962,7 +11962,7 @@ def write_sweep_measured(proj, mode, variant_cols, stem, title, col_notes,
                  % OVERSHOOT_SPIKE_S)
         fh.write("'-' = that run has no value for this element and fault: it did\n")
         fh.write("not score that fault, or did not monitor that element. It does\n")
-        fh.write("NOT mean the element was fine there.\n\n")
+        fh.write("NOT mean the element met the criterion there.\n\n")
         fh.write("'best run' names the column with the LOWEST value on that row --\n")
         fh.write("base and project included, because if the base is the best result\n")
         fh.write("that is the finding. It is the answer to 'which run should I use'.\n\n")
@@ -21753,7 +21753,7 @@ def _gt_impact(runs, faults, proj):
          "        NOT RECOMM. = fewer spikes, but it FAILS another criterion the reference passes",
          "                      (voltage recovery, steady state, trips, damping, stability) -- not a fix",
          "        REFERENCE BORDERLINE = a criterion that most element runs of a fault + scenario 'newly' fail:",
-         "                      the reference only just passes it, so it is noted, not held against any element",
+         "                      the reference passes it by a narrow margin, so it is noted, not held against any element",
          "        NOTE        = P90 power recovery not held / never reached, POI ripple, or not settled",
          "                      at the end, where the reference had none: noticed and shown, never a FAIL", ""]
     # SUMMARY -- per fault, the elements that matter (first scenario that has them)
