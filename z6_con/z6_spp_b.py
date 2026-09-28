@@ -17528,7 +17528,7 @@ def make_plots(path, is_flat, kb, tclear=None):
             _has_c = any(_kd == "C" for _kd, _it in chunk)
             if _has_v or not _has_c:
                 fig.text(0.06, 0.868, ("%-6s %-9s %-30s %s"
-                                       % ("Page", "Quantity", "Element", "What it broke")) if _has_v else
+                                       % ("Page", "Signal", "Element", "Violation")) if _has_v else
                          ("%-6s %-34s %s" % ("Page", "Panel", "Note")),
                          fontsize=8, family="monospace", fontweight="bold", va="top")
             _y = 0.850
@@ -19897,7 +19897,7 @@ def _pdf_index_pages(panels, name, kind_txt, W, margL, per_page, first_panel_pag
                 ("   Page %d of %d of this index." % (pg + 1, n_pg))
                 if n_pg > 1 else ""))
         _txt(margL, TOP - 8, 9, "%-6s %-8s %-30s %s"
-             % ("Page", "Quantity", "Element", "What it broke"))
+             % ("Page", "Signal", "Element", "Violation"))
         # a rule under the heading
         ops.append("0.5 w 0.6 0.6 0.6 RG %.1f %.1f m %.1f %.1f l S"
                    % (margL, PGH - (TOP - 2), W - 40, PGH - (TOP - 2)))
