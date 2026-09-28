@@ -12110,19 +12110,120 @@ def _release_compare_memory():
         pass
 
 
-def _frees_memory_first(fn):
+# EMPTYING THE CACHES WAS NOT ENOUGH. A 32-bit Python does not get its
+# address space back in one piece: after the main comparison IronStar's
+# surplus run still could not be read (365,000 voltage rows for its base
+# alone), and steps that had worked for one project failed for the next. So
+# each of these steps, for each project, now runs in a CHILD Python of its
+# own -- this same script, the same panel, a fresh 2 GB -- and hands back
+# only the files it writes. A child that cannot be started falls back to
+# running the step here, as before.
+_EXTRA_STEP_ENV = "SPP_EXTRA_STEP"
+_EXTRA_STEPS = {}
+_IN_EXTRA_CHILD = [False]
+
+
+def _echo_child(proc):
+    """The child's console, line by line, in THIS thread (no reader thread to
+       start: that was what failed with "can't start new thread")."""
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    while True:
+        try:
+            line = proc.stdout.readline()
+        except Exception:
+            break
+        if not line:
+            break
+        try:
+            sys.stdout.write(line)
+        except UnicodeEncodeError:
+            try:
+                sys.stdout.write(line.encode(enc, "replace").decode(enc, "replace"))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def _in_own_process(fn):
+    name = fn.__name__
+    _EXTRA_STEPS[name] = fn
+
     def _w(*a, **k):
+        if _IN_EXTRA_CHILD[0] or k:
+            _release_compare_memory()
+            return fn(*a, **k)
         _release_compare_memory()
-        return fn(*a, **k)
-    _w.__name__ = fn.__name__
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="z7_step_")
+        rp = os.path.join(tmp, "result.json")
+        env = dict(os.environ)
+        env[_EXTRA_STEP_ENV] = json.dumps({
+            "step": name, "args": list(a), "result": rp,
+            "cmp_sub": list(_CMP_SUB), "egf_skip": list(_EGF_SKIP)})
+        try:
+            p = subprocess.Popen([PYTHON, "-u", os.path.abspath(__file__)],
+                                 cwd=os.path.dirname(os.path.abspath(__file__)), env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 universal_newlines=True, bufsize=1)
+        except Exception as e:
+            print("[compare] could not start a separate Python for %s (%s) -- "
+                  "running it here" % (name, e))
+            shutil.rmtree(tmp, ignore_errors=True)
+            return fn(*a, **k)
+        _echo_child(p)
+        rc = p.wait()
+        try:
+            with open(rp) as fh:
+                res = json.load(fh)
+        except Exception:
+            res = {"ok": False, "error": "the separate Python ended rc=%s without "
+                                         "a result -- see its lines above" % rc}
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error") or "failed")
+        return res.get("value")
+    _w.__name__ = name
     _w.__doc__ = fn.__doc__
     return _w
 
 
-compare_surplus_scenarios = _frees_memory_first(compare_surplus_scenarios)
-compare_egf_variants = _frees_memory_first(compare_egf_variants)
-compare_three_way = _frees_memory_first(compare_three_way)
-write_all_variants_overvoltage = _frees_memory_first(write_all_variants_overvoltage)
+def _run_extra_step(spec):
+    """In the child: one step for one project, then exit. 0 = it returned."""
+    _IN_EXTRA_CHILD[0] = True
+    _CMP_SUB[:] = spec.get("cmp_sub") or []
+    _EGF_SKIP[:] = spec.get("egf_skip") or []
+    res = {"ok": False}
+    try:
+        v = _EXTRA_STEPS[spec["step"]](*spec.get("args") or [])
+        try:
+            json.dumps(v)
+        except Exception:
+            v = None
+        res = {"ok": True, "value": v}
+    except BaseException as e:
+        try:
+            import traceback as _tb
+            _tb.print_exc()
+        except Exception:
+            pass
+        res = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    try:
+        with open(spec["result"], "w") as fh:
+            json.dump(res, fh)
+    except Exception:
+        pass
+    return 0 if res.get("ok") else 1
+
+
+compare_surplus_scenarios = _in_own_process(compare_surplus_scenarios)
+compare_egf_variants = _in_own_process(compare_egf_variants)
+compare_three_way = _in_own_process(compare_three_way)
+write_all_variants_overvoltage = _in_own_process(write_all_variants_overvoltage)
 
 
 def write_dyr_sweep_comparisons(proj, mode, variants, cap_tag=""):
@@ -24184,6 +24285,10 @@ def main():
         print("[compare] (the summary is at %s -- this console cannot print it)" % p)
     return 0
 
+
+if __name__ == "__main__" and os.environ.get(_EXTRA_STEP_ENV):
+    # A CHILD STARTED BY _in_own_process: one extra comparison, then exit.
+    sys.exit(_run_extra_step(json.loads(os.environ[_EXTRA_STEP_ENV])))
 
 if __name__ == "__main__":
     # THE TIME TABLE IS THE LAST THING PRINTED, whatever main() returns and
