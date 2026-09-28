@@ -693,6 +693,9 @@ if QUICK_DYR_TEST:
     RUN_CASES = "proj"
     ONLY_FAULTS = list(_QUICK_DYR[QUICK_DYR_TEST]["faults"])
     SKIP_DONE = True
+    FLAT_RUN_S = 5                           # s, no-fault run      (study: 25)
+    PRE_FAULT_S = 3                          # s before the fault   (study: 5)
+    SIM_END_S = 8                            # s per fault          (study: 25.2)
     DYR_SHOW = ["REECCU1", "REGCAU1", "REPCAU1"]     # prints the current values -- check them first
     DYR_SWEEP_BY_PROJECT = {QUICK_DYR_TEST: _QUICK_DYR[QUICK_DYR_TEST]["sweep"]}
     DYR_SWEEP_PROJECTS = [QUICK_DYR_TEST]
@@ -9505,8 +9508,10 @@ def _sweep_resume_env():
        writes DYR_EDITS.txt and COLLECTOR_IMPEDANCE.txt into its folder and
        ALL_RUNS_<proj>_<mode>.txt prints both per run -- check them, or set this
        False, when anything but the swept value has changed."""
+    # ITS OWN REPORT TOO: every caller reads the folder's verdicts straight
+    # after the run, so a report deferred to "after all projects" never exists.
     return {"SPP_SKIP_DONE": "1" if SWEEP_SKIP_DONE else "0",
-            "SPP_FRESH_START": "0"}
+            "SPP_FRESH_START": "0", "SPP_DEFER_REPORTS": "0"}
 
 
 def _cap_levels():
@@ -10056,7 +10061,7 @@ def run_capacity_sweep(proj, mode):
                                  for f in fails)
             continue
         _banner("CAPACITY %s%% -- re-running %d failing fault(s)" % (tag, len(fails)))
-        env = {"SPP_CAP_SCALE": repr(lv), "SPP_CAP_TAG": tag}
+        env = {"SPP_CAP_SCALE": repr(lv), "SPP_CAP_TAG": tag, "SPP_DEFER_REPORTS": "0"}
         env.update(_sweep_resume_env())
         if (CAPACITY_FAULTS or "all").strip().lower() == "failing":
             # Restrict the run to the failing ids. Left unset the study runs its
@@ -10975,8 +10980,11 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
         _tbl = dict((k, [list(x) if isinstance(x, (list, tuple)) else x for x in v])
                     for k, v in (DYR_EDITS_BY_PROJECT or {}).items())
         _tbl[proj] = [[m, dict((str(c), v) for c, v in d.items())] for m, d in edits]
+        # ITS OWN REPORT, at the end of its own run -- read straight after, below.
+        # Deferred (REPORTS_AFTER_ALL_PROJECTS) it was never written: the value
+        # read "scored the FLAT RUN and NO FAULT" with every fault simulated.
         env = {"SPP_DYR_EDITS_BY_PROJECT": json.dumps(_tbl),
-               "SPP_RUN_TAG": tag}
+               "SPP_RUN_TAG": tag, "SPP_DEFER_REPORTS": "0"}
         # RESUME OR RE-SIMULATE -- see _sweep_resume_env(). This used to be
         # "always re-simulate", which on a second launch repeats every value
         # from nothing.
@@ -12412,7 +12420,7 @@ def run_new_plant(proj, mode):
         return []
     _banner("NEW PLANT -- %s (%s): new buses, GSU, collector, MPT, tie to the POI"
             % (proj, mode))
-    env = {"SPP_RUN_TAG": NEW_PLANT_TAG}
+    env = {"SPP_RUN_TAG": NEW_PLANT_TAG, "SPP_DEFER_REPORTS": "0"}
     env.update(_sweep_resume_env())
     # THE WHOLE EQUIPMENT DESCRIPTION, as JSON. "enabled" is forced on here
     # rather than read from the panel: this function exists to build the plant,
@@ -12585,7 +12593,7 @@ def run_project_off(proj, mode):
               % (proj, mode))
         return []
     _banner("PROJECT OFF -- %s (%s): the same case, machines out of service" % (proj, mode))
-    env = {"SPP_PROJECT_OFF": "1", "SPP_RUN_TAG": PROJECT_OFF_TAG}
+    env = {"SPP_PROJECT_OFF": "1", "SPP_RUN_TAG": PROJECT_OFF_TAG, "SPP_DEFER_REPORTS": "0"}
     env.update(_sweep_resume_env())
     rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
     if rc not in (0, None):
@@ -23760,10 +23768,25 @@ def main():
             _c, ob, ot = discover_projects(mode)
             _cands = sorted(set(_pj_all) | set(_c) | set(ob) | set(ot), key=str)
             _cands = [x for x in _cands if x not in _egf_skip]
+            # ONLY THE PANEL'S PROJECTS. With PROJECTS = ["EastFork"] every other
+            # project on disk was checked too, and the one with gaps was launched
+            # alongside it: a quick EastFork test ran EmpirePrairie's faults.
+            if _pj_all:
+                _cands = [x for x in _cands if x in _pj_all]
             for key, case in (("BASE", CASE_BASE), ("PROJ", CASE_TEST)):
                 for pj in _cands:
                     rdir = results_dir(case, pj, mode)
                     exp = _expected_fault_ids(case, pj, mode)
+                    # ... AND ONLY THE SELECTED FAULTS. "8 of 124 still to run" for
+                    # a launch restricted to five faults, all five finished, started
+                    # a study that had nothing to do.
+                    if exp and ONLY_IDS:
+                        _sel = [f for f in exp if _id_selected(f)]
+                        if not _sel:
+                            _lines.append("  %-5s %-16s none of ONLY_FAULTS is in its fault list"
+                                          % (key, pj))
+                            continue
+                        exp = _sel
                     if not os.path.isdir(rdir):
                         todo[key].add((pj, mode))
                         _lines.append("  %-5s %-16s no results folder -- %s to run"
