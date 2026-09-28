@@ -10115,6 +10115,134 @@ def _user_models_mark():
               "next build will run the .bat files again" % e)
 
 
+def _compile_env():
+    """The environment the compile .bat files run in -- THIS Python first.
+
+       cload4 (PSS/E 34, called by MyCload41.bat) is a Python script, and it ran
+       under whatever Python the machine offered: the first 'python' on PATH,
+       or the py launcher / .py file association that a Python installer sets
+       up (and leaves behind when that Python is uninstalled). On one machine
+       that was Python 2.7, which cannot import PSS/E's psse_env_manager
+       ("No module named psse_env_manager") -- no dsusr.dll was linked, and
+       every worker of the case died at start.
+
+       This study runs under the Python PSS/E works with (it imported psspy),
+       so the .bat files get that one: its folder first on PATH, the py
+       launcher pointed at its version, and the PSSPY## / PSSBIN folders it
+       uses on PYTHONPATH. Returns (env, what to print)."""
+    env = dict(os.environ)
+    exe = sys.executable or ""
+    d = os.path.dirname(exe)
+    pre = [x for x in (d, os.path.join(d, "Scripts")) if x and os.path.isdir(x)]
+    tag = "PSSPY%d%d" % sys.version_info[:2]
+    psse = []
+    for q in sys.path:
+        b = os.path.basename(os.path.normpath(q or "")).upper()
+        if b in (tag, "PSSBIN") and os.path.isdir(q) and q not in psse:
+            psse.append(q)
+    env["PATH"] = os.pathsep.join(pre + psse + [env.get("PATH", "")])
+    old = [x for x in (env.get("PYTHONPATH") or "").split(os.pathsep) if x and x not in psse]
+    if psse or old:
+        env["PYTHONPATH"] = os.pathsep.join(psse + old)
+    env.pop("PYTHONHOME", None)
+    ver = "%d.%d" % sys.version_info[:2]
+    env["PY_PYTHON"] = ver                    # the py launcher's default version
+    env["PY_PYTHON%d" % sys.version_info[0]] = ver
+    note = "Python %s (%s)%s" % (ver, exe or "?", ("; PSS/E modules from " + ", ".join(
+        os.path.basename(os.path.normpath(x)) for x in psse)) if psse else "")
+    return env, note
+
+
+def _pssbin_dirs():
+    """The PSSBIN folder(s) this interpreter loaded PSS/E from."""
+    out = []
+    for q in sys.path:
+        if os.path.basename(os.path.normpath(q or "")).upper() == "PSSBIN" \
+                and os.path.isdir(q) and q not in out:
+            out.append(q)
+    return out
+
+
+def _compile_diag(env):
+    """WHAT DECIDES WHICH PYTHON cload4 GETS -- printed before every link.
+
+       `call cload4` in MyCload41.bat is found by cmd: the study folder first,
+       then PATH, trying the PATHEXT extensions in turn. A PSSBIN\\cload4.py it
+       lands on is opened by Windows' .py association, not by any PATH setting,
+       and PSS/E's cload4 imports psse_env_manager, which exists only for the
+       Python versions PSS/E installed it for. These lines say, from the
+       machine itself, which of them is at fault."""
+    if os.name != "nt":
+        return
+    import subprocess
+
+    def _run(cmd):
+        try:
+            p = subprocess.Popen(cmd, cwd=STUDY_DIR, env=env, shell=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 universal_newlines=True)
+            out, _e = p.communicate()
+            return [x.strip() for x in (out or "").splitlines() if x.strip()]
+        except Exception as e:
+            return ["(could not ask: %s)" % e]
+    print("  [dyr] cload4 resolves to     : %s" % ("; ".join(_run("where cload4")[:4]) or "-"))
+    print("  [dyr] PATHEXT                : %s" % (env.get("PATHEXT") or "-"))
+    print("  [dyr] .py files open with    : %s"
+          % ("; ".join(_run("assoc .py") + _run("ftype Python.File")) or "-")[:300])
+    found = []
+    for pb in _pssbin_dirs():
+        root = os.path.dirname(os.path.normpath(pb))
+        for d, subs, files in os.walk(root):
+            if d[len(root):].count(os.sep) >= 2:
+                del subs[:]
+            found += [os.path.join(d, f) for f in files
+                      if f.lower().startswith("psse_env_manager")]
+        break
+    print("  [dyr] psse_env_manager exists: %s"
+          % ("; ".join(found[:8]) if found else "nowhere under the PSS/E folder"))
+
+
+def _cload4_shim():
+    """(path of a cload4.bat written into the study folder or "", what to print).
+
+       MyCload41.bat says `call cload4 ...` and cmd looks in the current folder
+       before PATH. PSS/E's cload4 is a Python script, PSSBIN\\cload4.py; opened
+       by the .py file association it ran under Python 2.7 on the study machine
+       ("No module named psse_env_manager") whatever PATH and PYTHONPATH said.
+       A cload4.bat here runs it with THIS interpreter -- the one PSS/E works
+       with, since it imported psspy. It is removed again after the link. A
+       cload4.bat already in the folder is someone's own and is left alone."""
+    if os.name != "nt":
+        return "", ""
+    here = os.path.join(STUDY_DIR, "cload4.bat")
+    if os.path.exists(here):
+        try:
+            with open(here) as fh:
+                ours = "written by the study for one link" in fh.read()
+        except Exception:
+            ours = False
+        if not ours:              # left by a worker killed mid-link: ours, replaced
+            return "", "cload4.bat already in %s -- used as it is" % STUDY_DIR
+    c4 = ""
+    for pb in _pssbin_dirs():
+        if os.path.isfile(os.path.join(pb, "cload4.py")):
+            c4 = os.path.join(pb, "cload4.py")
+            break
+    if not c4 or not sys.executable:
+        return "", ""
+    try:
+        with open(here, "w") as fh:
+            fh.write("@echo off\n")
+            fh.write("rem written by the study for one link and removed afterwards:\n")
+            fh.write("rem PSS/E's cload4.py run by the study's own Python\n")
+            fh.write('"%s" "%s" %%*\n' % (sys.executable, c4))
+            fh.write("exit /b %errorlevel%\n")
+    except Exception as e:
+        return "", "could not write %s (%s) -- cload4 runs as Windows opens it" % (here, e)
+    return here, "cload4 runs as: %s %s  (via %s, removed after the link)" % (
+        sys.executable, c4, here)
+
+
 def _dyr_compile_user_models(changed):
     """Run the compile/link batch files. Raises if either fails.
 
@@ -10235,57 +10363,73 @@ def _dyr_compile_user_models(changed):
                 pass
 
     import subprocess
-    for b in bats:
-        print("  [dyr] compiling user models: %s" % b)
-        sys.stdout.flush()
-        try:
-            fh = open(os.devnull, "rb")
-        except Exception:
-            fh = None
-        try:
-            proc = subprocess.Popen([os.path.join(STUDY_DIR, b)], cwd=STUDY_DIR,
-                                    stdin=fh, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT,
-                                    universal_newlines=True, shell=False)
-            out, _err = proc.communicate()
-            rc = proc.returncode
-        except Exception as e:
-            raise RuntimeError("%s could not be run (%s)" % (b, e))
-        finally:
+    _cenv, _cnote = _compile_env()
+    print("  [dyr] the .bat files run with %s" % _cnote)
+    _compile_diag(_cenv)
+    _shim, _snote = _cload4_shim()
+    if _snote:
+        print("  [dyr] %s" % _snote)
+    _bat_out = []
+    try:
+        for b in bats:
+            print("  [dyr] compiling user models: %s" % b)
+            sys.stdout.flush()
             try:
-                if fh:
-                    fh.close()
+                fh = open(os.devnull, "rb")
+            except Exception:
+                fh = None
+            try:
+                proc = subprocess.Popen([os.path.join(STUDY_DIR, b)], cwd=STUDY_DIR,
+                                        env=_cenv,
+                                        stdin=fh, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT,
+                                        universal_newlines=True, shell=False)
+                out, _err = proc.communicate()
+                rc = proc.returncode
+            except Exception as e:
+                raise RuntimeError("%s could not be run (%s)" % (b, e))
+            finally:
+                try:
+                    if fh:
+                        fh.close()
+                except Exception:
+                    pass
+            _bat_out.append(out or "")
+            for ln in (out or "").splitlines():
+                print("  [dyr]   | %s" % ln.rstrip())
+            # DOES THE OUTPUT SHOW A REAL FAILURE?
+            #
+            # The exit code alone is not enough -- a batch file's code is its last
+            # command's, and both of these end in `pause`. But the bare word "error"
+            # is far too broad: MyCompile34.bat prints
+            #
+            #     If no errors, run "MyCload4.bat"
+            #
+            # on a completely successful compile, and matching "error" in that
+            # stopped a build that had just worked. Only the signatures the
+            # compiler and the linker actually emit count.
+            why = _compile_error(out or "")
+            if rc not in (0, None) or why:
+                _restore()
+                hint = ""
+                if "LNK1168" in (out or ""):
+                    hint = (" LNK1168 means the .dll was open in another process: "
+                            "close every PSS/E session (taskkill /F /IM psse34.exe) "
+                            "and run again.")
+                elif "LNK1104" in (out or ""):
+                    hint = (" LNK1104 names a library the link could not find -- it "
+                            "must be in %s, or the Windows SDK's ucrt folder is "
+                            "missing from LIB." % STUDY_DIR)
+                raise RuntimeError(
+                    "%s failed (exit %s%s) -- the user models were NOT rebuilt for "
+                    "the changed .dyr, and the simulation would run the previous "
+                    "model set.%s" % (b, rc, (": " + why) if why else "", hint))
+    finally:
+        if _shim:
+            try:
+                os.remove(_shim)          # the study folder is left as it was
             except Exception:
                 pass
-        for ln in (out or "").splitlines():
-            print("  [dyr]   | %s" % ln.rstrip())
-        # DOES THE OUTPUT SHOW A REAL FAILURE?
-        #
-        # The exit code alone is not enough -- a batch file's code is its last
-        # command's, and both of these end in `pause`. But the bare word "error"
-        # is far too broad: MyCompile34.bat prints
-        #
-        #     If no errors, run "MyCload4.bat"
-        #
-        # on a completely successful compile, and matching "error" in that
-        # stopped a build that had just worked. Only the signatures the
-        # compiler and the linker actually emit count.
-        why = _compile_error(out or "")
-        if rc not in (0, None) or why:
-            _restore()
-            hint = ""
-            if "LNK1168" in (out or ""):
-                hint = (" LNK1168 means the .dll was open in another process: "
-                        "close every PSS/E session (taskkill /F /IM psse34.exe) "
-                        "and run again.")
-            elif "LNK1104" in (out or ""):
-                hint = (" LNK1104 names a library the link could not find -- it "
-                        "must be in %s, or the Windows SDK's ucrt folder is "
-                        "missing from LIB." % STUDY_DIR)
-            raise RuntimeError(
-                "%s failed (exit %s%s) -- the user models were NOT rebuilt for "
-                "the changed .dyr, and the simulation would run the previous "
-                "model set.%s" % (b, rc, (": " + why) if why else "", hint))
     # DID IT ACTUALLY PRODUCE ANYTHING?
     #
     # An exit code says the batch file ran, not that it built. A cload4 that
@@ -10300,14 +10444,25 @@ def _dyr_compile_user_models(changed):
         _left = [x for x in ("dsusr.def", "dsusr.exp", "dsusr.lib", "dsusr.map",
                              "dsusr.res")
                  if os.path.isfile(os.path.join(STUDY_DIR, x))]
+        _txt = "\n".join(_bat_out)
+        _py = ""
+        if "psse_env_manager" in _txt or ("cload4.py" in _txt and "Traceback" in _txt):
+            # cload4 is a Python script: a traceback from it means the Python
+            # that ran it is not one PSS/E's tools work with -- not a link error.
+            _py = (" cload4 (a Python script) FAILED TO START: the Python that ran it "
+                   "could not load PSS/E's psse_env_manager. %s. The lines above -- "
+                   "'cload4 resolves to', '.py files open with', 'psse_env_manager "
+                   "exists' -- say which Python ran it and which Python versions PSS/E "
+                   "installed its environment manager for; cload4 needs one of those."
+                   % (_snote or ("the .bat files ran with " + _cnote)))
         raise RuntimeError(
             "the compile ran but produced no dsusr.dll in %s%s -- every scenario "
-            "would run the previous model set. Read the cload4 output above: "
+            "would run the previous model set.%s Read the cload4 output above: "
             "LNK1168 means the file was open in another process, LNK1104 means a "
             ".lib it links against is missing from this folder."
             % (STUDY_DIR,
-               (" (it left %s, so the link reached its final step)"
-                % ", ".join(_left)) if _left else ""))
+               (" (it left %s -- possibly from an earlier link)"
+                % ", ".join(_left)) if _left else "", _py))
     if _stashed:
         try:
             os.remove(_stash)
@@ -21684,12 +21839,35 @@ def evaluate_case(path, kind, tclear, kb):
     undamped_all, review_all = [], []
     skipped_async = []
     skipped_trip = []
+    skipped_island = []
+    try:
+        _isl_buses = set() if kind == "flat" else _event_island_buses(case)
+    except Exception:
+        _isl_buses = set()
     for ti, v in angles:
         seg = v[i_clr:]
         if not len(seg):
             continue
         # "measured as absolute maximum peak to absolute minimum peak"
         dev = max(seg) - min(seg)
+        if (_isl_buses and dev >= ISLAND_ANGLE_MIN_DEG
+                and _chan_bus(ti) in _isl_buses):
+            # ISLANDED BY THE EVENT. The fault's own trips leave this unit in a
+            # pocket with no path to the system (a P4 at 531445 opens S4 and S5
+            # GEN's step-up transformers), so its angle is a machine spinning
+            # alone -- 47,000 deg in SantaFe F177 -- not a swing of the system.
+            # Excluded, visibly, like a tripped unit. The run-away angle is
+            # required as well as the topology: the map has no circuit ids, and
+            # a parallel circuit left in service must not hide a real swing.
+            skipped_island.append((chan_label(ti), dev))
+            ang_rows.append([chan_label(ti), _chan_bus(ti),
+                             _machine_kind(ti) or "SYNC", dev, 0,
+                             None, None, None, None, None,
+                             None, None, None, None, None,
+                             None, None, 0, None,
+                             "ISLANDED BY THE EVENT -- no path to the system after "
+                             "the trips; not judged for damping"])
+            continue
         if chan_label(ti) in tripped_lbls:
             # A TRIPPED MACHINE HAS NO ROTOR ANGLE TO DAMP. When PSS/E
             # disconnects a unit its ANGL channel steps and freezes -- 584713
@@ -21851,6 +22029,14 @@ def evaluate_case(path, kind, tclear, kb):
             "generation tripping. Their frozen angle channels step %s"
             % (len(skipped_trip),
                "; ".join("%s %.0f deg" % (n, d) for n, d in skipped_trip[:6])))
+    if skipped_island:
+        skipped_island.sort(key=lambda r: -r[1])
+        add("Rotor angle: machines islanded by the event excluded", None,
+            "%d machine(s) are left with NO path to the system by this fault's own "
+            "trips, so their angle is a unit running alone, not a swing of the "
+            "system -- not judged on rotor-angle damping: %s"
+            % (len(skipped_island),
+               "; ".join("%s %.0f deg" % (n, d) for n, d in skipped_island[:6])))
     add("Rotor-angle damping SPPR1/SPPR5 (>= %.0f deg)" % ANGLE_DEV_DEG,
         not undamped,
         # "ALL ARE DAMPED" HAS TO MEAN ALL OF THEM. A machine moved to individual
@@ -24714,6 +24900,65 @@ def write_what_failed_report(cases, verdicts, rows, crit_rows=None):
         f.write("=" * W + "\n")
     print("What-failed      -> %s (%d violation row(s))" % (txt, len(recs)))
     return txt
+
+
+# ---- WHICH BUSES A FAULT'S OWN TRIPS LEAVE ISLANDED -------------------------
+# A machine behind them has no system to swing against: its rotor angle runs
+# away (S4/S5 GEN at 531445, 47,000 deg in SantaFe F177) and must not be scored
+# as a damping failure. ISLAND_ANGLE_MIN_DEG is the second condition -- see
+# the rotor-angle criterion.
+ISLAND_ANGLE_MIN_DEG = 360.0
+_EVENT_POCKETS = {}
+
+
+def _event_island_buses(scen_id):
+    """Buses this scenario's trips leave in a pocket of at most ISLAND_MAX_BUSES
+       buses with no other path to the system. Empty when it cannot be told
+       (no fault list, no network map) -- never a guess."""
+    if "_built" not in _EVENT_POCKETS:
+        _EVENT_POCKETS["_built"] = True
+        try:
+            faults = load_faults_csv(os.path.join(FAULTS_DIR, "SPP_FAULTS.csv"))
+        except Exception:
+            faults = []
+        for f in faults:
+            cut, ends = set(), []
+            for ln in (f.get("trip_lines") or []):
+                try:
+                    x = int(resolve_bus(ln[0], ln[2] if len(ln) > 2 else None) or 0)
+                    y = int(resolve_bus(ln[1], ln[2] if len(ln) > 2 else None) or 0)
+                except Exception:
+                    continue
+                if not x or not y:
+                    continue
+                cut.add((x, y))
+                cut.add((y, x))
+                ends += [x, y]
+            pocket, checked = set(), set()
+            for st in ends:
+                # A bus the map has no branch for is unknown, not islanded.
+                if st in checked or not _dist_nbrs(st):
+                    continue
+                seen, fr, isl = set([st]), [st], True
+                while fr:
+                    if len(seen) > ISLAND_MAX_BUSES:
+                        isl = False
+                        break
+                    nx = []
+                    for u in fr:
+                        for w in _dist_nbrs(u):
+                            if (u, w) in cut or w in seen:
+                                continue
+                            seen.add(w)
+                            nx.append(w)
+                    fr = nx
+                checked |= seen
+                if isl:
+                    pocket |= seen
+            if pocket:
+                _EVENT_POCKETS[str(f["id"]).strip().upper()] = pocket
+    s = str(scen_id).strip().upper()
+    return _EVENT_POCKETS.get(s) or _EVENT_POCKETS.get(re.split(r"[_\s]", s)[0]) or set()
 
 
 # ---- WHICH FAULTS DISCONNECT THE PROJECT ----------------------------------

@@ -6696,6 +6696,9 @@ def _xl_col(n):
     return out
 
 
+_XL_LONGDEC = re.compile(r"^-?\d{1,9}\.\d{4,}$")
+
+
 def _xl_cell(col, row, value, style):
     ref = "%s%d" % (_xl_col(col), row)
     st = ' s="%d"' % style if style else ""
@@ -6704,6 +6707,12 @@ def _xl_cell(col, row, value, style):
     # NUMBERS AS NUMBERS. Stored as text, a voltage column sorts 1.2 above 1.19
     # and the filter offers "text filters" rather than "greater than" -- which
     # is most of the reason to produce a spreadsheet at all.
+    # EVERY DECIMAL TO 3 PLACES (1.07322835922 -> 1.073), whether it arrives as
+    # a number or as a long decimal read back from a CSV.
+    if isinstance(value, str) and _XL_LONGDEC.match(value.strip()):
+        value = float(value.strip())
+    if isinstance(value, float):
+        value = round(value, 3)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return '<c r="%s"%s><v>%s</v></c>' % (ref, st, repr(value))
     # EXCEL'S HARD LIMIT IS 32,767 CHARACTERS IN ONE CELL. One character over
@@ -7359,6 +7368,36 @@ def _element_class(fam, kind, bv, tv, lim, base_scored=False, new_bus=False,
 _COL = dict((c, i) for i, c in enumerate(_REPORT_COLS))
 
 
+def _poi_nodes_num(v):
+    """nodes_from_poi as a number to sort by -- nearest the POI first; a bus
+       with no path in the map ("beyond map", "-") after every counted one."""
+    try:
+        return int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return 10 ** 6
+
+
+def _fault_num_key(f):
+    """F2 before F10 (and FLAT_RUN after the numbered faults)."""
+    m = re.match(r"^([A-Za-z_]*?)(\d+)$", str(f).strip())
+    return (0, m.group(1), int(m.group(2))) if m else (1, str(f), 0)
+
+
+def _by_poi_distance(rows):
+    """Rows sorted fault, criterion, then NODES FROM THE POI (1 on top), then
+       the worst first -- each violation read outward from the plant."""
+    fi, ci, hpi, pli = (_COL["fault"], _COL["criterion"], _COL["hops_from_poi"],
+                        _COL["past_limit"])
+
+    def _k(r):
+        try:
+            past = -float(r[pli])
+        except (TypeError, ValueError):
+            past = 0.0
+        return (_fault_num_key(r[fi]), str(r[ci]), _poi_nodes_num(r[hpi]), past)
+    return sorted(rows, key=_k)
+
+
 def _report_rows(results):
     """The report as one flat table -- fault, criterion, element per row.
 
@@ -7690,42 +7729,22 @@ def _report_rows(results):
                         worst_base="" if c["mb"] is None else c["mb"],
                         worst_projects="" if c["mt"] is None else c["mt"],
                         description=desc, **_lbl))
-    return out
+    return _by_poi_distance(out)
 
 
 def _project_caused_rows(detail_rows):
     """The element rows the projects are responsible for -- element class NEW
-       -- worst first within each criterion. This is the sheet to act on."""
-    ic, ip, ik = (_COL["element_classification"], _COL["past_limit"],
-                  _COL["criterion"])
-    rows = [r for r in detail_rows if r[ic] == CLS_NEW]
-
-    def _k(r):
-        try:
-            past = -float(r[ip])
-        except (TypeError, ValueError):
-            past = 0.0
-        return (str(r[ik]), past, str(r[_COL["fault"]]))
-    rows.sort(key=_k)
-    return rows
+       -- per fault and criterion, nearest the POI first. The sheet to act on."""
+    ic = _COL["element_classification"]
+    return _by_poi_distance([r for r in detail_rows if r[ic] == CLS_NEW])
 
 
 def _pre_existing_element_rows(detail_rows):
     """Per-bus rows the base system ALREADY fails -- element class PRE-EXISTING
-       -- worst first within each criterion. The companion to the project-caused
-       list: same shape, the other half of the answer."""
-    ic, ip, ik = (_COL["element_classification"], _COL["past_limit"],
-                  _COL["criterion"])
-    rows = [r for r in detail_rows if r[ic] == CLS_PRE]
-
-    def _k(r):
-        try:
-            past = -float(r[ip])
-        except (TypeError, ValueError):
-            past = 0.0
-        return (str(r[ik]), past, str(r[_COL["fault"]]))
-    rows.sort(key=_k)
-    return rows
+       -- per fault and criterion, nearest the POI first. The companion to the
+       project-caused list: same shape, the other half of the answer."""
+    ic = _COL["element_classification"]
+    return _by_poi_distance([r for r in detail_rows if r[ic] == CLS_PRE])
 
 
 # ---- THE READABLE, NARROW VIEW ---------------------------------------------
@@ -12110,19 +12129,127 @@ def _release_compare_memory():
         pass
 
 
-def _frees_memory_first(fn):
+# EMPTYING THE CACHES WAS NOT ENOUGH. A 32-bit Python does not get its
+# address space back in one piece: after the main comparison IronStar's
+# surplus run still could not be read (365,000 voltage rows for its base
+# alone), and steps that had worked for one project failed for the next. So
+# each of these steps, for each project, now runs in a CHILD Python of its
+# own -- this same script, the same panel, a fresh 2 GB -- and hands back
+# only the files it writes. A child that cannot be started falls back to
+# running the step here, as before.
+_EXTRA_STEP_ENV = "SPP_EXTRA_STEP"
+_EXTRA_STEPS = {}
+_IN_EXTRA_CHILD = [False]
+
+
+def _echo_child(proc):
+    """The child's console, line by line, in THIS thread (no reader thread to
+       start: that was what failed with "can't start new thread")."""
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    while True:
+        try:
+            line = proc.stdout.readline()
+        except Exception:
+            break
+        if not line:
+            break
+        try:
+            sys.stdout.write(line)
+        except UnicodeEncodeError:
+            try:
+                sys.stdout.write(line.encode(enc, "replace").decode(enc, "replace"))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def _in_own_process(fn):
+    name = fn.__name__
+    _EXTRA_STEPS[name] = fn
+
     def _w(*a, **k):
+        if _IN_EXTRA_CHILD[0] or k:
+            _release_compare_memory()
+            return fn(*a, **k)
         _release_compare_memory()
-        return fn(*a, **k)
-    _w.__name__ = fn.__name__
+        # the campaign plan's NOW RUNNING line: the child's banners do not
+        # reach this process, so name the step here and take its last one back
+        _PLAN_NOW[0] = "%s %s   (since %s)" % (name, " ".join(str(x) for x in a),
+                                               time.strftime("%Y-%m-%d %H:%M"))
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="z6_step_")
+        rp = os.path.join(tmp, "result.json")
+        env = dict(os.environ)
+        env[_EXTRA_STEP_ENV] = json.dumps({
+            "step": name, "args": list(a), "result": rp,
+            "cmp_sub": list(_CMP_SUB), "egf_skip": list(_EGF_SKIP)})
+        try:
+            p = subprocess.Popen([PYTHON, "-u", os.path.abspath(__file__)],
+                                 cwd=os.path.dirname(os.path.abspath(__file__)), env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 universal_newlines=True, bufsize=1)
+        except Exception as e:
+            print("[compare] could not start a separate Python for %s (%s) -- "
+                  "running it here" % (name, e))
+            shutil.rmtree(tmp, ignore_errors=True)
+            return fn(*a, **k)
+        _echo_child(p)
+        rc = p.wait()
+        try:
+            with open(rp) as fh:
+                res = json.load(fh)
+        except Exception:
+            res = {"ok": False, "error": "the separate Python ended rc=%s without "
+                                         "a result -- see its lines above" % rc}
+        shutil.rmtree(tmp, ignore_errors=True)
+        if res.get("plan_now"):
+            _PLAN_NOW[0] = res["plan_now"]
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error") or "failed")
+        return res.get("value")
+    _w.__name__ = name
     _w.__doc__ = fn.__doc__
     return _w
 
 
-compare_surplus_scenarios = _frees_memory_first(compare_surplus_scenarios)
-compare_egf_variants = _frees_memory_first(compare_egf_variants)
-compare_three_way = _frees_memory_first(compare_three_way)
-write_all_variants_overvoltage = _frees_memory_first(write_all_variants_overvoltage)
+def _run_extra_step(spec):
+    """In the child: one step for one project, then exit. 0 = it returned."""
+    _IN_EXTRA_CHILD[0] = True
+    _CMP_SUB[:] = spec.get("cmp_sub") or []
+    _EGF_SKIP[:] = spec.get("egf_skip") or []
+    res = {"ok": False}
+    try:
+        v = _EXTRA_STEPS[spec["step"]](*spec.get("args") or [])
+        try:
+            json.dumps(v)
+        except Exception:
+            v = None
+        res = {"ok": True, "value": v}
+    except BaseException as e:
+        try:
+            import traceback as _tb
+            _tb.print_exc()
+        except Exception:
+            pass
+        res = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    res["plan_now"] = _PLAN_NOW[0]
+    try:
+        with open(spec["result"], "w") as fh:
+            json.dump(res, fh)
+    except Exception:
+        pass
+    return 0 if res.get("ok") else 1
+
+
+compare_surplus_scenarios = _in_own_process(compare_surplus_scenarios)
+compare_egf_variants = _in_own_process(compare_egf_variants)
+compare_three_way = _in_own_process(compare_three_way)
+write_all_variants_overvoltage = _in_own_process(write_all_variants_overvoltage)
 
 
 def write_dyr_sweep_comparisons(proj, mode, variants, cap_tag=""):
@@ -18114,6 +18241,12 @@ def auto_remerge_stale_reports(quiet=False):
                     by = _report_behind_parts_by(rdir, proj)
                     if by > STALE_REPORT_TOL_S:
                         todo.append((case, proj, rdir, by))
+                    elif (not (rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj)
+                               or rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj))
+                          and glob.glob(os.path.join(rdir, "parts", "SCEN_*.csv"))):
+                        # SCORED PARTS AND NO MERGED REPORT AT ALL -- "behind"
+                        # reads 0 there, so it was never rebuilt.
+                        todo.append((case, proj, rdir, -1))
     if not todo:
         return 0
     print("")
@@ -18124,8 +18257,9 @@ def auto_remerge_stale_reports(quiet=False):
     print("[auto-merge] Rebuilding them from parts\\ first (merge only -- no .out is read).")
     n = 0
     for case, proj, rdir, by in todo:
-        print("[auto-merge] %-6s %-16s %-42s report is %s behind"
-              % (case["key"], proj, os.path.basename(rdir), _fmt_hms(by)))
+        print("[auto-merge] %-6s %-16s %-42s %s"
+              % (case["key"], proj, os.path.basename(rdir),
+                 "no merged report yet" if by < 0 else "report is %s behind" % _fmt_hms(by)))
         if _merge_one_folder(case, rdir):
             n += 1
     print("[auto-merge] %d of %d folder(s) rebuilt." % (n, len(todo)))
@@ -18188,6 +18322,79 @@ def _out_and_scored_sets(rdir, proj):
     return outs, scored
 
 
+def _tag_env(proj, tag):
+    """The run settings of an EGF / surplus tagged folder, or None for any other
+       tag (a sweep or capacity folder is scored by its own pass)."""
+    for sc in surplus_scenarios():
+        if sc["tag"] == tag:
+            return _surplus_env(sc)
+    for t, _label, venv in _egf_variants(proj):
+        if t == tag:
+            env = {"SPP_RUN_TAG": tag, "SPP_DEFER_REPORTS": "0"}
+            env.update(venv)
+            return env
+    return None
+
+
+def _score_tagged_folder(case, proj, mode, rdir, missing):
+    """Score the .out files of an EGF / surplus folder that have no verdict.
+       Returns the ids still unscored afterwards, or None when nothing was run."""
+    _p, _m, tag = _split_run_folder(rdir)
+    if not tag:
+        return None
+    env = _tag_env(proj, tag)
+    if env is None:
+        return None
+    od = os.path.join(rdir, "outs")
+    todo = []
+    for sid in missing:
+        q = os.path.join(od, sid + ".out")
+        if sid.upper().startswith("FLAT") or not os.path.isfile(q):
+            continue
+        if not (os.path.isfile(os.path.join(od, sid + ".done"))
+                or os.path.isfile(os.path.join(od, sid + ".partial"))):
+            continue                    # still running / never finished: not a scoring job
+        if os.path.isfile(q + ".badout"):
+            continue
+        stamp = os.path.join(od, sid + ".scoretry")
+        omt = "%.0f" % os.path.getmtime(q)
+        try:
+            if os.path.isfile(stamp) and open(stamp).read().strip() == omt:
+                continue                # asked once already for this .out
+        except Exception:
+            pass
+        todo.append((sid, stamp, omt))
+    if not todo:
+        return None
+    ids = [s for s, _st, _o in todo]
+    print("[coverage]     scoring %d of them now under the %s settings -- no simulation: %s"
+          % (len(ids), tag, ", ".join(ids[:12]) + (" ..." if len(ids) > 12 else "")))
+    for _sid, stamp, omt in todo:
+        try:
+            with open(stamp, "w") as fh:
+                fh.write(omt)
+        except Exception:
+            pass
+    env.update({"SPP_REPORT_ONLY": "1", "SPP_REPORT_FAULTS": ",".join(ids),
+                "SPP_ONLY_FAULTS": ""})
+    try:
+        rc = run_study(case, projects=[proj], modes=[mode], extra_env=env)
+    except Exception as e:
+        print("[coverage]     the scoring pass could not start (%s)" % e)
+        return None
+    if rc not in (0, None):
+        print("[coverage]     the scoring pass ended rc=%s -- what it scored is kept" % rc)
+    # ITS REPORTS ARE THE _SELECTED ONES -- rebuild the full ones from every part.
+    _merge_one_folder(case, rdir)
+    _MEAS_CACHE.clear()
+    _SCEN_PART_CACHE.clear()
+    _OUT_SET_CACHE.clear()
+    outs, scored = _out_and_scored_sets(rdir, proj)
+    after = sorted(outs - scored, key=_fault_key)
+    print("[coverage]     %d of %d now scored" % (len(missing) - len(after), len(missing)))
+    return after
+
+
 def verify_scoring_coverage(quiet=False):
     """Does every .out in every folder have a verdict? Run BEFORE comparing.
 
@@ -18229,7 +18436,13 @@ def verify_scoring_coverage(quiet=False):
                     # the merge rebuilds the same report (every launch, for a
                     # folder with an .out that can never be scored) and could
                     # bring back a score older than a re-run .out.
-                    if (_report_behind_parts_by(rdir, proj) > STALE_REPORT_TOL_S
+                    # A FOLDER WITH PARTS AND NO MERGED REPORT AT ALL is behind
+                    # its parts too -- _report_behind_parts_by() says 0 there, so
+                    # EmpirePrairie_spp_egfoff (246 scored parts, no report) was
+                    # never merged, launch after launch.
+                    _no_rep = not (rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj)
+                                   or rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj))
+                    if ((_no_rep or _report_behind_parts_by(rdir, proj) > STALE_REPORT_TOL_S)
                             and _merge_one_folder(case, rdir)):
                         _MEAS_CACHE.clear()
                         _SCEN_PART_CACHE.clear()
@@ -18240,6 +18453,16 @@ def verify_scoring_coverage(quiet=False):
                             print("[coverage]     merged from parts -- %d of those now "
                                   "scored" % (len(missing) - len(_after)))
                         missing = _after
+                    # EGF-OFF AND SURPLUS FOLDERS ARE SCORED HERE. ensure_reports()
+                    # scores the plain <proj>_<mode> folders only, so a tagged
+                    # folder whose own run died in its report phase kept its
+                    # unscored .out files for good (EmpirePrairie_spp_s1_egfoff:
+                    # 198 of 285). One pass restricted to those ids, under the
+                    # tag's own settings; asked once per version of each .out.
+                    if missing:
+                        _after = _score_tagged_folder(case, proj, mode, rdir, missing)
+                        if _after is not None:
+                            missing = _after
                     if missing:
                         still.append((case, proj, rdir, missing))
     if not still:
@@ -24184,6 +24407,10 @@ def main():
         print("[compare] (the summary is at %s -- this console cannot print it)" % p)
     return 0
 
+
+if __name__ == "__main__" and os.environ.get(_EXTRA_STEP_ENV):
+    # A CHILD STARTED BY _in_own_process: one extra comparison, then exit.
+    sys.exit(_run_extra_step(json.loads(os.environ[_EXTRA_STEP_ENV])))
 
 if __name__ == "__main__":
     # THE TIME TABLE IS THE LAST THING PRINTED, whatever main() returns and

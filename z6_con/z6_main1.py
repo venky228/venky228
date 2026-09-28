@@ -318,6 +318,12 @@ def _print_phase_times(total):
 #   None = leave the study scripts' own value. Values go to BOTH cases.
 # ============================================================================
 
+# ---- 0. QUICK .dyr TEST (project BESS) -- one project per launch ----------------
+# "EastFork" = run 1, "SantaFe" = run 2, None = normal study (every setting below as it was).
+# It sets PROJECTS, PIPELINE, RUN_CASES, ONLY_FAULTS, DYR_SHOW, DYR_SWEEP_BY_PROJECT /
+# _PROJECTS (see the end of section 12). New folders only: <proj>_spp_dyr_<tag>.
+QUICK_DYR_TEST = "EastFork"            # z6_main1.py = the QUICK .dyr TEST copy of z6_main.py
+
 # ---- 1. WHAT TO RUN ------------------------------------------------------------
 PROJECTS = ["SantaFe", "IronStar","EmpirePrairie","EastFork"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
@@ -368,7 +374,7 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 # GEN_TEST = True runs ONLY this test (normal study skipped).
 # Results: comparison_scenarios\<project>\BASE_CASE\gen_test\  (all projects: comparison_scenarios\GEN_TEST_ALL_PROJECTS.txt)
 # Live, every project on one page: comparison_scenarios\GEN_TEST_STATUS_ALL.txt
-# Preview the plan without simulating:  python z7_gt_report.py
+# Preview the plan without simulating:  python z6_gt_report.py
 # -- 3a. on / off, projects, faults
 GEN_TEST = False                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
@@ -592,7 +598,7 @@ MAKE_FAULT_LIST = False                      # False: never build/copy a list he
 REGEN_FAULTS = None                          # "if-missing" | "always" | "never"
 NEW_FAULT_LIST = False                       # True = brand-new list (renumbers, retires old results)
 FAULT_LIST_FROM = "BASE"                     # "BASE" | "TEST" topology
-SHARED_FAULTS_CSV = r"{root}\FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"  # the lists z7_fault_list.py writes
+SHARED_FAULTS_CSV = r"{root}\FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"  # the lists z6_fault_list.py writes
                                              #   (old: r"{root}\SPP_FAULTS_CON_{project}.csv"); {root} = case folder
 SPP_FAULT_HOPS = None                        # levels out from the POI
 SPP_FAULT_KV_MIN = None                      # ignore below this kV
@@ -670,6 +676,36 @@ DYR_SWEEP_COMPARE = True                     # full comparison per value
 DYR_SWEEP_SKIP_DECK = True                   # skip a value the deck already has
 DYR_DECK_VALUES = {}                         # override the deck values read from the template
 
+# QUICK_DYR_TEST (section 0): the SWEEP STUDIES ONLY are simulated with these times.
+# Everything else in the launch keeps the study's own (FLAT_RUN_S / PRE_FAULT_S /
+# SIM_END_S), so the existing folders are checked and scored exactly as before --
+# and no existing folder is simulated into (see the end of section 15).
+QUICK_SIM_TIMES = {"FLAT_RUN_S": 5,          # s, no-fault run      (study: 25)
+                   "PRE_FAULT_S": 3,         # s before the fault   (study: 5)
+                   "SIM_END_S": 8}           # s per fault          (study: 25.2)
+
+# QUICK_DYR_TEST (section 0). Constant names as the project's BESS_MODEL_TEMPLATE
+# records name them (REECCU1 has no Thld -- that is REECA1). Deck: Kqv 0.5,
+# Volim 1.2, Khv 0.0, Vfrz 0.88. Every combination is one run.
+_QUICK_DYR = {
+    "EastFork": {"faults": ["F01", "F06", "F07", "F17", "F30"],   # 3 still failing + 2 the EGF-off run cleared
+                 "sweep": {"REECCU1": {"Kqv": [0.0, 1.0]}}},
+    "SantaFe":  {"faults": ["F03", "F07", "F12", "F17"],
+                 "sweep": {"REECCU1": {"Kqv": [0.0, 1.0]},
+                           "REGCAU1": {"Volim": [1.1], "Khv": [0.7]},
+                           "REPCAU1": {"Vfrz": [0.9]}}},
+}
+if QUICK_DYR_TEST:
+    PROJECTS = [QUICK_DYR_TEST]
+    PIPELINE = "missing"                     # the sweep does not run under "compare"
+    RUN_CASES = "proj"
+    ONLY_FAULTS = list(_QUICK_DYR[QUICK_DYR_TEST]["faults"])
+    SKIP_DONE = True
+    DYR_SHOW = ["REECCU1", "REGCAU1", "REPCAU1"]     # prints the current values -- check them first
+    DYR_SWEEP_BY_PROJECT = {QUICK_DYR_TEST: _QUICK_DYR[QUICK_DYR_TEST]["sweep"]}
+    DYR_SWEEP_PROJECTS = [QUICK_DYR_TEST]
+    DYR_SWEEP_FAULTS = "all"                 # "all" is cut down to ONLY_FAULTS
+
 # ---- 13. COLLECTOR SYSTEM ------------------------------------------------------
 COLLECTOR_ON = True                          # False = leave every collector alone
 # COLLECTOR_BRANCHES: per project: (gen bus, from, to, ckt, R, X, B); None = keep
@@ -741,6 +777,20 @@ SWEEP_SKIP_DONE = True                       # True = swept runs resume
 PROJECT_OFF_RUN = False                      # True = extra study with the project machines off
 PROJECT_OFF_PROJECTS = []                    # [] = every project
 PROJECT_OFF_COMPARE = False
+
+# QUICK_DYR_TEST: ONLY the sweep simulates. The EGF-off base run and the surplus
+# runs launch into EXISTING folders, and so would the "missing" fill-in; at other
+# simulation times the launcher moves a finished run aside and runs it again.
+if QUICK_DYR_TEST:
+    EGF_DYR_RUN = False
+    EGF_OFF_RUN = False
+    EGF_OFF_BASE_RUN = False
+    SURPLUS_SCENARIOS = []
+    NEW_PLANT_RUN = False
+    PROJECT_OFF_RUN = False
+    CAPACITY_LEVELS = []
+    POI_P_LEVELS = []
+    POI_P_LEVELS_PCT = []
 
 # ---- 16. RESUME RULES ----------------------------------------------------------
 RUN_ONLY_MISSING_OUT = True                  # True = simulate only faults with no .out
@@ -1724,13 +1774,13 @@ SEARCH_ROOT = STUDY_ROOT                   # the folder the cases sit in
 CASE_BASE = {
     "key":    "BASE",
     "dir":    BASE_DIR,
-    "script": "z7_lch_b.py",
+    "script": "z6_lch_b.py",
     "label":  "base case -- projects NOT modelled",
 }
 CASE_TEST = {
     "key":    "PROJ",
     "dir":    TEST_DIR,
-    "script": "z7_lch_p.py",
+    "script": "z6_lch_p.py",
     "label":  "one BESS project added to the base case, one project at a time",
 }
 
@@ -9477,8 +9527,10 @@ def _sweep_resume_env():
        writes DYR_EDITS.txt and COLLECTOR_IMPEDANCE.txt into its folder and
        ALL_RUNS_<proj>_<mode>.txt prints both per run -- check them, or set this
        False, when anything but the swept value has changed."""
+    # ITS OWN REPORT TOO: every caller reads the folder's verdicts straight
+    # after the run, so a report deferred to "after all projects" never exists.
     return {"SPP_SKIP_DONE": "1" if SWEEP_SKIP_DONE else "0",
-            "SPP_FRESH_START": "0"}
+            "SPP_FRESH_START": "0", "SPP_DEFER_REPORTS": "0"}
 
 
 def _cap_levels():
@@ -9583,12 +9635,12 @@ def run_surplus_scenarios(proj, mode):
 
 def compare_three_way(proj, mode):
     """Base | GIA | each SURPLUS scenario for one project, in ONE side-by-side
-       workbook (z7_cmp_multi.py, run for this project's folders only): every
+       workbook (z6_cmp_multi.py, run for this project's folders only): every
        fault with each run's verdict, worst criterion, values and POI power.
        Written to <root>\\comparison_pairs\\<project>\\."""
-    cm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "z7_cmp_multi.py")
+    cm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "z6_cmp_multi.py")
     if not os.path.isfile(cm):
-        print("[3-way] z7_cmp_multi.py is not beside %s -- no side-by-side"
+        print("[3-way] z6_cmp_multi.py is not beside %s -- no side-by-side"
               % os.path.basename(__file__))
         return False
     rb = results_dir(CASE_BASE, proj, mode)
@@ -9621,7 +9673,7 @@ def compare_three_way(proj, mode):
             names[rt + psfx] = "PROJECT_SGF_EGF_OFF"
             sbs_name = "{proj}_ALL_4_SCENARIOS"
     import tempfile
-    tmp = tempfile.mkdtemp(prefix="z7_3way_")
+    tmp = tempfile.mkdtemp(prefix="z6_3way_")
     pj, dj = os.path.join(tmp, "pairs.json"), os.path.join(tmp, "done.json")
     tj = os.path.join(tmp, "tags.json")
     with open(pj, "w") as fh:
@@ -9655,7 +9707,7 @@ def compare_three_way(proj, mode):
     if th is not None:
         th.join(timeout=5)
     if rc not in (0, None):
-        print("[3-way] *** %s: z7_cmp_multi ended rc=%s ***" % (proj, rc))
+        print("[3-way] *** %s: z6_cmp_multi ended rc=%s ***" % (proj, rc))
     return rc in (0, None)
 
 
@@ -10028,7 +10080,7 @@ def run_capacity_sweep(proj, mode):
                                  for f in fails)
             continue
         _banner("CAPACITY %s%% -- re-running %d failing fault(s)" % (tag, len(fails)))
-        env = {"SPP_CAP_SCALE": repr(lv), "SPP_CAP_TAG": tag}
+        env = {"SPP_CAP_SCALE": repr(lv), "SPP_CAP_TAG": tag, "SPP_DEFER_REPORTS": "0"}
         env.update(_sweep_resume_env())
         if (CAPACITY_FAULTS or "all").strip().lower() == "failing":
             # Restrict the run to the failing ids. Left unset the study runs its
@@ -10737,7 +10789,7 @@ def _dyr_sweep_variants(proj=None):
     variants = [("dyr_" + t, e) for t, e in out]
     # DROP ANY VARIANT THAT IS THE DECK AS IT STANDS. The deck values come from
     # the engine's BESS_MODEL_TEMPLATE automatically (they are already in
-    # z7_spp_p.py), overlaid by DYR_DECK_VALUES and the panel edits -- so no
+    # z6_spp_p.py), overlaid by DYR_DECK_VALUES and the panel edits -- so no
     # value need be typed twice. See DYR_DECK_VALUES / DYR_SWEEP_SKIP_DECK.
     if DYR_SWEEP_SKIP_DECK:
         kept, dropped = [], []
@@ -10762,7 +10814,7 @@ _ENGINE_DYR_DEFAULTS = [None]
 
 def _engine_dyr_defaults():
     """{model: {constant name: value}} read from BESS_MODEL_TEMPLATE in the
-       project engine (z7_spp_p.py) -- the deck defaults that are ALREADY in the
+       project engine (z6_spp_p.py) -- the deck defaults that are ALREADY in the
        file, so the guard needs no hand-typed DYR_DECK_VALUES.
 
        The template annotates every record: an "@!/ name name ..." line above a
@@ -10776,8 +10828,8 @@ def _engine_dyr_defaults():
     try:
         spp = _study_script_for(CASE_TEST)
         if not spp:
-            for _p in (os.path.join(TEST_DIR, "z7_spp_p.py"),
-                       _root_named("z7_spp_p.py")):
+            for _p in (os.path.join(TEST_DIR, "z6_spp_p.py"),
+                       _root_named("z6_spp_p.py")):
                 if os.path.isfile(_p):
                     spp = _p
                     break
@@ -10887,6 +10939,22 @@ def _dyr_sweep_dir(proj, mode, tag, cap_tag=""):
                         "%s_%s%s_%s" % (proj, mode, _cap_suffix(cap_tag), tag))
 
 
+def _quick_sim_env():
+    """QUICK_SIM_TIMES for a sweep study (QUICK_DYR_TEST), as the study reads them."""
+    t = QUICK_SIM_TIMES or {}
+    out = {}
+    for k in ("FLAT_RUN_S", "PRE_FAULT_S", "SIM_END_S"):
+        if t.get(k) is not None:
+            out["SPP_" + k] = repr(float(t[k]))
+    return out
+
+
+def _is_quick_folder(d):
+    """A .dyr sweep folder of a QUICK_DYR_TEST launch: simulated at QUICK_SIM_TIMES."""
+    return bool(QUICK_DYR_TEST) and "_dyr_" in os.path.basename(os.path.normpath(os.path.dirname(d)
+                                                                             if os.path.basename(d) == "outs" else d))
+
+
 def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
     """Run the project case once per DYR_SWEEP variant, at ONE capacity level.
 
@@ -10929,6 +10997,10 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
         print("[dyr-sweep] %s %s: nothing to sweep -- the project case scored no fault"
               % (proj, mode))
         return [], []
+    if QUICK_DYR_TEST:
+        print("[dyr-sweep] QUICK_DYR_TEST: these studies run at %s -- every other folder keeps the "
+              "study's own times" % ", ".join("%s %g s" % (k, v) for k, v in
+                                           sorted((QUICK_SIM_TIMES or {}).items())))
     print("[dyr-sweep] %s %s%s: %d value combination(s) x %d %s"
           % (proj, mode, _cap_note(cap_tag), len(variants), len(faults), what))
     for tag, edits in variants:
@@ -10947,8 +11019,13 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
         _tbl = dict((k, [list(x) if isinstance(x, (list, tuple)) else x for x in v])
                     for k, v in (DYR_EDITS_BY_PROJECT or {}).items())
         _tbl[proj] = [[m, dict((str(c), v) for c, v in d.items())] for m, d in edits]
+        # ITS OWN REPORT, at the end of its own run -- read straight after, below.
+        # Deferred (REPORTS_AFTER_ALL_PROJECTS) it was never written: the value
+        # read "scored the FLAT RUN and NO FAULT" with every fault simulated.
         env = {"SPP_DYR_EDITS_BY_PROJECT": json.dumps(_tbl),
-               "SPP_RUN_TAG": tag}
+               "SPP_RUN_TAG": tag, "SPP_DEFER_REPORTS": "0"}
+        if QUICK_DYR_TEST:
+            env.update(_quick_sim_env())
         # RESUME OR RE-SIMULATE -- see _sweep_resume_env(). This used to be
         # "always re-simulate", which on a second launch repeats every value
         # from nothing.
@@ -12182,7 +12259,7 @@ def _in_own_process(fn):
         _PLAN_NOW[0] = "%s %s   (since %s)" % (name, " ".join(str(x) for x in a),
                                                time.strftime("%Y-%m-%d %H:%M"))
         import tempfile
-        tmp = tempfile.mkdtemp(prefix="z7_step_")
+        tmp = tempfile.mkdtemp(prefix="z6_step_")
         rp = os.path.join(tmp, "result.json")
         env = dict(os.environ)
         env[_EXTRA_STEP_ENV] = json.dumps({
@@ -12384,7 +12461,7 @@ def run_new_plant(proj, mode):
         return []
     _banner("NEW PLANT -- %s (%s): new buses, GSU, collector, MPT, tie to the POI"
             % (proj, mode))
-    env = {"SPP_RUN_TAG": NEW_PLANT_TAG}
+    env = {"SPP_RUN_TAG": NEW_PLANT_TAG, "SPP_DEFER_REPORTS": "0"}
     env.update(_sweep_resume_env())
     # THE WHOLE EQUIPMENT DESCRIPTION, as JSON. "enabled" is forced on here
     # rather than read from the panel: this function exists to build the plant,
@@ -12557,7 +12634,7 @@ def run_project_off(proj, mode):
               % (proj, mode))
         return []
     _banner("PROJECT OFF -- %s (%s): the same case, machines out of service" % (proj, mode))
-    env = {"SPP_PROJECT_OFF": "1", "SPP_RUN_TAG": PROJECT_OFF_TAG}
+    env = {"SPP_PROJECT_OFF": "1", "SPP_RUN_TAG": PROJECT_OFF_TAG, "SPP_DEFER_REPORTS": "0"}
     env.update(_sweep_resume_env())
     rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
     if rc not in (0, None):
@@ -15027,8 +15104,8 @@ def _push_settings(env, case):
     # arrangement exists to avoid.
     _say("[compare] %-4s deck : %s / %s%s"
           % (case.get("key", "?"),
-             _sav or "(z7_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
-             _dyr or "(z7_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
+             _sav or "(z6_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
+             _dyr or "(z6_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
              ("   <- the INPUT deck (no project in it); the plant is built onto "
               "a copy and that copy is what runs"
               if _this == "project" and _sav and _sav == BASE_SAV else "")))
@@ -15039,7 +15116,7 @@ def _push_settings(env, case):
     # change the very case the comparison measures against -- so every difference
     # afterwards would be "the project, plus a base case we moved".
     #
-    # z7_spp_b.py implements none of this, so the variables were ignored there in
+    # z6_spp_b.py implements none of this, so the variables were ignored there in
     # any case. They are removed rather than left to be ignored: an environment
     # that carries a setting the process does not honour is a setting somebody
     # will later believe was applied.
@@ -16193,7 +16270,7 @@ def check_fault_lists():
         print("[compare]     %s  ->  %s + its study script"
               % (CASE_TEST["dir"], CASE_TEST["script"]))
         print("[compare]   This file (%s) sits in the folder ABOVE them."
-              % os.path.basename(__file__ if "__file__" in dir() else "z7_main.py"))
+              % os.path.basename(__file__ if "__file__" in dir() else "z6_main.py"))
         return False
 
     # BOTH GENERATING = two different fault sets, and nothing later can tell.
@@ -16320,7 +16397,7 @@ def check_feeder_ratings():
        equally across its feeders and ABORTS when a feeder would carry more
        than FEEDER_MAX_MW:  804 / 4 = 201.0 against a cap of 200.0.
 
-       That check is module-level code in z7_spp_p.py, so it raises on IMPORT,
+       That check is module-level code in z6_spp_p.py, so it raises on IMPORT,
        before main(). Every process of that project's PROJECT-case pass died the
        same way -- build, worker, report, plot -- the launcher retried the build
        three times and gave up, and the pass produced no results folder at all.
@@ -16993,7 +17070,7 @@ def _cases_to_run():
 
 
 def _study_script_for(case):
-    """The STUDY script for this case -- z7_spp_b.py / z7_spp_p.py.
+    """The STUDY script for this case -- z6_spp_b.py / z6_spp_p.py.
 
        NOT case["script"], which is the LAUNCHER. The launcher runs a whole
        study: build, simulate, report. It does not know SPP_PLOT_MISSING and
@@ -17003,7 +17080,7 @@ def _study_script_for(case):
        script itself, whose very first act under SPP_PLOT_MISSING is to draw
        what is on disk and exit before main() -- no PSS/E, no queue, no case."""
     lch = case.get("script") or ""
-    spp = os.path.basename(lch).replace("z7_lch_", "z7_spp_")
+    spp = os.path.basename(lch).replace("z6_lch_", "z6_spp_")
     p = os.path.join(case["dir"], spp)
     return p if os.path.isfile(p) else ""
 
@@ -17989,7 +18066,7 @@ def run_merge_only():
     """The merge step alone, for every project and both cases. Returns how many
        folders were rebuilt.
 
-       See MERGE_ONLY. This spawns the STUDY script (z7_spp_p.py / z7_spp_b.py)
+       See MERGE_ONLY. This spawns the STUDY script (z6_spp_p.py / z6_spp_b.py)
        with SPP_MERGE_ONLY=1, which is handled before main() -- so no PSS/E
        session is started, no case is loaded and no .out is opened. A folder
        with no parts\ is skipped and said so, rather than writing an empty
@@ -18182,7 +18259,7 @@ def _merge_one_folder(case, rdir):
     env = dict(os.environ)
     # THE SAME ENVIRONMENT THE RUN HAD. Without it the merge process fell back
     # to the study script's own deck names -- "DIS2201-25SP-G03-CQ.sav (this
-    # file -- z7_main.py did not name one)" -- could not find the
+    # file -- z6_main.py did not name one)" -- could not find the
     # _CQ_F_..._NEWPLANT_newplant_buses.txt the run had written, and rebuilt
     # the violations report with "PROJECT_GENS stays on the project's declared
     # feeder buses": the wrong machines labelled as the project's. The decks,
@@ -18384,6 +18461,12 @@ def _score_tagged_folder(case, proj, mode, rdir, missing):
         return None
     if rc not in (0, None):
         print("[coverage]     the scoring pass ended rc=%s -- what it scored is kept" % rc)
+        # NOT ASKED AFTER ALL: the next launch tries these again (see _SCORETRY_NEW)
+        for _sid, stamp, _omt in todo:
+            try:
+                os.remove(stamp)
+            except Exception:
+                pass
     # ITS REPORTS ARE THE _SELECTED ONES -- rebuild the full ones from every part.
     _merge_one_folder(case, rdir)
     _MEAS_CACHE.clear()
@@ -18826,7 +18909,7 @@ def mark_partial_runs(quiet=False):
         for sid, te in found:
             try:
                 with open(os.path.join(od, sid + ".partial"), "w") as fh:
-                    fh.write("tend=%.3f\nby=z7_main (time axis)\n" % te)
+                    fh.write("tend=%.3f\nby=z6_main (time axis)\n" % te)
                 n_new += 1
                 if not quiet:
                     print("[compare]     %-10s reached %.2f s of %.2f s" % (sid, te, _end))
@@ -18906,6 +18989,23 @@ def retire_truncated_done(quiet=False):
         _t_full = None
     n_back = 0
     for case, od, _proj, _mode in folders:
+        if _is_quick_folder(od):
+            # A QUICK_DYR_TEST sweep folder: run at QUICK_SIM_TIMES on purpose. A
+            # compare at the study's own times (z6_main.py) renamed its markers
+            # .done.truncated -- give back the ones that reached the quick end.
+            try:
+                _qe = float((QUICK_SIM_TIMES or {}).get("SIM_END_S")) - 0.11
+            except (TypeError, ValueError):
+                _qe = None
+            for _tp in glob.glob(os.path.join(od, "*.done.truncated")):
+                _te = _marker_tend(_tp)
+                if _qe is not None and _te is not None and _te >= _qe:
+                    try:
+                        os.rename(_tp, _tp[:-len(".truncated")])
+                        n_back += 1
+                    except Exception:
+                        pass
+            continue
         sizes = {}
         for p in glob.glob(os.path.join(od, "*.out")):
             sid = os.path.splitext(os.path.basename(p))[0]
@@ -19058,6 +19158,31 @@ def retire_truncated_done(quiet=False):
         print("[compare]     Set RESCORE_STALE_REPORTS = True, or re-run those "
               "scenarios.")
     return n_moved + n_back
+
+
+# "ASKED ONCE" MARKERS WRITTEN THIS LAUNCH, per (case key, project). outs\<id>.scoretry
+# is written before the scoring pass starts; a pass that never ran -- the launcher
+# refused the Python (3.11 has no PSSPY311) and returned rc=2 at once -- left every
+# unscored fault marked as asked, and no later launch scored it again.
+_SCORETRY_NEW = {}
+
+
+def _scoretry_undo(case_key, projects, rc):
+    """The scoring pass for these projects did not finish cleanly: forget its
+       markers, so the next launch asks again."""
+    if rc in (0, None):
+        return
+    n = 0
+    for pj in projects or []:
+        for st in _SCORETRY_NEW.pop((case_key, pj), []):
+            try:
+                os.remove(st)
+                n += 1
+            except Exception:
+                pass
+    if n:
+        print("[compare] %s: the scoring pass ended rc=%s -- %d unscored run(s) will be "
+              "asked for again next launch" % (case_key, rc, n))
 
 
 def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
@@ -19256,6 +19381,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                     try:
                         with open(_stamp, "w") as _fh:
                             _fh.write(_omt)
+                        _SCORETRY_NEW.setdefault((case["key"], proj), []).append(_stamp)
                     except Exception:
                         pass
                 need.append(proj)
@@ -19376,6 +19502,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                 _env.update(env_add)
             _r = run_study(c, projects=_projs, modes=mode_list, extra_env=_env,
                            log_path=log_path)
+            _scoretry_undo(c["key"], _projs, _r)
             if _r not in (0, None) and _rc in (0, None):
                 _rc = _r
         return _rc
@@ -19613,21 +19740,21 @@ _GT_NET = [None, False]
 
 
 def _gt_net():
-    """The case's network, read once (z7_spike_find's child process)."""
+    """The case's network, read once (z6_spike_find's child process)."""
     if _GT_NET[1]:
         return _GT_NET[0]
     here = os.path.dirname(os.path.abspath(__file__))
     for d in (here, STUDY_ROOT):
-        if os.path.isfile(os.path.join(d, "z7_spike_find.py")):
+        if os.path.isfile(os.path.join(d, "z6_spike_find.py")):
             if d not in sys.path:
                 sys.path.insert(0, d)
             break
     else:
-        print("[gen-test] *** z7_spike_find.py not found beside this panel -- it is used to")
+        print("[gen-test] *** z6_spike_find.py not found beside this panel -- it is used to")
         print("[gen-test]     read the network. Copy it here, or list GEN_TEST_GENS by hand ***")
         _GT_NET[1] = True
         return None
-    import z7_spike_find as S
+    import z6_spike_find as S
     kind = "base" if _gt_case() is CASE_BASE else "proj"
     _GT_NET[0] = S._load_net_via_child(kind)
     _GT_NET[1] = True
@@ -19645,7 +19772,7 @@ def _gt_cap_list(hops):
     net = _gt_net()
     if net is None:
         return None
-    import z7_spike_find as S
+    import z6_spike_find as S
     caps = []
     for b, h, z in S.nearby(net, GEN_TEST_POI, hops):
         for d in net["dev"].get(b, []):
@@ -19922,9 +20049,9 @@ def _gt_each_lines():
     net = _gt_net()
     if net is None or "brn" not in net:
         print("[gen-test] line-off runs skipped: the network (with its branch list) could not "
-              "be read -- is z7_spike_find.py the new one?")
+              "be read -- is z6_spike_find.py the new one?")
         return []
-    import z7_spike_find as S
+    import z6_spike_find as S
     near = dict((b, (h, z)) for b, h, z in S.nearby(net, GEN_TEST_POI, GEN_TEST_LINES_HOPS))
     want = None
     if GEN_TEST_LINES_LIST:
@@ -20026,7 +20153,7 @@ def _gt_find_gens():
     net = _gt_net()
     if net is None:
         return None
-    import z7_spike_find as S
+    import z6_spike_find as S
     if GEN_TEST_POI not in net["bus"]:
         print("[gen-test] *** POI bus %s is not in the case ***" % GEN_TEST_POI)
         return None
@@ -21107,7 +21234,7 @@ def _gt_env(sc, g, faults):
            "SPP_BUSES_DSCN": ";".join(str(b) for b in g.get("dscn") or []) if g else ""}
     if g and g.get("egf"):
         # the existing machines at the project's feeders, constants changed
-        # (z7_spp_*.py: egf_dyr_with_edits) -- nothing switched off
+        # (z6_spp_*.py: egf_dyr_with_edits) -- nothing switched off
         env["SPP_EGF_DYR_EDITS"] = json.dumps([[m, d] for m, d in g["egf"]])
     if it or acc:
         env["SPP_SOLVER_RETRY"] = "1"
@@ -23713,7 +23840,12 @@ def main():
     # one of its faults comes out "scored on one side only", which is true and
     # useless. This runs exactly the side that is missing, for exactly the
     # projects that are missing it, and nothing else.
-    if pipeline == "missing":
+    if pipeline == "missing" and QUICK_DYR_TEST:
+        print("")
+        print("[compare] QUICK_DYR_TEST = %r: the existing folders are NOT filled in --"
+              % QUICK_DYR_TEST)
+        print("[compare]     only the .dyr sweep simulates, each value in its own folder.")
+    if pipeline == "missing" and not QUICK_DYR_TEST:
         # WHAT "MISSING" MEANS. It used to mean "a project that has a results
         # folder on one side and not the other" -- so a project with no folder
         # on EITHER side (IronStar, EmpirePrairie, never started) was not
@@ -23732,10 +23864,25 @@ def main():
             _c, ob, ot = discover_projects(mode)
             _cands = sorted(set(_pj_all) | set(_c) | set(ob) | set(ot), key=str)
             _cands = [x for x in _cands if x not in _egf_skip]
+            # ONLY THE PANEL'S PROJECTS. With PROJECTS = ["EastFork"] every other
+            # project on disk was checked too, and the one with gaps was launched
+            # alongside it: a quick EastFork test ran EmpirePrairie's faults.
+            if _pj_all:
+                _cands = [x for x in _cands if x in _pj_all]
             for key, case in (("BASE", CASE_BASE), ("PROJ", CASE_TEST)):
                 for pj in _cands:
                     rdir = results_dir(case, pj, mode)
                     exp = _expected_fault_ids(case, pj, mode)
+                    # ... AND ONLY THE SELECTED FAULTS. "8 of 124 still to run" for
+                    # a launch restricted to five faults, all five finished, started
+                    # a study that had nothing to do.
+                    if exp and ONLY_IDS:
+                        _sel = [f for f in exp if _id_selected(f)]
+                        if not _sel:
+                            _lines.append("  %-5s %-16s none of ONLY_FAULTS is in its fault list"
+                                          % (key, pj))
+                            continue
+                        exp = _sel
                     if not os.path.isdir(rdir):
                         todo[key].add((pj, mode))
                         _lines.append("  %-5s %-16s no results folder -- %s to run"
@@ -24465,10 +24612,10 @@ if __name__ == "__main__":
 # HOW THE TWO SIDES STAY APART. They read the same file and write different
 # ones:
 #
-#   base case      ENABLE_BESS = False in z7_spp_b.py, so NO .sav is ever
+#   base case      ENABLE_BESS = False in z6_spp_b.py, so NO .sav is ever
 #                  saved -- it reads the deck, converts in memory, and writes
 #                  DIS2201-25SP-G03-CQ.cnv/.snp/.cnl into the Base folder
-#   project case   ENABLE_BESS = True in z7_spp_p.py, so the build writes
+#   project case   ENABLE_BESS = True in z6_spp_p.py, so the build writes
 #                  DIS2201-25SP-G03-CQ_BESS_<project>_<MW>MW.sav/.cnv/.snp
 #                  into the Projects folder -- one set per project, beside the
 #                  untouched original
@@ -25168,9 +25315,9 @@ if __name__ == "__main__":
 # ============================  CONTROL PANEL  ===============================
 # ============================================================================
 # EVERYTHING YOU NORMALLY CHANGE IS HERE. The rest of this file, and both
-# launchers, take their instructions from these -- z7_main.py passes
+# launchers, take their instructions from these -- z6_main.py passes
 # them down through the environment, so a run driven from here does not need
-# z7_lch_b.py or z7_lch_p.py to be edited at all. Anything set in
+# z6_lch_b.py or z6_lch_p.py to be edited at all. Anything set in
 # a launcher is OVERRIDDEN while this script is driving.
 #
 # Each setting keeps its full explanation further down, beside the code that
@@ -25188,9 +25335,9 @@ if __name__ == "__main__":
 # to another machine: put the five scripts and the two case folders on the new
 # PC, run this file from where it sits, and every path below follows it.
 #
-#   <ROOT>\                  z7_main.py    <- this file
-#     Base\                  z7_lch_b.py  z7_spp_b.py
-#     Projects\              z7_lch_p.py  z7_spp_p.py  + THE ONE DECK
+#   <ROOT>\                  z6_main.py    <- this file
+#     Base\                  z6_lch_b.py  z6_spp_b.py
+#     Projects\              z6_lch_p.py  z6_spp_p.py  + THE ONE DECK
 #
 # With SHARED_DECK on there is a single deck, in Projects\, and it is the BASE
 # CASE -- the system with none of the new BESS in it. The Base folder holds the

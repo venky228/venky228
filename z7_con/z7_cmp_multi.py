@@ -52,6 +52,7 @@ import time
 import types
 import subprocess
 import json
+import csv
 
 # ============================================================================
 #  SETTINGS
@@ -995,6 +996,13 @@ def _merge_one(store, col):
     return lst[0][1] if lst and len(lst) == 1 else None
 
 
+def _poi_hops(z4, store):
+    """Nodes from the POI to sort by: the nearest any run reports (runs can
+       disagree by a node where the project adds buses); unknown sorts last."""
+    return min([z4._poi_nodes_num(ent[1]) for ent in (store.get("hops_from_poi") or [])]
+               or [10 ** 6])
+
+
 def _sbs_context(z4, ref, group, tags, rk, lay=None):
     """What every side-by-side sheet needs besides the pair rows themselves:
        each run's detail and summary indexed by key, each reference's values
@@ -1346,6 +1354,114 @@ def _el_rank(z4, cls):
     return 1
 
 
+def _rounded3(res):
+    """A sheet builder's (header, rows, widths, style) with every float cell
+       rounded to 3 decimals; rows may be a generator and stay one."""
+    header, rows, widths, style = res
+
+    def _r(v):
+        return round(v, 3) if isinstance(v, float) else v
+    return header, ([_r(v) for v in row] for row in rows), widths, style
+
+
+_ANG_CACHE = {}
+
+
+def _angle_ratios(z4, folder, proj):
+    """{(fault, bus): [(deviation, SPPR1, SPPR5)]} from ONE folder's
+       SPP_MEASURE_ANGLES -- read once per folder, a few columns only."""
+    key = (folder, proj)
+    if key in _ANG_CACHE:
+        return _ANG_CACHE[key]
+    out = {}
+    try:
+        ap = z4.rfile(folder, "SPP_MEASURE_ANGLES", "csv", proj) if folder else None
+        if ap:
+            with z4.csv_open(ap) as fh:
+                rd = csv.reader(fh)
+                H = dict((h.strip(), i) for i, h in enumerate(next(rd, None) or []))
+                i_sc, i_b, i_d = H.get("Scenario"), H.get("Bus"), H.get("Deviation (deg)")
+                i_1, i_5 = H.get("SPPR1"), H.get("SPPR5")
+                if None not in (i_sc, i_b, i_d):
+                    for r in rd:
+                        try:
+                            k = (r[i_sc].strip(), r[i_b].strip().split(".")[0])
+                            d = _num(r[i_d])
+                            s1 = _num(r[i_1]) if i_1 is not None else None
+                            s5 = _num(r[i_5]) if i_5 is not None else None
+                        except IndexError:
+                            continue
+                        if d is not None:
+                            out.setdefault(k, []).append((d, s1, s5))
+    except Exception as e:
+        print("[pair]   SPPR not read from %s (%s)" % (folder, e))
+    _ANG_CACHE[key] = out
+    return out
+
+
+def _sppr_text(z4, folder, proj, fid, el, bus, value):
+    """'SPPR1 0.803 / SPPR5 1.015' of the machine on this row in that folder --
+       of the unit whose swing matches the value shown, when a bus has several."""
+    b = _num(bus) if _num(bus) is not None else z4._bus_of_element(el)
+    if b is None:
+        return "-"
+    lst = _angle_ratios(z4, folder, proj).get((str(fid).strip(), str(int(b))))
+    if not lst:
+        return "-"
+    v = _num(value)
+    d, s1, s5 = (min(lst, key=lambda x: abs(x[0] - v)) if v is not None
+                 else max(lst, key=lambda x: x[0]))
+    if s1 is None and s5 is None:
+        return "-"
+    f = lambda x: "-" if x is None else "%.3f" % x
+    return "SPPR1 %s / SPPR5 %s" % (f(s1), f(s5))
+
+
+def _band_gap(z4, value):
+    """pu outside the steady-state band: negative below it, positive above,
+       0 inside."""
+    v = _num(value)
+    if v is None:
+        return "-"
+    lo = float(getattr(z4, "V_SS_LOW", 0.90))
+    hi = float(getattr(z4, "V_SS_HIGH", 1.10))
+    return round(v - lo, 3) if v < lo else (round(v - hi, 3) if v > hi else 0.0)
+
+
+def _beside(z4, fam, secs, value, folder, proj, k4):
+    """The cell beside a value: cycles above 1.20 pu (overvoltage), SPPR1 /
+       SPPR5 (rotor angle), pu outside 0.90-1.10 (steady state); '-' else."""
+    if fam == "overshoot":
+        return _cycles(fam, secs)
+    if fam == "angle":
+        return _sppr_text(z4, folder, proj, k4[0], k4[2], k4[3], value)
+    if fam == "steady":
+        return _band_gap(z4, value)
+    return "-"
+
+
+_BESIDE_HDR = "cycles / SPPR / pu out"
+
+
+def _cycles(fam, secs):
+    """Seconds above 1.20 pu as cycles (60 Hz), for an overvoltage row."""
+    if fam != "overshoot":
+        return "-"
+    if isinstance(secs, str) and ":" in secs:
+        return secs                     # comparisons disagree -- each named, as the value
+    v = _num(secs)
+    if v is None:
+        return secs if str(secs).strip() not in ("", "None") else "-"
+    return round(v * 60.0, 1)
+
+
+def _pu3(fam, v):
+    """A measured pu value to 3 decimals (1.073228359 -> 1.073); text as it is."""
+    if fam in ("overshoot", "recovery", "steady") and isinstance(v, float):
+        return round(v, 3)
+    return v
+
+
 def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
     """Sheet 2: one row per fault x criterion x ELEMENT (bus or machine) --
        the reference value and state, then each scenario's value, state and
@@ -1369,8 +1485,12 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
     # past-limit per comparison, then states; the element's particulars last.
     header = ["fault", "criterion", "element", "bus_number", "limit"]
     widths = [8, 22, 18, 10, 12]
+    # EACH VALUE WITH ITS TIME ABOVE 1.20 pu BESIDE IT, in cycles -- "1.24 pu,
+    # 3 cycles" read in one glance per scenario (transient overvoltage rows;
+    # '-' on every other criterion).
     for x in lay["refs"] + lay["tests"]:
         header.append("value | %s" % x); widths.append(_w["value"])
+        header.append("%s | %s" % (_BESIDE_HDR, x)); widths.append(14)
     header.append("worst_across_scenarios"); widths.append(26)
     for nm in ("change", "class", "past_limit"):
         for t in tags:
@@ -1385,10 +1505,13 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
     header.append("description"); widths.append(40)
     rows = []
 
+    # EACH FAULT'S VIOLATIONS PER CRITERION, NEAREST THE POI FIRST: node 1,
+    # then node 2 ... then buses the map has no path to.
     def _fkey(k):
         f = k[0]
         m = re.match(r"^([A-Za-z]*)(\d+)$", f)
-        return ((m.group(1), int(m.group(2))) if m else ("~", 0), f, k[1], k[2], k[3])
+        hp = _poi_hops(z4, ctx["shared"].get(k, {}))
+        return ((m.group(1), int(m.group(2))) if m else ("~", 0), f, k[1], hp, k[2], k[3])
     for k in sorted(ctx["order"], key=_fkey):
         fid, crit, el, bus = k
         s = ctx["shared"].get(k, {})
@@ -1397,11 +1520,16 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
         limit = _merge_one(s, "limit")            # to judge with
         row = [fid, crit, ctx["label"].get(k, el), bus, _merge_get(s, "limit", z4)]
         got, own = {}, {}                         # comparison -> [value, state, class, change, past]
+        above = {}                                # comparison -> seconds above 1.20 pu
         worst, rank = "", -1
         for t in tags:
             r = ctx["det"][t].get(k)
             f = ctx["fills"].get((lay["tt_of"][t],) + k)
             own[t] = r is not None
+            a = r[RC["secs_above_1_20_project"]] if (r is not None and "secs_above_1_20_project" in RC) else None
+            if (a is None or _empty(z4, a)) and f:
+                a = f[2]
+            above[t] = a
             if r is None and not crit:
                 cells = ["-", "-", "-", "-", "-"]
                 cls = "-"
@@ -1429,10 +1557,17 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
             rk2 = _el_rank(z4, cls)
             if rk2 > rank:
                 rank, worst = rk2, ("%s: %s" % (t, cls) if rk2 > 0 else cls)
-        for b in bs:
-            row.append(_merge_get(b, "base_value", z4, default="-"))
+        for x, b in zip(lay["refs"], bs):
+            _v = _pu3(fam, _merge_get(b, "base_value", z4, default="-"))
+            row.append(_v)
+            row.append(_beside(z4, fam, _merge_get(b, "secs_above_1_20_base", z4, default="-"),
+                               _v, lay["ref_dir"].get(x), proj, k))
         for tt in lay["tests"]:
-            row.append(_per_test(z4, [(t, got[t][0], own[t]) for t in lay["of_test"][tt]]))
+            _v = _pu3(fam, _per_test(z4, [(t, got[t][0], own[t]) for t in lay["of_test"][tt]]))
+            row.append(_v)
+            row.append(_beside(z4, fam, _per_test(z4, [(t, above[t], own[t])
+                                                       for t in lay["of_test"][tt]]),
+                               _v, lay["test_dir"].get(tt), proj, k))
         row.append(worst or "-")
         for ix in (3, 2, 4):                      # change, class, past_limit
             for t in tags:
@@ -1650,15 +1785,43 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
             for t in tags:
                 spec.append((_rank_col(c, el4), "%s | %s" % (c, t), "pair", c, t))
     spec = [sp[1:] for _i, sp in sorted(enumerate(spec), key=lambda e: (e[1][0], e[0]))]
+    # THE TIME ABOVE 1.20 pu RIGHT AFTER ITS OWN VALUE, in cycles: base_value |
+    # BASE, cycles_above_1.20 | BASE, base_value | BASE_EGF_OFF, cycles ... then
+    # each project value with its cycles -- not seconds at the far end.
+    _secs_of = {"base_value": ("secs_above_1_20_base", "above_1.20_base_s"),
+                "project_value": ("secs_above_1_20_project", "above_1.20_project_s")}
+    _is_secs = set(x for v in _secs_of.values() for x in v)
+    cyc_pos = set()
+    if el4 and "criterion" in ix:
+        _rest = [sp for sp in spec if sp[2] not in _is_secs]
+        _secs = [sp for sp in spec if sp[2] in _is_secs]
+        spec = []
+        for sp in _rest:
+            spec.append(sp)
+            for sc in _secs:
+                if sc[2] in _secs_of.get(sp[2], ()) and sc[3] == sp[3]:
+                    cyc_pos.add(len(spec))
+                    spec.append(("%s | %s" % (_BESIDE_HDR, sp[3]) if sp[3] else
+                                 _BESIDE_HDR, sc[1], sc[2], sc[3]))
+        for sc in _secs:                          # a seconds column with no value beside it
+            if not any(sp[2] == sc[2] and sp[3] == sc[3] for sp in spec):
+                spec.append(sc)
     header = list(keys) + [h for h, _kd, _c, _t in spec]
     widths = [10] * len(keys) + [14] * len(spec)
+    ix_crit = keys.index("criterion") if "criterion" in keys else 0
+    _proj = (group[0].get("proj") if group else "") or ""
     cls_cols = [i for i, hh in enumerate(header)
                 if hh.split(" | ")[0] in ("classification", "element_classification",
                                           "fault_classification", "who_caused_it")]
 
     def _k(k):
         m = re.match(r"^([A-Za-z]*)(\d+)$", k[0])
-        return ((m.group(1), int(m.group(2))) if m else ("~", 0),) + tuple(k)
+        fk = ((m.group(1), int(m.group(2))) if m else ("~", 0),)
+        if el4 and "hops_from_poi" in ix:
+            # per fault and criterion, nearest the POI first
+            hp = _poi_hops(z4, merged[k])
+            return fk + (k[0], k[1], hp) + tuple(k[2:])
+        return fk + tuple(k)
 
     def _rows():
         for k in sorted(order, key=_k):
@@ -1694,7 +1857,8 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
             row = list(k[:len(keys)])
             if el4:
                 row[2] = wl.get(tuple(k[:4]), row[2])
-            for _h, kind, c, t in spec:
+            _fam = z4._criterion_family(str(k[ix_crit])) if cyc_pos else ""
+            for _si, (_h, kind, c, t) in enumerate(spec):
                 if kind == "front":
                     row.append(_merge_get(mk if t is None else mr[t], c, z4))
                 elif kind == "ref":
@@ -1708,6 +1872,11 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
                     row.append("not in this run" if v is None else v)
                 else:
                     row.append(_per_test(z4, [(p, _val(p, c), own[p]) for p in lay["of_test"][t]]))
+                if _si in cyc_pos:
+                    _fold = (lay["ref_dir"].get(t) if kind == "ref" else
+                             lay.get("test_dir", {}).get(t))
+                    row[-1] = _beside(z4, _fam, row[-1], row[-2], _fold, _proj,
+                                      tuple(k[:4]) if el4 else (k[0], "", "", ""))
             yield [(z4.EMPTY_CELL if v in ("", None) else v) for v in row]
 
     def _style(row):
@@ -2024,6 +2193,8 @@ def write_side_by_side(z4, ref, group):
              ("8 All detail", "DETAIL",
               lambda: _wide_sheet(z4, group, tags, "detail", z4._REPORT_COLS, rk, ctx)),
              ("9 Runs", "RUNS", lambda: _sbs_runs(z4, ref, group, tags, rk, lay))]
+    # EVERY DECIMAL TO 3 PLACES (1.07322835922 -> 1.073), on every sheet.
+    specs = [(nm, key, (lambda fn=fn: _rounded3(fn()))) for nm, key, fn in specs]
     counts, xp = _write_workbook_streamed(z4, xp, specs, d, lab, legend=z4._XL_LEGEND,
                                           title_rows=title)
     write_rerun_list(z4, os.path.join(d, "RERUN_%s.txt" % proj),
