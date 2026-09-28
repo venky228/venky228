@@ -7368,6 +7368,36 @@ def _element_class(fam, kind, bv, tv, lim, base_scored=False, new_bus=False,
 _COL = dict((c, i) for i, c in enumerate(_REPORT_COLS))
 
 
+def _poi_nodes_num(v):
+    """nodes_from_poi as a number to sort by -- nearest the POI first; a bus
+       with no path in the map ("beyond map", "-") after every counted one."""
+    try:
+        return int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return 10 ** 6
+
+
+def _fault_num_key(f):
+    """F2 before F10 (and FLAT_RUN after the numbered faults)."""
+    m = re.match(r"^([A-Za-z_]*?)(\d+)$", str(f).strip())
+    return (0, m.group(1), int(m.group(2))) if m else (1, str(f), 0)
+
+
+def _by_poi_distance(rows):
+    """Rows sorted fault, criterion, then NODES FROM THE POI (1 on top), then
+       the worst first -- each violation read outward from the plant."""
+    fi, ci, hpi, pli = (_COL["fault"], _COL["criterion"], _COL["hops_from_poi"],
+                        _COL["past_limit"])
+
+    def _k(r):
+        try:
+            past = -float(r[pli])
+        except (TypeError, ValueError):
+            past = 0.0
+        return (_fault_num_key(r[fi]), str(r[ci]), _poi_nodes_num(r[hpi]), past)
+    return sorted(rows, key=_k)
+
+
 def _report_rows(results):
     """The report as one flat table -- fault, criterion, element per row.
 
@@ -7699,42 +7729,22 @@ def _report_rows(results):
                         worst_base="" if c["mb"] is None else c["mb"],
                         worst_projects="" if c["mt"] is None else c["mt"],
                         description=desc, **_lbl))
-    return out
+    return _by_poi_distance(out)
 
 
 def _project_caused_rows(detail_rows):
     """The element rows the projects are responsible for -- element class NEW
-       -- worst first within each criterion. This is the sheet to act on."""
-    ic, ip, ik = (_COL["element_classification"], _COL["past_limit"],
-                  _COL["criterion"])
-    rows = [r for r in detail_rows if r[ic] == CLS_NEW]
-
-    def _k(r):
-        try:
-            past = -float(r[ip])
-        except (TypeError, ValueError):
-            past = 0.0
-        return (str(r[ik]), past, str(r[_COL["fault"]]))
-    rows.sort(key=_k)
-    return rows
+       -- per fault and criterion, nearest the POI first. The sheet to act on."""
+    ic = _COL["element_classification"]
+    return _by_poi_distance([r for r in detail_rows if r[ic] == CLS_NEW])
 
 
 def _pre_existing_element_rows(detail_rows):
     """Per-bus rows the base system ALREADY fails -- element class PRE-EXISTING
-       -- worst first within each criterion. The companion to the project-caused
-       list: same shape, the other half of the answer."""
-    ic, ip, ik = (_COL["element_classification"], _COL["past_limit"],
-                  _COL["criterion"])
-    rows = [r for r in detail_rows if r[ic] == CLS_PRE]
-
-    def _k(r):
-        try:
-            past = -float(r[ip])
-        except (TypeError, ValueError):
-            past = 0.0
-        return (str(r[ik]), past, str(r[_COL["fault"]]))
-    rows.sort(key=_k)
-    return rows
+       -- per fault and criterion, nearest the POI first. The companion to the
+       project-caused list: same shape, the other half of the answer."""
+    ic = _COL["element_classification"]
+    return _by_poi_distance([r for r in detail_rows if r[ic] == CLS_PRE])
 
 
 # ---- THE READABLE, NARROW VIEW ---------------------------------------------

@@ -995,6 +995,13 @@ def _merge_one(store, col):
     return lst[0][1] if lst and len(lst) == 1 else None
 
 
+def _poi_hops(z4, store):
+    """Nodes from the POI to sort by: the nearest any run reports (runs can
+       disagree by a node where the project adds buses); unknown sorts last."""
+    return min([z4._poi_nodes_num(ent[1]) for ent in (store.get("hops_from_poi") or [])]
+               or [10 ** 6])
+
+
 def _sbs_context(z4, ref, group, tags, rk, lay=None):
     """What every side-by-side sheet needs besides the pair rows themselves:
        each run's detail and summary indexed by key, each reference's values
@@ -1418,10 +1425,13 @@ def _sbs_elements(z4, ref, group, tags, rk, ctx=None, lay=None):
     header.append("description"); widths.append(40)
     rows = []
 
+    # EACH FAULT'S VIOLATIONS PER CRITERION, NEAREST THE POI FIRST: node 1,
+    # then node 2 ... then buses the map has no path to.
     def _fkey(k):
         f = k[0]
         m = re.match(r"^([A-Za-z]*)(\d+)$", f)
-        return ((m.group(1), int(m.group(2))) if m else ("~", 0), f, k[1], k[2], k[3])
+        hp = _poi_hops(z4, ctx["shared"].get(k, {}))
+        return ((m.group(1), int(m.group(2))) if m else ("~", 0), f, k[1], hp, k[2], k[3])
     for k in sorted(ctx["order"], key=_fkey):
         fid, crit, el, bus = k
         s = ctx["shared"].get(k, {})
@@ -1699,7 +1709,12 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
 
     def _k(k):
         m = re.match(r"^([A-Za-z]*)(\d+)$", k[0])
-        return ((m.group(1), int(m.group(2))) if m else ("~", 0),) + tuple(k)
+        fk = ((m.group(1), int(m.group(2))) if m else ("~", 0),)
+        if el4 and "hops_from_poi" in ix:
+            # per fault and criterion, nearest the POI first
+            hp = _poi_hops(z4, merged[k])
+            return fk + (k[0], k[1], hp) + tuple(k[2:])
+        return fk + tuple(k)
 
     def _rows():
         for k in sorted(order, key=_k):
