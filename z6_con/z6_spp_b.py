@@ -21354,21 +21354,16 @@ def evaluate_case(path, kind, tclear, kb):
             v_high_worst = (mx, tm, chan_label(ti))
         lim, why = _overshoot_limit(ti)
         if mx > lim:
-            # THE FOURTH FIELD IS THE DURATION: the LONGEST SINGLE EXCURSION
-            # above the limit from the judged instant on, in seconds. It rides
-            # in the spare 'd' column of every part file, so nothing downstream
-            # had to learn a new schema, and it is what lets a reader tell a
-            # one-step spike from a swing without opening the plot. NOT the
-            # total: three one-step spikes at clearing, reclose and re-clear
-            # add up to more than two cycles and were labelled a SWING, though
-            # no one excursion was longer than a step. The total is still in
-            # the v_high text and the measurement workbook.
+            # THE FOURTH FIELD IS THE DURATION: total seconds the bus spent
+            # above its limit from the judged instant on. It rides in the
+            # spare 'd' column of every part file, so nothing downstream had
+            # to learn a new schema, and it is what lets a reader tell a
+            # one-step spike from a swing without opening the plot.
             _abv, _abv_long = _above_for(v, _i_judge, lim)
-            v_high.append("%s=%.3f@%.2fs for %.0fms (longest %.0fms)%s"
+            v_high.append("%s=%.3f@%.2fs for %.0fms%s"
                           % (chan_label(ti), mx, tm, 1000.0 * _abv,
-                             1000.0 * _abv_long,
                              (" [limit %.2f: %s]" % (lim, why)) if why else ""))
-            v_high_all.append((chan_label(ti), mx, tm, round(_abv_long, 4)))
+            v_high_all.append((chan_label(ti), mx, tm, round(_abv, 4)))
         elif why and mx > V_OVERSHOOT_PU:
             # Above 1.20 but inside the limit its equipment is designed for.
             # Not a violation, and NOT silent either.
@@ -24623,9 +24618,8 @@ OVERSHOOT_SPIKE_S = 2.0 / 60.0
 
 
 def _dur_text(sec):
-    """'0.017 s (1 cycle) SPIKE' / '0.317 s (19 cycles) SWING' for the longest
-       single excursion above the overshoot limit, or '' when none was
-       recorded."""
+    """'0.017 s (1 cycle) SPIKE' / '0.317 s (19 cycles) SWING' for a duration
+       above the overshoot limit, or '' when none was recorded."""
     try:
         s = float(sec)
     except (TypeError, ValueError):
@@ -24640,8 +24634,7 @@ def _dur_text(sec):
 
 
 def _item_dur(it):
-    """The duration field of an overshoot record (the longest single excursion
-       above the limit, s), or None when the record predates it."""
+    """The duration field of an overshoot record, or None when it predates it."""
     try:
         if len(it) > 3 and str(it[3]).strip() != "":
             return float(it[3])
@@ -25480,8 +25473,8 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                         except (IndexError, TypeError, ValueError):
                             _val = 0.0
                         # [scenarios, worst value, scenario it was worst in,
-                        #  longest excursion above the limit in that scenario,
-                        #  longest excursion in any scenario]
+                        #  duration above the limit in that scenario, longest
+                        #  duration in any scenario]
                         _e = _elem.setdefault((_k, _lbl), [0, None, "", None, None])
                         _e[0] += 1
                         _dur = _item_dur(_it) if _k == "overshoot" else None
@@ -25522,7 +25515,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                 if _k == "overshoot":
                     f.write(" %-30s %-16s %9s   %-9s %-6s  %-26s %s\n"
                             % ("bus / machine", "area", "scenarios", "worst", "in",
-                               "longest excursion (worst)", "any case / where"))
+                               "above limit (worst case)", "longest / where"))
                     f.write(" " + "-" * 118 + "\n")
                 else:
                     f.write(" %-30s %-16s %9s   %-9s %s\n"
@@ -25583,7 +25576,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                 f.write("\n BY AREA -- distinct elements over a limit, all scenarios together\n")
                 f.write(" %-22s %-10s %9s  %-10s %-8s %s\n"
                         % ("area", "type", "elements", "worst", "in",
-                           "longest excursion (overshoot only)"))
+                           "above limit (overshoot only)"))
                 f.write(" " + "-" * 86 + "\n")
                 _ord = dict((k, i) for i, (k, _d) in enumerate(_KINDS))
                 _ak_sorted = sorted(_area_roll,
@@ -25603,9 +25596,8 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                                    "%.3g %s" % (_v[1], _units.get(_kk, "")),
                                    _v[2][:8],
                                    _dur_text(_v[3]) if _kk == "overshoot" else ""))
-                f.write("\n Spike / swing: a longest single excursion above the limit of <= %.3f s\n"
-                        " (2 cycles) is a SPIKE at the switching instant; longer is a SWING.\n"
-                        " Both are violations under the\n"
+                f.write("\n Spike / swing: above the limit for <= %.3f s (2 cycles) is a SPIKE at the\n"
+                        " switching instant; longer is a SWING. Both are violations under the\n"
                         " criterion as written; the label is to help decide what to argue.\n"
                         % OVERSHOOT_SPIKE_S)
         f.write("\n" + "=" * 92 + "\n")
@@ -25743,9 +25735,8 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                                      ""]))
                     else:
                         _w = _where_text(it[0], _fbus)
-                        # THE OVERSHOOT RECORD CARRIES A FOURTH FIELD -- the
-                        # longest single stretch the bus was over its limit --
-                        # which the format
+                        # THE OVERSHOOT RECORD CARRIES A FOURTH FIELD -- how
+                        # long the bus was over its limit -- which the format
                         # does not take. Printed as its own phrase, so a
                         # reader can see at once whether 1.28 pu was one
                         # integration step or a swing.
@@ -25759,7 +25750,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                             # rather than lose the rest of the file to it.
                             _txt = "  ".join(str(x) for x in it)
                         if kind == "overshoot":
-                            _txt += "   longest excursion above limit %s" % (
+                            _txt += "   above limit for %s" % (
                                 _dur_text(_dur) if _dur is not None
                                 else "n/a (scored before durations were recorded)")
                         f.write("      " + _txt
@@ -25772,7 +25763,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                         tm = ("%.2f" % it[2]) if (len(it) > 2 and kind in ("recovery", "overshoot")) else ""
                         note = ("ended %.1f MW" % it[2]) if kind == "tripped" else ""
                         if kind == "overshoot" and _dur is not None:
-                            note = "longest excursion above limit %s" % _dur_text(_dur)
+                            note = "above limit for %s" % _dur_text(_dur)
                         _ar, _nm = _bus_area(_elem_bus(it[0]))
                         _hh = _hops_to_fault(_elem_bus(it[0]), _fbus)
                         rows.append(_vio_csv_fill([case, verdicts.get(case, "?"), kind, it[0],
