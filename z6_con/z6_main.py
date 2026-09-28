@@ -1998,6 +1998,12 @@ def _banner(msg):
     print("=" * 78)
     print(" [compare] %s" % msg)
     print("=" * 78)
+    # EVERY STEP OF THE LAUNCH IS ANNOUNCED HERE, so the campaign plan's
+    # NOW RUNNING line is the latest of them and when it started.
+    try:
+        _PLAN_NOW[0] = "%s   (since %s)" % (msg, time.strftime("%Y-%m-%d %H:%M"))
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -13387,7 +13393,41 @@ def _plan_runs(projects, modes):
             if PROJECT_OFF_RUN and proj in _project_off_projects(projects):
                 out.append((proj, mode, "project machines OFF",
                             "_" + PROJECT_OFF_TAG))
+            # THE SURPLUS SCENARIOS (project case, compared with the plain base).
+            for sc in surplus_scenarios():
+                out.append((proj, mode, "PROJECT %s (%s)" % (sc["tag"], sc["label"]),
+                            "_" + sc["tag"]))
+            # THE EGF RUNS. A base-only one lives in the BASE case: its suffix
+            # carries _PLAN_BASE so the plan reads the right folder.
+            if not EGF_PROJECTS or proj in EGF_PROJECTS:
+                _vars = []
+                if EGF_DYR_RUN and (EGF_DYR_EDITS_BY_PROJECT or {}).get(proj):
+                    _vars.append((EGF_TAG, "existing machines EDITED"))
+                if EGF_OFF_RUN or EGF_OFF_BASE_RUN:
+                    _vars.append((EGF_OFF_TAG, "existing machines OFF"))
+                for tag, label in _vars:
+                    if CASE_TEST in _egf_cases(tag):
+                        out.append((proj, mode, "EGF %s (%s)" % (tag, label), "_" + tag))
+                    else:
+                        out.append((proj, mode, "BASE %s (%s)" % (tag, label),
+                                    _PLAN_BASE + "_" + tag))
     return out
+
+
+_PLAN_BASE = "@base:"     # suffix prefix: this planned run is in the BASE case only
+_PLAN_NOW = [""]          # the launch step running now, shown at the top of the plan
+
+
+def _plan_where(sfx):
+    """(case, folder suffix, base suffix or None) of one planned run.
+       A run of the base case alone has no separate base side (None); a surplus
+       scenario is compared with the plain base (""); anything else with the
+       base folder of the same suffix."""
+    if sfx.startswith(_PLAN_BASE):
+        return CASE_BASE, sfx[len(_PLAN_BASE):], None
+    if sfx and sfx.lstrip("_") in [sc["tag"] for sc in surplus_scenarios()]:
+        return CASE_TEST, sfx, ""
+    return CASE_TEST, sfx, sfx
 
 
 # THE SHARED LIST, PER PROJECT, FROM THE PATH THE STUDIES ACTUALLY USE.
@@ -13468,11 +13508,12 @@ def _plan_expected(d, proj=None):
 
 def _plan_state(proj, mode, sfx):
     """What is on disk for one run: state, scenario counts, verdicts."""
-    d = _run_path(CASE_TEST, proj,
-                     "%s_%s%s" % (proj, mode, sfx))
+    _case, _sfx, _bsfx = _plan_where(sfx)
+    d = _run_path(_case, proj, "%s_%s%s" % (proj, mode, _sfx))
     if not os.path.isdir(d):
         return {"dir": d, "state": "TO RUN", "n_out": 0, "n_scored": 0,
-                "n_pass": 0, "n_fail": 0, "when": ""}
+                "n_pass": 0, "n_fail": 0, "when": "",
+                "base_run": _case is CASE_BASE}
     try:
         n_out = len(glob.glob(os.path.join(d, "outs", "*.out")))
     except Exception:
@@ -13535,7 +13576,7 @@ def _plan_state(proj, mode, sfx):
         state = "TO RUN"
     return {"dir": d, "state": state, "n_out": n_out, "n_scored": len(scored),
             "n_pass": n_pass, "n_fail": n_fail, "n_faults": n_faults,
-            "n_want": n_want,
+            "n_want": n_want, "base_run": _case is CASE_BASE,
             "when": (time.strftime("%Y-%m-%d %H:%M", time.localtime(newest))
                      if newest else "")}
 
@@ -13648,7 +13689,8 @@ def _plan_scenario_matrix(rows):
         _bdir = _run_path(CASE_BASE, p, "%s_%s" % (p, mode))
         cols.append(("base", _plan_scn_states(_bdir, p)))
         for (_p, _m, _lbl, _sfx, st) in prows:
-            cols.append((_plan_col_label(p, mode, os.path.basename(st["dir"])),
+            _cl = _plan_col_label(p, mode, os.path.basename(st["dir"]))
+            cols.append((("base_" + _cl) if st.get("base_run") else _cl,
                          _plan_scn_states(st["dir"], p)))
         faults = set()
         for _lbl, s in cols:
@@ -13821,7 +13863,10 @@ def _plan_base_counts(proj, mode, sfx):
        base study that never ran, or stopped half way, was invisible in it. A
        comparison needs BOTH sides of every fault, so a project whose base case
        is missing is as unfinished as one whose project case is."""
-    d = _run_path(CASE_BASE, proj, "%s_%s%s" % (proj, mode, sfx))
+    _case, _sfx, _bsfx = _plan_where(sfx)
+    if _bsfx is None:
+        return None, None               # the run IS a base run -- no other base side
+    d = _run_path(CASE_BASE, proj, "%s_%s%s" % (proj, mode, _bsfx))
     n_out = n_want = 0
     try:
         n_out = len(glob.glob(os.path.join(d, "outs", "*.out")))
@@ -13863,6 +13908,9 @@ def write_sweep_plan(projects=None, modes=None, note=""):
         if SWEEP_PLAN_EVERY:
             L.append(" refreshed every %ds while the studies run" % SWEEP_PLAN_EVERY)
         L.append("=" * 118)
+        if _PLAN_NOW[0]:
+            L.append(" NOW RUNNING:  %s" % _PLAN_NOW[0])
+            L.append("=" * 118)
         L.append(" %d run(s):  %d COMPLETE, %d RUNNING, %d PART DONE, %d TO RUN"
                  % (len(rows), n["COMPLETE"], n["RUNNING"], n["PART DONE"],
                     n["TO RUN"]))
@@ -13896,12 +13944,16 @@ def write_sweep_plan(projects=None, modes=None, note=""):
             # COMPLETE while the base case it must be compared against has no
             # results at all -- which is the state a comparison cannot use.
             _bo, _bw = _plan_base_counts(p, m, sfx)
-            _bcol = ("%d/%d" % (_bo, _bw)) if _bw else (str(_bo) if _bo else "-")
-            if _bo == 0 or (_bw and _bo < _bw):
-                _incomplete.append("%s %s: base %s" % (p, lbl, _bcol))
+            if _bo is None:
+                _bcol = "(base)"          # this row IS the base run
+            else:
+                _bcol = ("%d/%d" % (_bo, _bw)) if _bw else (str(_bo) if _bo else "-")
+                if _bo == 0 or (_bw and _bo < _bw):
+                    _incomplete.append("%s %s: base %s" % (p, lbl, _bcol))
             if st["state"] in ("TO RUN", "PART DONE"):
-                _incomplete.append("%s %s: project %s (%s)"
-                                   % (p, lbl, _sc, st["state"]))
+                _incomplete.append("%s %s: %s %s (%s)"
+                                   % (p, lbl, "base" if st.get("base_run") else "project",
+                                      _sc, st["state"]))
             L.append(" %-*s %-*s %-10s %5s %7s %5s %5s %9s  %s"
                      % (wp, p, wl, lbl, st["state"],
                         st["n_out"] or "-", _sc,
