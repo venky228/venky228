@@ -31,7 +31,14 @@
    - At startup, before psspy is imported, a `dsusr.dll` of the wrong bitness is moved aside as `dsusr.dll.32bit`, and the build compiles a new one. If it cannot be moved, the process exits with rc=1 before PSS/E starts.
    - After the compile, a 32-bit `dsusr.dll` (the `.bat` files still set up for PSS/E 34) is moved aside, the previous one is put back, and the build stops, naming the `.bat` files.
    - Model DLLs named in `add_library.idv`, all `*.dll` (`load_user_dlls`), and the BESS DLLs are checked before `addmodellibrary`. A wrong one stops the run and is named. The BESS scan ignores wrong-bitness copies.
-9. **`z7_init_check_v35.py`** (study root, reads only): lists every `.dll` in `Base\` and `Projects\` with its bitness, and the PSSE3x paths in the `.bat` files. It starts PSS/E in separate processes (an empty folder; an empty folder with only `Base\dsusr.dll`; `Base\`; `Projects\`; `Base\` with redirect and tee as the study does), reads the Windows Application Error log, and writes `INIT_CHECK.txt`.
+9. **`z7_init_check_v35.py`** (study root, reads only; v2). It counts the `.dll` in `Base\` and `Projects\` by bitness and reads the main-thread stack reserve of `python.exe` and `psse35.exe`. It starts PSS/E in an empty folder, one process per test:
+   - `psseinit(150000)`, as the study does;
+   - `psseinit()` at the default size;
+   - `psseinit(50000)`;
+   - `psseinit(150000)` on a 255 MB-stack thread;
+   - `psse35.py` setting up its own paths.
+
+   The first test that starts is repeated beside a copy of `Base\dsusr.dll`. It then reads the Windows Application Error log, prints a verdict (STACK / BUS SIZE / PATHS / install) and writes `INIT_CHECK.txt`.
 
 ## v34 fixes made after the v35 set, NOT in v35
 The user asked for the first two to be v34-only. Ask before carrying any of them to v35.
@@ -51,8 +58,19 @@ The user asked for the first two to be v34-only. Ask before carrying any of them
 - `z7_init_check_v35.py`: tested with a fake install. Covered: a crash on dsusr.dll, a vendor DLL only, no PSS/E, PSS/E failing everywhere, a hang (timeout), and no case folders.
 - **First real PSS/E 35.6 run (2026-09-28)**, Python 3.11 at `C:\Users\conti\AppData\Local\Programs\Python\Python311`, found `PSSPY311`:
   - The BASE build exited `rc=3221225477` (0xC0000005, access violation) on all 3 launches, inside `psseinit(150000)`, right after the copyright banner. That is before the case loads; "150000 BUS POWER SYSTEM SIMULATOR" never printed.
-  - Main suspect: a 32-bit PSS/E 34 `dsusr.dll` in `Base\`. Not confirmed yet: the user has `z7_init_check_v35.py` and will send `INIT_CHECK.txt`.
-  - The study sets `SetErrorMode(SEM_NOGPFAULTERRORBOX)`, so its crashes may not reach the Application event log. The check script's children do not set it.
+  - `INIT_CHECK.txt` (v1): PSS/E dies in `psseinit(150000)` **even in an empty folder**, so the cause is not the study or `dsusr.dll`.
+    - Windows log for each start: `GIC.dll` 0xC00000FD (stack overflow), then `MUSTENG.dll` 0xC0000005, then `ntdll.dll` 0xC0000005, all from `...\PSSE35\35.6\PSSBIN`.
+    - Main suspect: `python.exe`'s ~2 MB main-thread stack.
+    - The v2 check was sent to test it; result pending.
+  - **Prepared, not committed:** run PSS/E on a thread with a 255 MB stack.
+    - `spp_b`/`spp_p`: at the top, after `SetErrorMode`, `_run_on_big_stack()` reruns the file with `runpy.run_path(__file__, run_name="__main__", init_globals={"_ON_BIG_STACK": True})` on the big-stack thread, then `sys.exit(code)`.
+    - `spike_find` (including `--net`), `fault_list`, `scr`, `probe`: `main()` runs through `_on_big_stack(fn)`.
+    - `threading.stack_size(0)` is restored right after the thread starts. CPython passes the size as the initial commit, not a reservation.
+    - Tested with a fake psspy that crashes on the main thread: exit codes 0/5/7, exceptions give 1, and `sys.exit("msg")` behaves the same.
+  - Also from the check:
+    - All 84 `.dll` in each of `Base\` and `Projects\` are 32-bit PSS/E 34 builds: Vestas, SMA, ABB HVDC, PE, GE, `MyUsrdll.dll`, `dsusr.dll`, and more. Each model the deck uses needs its PSS/E 35 64-bit build.
+    - The folders have `MyCompile34.bat` and `MyCload4.bat`, which point at PSSE34 and `PSSE33.lib`. The panel's `DYR_COMPILE_BATS` names `MyCompile35.bat` and `MyCload41.bat`, which do not exist yet.
+  - The study sets `SetErrorMode(SEM_NOGPFAULTERRORBOX)`, so its own crashes may not reach the Application event log. The check script's children do not set it.
 - **Not yet done:**
   - A full e2e run of the renamed `_v35` set. The user cancelled it twice.
   - A run on real PSS/E 35 that gets past `psseinit`.
