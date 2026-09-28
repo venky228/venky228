@@ -93,6 +93,18 @@
 """
 
 import os, sys, re, csv, glob, time, subprocess, threading, io, json, socket, shutil
+
+# NO WINDOWS ERROR BOXES. A crashed process (an access violation in PSS/E, a
+# floating-point trap) otherwise waits on "python.exe has stopped working" --
+# alive, holding its slot, until someone clicks. With these flags it exits with
+# its crash code and the launcher relaunches it. Child processes inherit the
+# mode, so every launcher, worker, shard and plotter started from here has it.
+if os.name == "nt":
+    try:
+        import ctypes as _ct_em
+        _ct_em.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    except Exception:
+        pass
 # ast: to read BESS_PROJECTS and FEEDER_MAX_MW out of the study script for the
 # preflight, WITHOUT importing it -- importing it needs PSS/E and would run its
 # module-level checks, which is the very thing being checked for.
@@ -9672,6 +9684,12 @@ def run_egf_variants(proj, mode):
             env.update(venv)
             env.update(_egf_fault_env())
             env.update(_sweep_resume_env())
+            # FRESH_START RE-RUNS THESE TOO, as it does the surplus runs. The
+            # resume env always said "resume", so after a deck change a fresh
+            # start compared new as-is runs against the old EGF results.
+            if FRESH_START:
+                env["SPP_FRESH_START"] = "1"
+                env["SPP_SKIP_DONE"] = "0"
             rc = run_study(case, projects=[proj], modes=[mode], extra_env=env)
             if rc not in (0, None):
                 print("[egf] %s %s %s: the run ended with code %s -- its comparison "

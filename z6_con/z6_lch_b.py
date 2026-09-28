@@ -69,6 +69,18 @@
 """
 import os, sys, re, subprocess, time, glob, csv, threading
 
+# NO WINDOWS ERROR BOXES. A crashed process (an access violation in PSS/E, a
+# floating-point trap) otherwise waits on "python.exe has stopped working" --
+# alive, holding its slot, until someone clicks. With these flags it exits with
+# its crash code and the launcher relaunches it. Child processes inherit the
+# mode, so every launcher, worker, shard and plotter started from here has it.
+if os.name == "nt":
+    try:
+        import ctypes as _ct_em
+        _ct_em.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    except Exception:
+        pass
+
 # --- EDIT THESE ------------------------------------------------------------
 def _script_dir():
     """The folder THIS FILE is in. Used when the study is run on its own; when
@@ -599,6 +611,7 @@ CLOSE_PSSE_DIALOGS    = True
 LICENCE_BACKOFF_S     = 60.0
 LICENCE_BACKOFF_MAX_S = 900.0
 MAX_LICENCE_FAILS     = 30      # per worker; after this it gives up with a note on what to do
+START_FAIL_MAX        = 5       # deaths at start with no licence evidence, in a row, before a slot gives up
 STARTUP_SILENT_S      = 900.0   # 15 min silent with NO claim = stuck at start (dialog / dead licence)
 OUT_MIN_BYTES         = 1048576  # an .out under this holds no samples (a header at most): not a finished run, whatever its marker says
 KEEP_PARTIAL_RUNS     = str(os.environ.get("SPP_KEEP_PARTIAL", "1")).strip().lower() \
@@ -1766,7 +1779,7 @@ _DIALOG_SEEN = {}          # hwnd -> when it was last closed. A box that is STIL
                            # with the sweeper on.
 _DIALOG_RECLOSE_S = 30.0
 _DIALOG_LOCK = threading.Lock()
-_LICENCE_RE  = re.compile(r"codemeter|licen[cs]e|start error|pssenng|psseng|dll load failed|initialization routine failed", re.I)
+_LICENCE_RE  = re.compile(r"codemeter|licen[cs]e|start error|pssenng|psseng|dll load failed|initialization routine failed|network error|error 100|wibu", re.I)
 _DLL_INIT_RE = re.compile(r"DLL load failed|initialization routine failed", re.I)
 
 
@@ -4247,6 +4260,7 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
     procs, threads, launches, done = {}, {}, {i: 0 for i in range(n)}, set()
     launched_at = {}                  # i -> time of its current launch
     lic_fails   = {i: 0 for i in range(n)}
+    start_fail  = {i: 0 for i in range(n)}   # deaths at start with NO licence evidence
     pending     = {}                  # i -> time at which to relaunch it (licence backoff)
 
     def start(i, first=False):
@@ -4508,7 +4522,19 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                 _why = _exit_reason(rc)
                 _worker_exit_note(i, _why + " (died %ds after launch, before any scenario)"
                                   % int(now - launched_at.get(i, now)))
-                _schedule(i, "died at start: %s" % _why)
+                # A START FAILURE THAT IS NOT THE LICENCE IS USUALLY THE SAME
+                # EVERY TIME (a case that cannot be built, a missing machine):
+                # parking and relaunching it for ever kept the launcher, and
+                # z6_main behind it, from ever finishing. The licence branch
+                # above still waits for as long as it takes.
+                start_fail[i] += 1
+                if start_fail[i] > START_FAIL_MAX:
+                    _banner("worker %d died at start %d times in a row (%s) with no licence "
+                            "box -- giving up on this slot; its faults will show as not run. "
+                            "See this worker's log for the error." % (i, start_fail[i], _why))
+                    done.add(i)
+                else:
+                    _schedule(i, "died at start: %s" % _why)
             elif launches[i] >= MAX_LAUNCHES_PER:
                 _banner("worker %d GAVE UP after %d launch(es) -- moving on (its faults will show "
                         "as CRASHED/INCOMPLETE in RUN_SUMMARY)" % (i, launches[i])); done.add(i)
@@ -4521,6 +4547,7 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                 # a normal small code is the script itself exiting. Without this
                 # every death looked the same and the fix was guesswork.
                 lic_fails[i] = 0                           # it got as far as real work
+                start_fail[i] = 0
                 _why = _exit_reason(rc)
                 _worker_exit_note(i, _why)
                 _banner("worker %d exited without sentinel -- %s -- relaunching"
@@ -5797,7 +5824,32 @@ def _run_one_study():
         n_work = _cap
         _write_alive(n_work, force=True)
     _announce_work(selected, n_work)
+    # EVERY .out MARKED, not only every scenario counted done. With
+    # ONLY_MISSING_OUT a finished .out counts as done without a .done; the
+    # catch-up plotter is what writes that marker (and .partial), and without
+    # it the report would leave those scenarios out.
+    _unmarked = []
     if selected == ["__ALL_ALREADY_DONE__"]:
+        for _o in glob.glob(os.path.join(OUT_DIR, "*.out")):
+            _b = _o[:-4]
+            if os.path.isfile(_b + ".done") or os.path.isfile(_b + ".partial"):
+                continue
+            # ALREADY JUDGED: a .plotted / .badout marker at least as new as the
+            # .out means the catch-up pass has looked at it since it was run
+            # (a non-converged run, refused) and would do nothing new.
+            try:
+                _om = os.path.getmtime(_o)
+                if any(os.path.isfile(_b + _x) and os.path.getmtime(_b + _x) + 1.0 >= _om
+                       for _x in (".plotted", ".badout")):
+                    continue
+            except Exception:
+                pass
+            _unmarked.append(os.path.basename(_b))
+        if _unmarked:
+            print("[parallel] every scenario is simulated, but %d .out file(s) have no "
+                  ".done/.partial marker yet (%s) -- running the catch-up pass that "
+                  "writes them" % (len(_unmarked), ", ".join(sorted(_unmarked)[:6])))
+    if selected == ["__ALL_ALREADY_DONE__"] and not _unmarked:
         # NOTHING TO SIMULATE: NO WORKER AND NO CATCH-UP PLOTTER. A worker here
         # started PSS/E -- a licence checkout, often a snapshot rebuild -- to run
         # nothing, and the catch-up plotter behind it drew the folder one file

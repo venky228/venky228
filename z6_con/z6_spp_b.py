@@ -44,6 +44,18 @@
 
 import os, sys, re, csv, glob, time, traceback, contextlib
 
+# NO WINDOWS ERROR BOXES. A crashed process (an access violation in PSS/E, a
+# floating-point trap) otherwise waits on "python.exe has stopped working" --
+# alive, holding its slot, until someone clicks. With these flags it exits with
+# its crash code and the launcher relaunches it. Child processes inherit the
+# mode, so every launcher, worker, shard and plotter started from here has it.
+if os.name == "nt":
+    try:
+        import ctypes as _ct_em
+        _ct_em.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    except Exception:
+        pass
+
 # ============================================================================
 # >>>>>>>>>>>>>>>>>>>>>>  EDIT THESE  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 # ============================================================================
@@ -4247,7 +4259,11 @@ else:
     except Exception as e:
         _licence_init_unlock(_lic_tok)
         _msg = str(e)
-        if re.search(r"codemeter|licen[cs]e|start error|busy", _msg, re.I):
+        # "A network error occurred, Error 100" is the licence server too (the
+        # 2026-09-16 outage): it must take the licence path -- wait and retry
+        # for as long as it takes -- not the generic start-failure one.
+        if re.search(r"codemeter|licen[cs]e|start error|busy|network error|error 100|wibu|cmstick",
+                     _msg, re.I):
             # THE LICENCE RUNTIME REFUSED US. Nothing in this process can run,
             # so say so and leave with a code the launcher knows: it relaunches
             # after a pause and charges no scenario attempt (none was reached).
@@ -15612,7 +15628,10 @@ def _ffill_nonfinite(ch):
         vals = list(v)
         last = None
         for i, x in enumerate(vals):
-            if x == x:
+            # +/-inf is non-finite too (_nan_window counts it): left in place it
+            # tripped the off-scale test and failed a run whose bad values were
+            # all inside the fault.
+            if x == x and x not in (_INF_POS, _INF_NEG):
                 last = x
             elif last is not None:
                 vals[i] = last
@@ -20117,6 +20136,26 @@ def _envelope_text(info):
     return ", ".join(bits)
 
 
+def _angle_runaway(seg):
+    """(True, span) when a rotor angle WENT AND DID NOT COME BACK: it moved more
+       than the deviation gate and ends within 10 % of the span of its own
+       maximum -- still moving in the last fifth of the record, or past 180 deg
+       -- or of its own minimum while still moving. A settled step to a new
+       angle (flat at the end) is not a runaway, in either direction."""
+    if len(seg) < 3:
+        return False, 0.0
+    hi, lo = max(seg), min(seg)
+    span = hi - lo
+    if span < float(ANGLE_DEV_DEG):
+        return False, span
+    end = seg[-1]
+    tail = seg[int(0.8 * len(seg)):] or seg[-1:]
+    moving = abs(tail[-1] - tail[0]) > max(1.0, 0.05 * span)
+    up = abs(end - hi) <= 0.10 * span and (moving or span >= 180.0)
+    down = abs(end - lo) <= 0.10 * span and moving
+    return (up or down), span
+
+
 def spp_damping(seg):
     """SPP Disturbance Performance Requirements Rev 3.0, ROTOR ANGLE DAMPING.
 
@@ -20168,18 +20207,13 @@ def spp_damping(seg):
         # large and one-directional. So a run with no peaks fails when it has
         # moved more than the deviation gate AND ends near its own extreme --
         # i.e. it went and did not come back.
-        _span = max(seg) - vmin
-        _end = seg[-1]
         # STILL GOING AT THE END, or past 180 deg. A machine that steps to a
         # new operating angle and SETTLES there (a line out: 10 -> 30 deg and
         # flat) also has no peaks and ends at its extreme -- that is a new
         # steady state, not a slip. A slipping rotor is still moving in the
-        # last fifth of the record (or has already gone past 180 deg).
-        _tail = seg[int(0.8 * len(seg)):] or seg[-1:]
-        _moving = abs(_tail[-1] - _tail[0]) > max(1.0, 0.05 * _span)
-        _ramped = (_span >= float(ANGLE_DEV_DEG)
-                   and abs(_end - max(seg)) <= 0.10 * _span
-                   and (_moving or _span >= 180.0))
+        # last fifth of the record (or has already gone past 180 deg). Either
+        # direction: a rotor can slip downward too.
+        _ramped, _span = _angle_runaway(seg)
         if _ramped:
             info["poleslip"] = True
             info["span"] = _span
@@ -20253,6 +20287,14 @@ def spp_damping(seg):
     info["damp1"] = None if info["sppr1"] is None else (1.0 - info["sppr1"]) * 100.0
     info["damp5"] = None if info["sppr5"] is None else (1.0 - info["sppr5"]) * 100.0
     if info["sppr1"] is None and info["sppr5"] is None:
+        # ONE PEAK, THEN A RUNAWAY, is a slip with a first swing in front of
+        # it -- this returned "damped" for a machine that swung to 90 deg, came
+        # back to 30 and then ran away to 700.
+        _ramped, _span = _angle_runaway(seg)
+        if _ramped:
+            info["poleslip"] = True
+            info["span"] = _span
+            return False, info
         return True, info                      # a single positive peak -- not oscillatory
 
     # THE SETTLING VALUE AND THE FLOOR THE RATIOS DECAY TOWARDS.
@@ -22082,11 +22124,31 @@ def evaluate_case(path, kind, tclear, kb):
                                 "(add_channels) for this run. (%s)" % (_what, _r["Detail"]))
     return rows, ("PASS" if all(r["Result"] != "FAIL" for r in rows) else "FAIL")
 
+
+# THE FP MASK, RE-APPLIED ON EVERY READ AND EVERY SCORE. It is per thread, and
+# PSS/E unmasks it again on some API calls -- after which a NaN in a .out
+# traps into a modal "floating-point arithmetic error" box and the process
+# hangs on it. Masked once at start-up only, a report shard that had loaded a
+# case was exposed from its first psspy call on.
+def _fp_guard(fn):
+    def _guarded(*a, **k):
+        _fp_mask_exceptions()
+        return fn(*a, **k)
+    _guarded.__name__ = fn.__name__
+    _guarded.__doc__ = fn.__doc__
+    return _guarded
+
+
+load_out = _fp_guard(load_out)
+_nan_window = _fp_guard(_nan_window)
+evaluate_case = _fp_guard(evaluate_case)
+
 # WHICH CASE THIS SCRIPT RUNS. It goes in every report's NAME and on every
 # report's first line, because a base result and a project result in two folders
 # with identical filenames are two files you have to remember the provenance of
 # -- and remembering it wrongly once is a comparison that says the project fixed
 # something the base never had.
+
 RUN_KIND = "BASE"
 
 # THE ROOT OF A RESULTS FOLDER HOLDS THREE FILES, NOT FIFTEEN.
@@ -22930,6 +22992,26 @@ def merge_report_parts():
                         verdicts[r["Case"]] = (r.get("Verdict") or "").strip()
         except Exception as e:
             print("[merge] could not read %s: %s" % (f, e))
+    # ...AND ANY SCENARIO SCORED SINCE ITS SHARD LAST WROTE ITS PART. A shard
+    # writes its part every PART_WRITE_EVERY_S and at its end; one that died
+    # for good in between left those scenarios in their own SCEN_<id>.csv only.
+    # Current files only (read_scenario_parts skips one older than its .out),
+    # for a scenario whose .out is still in the folder and in the selection.
+    try:
+        _gap = []
+        for _c, (_rw, _v) in read_scenario_parts().items():
+            if (_c not in verdicts and _rw and _wanted(_c)
+                    and os.path.isfile(os.path.join(OUT_DIR, _c + ".out"))
+                    and (os.path.isfile(_state_path(_c, "done")) or _is_partial(_c))):
+                all_rows += _rw
+                verdicts[_c] = _v
+                _gap.append(_c)
+        if _gap:
+            print("[merge] %d scenario(s) not in any shard part were taken from their "
+                  "per-scenario parts: %s" % (len(_gap), ", ".join(sorted(_gap)[:8])
+                                              + (" ..." if len(_gap) > 8 else "")))
+    except Exception as e:
+        print("[merge] could not read the per-scenario parts (%s)" % e)
     # rebuild SPP_VIOLATIONS so the violations report is written from the shards
     SPP_VIOLATIONS.clear()
     _xfiles = ([f for f in (_part_path(i, "VIOLATIONS") for i in range(_nsh))
@@ -28689,11 +28771,16 @@ def _rclaim_fin(sid):
 
 
 class _ExcludedList(list):
-    """nan_excluded: every scenario set aside is also marked dealt with."""
+    """nan_excluded: a scenario set aside for a reason that WILL REPEAT (non-
+       finite values, no clearing time) is also marked dealt with. One set aside
+       because a read failed -- memory, a locked file -- is not: another shard,
+       in a fresh process, may well read it."""
     def append(self, item):
         list.append(self, item)
         try:
-            _rclaim_fin(item[0])
+            _why = str(item[1] if len(item) > 1 else "")
+            if not re.search(r"could not be read|fill failed|could not read", _why, re.I):
+                _rclaim_fin(item[0])
         except Exception:
             pass
 
@@ -30494,7 +30581,14 @@ def finalize_report(produced, part=None, claim=False):
             _nbf, _totf = out_scan_nonfinite(p, threshold=OUT_NAN_BYTES_MAX)
             _nan_ffill = False
             _nan_drop, _nan_drop_note = [], ""
-            if _nbf < 0 or _nbf > OUT_NAN_BYTES_MAX:
+            # ANY NON-FINITE VALUE IS LOCATED, not only more than
+            # OUT_NAN_BYTES_MAX of them. A file with a few hundred NaN words was
+            # scored raw -- and max()/min() over a NaN sample return NaN, every
+            # comparison with NaN is False, so the buses and machines nearest
+            # the fault read as within limits. Located, the few are treated
+            # like the many: filled if inside the fault, set aside if local,
+            # a divergence FAIL if the network came apart after clearing.
+            if _nbf != 0:
                 # WHERE the non-finite values are, not how many. See _nan_window.
                 # THE CLEARING TIME THE LOOP ALREADY HAS, not the .done's alone.
                 # A .partial run has no .done, so this read None, _nan_window
@@ -30727,13 +30821,20 @@ def finalize_report(produced, part=None, claim=False):
                                    "as a failure; the individual criteria could not "
                                    "be computed." % (_t_div, _win[1])))
                         continue
-                    _why = ("%s non-finite value(s), and neither reader could "
-                            "establish where they fall -- see the [nan] line above"
-                            % ("an unreadable number of" if _nbf < 0 else _nbf))
-                    print("  [score] %s EXCLUDED -- %s" % (_sid, _why))
-                    sys.stdout.flush()
-                    nan_excluded.append((_sid, _why))
-                    continue
+                    if not _win and 0 < _nbf <= OUT_NAN_BYTES_MAX:
+                        # A FEW WORDS THAT NO READER COULD PLACE -- as often a
+                        # stray word in the file header as a value. Scored as
+                        # such files always were.
+                        print("  [score] %s: %d non-finite word(s) that could not be "
+                              "placed in any channel -- scored as before" % (_sid, _nbf))
+                    else:
+                        _why = ("%s non-finite value(s), and neither reader could "
+                                "establish where they fall -- see the [nan] line above"
+                                % ("an unreadable number of" if _nbf < 0 else _nbf))
+                        print("  [score] %s EXCLUDED -- %s" % (_sid, _why))
+                        sys.stdout.flush()
+                        nan_excluded.append((_sid, _why))
+                        continue
             _iso = False
             if ISOLATE_OUT_READS is True:
                 _iso = True
@@ -30852,7 +30953,10 @@ def finalize_report(produced, part=None, claim=False):
                     print("  [%-4s] %-50s : %s" % (r["Result"], r["Criterion"], r["Detail"]))
             except Exception as e:
                 print("  SCORE ERROR %s: %s" % (p, e)); traceback.print_exc()
-                _rclaim_fin(_sid)
+                # Out of memory or a file error may not happen in another
+                # process: leave it for the other shards. Anything else will.
+                if not isinstance(e, (MemoryError, EnvironmentError)):
+                    _rclaim_fin(_sid)
             sys.stdout.flush()      # keep the launcher's silence watchdog fed on a slow file
             # >>> WRITE THE PART AFTER EVERY SCENARIO, not once at the end.
             # A .out takes minutes to score, so a shard holds hours of work in
@@ -32848,6 +32952,16 @@ def _pdf_current(sid):
 _OUT_FULL_SIZE = {"ref": None}
 
 
+def _plot_marker_refused(sid):
+    """True when this scenario's .plotted marker records a REFUSAL ("NOT
+       drawn"), not a PDF that was written and has since been removed."""
+    try:
+        with open(_state_path(sid, "plotted")) as fh:
+            return "NOT drawn" in fh.read(4000)
+    except Exception:
+        return False
+
+
 def _plot_only_current(sid, out_path):
     """True when this scenario was DRAWN on a launch at least as recent as its
        .out, and could not be marked done (an incomplete or non-finite run).
@@ -33169,7 +33283,8 @@ def plot_missing_outs():
         # says it was judged against this .out (and, under FORCE_REPLOT, in
         # this launch); the panel's count treats it the same way.
         if (not had_pdf and not had_done and not _only_one
-                and not _is_partial(sid) and _plot_only_current(sid, p)):
+                and not _is_partial(sid) and _plot_only_current(sid, p)
+                and _plot_marker_refused(sid)):
             continue
         if had_pdf and (_done_and_scored or _plot_only_current(sid, p)):
             # NOTHING LEFT FOR THIS ONE.
