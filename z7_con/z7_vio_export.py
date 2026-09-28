@@ -9,7 +9,9 @@ project EGF off, sweeps, ...):
     violations_export\\ALL_FAILED_CRITERIA.csv   every criterion that FAILED, with its detail
     violations_export\\FAULT_VERDICTS_<proj>.csv  one row per fault, one column per scenario:
                                                  PASS / FAIL (n violations) / - (not run)
-    violations_export\\SUMMARY.txt               per scenario: faults, pass, fail, violations, source
+    violations_export\\MISSING.csv               every gap, one row per fault and scenario (see below)
+    violations_export\\SUMMARY.txt               per scenario: faults, pass, fail, violations, source,
+                                                 and WHAT IS MISSING, as fault ranges
     violations_export.zip                        all of the above, to hand over in one file
 
 BACKUP FOLDERS ARE LEFT OUT: any folder (or folder above it) whose name has
@@ -17,6 +19,15 @@ backup / bak / old / prev / previous / archive / copy / before as a word, or
 ends __run<n> (a previous run set aside), _prev_<time> or _before_fixed_<time>.
 Each one skipped is listed on screen and in SUMMARY.txt. Add more words to
 SKIP_WORDS below.
+
+WHAT IS MISSING, per scenario (checked against that folder's own fault list
+faults\\SPP_FAULTS.csv and every other scenario of the same project):
+    not run            in a fault list, no .out
+    not finished       .out but no .done (crashed, gave up, or still running)
+    not scored         .out but no score anywhere (merged report or parts)
+    not in merged report   scored in parts\\SCEN_<id>.csv only (merge unfinished)
+    no PDF             .out but no plots\\<id>_plots.pdf
+and whether the folder has no 02_VIOLATIONS / SPP_CRITERIA_REPORT file at all.
 
 Where a folder's merged report is incomplete (a merge that did not finish),
 the faults it lacks are read from parts\\SCEN_<id>.csv -- the worker's own
@@ -55,6 +66,43 @@ def _is_backup(name):
 VIO_COLS = ["fault_id", "fault_result", "violation", "element", "value", "unit",
             "time_s", "area", "area_name", "nodes_from_fault", "fault_bus", "note",
             "above_limit_s"]
+
+
+def _ranges(ids):
+    """F09, F10, F11, F22 -> 'F09-F11, F22'."""
+    ids = sorted(set(ids), key=_fid_key)
+    out, run = [], []
+    for f in ids:
+        k = _fid_key(f)
+        if run and not k[2] and not _fid_key(run[-1])[2] and k[0] == _fid_key(run[-1])[0] \
+                and k[1] == _fid_key(run[-1])[1] + 1:
+            run.append(f)
+            continue
+        if run:
+            out.append(run[0] if len(run) == 1 else "%s-%s" % (run[0], run[-1]))
+        run = [f]
+    if run:
+        out.append(run[0] if len(run) == 1 else "%s-%s" % (run[0], run[-1]))
+    return ", ".join(out)
+
+
+def _stems(d, pat, suffix):
+    return set(os.path.basename(p)[:-len(suffix)] for p in glob.glob(os.path.join(d, pat)))
+
+
+def _planned(d):
+    p = os.path.join(d, "faults", "SPP_FAULTS.csv")
+    ids = set()
+    if os.path.isfile(p):
+        try:
+            with _open_r(p) as fh:
+                for r in csv.DictReader(fh):
+                    f = (r.get("fault_id") or "").strip()
+                    if f:
+                        ids.add(f)
+        except Exception as e:
+            print("  could not read %s (%s)" % (p, e))
+    return ids
 
 
 def _open_r(p):
@@ -175,6 +223,7 @@ def main():
                  "detail", "folder"])
     verdicts = {}          # proj -> {scenario: {fault: (verdict, n_vio)}}
     summary = []
+    status = []            # (proj, label, d, planned, outs, done, scored, parts-only, pdfs, has_vp, has_cp)
     for case, proj, label, d in folders:
         print("%-14s %-28s %s" % (proj, label, d))
         crit = {}          # fault -> (verdict, [(criterion, result, detail)])
@@ -235,12 +284,43 @@ def main():
         vt = verdicts.setdefault(proj, {}).setdefault(label, {})
         for f in crit:
             vt[f] = (crit[f][0], nvio.get(f, 0))
+        status.append((proj, label, d, _planned(d),
+                       _stems(os.path.join(d, "outs"), "*.out", ".out"),
+                       _stems(os.path.join(d, "outs"), "*.done", ".done"),
+                       set(crit), set(from_parts),
+                       _stems(os.path.join(d, "plots"), "*_plots.pdf", "_plots.pdf"),
+                       bool(vp), bool(cp)))
         nf = sum(1 for f in crit if crit[f][0] == "FAIL")
         summary.append((proj, label, case, len(crit), len(crit) - nf, nf,
                         sum(nvio.values()), len(from_parts), n_pv, d))
     fv.close()
     fc.close()
-    written = ["ALL_VIOLATIONS.csv", "ALL_FAILED_CRITERIA.csv"]
+    written = ["ALL_VIOLATIONS.csv", "ALL_FAILED_CRITERIA.csv", "MISSING.csv"]
+    # ---- WHAT IS MISSING ----------------------------------------------------
+    union = {}
+    for st in status:
+        union.setdefault(st[0], set()).update(st[3])
+    gaps = []              # (proj, label, kind, [faults], d)
+    for proj, label, d, planned, outs, done, scored, pponly, pdfs, has_vp, has_cp in status:
+        want = (planned | union.get(proj, set())) - set(["FLAT_RUN"])
+        g = [("not run", sorted(want - outs, key=_fid_key)),
+             ("not finished", sorted(outs - done, key=_fid_key)),
+             ("not scored", sorted(outs - scored, key=_fid_key)),
+             ("not in merged report", sorted(pponly, key=_fid_key)),
+             ("no PDF", sorted((outs & done) - pdfs - set(["FLAT_RUN"]), key=_fid_key))]
+        for kind, ids in g:
+            if ids:
+                gaps.append((proj, label, kind, ids, d))
+        if not has_vp:
+            gaps.append((proj, label, "no 02_VIOLATIONS file", [], d))
+        if not has_cp:
+            gaps.append((proj, label, "no SPP_CRITERIA_REPORT file", [], d))
+    with _open_w(os.path.join(OUT, "MISSING.csv")) as fh:
+        w = csv.writer(fh)
+        w.writerow(["project", "scenario", "missing", "fault_id", "folder"])
+        for proj, label, kind, ids, d in gaps:
+            for f in (ids or [""]):
+                w.writerow([proj, label, kind, f, d])
     for proj in sorted(verdicts):
         scen = sorted(verdicts[proj], key=lambda s: (not s.startswith("BASE"), s))
         faults = sorted(set(f for s in scen for f in verdicts[proj][s]), key=_fid_key)
@@ -265,6 +345,13 @@ def main():
             fh.write("%-14s %-30s %-5s %6d %6d %6d %10d %12s\n" % (
                 s[0], s[1], s[2], s[3], s[4], s[5], s[6],
                 ("%d fault(s)" % s[7]) if s[7] else "-"))
+        fh.write("\nWHAT IS MISSING (details in MISSING.csv):\n")
+        if not gaps:
+            fh.write("  nothing -- every fault in every scenario is run, finished, scored,\n"
+                     "  merged and plotted\n")
+        for proj, label, kind, ids, d in gaps:
+            fh.write("  %-14s %-28s %-24s %s\n" % (
+                proj, label, kind + (" (%d)" % len(ids) if ids else ""), _ranges(ids)))
         fh.write("\n'from parts' = faults missing from that folder's merged report, read\n"
                  "from parts\\SCEN_<id>.csv (the worker's own score).\n\nFolders:\n")
         for s in summary:
