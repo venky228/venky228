@@ -322,7 +322,7 @@ def _print_phase_times(total):
 PROJECTS = ["SantaFe", "IronStar","EmpirePrairie","EastFork"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
 MODES = ["spp"]                              # fault set: spp | con | table | custom | manual
-PIPELINE = "all"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
+PIPELINE = "compare"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
 RUN_CASES = "both"                           # "both" | "base" | "proj" -- which case to simulate
 ONLY_FAULTS = []                    # [] = every fault | e.g. ["F01-F04"]
 ONLY_EVENTS = []                             # [] = every event
@@ -755,7 +755,7 @@ RESTORE_TRUNCATED_DONE = True
 OUT_EMPTY_BYTES = 1048576                    # .out under this = empty
 
 # ---- 17. SCORING ---------------------------------------------------------------
-FORCE_RESCORE = True                        # True = re-score everything every launch
+FORCE_RESCORE = False                        # True = re-score everything every launch
 RESCORE_STALE_REPORTS = True                 # re-score a report older than its .out
 STALE_REPORT_TOL_S = 120
 REPORT_COVERAGE_MIN = 0.90                   # re-score a report covering less than this
@@ -769,7 +769,7 @@ FAST_COMPARE_PARALLEL = 4                    # projects at once
 
 # ---- 18. PLOTS -----------------------------------------------------------------
 MAKE_PLOTS = None                            # None = draw | False = no PDFs (faster)
-PLOT_MISSING_OUTS = True                    # draw PDFs for .out files without one
+PLOT_MISSING_OUTS = False                    # draw PDFs for .out files without one
 FORCE_REPLOT = False                         # True = redraw every PDF
 PLOT_SCOPE = "compact"                       # "compact" | "full"
 PLOT_ONE_PROJECT_AT_A_TIME = True
@@ -9623,9 +9623,18 @@ def compare_three_way(proj, mode):
                          universal_newlines=True, bufsize=1)
     th = threading.Thread(target=_pump, args=("[3-way]", p))
     th.daemon = True
-    th.start()
+    try:
+        th.start()
+    except Exception as _e:
+        # "can't start new thread": a 32-bit process short of address space
+        # for one more stack. The child still needs its pipe drained, and
+        # this process is only waiting for it anyway -- so drain it here.
+        print("[3-way] no thread for the child's output (%s) -- reading it here" % _e)
+        th = None
+        _pump("[3-way]", p)
     rc = p.wait()
-    th.join(timeout=5)
+    if th is not None:
+        th.join(timeout=5)
     if rc not in (0, None):
         print("[3-way] *** %s: z7_cmp_multi ended rc=%s ***" % (proj, rc))
     return rc in (0, None)
@@ -12078,6 +12087,42 @@ def write_all_variants_overvoltage(proj, mode):
     return write_sweep_overvoltage(proj, mode, cols, "ALL_VARIANTS_MEASURED",
                                    "EVERY VARIANT ON DISK", notes, "[variants]",
                                    noun="variant")
+
+
+# ---- MEMORY BETWEEN THE EXTRA COMPARISONS ------------------------------------
+# The main comparison leaves every folder's measurements in _MEAS_CACHE -- for
+# IronStar alone that is 365,000 bus-voltage rows a side. In a 32-bit Python
+# (2 GB of address space) the extra comparisons that follow then failed with
+# an EMPTY message -- a MemoryError prints as "()" -- and the 3-way step with
+# "can't start new thread": surplus, EGF, all-variants and ALL_4_SCENARIOS all
+# lost, while the main reports had been written fine. The caches only save
+# re-reading a CSV, so each of these steps now starts with them emptied.
+def _release_compare_memory():
+    for _c in (_MEAS_CACHE, _SCEN_PART_CACHE, _OUT_SET_CACHE, _PART_LAY_CACHE):
+        try:
+            _c.clear()
+        except Exception:
+            pass
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+
+def _frees_memory_first(fn):
+    def _w(*a, **k):
+        _release_compare_memory()
+        return fn(*a, **k)
+    _w.__name__ = fn.__name__
+    _w.__doc__ = fn.__doc__
+    return _w
+
+
+compare_surplus_scenarios = _frees_memory_first(compare_surplus_scenarios)
+compare_egf_variants = _frees_memory_first(compare_egf_variants)
+compare_three_way = _frees_memory_first(compare_three_way)
+write_all_variants_overvoltage = _frees_memory_first(write_all_variants_overvoltage)
 
 
 def write_dyr_sweep_comparisons(proj, mode, variants, cap_tag=""):
