@@ -105,6 +105,111 @@ if os.name == "nt":
         _ct_em.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
     except Exception:
         pass
+# ---- LICENCE BOXES OF THIS PANEL'S OWN CHILDREN ------------------------------
+# The launchers close the CodeMeter "runtime busy" box for the processes THEY
+# start. The plotters, .sav builds and compare runs this panel starts itself had
+# nobody to press OK, so one such box sat on screen and held its process. This
+# sweeper closes, every 5 s, a dialog (#32770) whose owner is a DIRECT child of
+# this panel AND whose text is a licence / psseng message -- nothing else, so a
+# person's own windows and the launchers' children (swept, and counted, by the
+# launchers) are never touched.
+CLOSE_CHILD_LICENCE_BOXES = True
+
+
+def _child_licence_sweeper():
+    import ctypes, re as _re, time as _t
+    from ctypes import wintypes as _w
+    k32, u = ctypes.windll.kernel32, ctypes.windll.user32
+    me = os.getpid()
+    rx = _re.compile(r"codemeter|licen[cs]e|start error|psseng|runtime system|wibu|"
+                     r"network error|error 100", _re.I)
+
+    class PE(ctypes.Structure):
+        _fields_ = [("dwSize", _w.DWORD), ("cntUsage", _w.DWORD),
+                    ("th32ProcessID", _w.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", _w.DWORD), ("cntThreads", _w.DWORD),
+                    ("th32ParentProcessID", _w.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", _w.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+    k32.CreateToolhelp32Snapshot.restype = _w.HANDLE
+
+    def kids():
+        out = set()
+        h = k32.CreateToolhelp32Snapshot(2, 0)
+        if not h or h == _w.HANDLE(-1).value:
+            return out
+        try:
+            e = PE()
+            e.dwSize = ctypes.sizeof(PE)
+            ok = k32.Process32FirstW(h, ctypes.byref(e))
+            while ok:
+                if e.th32ParentProcessID == me:
+                    out.add(int(e.th32ProcessID))
+                ok = k32.Process32NextW(h, ctypes.byref(e))
+        finally:
+            k32.CloseHandle(h)
+        return out
+
+    buf = ctypes.create_unicode_buffer(512)
+    ENUM = ctypes.WINFUNCTYPE(ctypes.c_bool, _w.HWND, _w.LPARAM)
+
+    def txt(h):
+        buf.value = ""
+        u.GetWindowTextW(h, buf, 512)
+        return buf.value
+
+    def cls(h):
+        buf.value = ""
+        u.GetClassNameW(h, buf, 512)
+        return buf.value
+
+    seen = {}
+    while True:
+        try:
+            ks = kids()
+            boxes = []
+
+            def top(h, _lp):
+                try:
+                    if u.IsWindowVisible(h) and cls(h) == "#32770":
+                        pid = _w.DWORD(0)
+                        u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                        if int(pid.value) in ks:
+                            parts = [txt(h)]
+
+                            def ch(c, _l):
+                                if cls(c).lower() == "static":
+                                    parts.append(txt(c))
+                                return True
+                            u.EnumChildWindows(h, ENUM(ch), 0)
+                            boxes.append((h, int(pid.value), " | ".join(x for x in parts if x)))
+                except Exception:
+                    pass
+                return True
+            u.EnumWindows(ENUM(top), 0)
+            for h, pid, text in boxes:
+                if not rx.search(text):
+                    continue
+                if _t.time() - seen.get(h, 0) < 30:
+                    continue
+                seen[h] = _t.time()
+                print("[dialog] panel child pid %d is showing a LICENCE box: %s -- closing it "
+                      "(that process ends; its work is picked up again)" % (pid, text[:200]))
+                for wp in (5, 3, 1, 2):          # Ignore, Abort, OK, Cancel -- never Retry
+                    u.PostMessageW(h, 0x0111, wp, 0)
+                u.PostMessageW(h, 0x0010, 0, 0)  # WM_CLOSE
+        except Exception:
+            pass
+        _t.sleep(5)
+
+
+if os.name == "nt" and CLOSE_CHILD_LICENCE_BOXES:
+    try:
+        import threading as _th_sw
+        _sw = _th_sw.Thread(target=_child_licence_sweeper)
+        _sw.daemon = True
+        _sw.start()
+    except Exception:
+        pass
 # ast: to read BESS_PROJECTS and FEEDER_MAX_MW out of the study script for the
 # preflight, WITHOUT importing it -- importing it needs PSS/E and would run its
 # module-level checks, which is the very thing being checked for.
@@ -13599,14 +13704,16 @@ def _plan_expected(d, proj=None):
         return 0
 
 
-def _plan_state(proj, mode, sfx):
-    """What is on disk for one run: state, scenario counts, verdicts."""
+def _plan_state(proj, mode, sfx, _dir=None, _base_run=None):
+    """What is on disk for one run: state, scenario counts, verdicts.
+       _dir / _base_run read another folder of the same run -- its BASE side."""
     _case, _sfx, _bsfx = _plan_where(sfx)
-    d = _run_path(_case, proj, "%s_%s%s" % (proj, mode, _sfx))
+    d = _dir or _run_path(_case, proj, "%s_%s%s" % (proj, mode, _sfx))
+    _br = (_case is CASE_BASE) if _base_run is None else bool(_base_run)
     if not os.path.isdir(d):
         return {"dir": d, "state": "TO RUN", "n_out": 0, "n_scored": 0,
-                "n_pass": 0, "n_fail": 0, "when": "",
-                "base_run": _case is CASE_BASE}
+                "n_pass": 0, "n_fail": 0, "when": "", "t_new": 0.0,
+                "base_run": _br}
     try:
         n_out = len(glob.glob(os.path.join(d, "outs", "*.out")))
     except Exception:
@@ -13669,7 +13776,7 @@ def _plan_state(proj, mode, sfx):
         state = "TO RUN"
     return {"dir": d, "state": state, "n_out": n_out, "n_scored": len(scored),
             "n_pass": n_pass, "n_fail": n_fail, "n_faults": n_faults,
-            "n_want": n_want, "base_run": _case is CASE_BASE,
+            "n_want": n_want, "base_run": _br, "t_new": newest,
             "when": (time.strftime("%Y-%m-%d %H:%M", time.localtime(newest))
                      if newest else "")}
 
@@ -14014,13 +14121,38 @@ def write_sweep_plan(projects=None, modes=None, note=""):
         L.append(" RUNNING    written to in the last %d min" % (_PLAN_RUNNING_S // 60))
         L.append(" PART DONE  it stopped early -- the scored column shows how far")
         L.append(" TO RUN     no results folder yet")
-        L.append(" base       the BASE case's .out files for the same run, and the")
-        L.append("            fault count it is expected to have")
+        L.append(" BASE / PROJECT  each run's two cases, side by side, each with its own")
+        L.append("            state and counts. A BASE-only run (existing machines OFF)")
+        L.append("            has no project side: n/a.")
         L.append("=" * 118)
-        L.append(" %-*s %-*s %-10s %5s %7s %5s %5s %9s  %s"
-                 % (wp, "project", wl, "run", "state", ".out", "scored",
-                    "PASS", "FAIL", "base .out", "last written"))
-        L.append("-" * 118)
+        # BASE CASE AND PROJECT CASE IN THEIR OWN COLUMN GROUPS. One set of
+        # columns plus a lone "base .out" count mixed the two cases on one line
+        # and never said whether the base side was SCORED, or how it scored.
+        _gf = "%-10s %5s %7s %4s %4s"
+        _gw = len(_gf % ("", "", "", "", ""))
+        _pre_w = 1 + wp + 1 + wl + 1
+        _tw = _pre_w + _gw + 3 + _gw + 2 + 16
+        _hdr1 = (" " * _pre_w + ("-- BASE case ").ljust(_gw, "-") + " | "
+                 + ("-- PROJECT case ").ljust(_gw, "-"))
+        _hdr2 = (" %-*s %-*s " % (wp, "project", wl, "run")
+                 + _gf % ("state", ".out", "scored", "PASS", "FAIL") + " | "
+                 + _gf % ("state", ".out", "scored", "PASS", "FAIL")
+                 + "  last written")
+        L.append(_hdr1)
+        L.append(_hdr2)
+        L.append("-" * max(118, _tw))
+        _bcache = {}
+
+        def _grp(s):
+            if s is None:
+                return _gf % ("n/a", "", "", "", "")
+            # "3" says nothing; "3/142" says the run stopped. The denominator
+            # is the fault list that folder's own build wrote.
+            sc = ("%d/%d" % (s["n_scored"], s["n_want"])) if s.get("n_want") \
+                else (s["n_scored"] or "-")
+            return _gf % (s["state"], s["n_out"] or "-", sc,
+                          s["n_pass"] or "-", s["n_fail"] or "-")
+
         _last_p = None
         _incomplete = []
         for p, m, lbl, sfx, st in rows:
@@ -14029,30 +14161,30 @@ def write_sweep_plan(projects=None, modes=None, note=""):
             if _last_p is not None and p != _last_p:
                 L.append("")
             _last_p = p
-            # "3" says nothing; "3/142" says the run stopped. The denominator
-            # is the fault list that folder's own build wrote.
-            _sc = ("%d/%d" % (st["n_scored"], st["n_want"])) if st.get("n_want") \
-                else (st["n_scored"] or "-")
-            # THE BASE SIDE, BESIDE THE PROJECT SIDE. Without it a run reads
-            # COMPLETE while the base case it must be compared against has no
-            # results at all -- which is the state a comparison cannot use.
-            _bo, _bw = _plan_base_counts(p, m, sfx)
-            if _bo is None:
-                _bcol = "(base)"          # this row IS the base run
+            if st.get("base_run"):
+                bst, pst = st, None
             else:
-                _bcol = ("%d/%d" % (_bo, _bw)) if _bw else (str(_bo) if _bo else "-")
-                if _bo == 0 or (_bw and _bo < _bw):
-                    _incomplete.append("%s %s: base %s" % (p, lbl, _bcol))
-            if st["state"] in ("TO RUN", "PART DONE"):
-                _incomplete.append("%s %s: %s %s (%s)"
-                                   % (p, lbl, "base" if st.get("base_run") else "project",
-                                      _sc, st["state"]))
-            L.append(" %-*s %-*s %-10s %5s %7s %5s %5s %9s  %s"
-                     % (wp, p, wl, lbl, st["state"],
-                        st["n_out"] or "-", _sc,
-                        st["n_pass"] or "-", st["n_fail"] or "-", _bcol,
-                        st["when"] or "-"))
-        L.append("-" * 118)
+                pst = st
+                _c, _s, _bsfx = _plan_where(sfx)
+                bst = None
+                if _bsfx is not None:
+                    _bd = _run_path(CASE_BASE, p, "%s_%s%s" % (p, m, _bsfx))
+                    if _bd not in _bcache:
+                        _bcache[_bd] = _plan_state(p, m, sfx, _dir=_bd, _base_run=True)
+                    bst = _bcache[_bd]
+            for _side, s in (("base", bst), ("project", pst)):
+                if s is not None and s["state"] in ("TO RUN", "PART DONE"):
+                    _w = "%s %s: %s %s (%s)" % (
+                        p, lbl, _side,
+                        ("%d/%d" % (s["n_scored"], s["n_want"])) if s.get("n_want")
+                        else (s["n_scored"] or "-"), s["state"])
+                    if _w not in _incomplete:
+                        _incomplete.append(_w)
+            _tn = max([x.get("t_new") or 0.0 for x in (bst, pst) if x is not None] or [0.0])
+            L.append(" %-*s %-*s " % (wp, p, wl, lbl) + _grp(bst) + " | " + _grp(pst)
+                     + "  " + (time.strftime("%Y-%m-%d %H:%M", time.localtime(_tn))
+                               if _tn else "-"))
+        L.append("-" * max(118, _tw))
         if _incomplete:
             L.append(" NOT READY TO COMPARE (%d):" % len(_incomplete))
             for _w in _incomplete:

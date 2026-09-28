@@ -4004,24 +4004,6 @@ try:
     import psse34
 except Exception:
     pass
-# ---- STAGGERED START -------------------------------------------------------
-# The launcher gives worker i a delay of i x LAUNCH_STAGGER_S so that N PSS/E
-# sessions do not all ask the CodeMeter licence runtime in the same second --
-# which is what produced "Start Error: CodeMeter runtime system is currently
-# busy" boxes on every worker at once. Slept BEFORE psspy is imported.
-EXIT_LICENCE_BUSY = 86
-try:
-    _START_DELAY_S = float((os.environ.get("SPP_START_DELAY_S") or "0").strip() or 0)
-except Exception:
-    _START_DELAY_S = 0.0
-if _START_DELAY_S > 0:
-    print("[init] staggered start: waiting %.0f s before starting PSS/E so the licence "
-          "requests of the %d workers arrive one at a time (SPP_START_DELAY_S)"
-          % (_START_DELAY_S, N_WORKERS))
-    sys.stdout.flush()
-    time.sleep(_START_DELAY_S)
-import psspy, dyntools                                 # PSS/E 34 python API + channel reader
-
 # ---- ONE LICENCE REQUEST AT A TIME -------------------------------------------
 # "CodeMeter runtime system is currently busy" is what the runtime says when two
 # PSS/E sessions ask for a licence at the same moment. The launchers already
@@ -4094,6 +4076,33 @@ def _licence_init_unlock(token):
     except Exception:
         pass
 
+
+# ---- STAGGERED START -------------------------------------------------------
+# The launcher gives worker i a delay of i x LAUNCH_STAGGER_S so that N PSS/E
+# sessions do not all ask the CodeMeter licence runtime in the same second --
+# which is what produced "Start Error: CodeMeter runtime system is currently
+# busy" boxes on every worker at once. Slept BEFORE psspy is imported.
+EXIT_LICENCE_BUSY = 86
+try:
+    _START_DELAY_S = float((os.environ.get("SPP_START_DELAY_S") or "0").strip() or 0)
+except Exception:
+    _START_DELAY_S = 0.0
+if _START_DELAY_S > 0:
+    print("[init] staggered start: waiting %.0f s before starting PSS/E so the licence "
+          "requests of the %d workers arrive one at a time (SPP_START_DELAY_S)"
+          % (_START_DELAY_S, N_WORKERS))
+    sys.stdout.flush()
+    time.sleep(_START_DELAY_S)
+# THE LICENCE IS TAKEN WHEN psseng.dll LOADS, not only in psseinit(): the
+# "psseng.dll: Start Error -- CodeMeter runtime system is currently busy"
+# box comes from this import. So the one-at-a-time lock covers it too --
+# 22 report shards and the plotters all import psspy, even the ones that
+# never call psseinit().
+_lic_tok_imp = _licence_init_lock()
+try:
+    import psspy, dyntools                             # PSS/E 34 python API + channel reader
+finally:
+    _licence_init_unlock(_lic_tok_imp)
 
 # UNIQUE CHANNEL IDENTIFIERS, ENFORCED AT THE API. Two channels with the same
 # identifier in one .out header is a file this build's dyntools cannot decode:
