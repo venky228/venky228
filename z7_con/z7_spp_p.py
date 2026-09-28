@@ -11521,38 +11521,48 @@ def _compile_diag(env):
        and PSS/E's cload4 imports psse_env_manager, which exists only for the
        Python versions PSS/E installed it for. These lines say, from the
        machine itself, which of them is at fault."""
-    if os.name != "nt":
-        return
-    import subprocess
+    # NEVER FATAL. On a Windows cp850 console under Python 3.4 a path
+    # with a non-ASCII character raises UnicodeEncodeError in print --
+    # and these lines only explain a failure, they must not cause one.
+    try:
+        if os.name != "nt":
+            return
+        import subprocess
 
-    def _run(cmd):
+        def _run(cmd):
+            try:
+                p = subprocess.Popen(cmd, cwd=STUDY_DIR, env=env, shell=True,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     universal_newlines=True)
+                out, _e = p.communicate()
+                return [x.strip() for x in (out or "").splitlines() if x.strip()]
+            except Exception as e:
+                return ["(could not ask: %s)" % e]
+        print("  [dyr] cload4 resolves to     : %s" % ("; ".join(_run("where cload4")[:4]) or "-"))
+        print("  [dyr] PATHEXT                : %s" % (env.get("PATHEXT") or "-"))
+        print("  [dyr] .py files open with    : %s"
+              % ("; ".join(_run("assoc .py") + _run("ftype Python.File")) or "-")[:300])
+        found = []
+        for pb in _pssbin_dirs():
+            root = os.path.dirname(os.path.normpath(pb))
+            for d, subs, files in os.walk(root):
+                if d[len(root):].count(os.sep) >= 2:
+                    del subs[:]
+                found += [os.path.join(d, f) for f in files
+                          if f.lower().startswith("psse_env_manager")]
+            break
+        print("  [dyr] psse_env_manager exists: %s"
+              % ("; ".join(found[:8]) if found else "nowhere under the PSS/E folder"))
+        py_hits = _env_manager_pythons()
+        print("  [dyr] ... and in Pythons    : %s"
+              % ("; ".join(h for _e, h in py_hits[:6]) if py_hits else
+                 "none of C:\\Python*, Program Files\\Python*, LOCALAPPDATA\\Programs\\Python"))
+    except Exception as e:
         try:
-            p = subprocess.Popen(cmd, cwd=STUDY_DIR, env=env, shell=True,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 universal_newlines=True)
-            out, _e = p.communicate()
-            return [x.strip() for x in (out or "").splitlines() if x.strip()]
-        except Exception as e:
-            return ["(could not ask: %s)" % e]
-    print("  [dyr] cload4 resolves to     : %s" % ("; ".join(_run("where cload4")[:4]) or "-"))
-    print("  [dyr] PATHEXT                : %s" % (env.get("PATHEXT") or "-"))
-    print("  [dyr] .py files open with    : %s"
-          % ("; ".join(_run("assoc .py") + _run("ftype Python.File")) or "-")[:300])
-    found = []
-    for pb in _pssbin_dirs():
-        root = os.path.dirname(os.path.normpath(pb))
-        for d, subs, files in os.walk(root):
-            if d[len(root):].count(os.sep) >= 2:
-                del subs[:]
-            found += [os.path.join(d, f) for f in files
-                      if f.lower().startswith("psse_env_manager")]
-        break
-    print("  [dyr] psse_env_manager exists: %s"
-          % ("; ".join(found[:8]) if found else "nowhere under the PSS/E folder"))
-    py_hits = _env_manager_pythons()
-    print("  [dyr] ... and in Pythons    : %s"
-          % ("; ".join(h for _e, h in py_hits[:6]) if py_hits else
-             "none of C:\\Python*, Program Files\\Python*, LOCALAPPDATA\\Programs\\Python"))
+            print("  [dyr] diagnostics unavailable (%s)"
+                  % ("%s: %s" % (type(e).__name__, e)).encode("ascii", "replace").decode("ascii"))
+        except Exception:
+            pass
 
 
 def _cload4_shim():
@@ -11582,16 +11592,41 @@ def _cload4_shim():
             c4 = os.path.join(pb, "cload4.py")
             break
     if not c4 or not sys.executable:
+        if not c4 and os.path.exists(here):
+            # A STALE SHIM OF OUR OWN (a worker killed mid-link) pointing at a
+            # cload4.py that is no longer found: cmd would still run it.
+            try:
+                with open(here) as fh:
+                    _stale = "written by the study for one link" in fh.read()
+            except Exception:
+                _stale = False
+            if _stale:
+                try:
+                    os.remove(here)
+                    return "", "removed a stale cload4.bat left by an earlier link"
+                except Exception as e:
+                    return "", "could not remove a stale %s (%s)" % (here, e)
         return "", ""
-    # THE PYTHON THAT HAS psse_env_manager, when that is not this one.
+    # THE PYTHON THAT HAS psse_env_manager, when that is not this one. Asked
+    # of THIS interpreter first: when it can import the module itself, it is
+    # the right one wherever the file lives, and a folder search that missed
+    # it must not send cload4 to another Python.
     py = sys.executable
+    _own = False
     try:
-        hits = _env_manager_pythons()
-        if hits and not any(os.path.normcase(e) == os.path.normcase(sys.executable)
-                            for e, _h in hits):
-            py = hits[0][0]
+        import imp as _imp
+        _imp.find_module("psse_env_manager")
+        _own = True
     except Exception:
-        pass
+        _own = False
+    if not _own:
+        try:
+            hits = _env_manager_pythons()
+            if hits and not any(os.path.normcase(e) == os.path.normcase(sys.executable)
+                                for e, _h in hits):
+                py = hits[0][0]
+        except Exception:
+            pass
     try:
         with open(here, "w") as fh:
             fh.write("@echo off\n")
@@ -11730,122 +11765,131 @@ def _dyr_compile_user_models(changed):
             except Exception:
                 pass
 
-    import subprocess
-    _cenv, _cnote = _compile_env()
-    print("  [dyr] the .bat files run with %s" % _cnote)
-    _compile_diag(_cenv)
-    _shim, _snote = _cload4_shim()
-    if _snote:
-        print("  [dyr] %s" % _snote)
-    _bat_out = []
+    # FROM HERE UNTIL THE BUILD IS VERIFIED, ANY EXCEPTION PUTS THE OLD
+    # dsusr.dll BACK. _compile_env, the diagnostics, the shim and a .bat
+    # that cannot be started all raise past the explicit _restore() calls
+    # below, and a folder with NO dsusr.dll breaks every later run too.
+    # _restore() does nothing when a dsusr.dll is in place.
     try:
-        for b in bats:
-            print("  [dyr] compiling user models: %s" % b)
-            sys.stdout.flush()
-            try:
-                fh = open(os.devnull, "rb")
-            except Exception:
-                fh = None
-            try:
-                proc = subprocess.Popen([os.path.join(STUDY_DIR, b)], cwd=STUDY_DIR,
-                                        env=_cenv,
-                                        stdin=fh, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT,
-                                        universal_newlines=True, shell=False)
-                out, _err = proc.communicate()
-                rc = proc.returncode
-            except Exception as e:
-                raise RuntimeError("%s could not be run (%s)" % (b, e))
-            finally:
+        import subprocess
+        _cenv, _cnote = _compile_env()
+        print("  [dyr] the .bat files run with %s" % _cnote)
+        _compile_diag(_cenv)
+        _shim, _snote = _cload4_shim()
+        if _snote:
+            print("  [dyr] %s" % _snote)
+        _bat_out = []
+        try:
+            for b in bats:
+                print("  [dyr] compiling user models: %s" % b)
+                sys.stdout.flush()
                 try:
-                    if fh:
-                        fh.close()
+                    fh = open(os.devnull, "rb")
+                except Exception:
+                    fh = None
+                try:
+                    proc = subprocess.Popen([os.path.join(STUDY_DIR, b)], cwd=STUDY_DIR,
+                                            env=_cenv,
+                                            stdin=fh, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT,
+                                            universal_newlines=True, shell=False)
+                    out, _err = proc.communicate()
+                    rc = proc.returncode
+                except Exception as e:
+                    raise RuntimeError("%s could not be run (%s)" % (b, e))
+                finally:
+                    try:
+                        if fh:
+                            fh.close()
+                    except Exception:
+                        pass
+                _bat_out.append(out or "")
+                for ln in (out or "").splitlines():
+                    print("  [dyr]   | %s" % ln.rstrip())
+                # DOES THE OUTPUT SHOW A REAL FAILURE?
+                #
+                # The exit code alone is not enough -- a batch file's code is its last
+                # command's, and both of these end in `pause`. But the bare word "error"
+                # is far too broad: MyCompile34.bat prints
+                #
+                #     If no errors, run "MyCload4.bat"
+                #
+                # on a completely successful compile, and matching "error" in that
+                # stopped a build that had just worked. Only the signatures the
+                # compiler and the linker actually emit count.
+                why = _compile_error(out or "")
+                if rc not in (0, None) or why:
+                    _restore()
+                    hint = ""
+                    if "LNK1168" in (out or ""):
+                        hint = (" LNK1168 means the .dll was open in another process: "
+                                "close every PSS/E session (taskkill /F /IM psse34.exe) "
+                                "and run again.")
+                    elif "LNK1104" in (out or ""):
+                        hint = (" LNK1104 names a library the link could not find -- it "
+                                "must be in %s, or the Windows SDK's ucrt folder is "
+                                "missing from LIB." % STUDY_DIR)
+                    raise RuntimeError(
+                        "%s failed (exit %s%s) -- the user models were NOT rebuilt for "
+                        "the changed .dyr, and the simulation would run the previous "
+                        "model set.%s" % (b, rc, (": " + why) if why else "", hint))
+        finally:
+            if _shim:
+                try:
+                    os.remove(_shim)          # the study folder is left as it was
                 except Exception:
                     pass
-            _bat_out.append(out or "")
-            for ln in (out or "").splitlines():
-                print("  [dyr]   | %s" % ln.rstrip())
-            # DOES THE OUTPUT SHOW A REAL FAILURE?
-            #
-            # The exit code alone is not enough -- a batch file's code is its last
-            # command's, and both of these end in `pause`. But the bare word "error"
-            # is far too broad: MyCompile34.bat prints
-            #
-            #     If no errors, run "MyCload4.bat"
-            #
-            # on a completely successful compile, and matching "error" in that
-            # stopped a build that had just worked. Only the signatures the
-            # compiler and the linker actually emit count.
-            why = _compile_error(out or "")
-            if rc not in (0, None) or why:
-                _restore()
-                hint = ""
-                if "LNK1168" in (out or ""):
-                    hint = (" LNK1168 means the .dll was open in another process: "
-                            "close every PSS/E session (taskkill /F /IM psse34.exe) "
-                            "and run again.")
-                elif "LNK1104" in (out or ""):
-                    hint = (" LNK1104 names a library the link could not find -- it "
-                            "must be in %s, or the Windows SDK's ucrt folder is "
-                            "missing from LIB." % STUDY_DIR)
-                raise RuntimeError(
-                    "%s failed (exit %s%s) -- the user models were NOT rebuilt for "
-                    "the changed .dyr, and the simulation would run the previous "
-                    "model set.%s" % (b, rc, (": " + why) if why else "", hint))
-    finally:
-        if _shim:
+        # DID IT ACTUALLY PRODUCE ANYTHING?
+        #
+        # An exit code says the batch file ran, not that it built. A cload4 that
+        # finds nothing to do, a compile whose output landed in another folder, a
+        # .dll held open by a PSS/E session that is still running -- each leaves the
+        # OLD dsusr.dll in place, and every scenario afterwards runs the previous
+        # model set. That is the garbage this whole step exists to prevent, so it is
+        # checked rather than assumed: what came out must be newer than the .flx
+        # files dyre_new had just written when we started.
+        if not os.path.isfile(dll):
+            _restore()
+            _left = [x for x in ("dsusr.def", "dsusr.exp", "dsusr.lib", "dsusr.map",
+                                 "dsusr.res")
+                     if os.path.isfile(os.path.join(STUDY_DIR, x))]
+            _txt = "\n".join(_bat_out)
+            _py = ""
+            if "psse_env_manager" in _txt or ("cload4.py" in _txt and "Traceback" in _txt):
+                # cload4 is a Python script: a traceback from it means the Python
+                # that ran it is not one PSS/E's tools work with -- not a link error.
+                _py = (" cload4 (a Python script) FAILED TO START: the Python that ran it "
+                       "could not load PSS/E's psse_env_manager. %s. The lines above -- "
+                       "'cload4 resolves to', '.py files open with', 'psse_env_manager "
+                       "exists' -- say which Python ran it and which Python versions PSS/E "
+                       "installed its environment manager for; cload4 needs one of those."
+                       % (_snote or ("the .bat files ran with " + _cnote)))
+            raise RuntimeError(
+                "the compile ran but produced no dsusr.dll in %s%s -- every scenario "
+                "would run the previous model set.%s Read the cload4 output above: "
+                "LNK1168 means the file was open in another process, LNK1104 means a "
+                ".lib it links against is missing from this folder."
+                % (STUDY_DIR,
+                   (" (it left %s -- possibly from an earlier link)"
+                    % ", ".join(_left)) if _left else "", _py))
+        if _stashed:
             try:
-                os.remove(_shim)          # the study folder is left as it was
+                os.remove(_stash)
             except Exception:
                 pass
-    # DID IT ACTUALLY PRODUCE ANYTHING?
-    #
-    # An exit code says the batch file ran, not that it built. A cload4 that
-    # finds nothing to do, a compile whose output landed in another folder, a
-    # .dll held open by a PSS/E session that is still running -- each leaves the
-    # OLD dsusr.dll in place, and every scenario afterwards runs the previous
-    # model set. That is the garbage this whole step exists to prevent, so it is
-    # checked rather than assumed: what came out must be newer than the .flx
-    # files dyre_new had just written when we started.
-    if not os.path.isfile(dll):
+        dll_t = os.path.getmtime(dll)
+        print("  [dyr] dsusr.dll %s"
+              % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(dll_t)))
+        if _flx_t and dll_t + 2.0 < _flx_t:
+            raise RuntimeError(
+                "dsusr.dll (%s) is OLDER than the conec/conet files dyre_new wrote "
+                "(%s) -- the link did not replace it. The usual cause is another "
+                "PSS/E session holding the .dll open; close them and re-run."
+                % (time.strftime("%H:%M:%S", time.localtime(dll_t)),
+                   time.strftime("%H:%M:%S", time.localtime(_flx_t))))
+    except BaseException:
         _restore()
-        _left = [x for x in ("dsusr.def", "dsusr.exp", "dsusr.lib", "dsusr.map",
-                             "dsusr.res")
-                 if os.path.isfile(os.path.join(STUDY_DIR, x))]
-        _txt = "\n".join(_bat_out)
-        _py = ""
-        if "psse_env_manager" in _txt or ("cload4.py" in _txt and "Traceback" in _txt):
-            # cload4 is a Python script: a traceback from it means the Python
-            # that ran it is not one PSS/E's tools work with -- not a link error.
-            _py = (" cload4 (a Python script) FAILED TO START: the Python that ran it "
-                   "could not load PSS/E's psse_env_manager. %s. The lines above -- "
-                   "'cload4 resolves to', '.py files open with', 'psse_env_manager "
-                   "exists' -- say which Python ran it and which Python versions PSS/E "
-                   "installed its environment manager for; cload4 needs one of those."
-                   % (_snote or ("the .bat files ran with " + _cnote)))
-        raise RuntimeError(
-            "the compile ran but produced no dsusr.dll in %s%s -- every scenario "
-            "would run the previous model set.%s Read the cload4 output above: "
-            "LNK1168 means the file was open in another process, LNK1104 means a "
-            ".lib it links against is missing from this folder."
-            % (STUDY_DIR,
-               (" (it left %s -- possibly from an earlier link)"
-                % ", ".join(_left)) if _left else "", _py))
-    if _stashed:
-        try:
-            os.remove(_stash)
-        except Exception:
-            pass
-    dll_t = os.path.getmtime(dll)
-    print("  [dyr] dsusr.dll %s"
-          % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(dll_t)))
-    if _flx_t and dll_t + 2.0 < _flx_t:
-        raise RuntimeError(
-            "dsusr.dll (%s) is OLDER than the conec/conet files dyre_new wrote "
-            "(%s) -- the link did not replace it. The usual cause is another "
-            "PSS/E session holding the .dll open; close them and re-run."
-            % (time.strftime("%H:%M:%S", time.localtime(dll_t)),
-               time.strftime("%H:%M:%S", time.localtime(_flx_t))))
+        raise
     for _o in ("CONEC.OBJ", "CONET.OBJ"):
         _p = os.path.join(STUDY_DIR, _o)
         if os.path.isfile(_p):
@@ -24845,16 +24889,21 @@ def evaluate_case(path, kind, tclear, kb):
             v_high_worst = (mx, tm, chan_label(ti))
         lim, why = _overshoot_limit(ti)
         if mx > lim:
-            # THE FOURTH FIELD IS THE DURATION: total seconds the bus spent
-            # above its limit from the judged instant on. It rides in the
-            # spare 'd' column of every part file, so nothing downstream had
-            # to learn a new schema, and it is what lets a reader tell a
-            # one-step spike from a swing without opening the plot.
+            # THE FOURTH FIELD IS THE DURATION: the LONGEST SINGLE EXCURSION
+            # above the limit from the judged instant on, in seconds. It rides
+            # in the spare 'd' column of every part file, so nothing downstream
+            # had to learn a new schema, and it is what lets a reader tell a
+            # one-step spike from a swing without opening the plot. NOT the
+            # total: three one-step spikes at clearing, reclose and re-clear
+            # add up to more than two cycles and were labelled a SWING, though
+            # no one excursion was longer than a step. The total is still in
+            # the v_high text and the measurement workbook.
             _abv, _abv_long = _above_for(v, _i_judge, lim)
-            v_high.append("%s=%.3f@%.2fs for %.0fms%s"
+            v_high.append("%s=%.3f@%.2fs for %.0fms (longest %.0fms)%s"
                           % (chan_label(ti), mx, tm, 1000.0 * _abv,
+                             1000.0 * _abv_long,
                              (" [limit %.2f: %s]" % (lim, why)) if why else ""))
-            v_high_all.append((chan_label(ti), mx, tm, round(_abv, 4)))
+            v_high_all.append((chan_label(ti), mx, tm, round(_abv_long, 4)))
         elif why and mx > V_OVERSHOOT_PU:
             # Above 1.20 but inside the limit its equipment is designed for.
             # Not a violation, and NOT silent either.
@@ -25276,15 +25325,22 @@ def evaluate_case(path, kind, tclear, kb):
     # changed TRIP_PGEN_DEAD_MW re-scores its finished runs once
     _trip_rule = (" (tripped = ends below %.2f MW and under %.0f%% of pre-fault)"
                   % (TRIP_PGEN_DEAD_MW, 100.0 * TRIP_RESIDUAL_FRAC))
-    add("No generator tripping (PELEC + ETERM)",
-        not (trips or proj_trips),
-        (("None -- %d machine(s) checked on power and %d on terminal voltage, "
-          "all still connected at t=%.1fs"
-          % (len(pelecs), len(eterms), t[-1])) if not (trips or proj_trips) else
-         ((("*** PROJECT MACHINE TRIPPED: %s *** " % ", ".join(proj_trips))
-           if proj_trips else "")
-          + (("%d other machine(s) tripped: " % len(trips) + ", ".join(trips[:VIOLATION_LIST_MAX]) + _more(trips))
-             if trips else ""))) + _trip_rule)
+    # A RECORD THAT ENDS BEFORE THE RECOVERY / STEADY-STATE WINDOW IS NOT
+    # JUDGED HERE EITHER (the voltage rows already were): a run cut off
+    # ~0.7 s after clearing read 'no rotor angle reached 16 deg' PASS, or
+    # took a unit mid-swing for a trip.
+    if _nojudge & set(["rec", "ss"]):
+        add("No generator tripping (PELEC + ETERM)", None, _nj_txt)
+    else:
+        add("No generator tripping (PELEC + ETERM)",
+            not (trips or proj_trips),
+            (("None -- %d machine(s) checked on power and %d on terminal voltage, "
+              "all still connected at t=%.1fs"
+              % (len(pelecs), len(eterms), t[-1])) if not (trips or proj_trips) else
+             ((("*** PROJECT MACHINE TRIPPED: %s *** " % ", ".join(proj_trips))
+               if proj_trips else "")
+              + (("%d other machine(s) tripped: " % len(trips) + ", ".join(trips[:VIOLATION_LIST_MAX]) + _more(trips))
+                 if trips else ""))) + _trip_rule)
 
     # ROTOR-ANGLE DAMPING. Only machine rotor angles reach here (bus voltage
     # angles were separated out above). A machine is judged only if its
@@ -25631,25 +25687,32 @@ def evaluate_case(path, kind, tclear, kb):
             "system -- not judged on rotor-angle damping: %s"
             % (len(skipped_island),
                "; ".join("%s %.0f deg" % (n, d) for n, d in skipped_island[:6])))
-    add("Rotor-angle damping SPPR1/SPPR5 (>= %.0f deg)" % ANGLE_DEV_DEG,
-        not undamped,
-        # "ALL ARE DAMPED" HAS TO MEAN ALL OF THEM. A machine moved to individual
-        # review was judged and did NOT pass on the ratios -- it was set aside
-        # because the ratios could not be met -- so counting it inside "1 of 464
-        # ... and ALL are damped" claimed a pass that was never granted. The
-        # three populations are stated separately.
-        (("%d of %d rotor angle(s) swung >=%d deg: %d damped on SPPR1<=%.2f or "
-          "SPPR5<=%.3f%s; largest swing %.1f deg (%s)"
-          % (n_eval, len(angles), int(ANGLE_DEV_DEG), n_eval - n_floor,
-             1.0 - SPPR1_DECAY, 1.0 - SPPR5_DECAY,
-             (", %d moved to INDIVIDUAL REVIEW (SPPR floor-limited -- see the "
-              "next line)" % n_floor) if n_floor else "",
-             worst[0], worst[1]))
-         if n_eval else
-         ("no rotor angle reached %d deg -- largest swing %.1f deg (%s) of %d machine(s)"
-          % (int(ANGLE_DEV_DEG), worst[0], worst[1], len(angles))))
-        if not undamped else
-        ("%d undamped of %d judged: " % (len(undamped), n_eval) + ", ".join(undamped[:VIOLATION_LIST_MAX]) + _more(undamped)))
+    # A RECORD THAT ENDS BEFORE THE RECOVERY / STEADY-STATE WINDOW IS NOT
+    # JUDGED HERE EITHER (the voltage rows already were): a run cut off
+    # ~0.7 s after clearing read 'no rotor angle reached 16 deg' PASS, or
+    # took a unit mid-swing for a trip.
+    if _nojudge & set(["rec", "ss"]):
+        add("Rotor-angle damping SPPR1/SPPR5 (>= %.0f deg)" % ANGLE_DEV_DEG, None, _nj_txt)
+    else:
+        add("Rotor-angle damping SPPR1/SPPR5 (>= %.0f deg)" % ANGLE_DEV_DEG,
+            not undamped,
+            # "ALL ARE DAMPED" HAS TO MEAN ALL OF THEM. A machine moved to individual
+            # review was judged and did NOT pass on the ratios -- it was set aside
+            # because the ratios could not be met -- so counting it inside "1 of 464
+            # ... and ALL are damped" claimed a pass that was never granted. The
+            # three populations are stated separately.
+            (("%d of %d rotor angle(s) swung >=%d deg: %d damped on SPPR1<=%.2f or "
+              "SPPR5<=%.3f%s; largest swing %.1f deg (%s)"
+              % (n_eval, len(angles), int(ANGLE_DEV_DEG), n_eval - n_floor,
+                 1.0 - SPPR1_DECAY, 1.0 - SPPR5_DECAY,
+                 (", %d moved to INDIVIDUAL REVIEW (SPPR floor-limited -- see the "
+                  "next line)" % n_floor) if n_floor else "",
+                 worst[0], worst[1]))
+             if n_eval else
+             ("no rotor angle reached %d deg -- largest swing %.1f deg (%s) of %d machine(s)"
+              % (int(ANGLE_DEV_DEG), worst[0], worst[1], len(angles))))
+            if not undamped else
+            ("%d undamped of %d judged: " % (len(undamped), n_eval) + ", ".join(undamped[:VIOLATION_LIST_MAX]) + _more(undamped)))
     if review:
         add("Evaluate individually (SPP: below %d deg without convergence, "
             "SPPR floor-limited, or SPPR not met but the angle settles)"
@@ -26567,6 +26630,36 @@ def read_scenario_parts(only=None):
     return out
 
 
+class _AtomicWrite(object):
+    """open(path, "w") that becomes visible only when complete: written to
+       <path>.tmp<pid> and moved over <path> on a clean close. A shard killed by
+       the watchdog mid-write left a truncated CRITERIA / VIOLATIONS part beside
+       a complete VERDICTS one, and the merge dropped the lost rows silently."""
+
+    def __init__(self, path):
+        self.path = path
+        self.tmp = "%s.tmp%d" % (path, os.getpid())
+        self.fh = None
+
+    def __enter__(self):
+        self.fh = open(self.tmp, "w")
+        return self.fh
+
+    def __exit__(self, et, ev, tb):
+        try:
+            self.fh.close()
+        except Exception:
+            pass
+        if et is None:
+            os.replace(self.tmp, self.path)
+        else:
+            try:
+                os.remove(self.tmp)
+            except Exception:
+                pass
+        return False
+
+
 def write_report_part(part, all_rows, verdicts, quiet=False):
     """One shard's scored rows, for the merge step to collect.
 
@@ -26622,7 +26715,7 @@ def write_report_part(part, all_rows, verdicts, quiet=False):
                   % (part, len(_rescued), ", ".join(sorted(_rescued)[:6])))
     except Exception:
         pass
-    with open(_part_path(part, "CRITERIA"), "w") as fh:
+    with _AtomicWrite(_part_path(part, "CRITERIA")) as fh:
         w = csv.DictWriter(fh, fieldnames=["Case", "Criterion", "Result", "Detail"],
                            lineterminator="\n")
         w.writeheader(); w.writerows(all_rows)
@@ -26634,7 +26727,7 @@ def write_report_part(part, all_rows, verdicts, quiet=False):
     # them all again, every relaunch. Recording the .out's own mtime beside
     # each verdict makes the question answerable per case.
     try:
-        with open(_part_path(part, "OUTSTAMP"), "w") as fh:
+        with _AtomicWrite(_part_path(part, "OUTSTAMP")) as fh:
             w = csv.writer(fh, lineterminator="\n")
             w.writerow(["Case", "out_mtime"])
             for _c in sorted(verdicts):
@@ -26643,12 +26736,12 @@ def write_report_part(part, all_rows, verdicts, quiet=False):
                     w.writerow([_c, "%.3f" % os.path.getmtime(_op)])
     except Exception:
         pass
-    with open(_part_path(part, "VERDICTS"), "w") as fh:
+    with _AtomicWrite(_part_path(part, "VERDICTS")) as fh:
         w = csv.writer(fh, lineterminator="\n")
         w.writerow(["Case", "Verdict"])
         for c in sorted(verdicts):
             w.writerow([c, verdicts[c]])
-    with open(_part_path(part, "VIOLATIONS"), "w") as fh:
+    with _AtomicWrite(_part_path(part, "VIOLATIONS")) as fh:
         w = csv.writer(fh, lineterminator="\n")
         w.writerow(["Case", "kind", "a", "b", "c", "d"])
         for case in sorted(SPP_VIOLATIONS):
@@ -28071,8 +28164,9 @@ OVERSHOOT_SPIKE_S = 2.0 / 60.0
 
 
 def _dur_text(sec):
-    """'0.017 s (1 cycle) SPIKE' / '0.317 s (19 cycles) SWING' for a duration
-       above the overshoot limit, or '' when none was recorded."""
+    """'0.017 s (1 cycle) SPIKE' / '0.317 s (19 cycles) SWING' for the longest
+       single excursion above the overshoot limit, or '' when none was
+       recorded."""
     try:
         s = float(sec)
     except (TypeError, ValueError):
@@ -28087,7 +28181,8 @@ def _dur_text(sec):
 
 
 def _item_dur(it):
-    """The duration field of an overshoot record, or None when it predates it."""
+    """The duration field of an overshoot record (the longest single excursion
+       above the limit, s), or None when the record predates it."""
     try:
         if len(it) > 3 and str(it[3]).strip() != "":
             return float(it[3])
@@ -28505,16 +28600,37 @@ ISLAND_ANGLE_MIN_DEG = 360.0
 _EVENT_POCKETS = {}
 
 
+def _island_fault_rows():
+    """The fault list the island rules read: the SHARED list first, then the
+       folder's own copy -- the order _tclear_from_faultlist and the launcher
+       use. The copy can be empty (base EmpirePrairie's had 0 rows), and read
+       alone it left one case with no island rules while the other had them:
+       the same fault then scored FAIL on one side and INFO on the other."""
+    lists = []
+    try:
+        if FAULTS_CSV:
+            lists.append(FAULTS_CSV)
+    except Exception:
+        pass
+    lists.append(os.path.join(FAULTS_DIR, "SPP_FAULTS.csv"))
+    for p in lists:
+        try:
+            if p and os.path.isfile(p):
+                rows = load_faults_csv(p)
+                if rows:
+                    return rows
+        except Exception:
+            continue
+    return []
+
+
 def _event_island_buses(scen_id):
     """Buses this scenario's trips leave in a pocket of at most ISLAND_MAX_BUSES
        buses with no other path to the system. Empty when it cannot be told
        (no fault list, no network map) -- never a guess."""
     if "_built" not in _EVENT_POCKETS:
-        _EVENT_POCKETS["_built"] = True
-        try:
-            faults = load_faults_csv(os.path.join(FAULTS_DIR, "SPP_FAULTS.csv"))
-        except Exception:
-            faults = []
+        faults = _island_fault_rows()
+        _known = [0]
         for f in faults:
             cut, ends = set(), []
             for ln in (f.get("trip_lines") or []):
@@ -28533,6 +28649,7 @@ def _event_island_buses(scen_id):
                 # A bus the map has no branch for is unknown, not islanded.
                 if st in checked or not _dist_nbrs(st):
                     continue
+                _known[0] += 1
                 seen, fr, isl = set([st]), [st], True
                 while fr:
                     if len(seen) > ISLAND_MAX_BUSES:
@@ -28551,6 +28668,10 @@ def _event_island_buses(scen_id):
                     pocket |= seen
             if pocket:
                 _EVENT_POCKETS[str(f["id"]).strip().upper()] = pocket
+        # BUILT ONLY WHEN THERE WAS SOMETHING TO BUILD FROM. With no fault list
+        # or no network map yet, "no pockets" was cached for the whole process.
+        if faults and (_known[0] or len(_EVENT_POCKETS) > 0):
+            _EVENT_POCKETS["_built"] = True
     s = str(scen_id).strip().upper()
     return _EVENT_POCKETS.get(s) or _EVENT_POCKETS.get(re.split(r"[_\s]", s)[0]) or set()
 
@@ -28589,11 +28710,11 @@ def _build_island_notes():
         return _ISLAND_NOTES["by_case"]
     _ISLAND_NOTES["built"] = True
     try:
-        _p = os.path.join(FAULTS_DIR, "SPP_FAULTS.csv")
-        if not os.path.isfile(_p):
-            _ISLAND_NOTES["why"] = "no SPP_FAULTS.csv to read the trip lists from"
+        faults = _island_fault_rows()
+        if not faults:
+            _ISLAND_NOTES["why"] = "no fault list to read the trip lists from"
+            _ISLAND_NOTES["built"] = False          # asked again once one exists
             return _ISLAND_NOTES["by_case"]
-        faults = load_faults_csv(_p)
         gens = [b for (b, _m) in PROJECT_GENS]
         ties = set((int(a), int(b), str(ck).strip())
                    for (a, b, ck) in _poi_ties_all(gens or _project_feeder_buses()))
@@ -28612,6 +28733,7 @@ def _build_island_notes():
     if not ties:
         if not _ISLAND_NOTES["why"]:
             _ISLAND_NOTES["why"] = "no interconnection tie branch could be identified"
+        _ISLAND_NOTES["built"] = False              # POI_TIES.csv may be written later
         return _ISLAND_NOTES["by_case"]
     try:
         faults
@@ -28917,8 +29039,8 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                         except (IndexError, TypeError, ValueError):
                             _val = 0.0
                         # [scenarios, worst value, scenario it was worst in,
-                        #  duration above the limit in that scenario, longest
-                        #  duration in any scenario]
+                        #  longest excursion above the limit in that scenario,
+                        #  longest excursion in any scenario]
                         _e = _elem.setdefault((_k, _lbl), [0, None, "", None, None])
                         _e[0] += 1
                         _dur = _item_dur(_it) if _k == "overshoot" else None
@@ -28959,7 +29081,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                 if _k == "overshoot":
                     f.write(" %-30s %-16s %9s   %-9s %-6s  %-26s %s\n"
                             % ("bus / machine", "area", "scenarios", "worst", "in",
-                               "above limit (worst case)", "longest / where"))
+                               "longest excursion (worst)", "any case / where"))
                     f.write(" " + "-" * 118 + "\n")
                 else:
                     f.write(" %-30s %-16s %9s   %-9s %s\n"
@@ -29020,7 +29142,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                 f.write("\n BY AREA -- distinct elements over a limit, all scenarios together\n")
                 f.write(" %-22s %-10s %9s  %-10s %-8s %s\n"
                         % ("area", "type", "elements", "worst", "in",
-                           "above limit (overshoot only)"))
+                           "longest excursion (overshoot only)"))
                 f.write(" " + "-" * 86 + "\n")
                 _ord = dict((k, i) for i, (k, _d) in enumerate(_KINDS))
                 _ak_sorted = sorted(_area_roll,
@@ -29040,8 +29162,9 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                                    "%.3g %s" % (_v[1], _units.get(_kk, "")),
                                    _v[2][:8],
                                    _dur_text(_v[3]) if _kk == "overshoot" else ""))
-                f.write("\n Spike / swing: above the limit for <= %.3f s (2 cycles) is a SPIKE at the\n"
-                        " switching instant; longer is a SWING. Both are violations under the\n"
+                f.write("\n Spike / swing: a longest single excursion above the limit of <= %.3f s\n"
+                        " (2 cycles) is a SPIKE at the switching instant; longer is a SWING.\n"
+                        " Both are violations under the\n"
                         " criterion as written; the label is to help decide what to argue.\n"
                         % OVERSHOOT_SPIKE_S)
         f.write("\n" + "=" * 92 + "\n")
@@ -29179,8 +29302,9 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                                      ""]))
                     else:
                         _w = _where_text(it[0], _fbus)
-                        # THE OVERSHOOT RECORD CARRIES A FOURTH FIELD -- how
-                        # long the bus was over its limit -- which the format
+                        # THE OVERSHOOT RECORD CARRIES A FOURTH FIELD -- the
+                        # longest single stretch the bus was over its limit --
+                        # which the format
                         # does not take. Printed as its own phrase, so a
                         # reader can see at once whether 1.28 pu was one
                         # integration step or a swing.
@@ -29194,7 +29318,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                             # rather than lose the rest of the file to it.
                             _txt = "  ".join(str(x) for x in it)
                         if kind == "overshoot":
-                            _txt += "   above limit for %s" % (
+                            _txt += "   longest excursion above limit %s" % (
                                 _dur_text(_dur) if _dur is not None
                                 else "n/a (scored before durations were recorded)")
                         f.write("      " + _txt
@@ -29207,7 +29331,7 @@ def write_violations_report(cases, verdicts, crit_rows=None):
                         tm = ("%.2f" % it[2]) if (len(it) > 2 and kind in ("recovery", "overshoot")) else ""
                         note = ("ended %.1f MW" % it[2]) if kind == "tripped" else ""
                         if kind == "overshoot" and _dur is not None:
-                            note = "above limit for %s" % _dur_text(_dur)
+                            note = "longest excursion above limit %s" % _dur_text(_dur)
                         _ar, _nm = _bus_area(_elem_bus(it[0]))
                         _hh = _hops_to_fault(_elem_bus(it[0]), _fbus)
                         rows.append(_vio_csv_fill([case, verdicts.get(case, "?"), kind, it[0],
@@ -29266,6 +29390,18 @@ def write_violations_report(cases, verdicts, crit_rows=None):
               "violations report above is unaffected" % e)
 
 
+def _truthy(x):
+    """A yes/no flag from the fault list: 1/true/yes/y/on, any case, spaces
+       ignored. ONE spelling rule for every reader of the same column -- the
+       loader and the scorer disagreeing on "yes" meant a reclose that was
+       simulated but not timed from its final clearing."""
+    if x is None or x is False:
+        return False
+    if x is True:
+        return True
+    return str(x).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -29315,7 +29451,7 @@ def load_faults_csv(path):
             pre = _dec_elems(r.get("pre_outage"))
             if pre:
                 f["pre_outage"] = pre
-            if (r.get("reclose") or "").strip() in ("1", "true", "True", "yes"):
+            if _truthy(r.get("reclose")):
                 f["reclose"] = True
                 if (r.get("reclose_wait") or "").strip():
                     try:
@@ -29710,7 +29846,7 @@ def _tclear_from_faultlist(scen_id):
                         # UNSUCCESSFUL RECLOSE: the fault is cleared a SECOND
                         # time, reclose_wait + clear_cycles after the first --
                         # see fault_run step d. Kept for the recovery window.
-                        if (_r.get("reclose") or "").strip() in ("1", "True", "true"):
+                        if _truthy(_r.get("reclose")):
                             try:
                                 _w = float((_r.get("reclose_wait") or "").strip()
                                            or RECLOSE_WAIT_CYCLES)

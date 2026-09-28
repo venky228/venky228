@@ -1988,6 +1988,15 @@ def _event_selected(ev):
     return False
 
 
+# ONE SPELLING: "Both" / "PROJ" were compared as typed in some places and
+# normalised in others, so the plot count and completeness table were skipped.
+RUN_CASES = str(RUN_CASES or "both").strip().lower()
+if RUN_CASES in ("base", "cq", "b"):
+    RUN_CASES = "base"
+elif RUN_CASES in ("proj", "test", "pq", "p", "t"):
+    RUN_CASES = "proj"
+else:
+    RUN_CASES = "both"        # "all", "" or a typo -- as _cases_to_run() reads it
 ONLY_IDS, ONLY_WORDS = _expand_only(ONLY_FAULTS)
 if ONLY_WORDS:
     print("[compare] %s resolve(s) per case, so the comparison is NOT filtered "
@@ -2295,6 +2304,17 @@ def rfile(rdir, stem, ext, proj=None):
                 _root.append("%s%s_%s.%s" % (_head, _k, proj, ext))
         _root.append("%s_SELECTED.%s" % (_head, ext))
         _root.append("%s.%s" % (_head, ext))
+        # THE SAME RULE AS `order` ABOVE. The _SELECTED root names went first
+        # whatever the comparison was, so a partial 02_VIOLATIONS written by a
+        # gap-scoring pass was read as the full one by every later comparison.
+        _rsel = [x for x in _root if "_SELECTED" in x]
+        _rfull = [x for x in _root if "_SELECTED" not in x]
+        if _sel_tag():
+            _root = _rsel + _rfull
+        elif stem in _MEAS_FALLBACK_STEMS:
+            _root = _rfull + _rsel
+        else:
+            _root = _rfull
         order = _root + [_head + n[len(stem):] for n in order] + order
     hit = _first(order)
     if hit:
@@ -6762,7 +6782,12 @@ def _xl_cell(col, row, value, style):
     if isinstance(value, str) and _XL_LONGDEC.match(value.strip()):
         value = float(value.strip())
     if isinstance(value, float):
-        value = round(value, 3)
+        # inf / nan AS TEXT: <v>inf</v> is not a number to Excel, which then
+        # calls the whole workbook corrupt.
+        if value != value or value in (float("inf"), float("-inf")):
+            value = str(value)
+        else:
+            value = round(value, 3)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return '<c r="%s"%s><v>%s</v></c>' % (ref, st, repr(value))
     # EXCEL'S HARD LIMIT IS 32,767 CHARACTERS IN ONE CELL. One character over
@@ -10032,7 +10057,7 @@ def write_egf_table(proj, mode, tags):
         for nm, d, c in data)]
     if not faults:
         L.append("  (no case has scored a fault yet)")
-    name = os.path.join(cmp_dir(), "EGF_CASES_%s_%s" % (proj, mode))
+    name = os.path.join(cmp_dir(), "EGF_CASES_%s_%s%s" % (proj, mode, _sel_tag()))   # a selection must not overwrite the whole-study table
     with open(name + ".txt", "w") as fh:
         fh.write("\n".join(L) + "\n")
     with csv_open(name + ".csv", "w") as fh:
@@ -10087,7 +10112,7 @@ def run_capacity_sweep(proj, mode):
             # whole list, which is what "all" means -- and is also why "all" is
             # not just a filter on the report: the .out files have to exist.
             env["SPP_ONLY_FAULTS"] = ",".join(fails)
-            env.pop("SPP_REPORT_FAULTS", None)     # see run_dyr_sweep: a subset folder's FULL report is the right one
+            env["SPP_REPORT_FAULTS"] = ""   # run_study sets it from ONLY_FAULTS; a pop cannot undo that     # see run_dyr_sweep: a subset folder's FULL report is the right one
         rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
         if rc not in (0, None):
             print("[capacity] the %s%% run ended with rc=%s -- reading whatever it scored"
@@ -10251,7 +10276,7 @@ def run_poi_p_sweep(proj, mode):
         env.update(_sweep_resume_env())
         if (POI_P_FAULTS or "all").strip().lower() == "failing":
             env["SPP_ONLY_FAULTS"] = ",".join(faults)
-            env.pop("SPP_REPORT_FAULTS", None)     # see run_dyr_sweep: a subset folder's FULL report is the right one
+            env["SPP_REPORT_FAULTS"] = ""   # run_study sets it from ONLY_FAULTS; a pop cannot undo that     # see run_dyr_sweep: a subset folder's FULL report is the right one
         rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
         if rc not in (0, None):
             print("[poi-p] the %.0f MW run ended with rc=%s -- reading whatever it scored"
@@ -10949,10 +10974,31 @@ def _quick_sim_env():
     return out
 
 
+QUICK_MARK = "QUICK_SIM_TIMES.txt"
+
+
+def _quick_folder_of(d):
+    """The run folder, given it or its outs\\ subfolder."""
+    return os.path.dirname(d) if os.path.basename(os.path.normpath(d)) == "outs" else d
+
+
 def _is_quick_folder(d):
-    """A .dyr sweep folder of a QUICK_DYR_TEST launch: simulated at QUICK_SIM_TIMES."""
-    return bool(QUICK_DYR_TEST) and "_dyr_" in os.path.basename(os.path.normpath(os.path.dirname(d)
-                                                                             if os.path.basename(d) == "outs" else d))
+    """A .dyr sweep folder simulated at QUICK_SIM_TIMES -- known by the
+       QUICK_SIM_TIMES.txt that QUICK_DYR_TEST writes into it, not by its name:
+       a quick run and a full-length sweep of the same value share the name."""
+    return os.path.isfile(os.path.join(_quick_folder_of(d), QUICK_MARK))
+
+
+def _quick_folder_end(d):
+    """SIM_END_S recorded in a quick folder's marker, or None."""
+    try:
+        with open(os.path.join(_quick_folder_of(d), QUICK_MARK)) as fh:
+            for ln in fh:
+                if ln.startswith("SIM_END_S="):
+                    return float(ln.split("=", 1)[1])
+    except Exception:
+        pass
+    return None
 
 
 def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
@@ -11010,6 +11056,30 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
     for tag, edits in variants:
         _banner("DYR SWEEP -- %s%s : %s"
                 % (proj, _cap_note(cap_tag), _dyr_edits_text(edits)))
+        # ONE SET OF SIMULATION TIMES PER FOLDER. A quick run (QUICK_SIM_TIMES)
+        # and a full-length sweep of the same value share the folder name, and
+        # resuming one into the other mixed 8 s and 25 s runs in one table.
+        _vdir = _dyr_sweep_dir(proj, mode, tag, cap_tag)
+        _was_quick = _is_quick_folder(_vdir)
+        if (QUICK_DYR_TEST and os.path.isdir(os.path.join(_vdir, "outs"))
+                and glob.glob(os.path.join(_vdir, "outs", "*.out")) and not _was_quick) \
+                or (not QUICK_DYR_TEST and _was_quick):
+            print("[dyr-sweep] *** %s: %s already holds runs at %s simulation times -- "
+                  "NOT run here, so the two are not mixed. Rename that folder to run "
+                  "this value again. ***"
+                  % (tag, os.path.basename(_vdir),
+                     "the QUICK" if _was_quick else "the study's full"))
+            per_tag[tag] = dict((f, "?") for f in faults)
+            continue
+        if QUICK_DYR_TEST:
+            try:
+                if not os.path.isdir(_vdir):
+                    os.makedirs(_vdir)
+                with open(os.path.join(_vdir, QUICK_MARK), "w") as fh:
+                    for _k, _v in sorted(_quick_sim_env().items()):
+                        fh.write("%s=%s\n" % (_k[len("SPP_"):], _v))
+            except Exception as _e:
+                print("[dyr-sweep] could not mark %s as a quick folder (%s)" % (_vdir, _e))
         # THE SWEPT VALUE REPLACES THE PANEL'S EDIT FOR THIS PROJECT.
         #
         # _push_settings() sends DYR_EDITS_BY_PROJECT from the panel, and if the
@@ -11041,7 +11111,7 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
             # launcher write a _SELECTED report that rfile() refuses to read
             # from an unrestricted comparison, and every value read "?".
             env["SPP_ONLY_FAULTS"] = ",".join(faults)
-            env.pop("SPP_REPORT_FAULTS", None)
+            env["SPP_REPORT_FAULTS"] = ""   # run_study sets it from ONLY_FAULTS; a pop cannot undo that
         else:
             # EVERY FAULT, AND NOT THE PANEL'S OWN SELECTION. run_study() sends
             # ONLY_FAULTS to every launcher it starts, and a keyword such as
@@ -11053,15 +11123,17 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
             # any folder, and a sweep launched with it set was running all
             # 291 faults per value while the panel said F02. Ids are passed
             # through; keywords are still dropped.
-            _ids_only = [str(f).strip() for f in (ONLY_FAULTS or [])
-                         if re.match(r"^F\d+$", str(f).strip(), re.I)]
-            if ONLY_FAULTS and len(_ids_only) == len(ONLY_FAULTS):
+            # IDS AND RANGES ("F19-F24") PASS THROUGH; a keyword cannot resolve
+            # in a fresh value folder, so any keyword means the whole list.
+            _xi, _xw = _expand_only(ONLY_FAULTS)
+            _ids_only = sorted(_xi, key=_fault_key) if (_xi and not _xw) else []
+            if ONLY_FAULTS and _ids_only:
                 env["SPP_ONLY_FAULTS"] = ",".join(_ids_only)
                 print("[dyr-sweep] ONLY_FAULTS = %s applies to this sweep value too"
                       % ", ".join(_ids_only))
             else:
                 env["SPP_ONLY_FAULTS"] = ""
-            env.pop("SPP_REPORT_FAULTS", None)
+            env["SPP_REPORT_FAULTS"] = ""   # run_study sets it from ONLY_FAULTS; a pop cannot undo that
         rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
         if rc not in (0, None):
             print("[dyr-sweep] %s ended with rc=%s -- reading whatever it scored"
@@ -14554,7 +14626,7 @@ def write_all_runs_comparison(results):
         if not rows:
             continue
         with _cmp_into(proj if COMPARE_BY_PROJECT else ""):
-            path = os.path.join(cmp_dir(), "ALL_RUNS_%s_%s.txt" % (proj, mode))
+            path = os.path.join(cmp_dir(), "ALL_RUNS_%s_%s%s.txt" % (proj, mode, _sel_tag()))
         bdir = results_dir(CASE_BASE, proj, mode)
         with open(path, "w") as fh:
             fh.write("=" * 104 + "\n")
@@ -16760,7 +16832,18 @@ def _live_compare_start():
     th.start()
     print("[compare] live comparison every %ds -> %s"
           % (LIVE_COMPARE_EVERY, COMPARE_DIR))
-    return stop.set
+
+    def _stop():
+        # STOP AND WAIT. Setting the Event alone let a refresh already in
+        # compare_now() keep running beside phase 3's own compare_now(): both
+        # move the shared _CMP_SUB, so files could land in the wrong project
+        # folder or a stale summary overwrite the final one.
+        stop.set()
+        try:
+            th.join()
+        except Exception:
+            pass
+    return _stop
 
 
 # WHICH CASES ARE STILL SIMULATING. With RUN_IN_PARALLEL the two case threads
@@ -18458,6 +18541,12 @@ def _score_tagged_folder(case, proj, mode, rdir, missing):
         rc = run_study(case, projects=[proj], modes=[mode], extra_env=env)
     except Exception as e:
         print("[coverage]     the scoring pass could not start (%s)" % e)
+        rc = "exception"
+        for _sid, stamp, _omt in todo:
+            try:
+                os.remove(stamp)       # not asked after all: next launch tries again
+            except Exception:
+                pass
         return None
     if rc not in (0, None):
         print("[coverage]     the scoring pass ended rc=%s -- what it scored is kept" % rc)
@@ -18993,11 +19082,12 @@ def retire_truncated_done(quiet=False):
             # A QUICK_DYR_TEST sweep folder: run at QUICK_SIM_TIMES on purpose. A
             # compare at the study's own times (z6_main.py) renamed its markers
             # .done.truncated -- give back the ones that reached the quick end.
-            try:
-                _qe = float((QUICK_SIM_TIMES or {}).get("SIM_END_S")) - 0.11
-            except (TypeError, ValueError):
-                _qe = None
-            for _tp in glob.glob(os.path.join(od, "*.done.truncated")):
+            _qe = _quick_folder_end(od)
+            _qe = (_qe - 0.11) if _qe is not None else None
+            for _tp in (glob.glob(os.path.join(od, "*.done.truncated"))
+                        if RESTORE_TRUNCATED_DONE else []):
+                if os.path.isfile(_tp[:-len(".truncated")]):
+                    continue
                 _te = _marker_tend(_tp)
                 if _qe is not None and _te is not None and _te >= _qe:
                     try:
@@ -19068,7 +19158,7 @@ def retire_truncated_done(quiet=False):
                 try:
                     os.rename(tp, os.path.join(od, sid + ".done"))
                     n_back += 1
-                    _retired.add((case["key"], _proj, _mode))
+                    _retired.add((case["key"], _proj, _mode, os.path.dirname(od)))
                     if not quiet:
                         print("[compare]     %-8s %s  -> .done" % (sid, how))
                 except Exception as e:
@@ -19080,8 +19170,8 @@ def retire_truncated_done(quiet=False):
             print("")
             print("[compare] %s: %d scenario(s) carry a .done marker but their .out is"
                   % (case.get("key", "?"), len(short)))
-            print("[compare] recorded as stopping before %.2f s (tend= in the marker) --"
-                  % _t_full)
+            print("[compare] recorded as stopping before %s (tend= in the marker) --"
+                  % (("%.2f s" % _t_full) if _t_full is not None else "a complete run"))
             print("[compare] they stopped early and must not be scored as finished:")
         for sid, how in sorted(short, key=lambda x: (len(x[0]), x[0])):
             src = os.path.join(od, sid + ".done")
@@ -19091,7 +19181,7 @@ def retire_truncated_done(quiet=False):
                     os.remove(tgt)
                 os.rename(src, tgt)
                 n_moved += 1
-                _retired.add((case["key"], _proj, _mode))
+                _retired.add((case["key"], _proj, _mode, os.path.dirname(od)))
                 if not quiet:
                     print("[compare]     %-8s %s  -> .done.truncated" % (sid, how))
             except Exception as e:
@@ -19122,10 +19212,11 @@ def retire_truncated_done(quiet=False):
     # The report is back-dated instead of deleted: ensure_reports() re-scores
     # anything older than the newest .out, the rescore replaces it, and if
     # anything goes wrong the previous report is still there to read.
-    for key, proj, mode in sorted(_retired):
-        _c = CASE_BASE if key == CASE_BASE.get("key") else CASE_TEST
+    # THE FOLDER THE MARKER WAS IN, not the project's plain results folder: a
+    # retired run in an EGF, surplus or .dyr-sweep folder left that folder's
+    # report scoring it as finished.
+    for key, proj, mode, _rd in sorted(_retired):
         try:
-            _rd = results_dir(_c, proj, mode)
             # WITH THE PROJECT, AND NEVER AN EMPTY PATH. Without proj the
             # per-project name (SPP_CRITERIA_REPORT_BASE_SantaFe.txt) matched
             # nothing, rfile returned "", and glob("" + "*") is glob("*") --
@@ -19171,6 +19262,10 @@ def _scoretry_undo(case_key, projects, rc):
     """The scoring pass for these projects did not finish cleanly: forget its
        markers, so the next launch asks again."""
     if rc in (0, None):
+        # asked and answered: these markers stand, and a later failed pass for
+        # the same project must not take them back
+        for pj in projects or []:
+            _SCORETRY_NEW.pop((case_key, pj), None)
         return
     n = 0
     for pj in projects or []:
@@ -19283,6 +19378,12 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                         if _id_selected(os.path.splitext(os.path.basename(_q))[0])])
                 except Exception:
                     _n_den = n_out
+            # ONLY_EVENTS WITHOUT IDS: _id_selected() accepts every id, so the
+            # denominator stayed every .out and an events-only _SELECTED report
+            # read as "thin" -- a full re-score on every launch. The event of
+            # each .out is not known here, so the coverage test is not made.
+            if _sel_tag() and not ONLY_IDS:
+                _n_den = 0
             if 0 <= _scored and _n_den and _scored < REPORT_COVERAGE_MIN * _n_den:
                 thin.append((proj, _scored, _n_den))
                 need.append(proj)
@@ -19332,6 +19433,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                                 if not os.path.isdir(os.path.dirname(_mk)):
                                     os.makedirs(os.path.dirname(_mk))
                                 open(_mk, "w").write("asked %s\n" % time.strftime("%Y-%m-%d %H:%M"))
+                                _SCORETRY_NEW.setdefault((case["key"], proj), []).append(_mk)
                             except Exception:
                                 pass
                 except Exception as _e:
@@ -19479,7 +19581,22 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             if proj in _full:
                 continue
             _e = dict(env_extra_base)
-            _e["SPP_REPORT_FAULTS"] = ",".join(sorted(_gap_ids[proj]))
+            _rf = set(_gap_ids[proj])
+            if _sel_tag() and ONLY_IDS:
+                # UNDER A SELECTION THE PASS COVERS THE WHOLE SELECTION. Its
+                # _SELECTED report replaces the selection's own, and one naming
+                # only the gap ids left every other selected fault "one side
+                # only" in the restricted comparison that reads it.
+                try:
+                    for _q in glob.glob(os.path.join(results_dir(case, proj, mode_list[0]
+                                                                 if mode_list else "spp"),
+                                                     "outs", "*.out")):
+                        _sid = os.path.splitext(os.path.basename(_q))[0]
+                        if _id_selected(_sid) and not _sid.upper().startswith("FLAT"):
+                            _rf.add(_sid)
+                except Exception:
+                    pass
+            _e["SPP_REPORT_FAULTS"] = ",".join(sorted(_rf, key=_fault_key))
             _runs.append(([proj], _e))
             print("[compare] %s %-16s shards read ONLY %d scenario(s): %s"
                   % (case["key"], proj, len(_gap_ids[proj]),
@@ -19500,8 +19617,12 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             if env_add:
                 _env = dict(_env)
                 _env.update(env_add)
-            _r = run_study(c, projects=_projs, modes=mode_list, extra_env=_env,
-                           log_path=log_path)
+            try:
+                _r = run_study(c, projects=_projs, modes=mode_list, extra_env=_env,
+                               log_path=log_path)
+            except Exception:
+                _scoretry_undo(c["key"], _projs, "exception")
+                raise
             _scoretry_undo(c["key"], _projs, _r)
             if _r not in (0, None) and _rc in (0, None):
                 _rc = _r
@@ -23801,7 +23922,7 @@ def main():
                     th.join()
             finally:
                 _es_stop()
-            rb, rt = res.get("BASE", 2), res.get("PROJ", 2)
+            rb, rt = res.get("BASE"), res.get("PROJ")    # a case not run has no exit code
         elif ONE_PROJECT_AT_A_TIME and pjs and len(pjs) > 1:
             # ONE PROJECT AT A TIME: its base study, then its project study,
             # before the next project is touched. The worst exit code of each
@@ -24064,8 +24185,9 @@ def main():
                     # SCORE FIRST, THEN STOP. Returning here skipped phase 2, so
                     # one fault that gave up left EVERY project unscored.
                     _stop_after_scoring = True
-                print("[compare]     Comparing anyway (COMPARE_REQUIRE_COMPLETE = False):")
-                print("[compare]     their scenarios show as scored on one side only.")
+                else:
+                    print("[compare]     Comparing anyway (COMPARE_REQUIRE_COMPLETE = False):")
+                    print("[compare]     their scenarios show as scored on one side only.")
             print("[compare] " + "=" * 70)
             print("")
         except Exception as _e:
