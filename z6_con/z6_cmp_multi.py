@@ -581,7 +581,11 @@ def compare_pair(z4, ref, test, label=None):
     # written without them; _prepare then sees reports older than the parts
     # and re-merges, so the verdicts come back before anything is compared.
     try:
-        if hasattr(z4, "retire_truncated_done"):
+        # NOT IN z6_main's SIDE-BY-SIDE CHILD (CMP_MULTI_FULL): the panel ran
+        # this over every folder moments earlier, and here it re-opened every
+        # .done of both cases once per pair.
+        if (hasattr(z4, "retire_truncated_done")
+                and (os.environ.get("CMP_MULTI_FULL") or "").strip() != "1"):
             z4.retire_truncated_done(quiet=False)
     except Exception as e:
         print("[pair]   the .done marker check failed (%s) -- comparing as the folders are" % e)

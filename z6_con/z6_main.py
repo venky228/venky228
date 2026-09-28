@@ -240,6 +240,7 @@ GEN_TEST_PARALLEL = "auto"                   # GEN TEST: "auto" | N runs at once
 PLOT_INRUN = 1                               # plotters per running folder
 PLOT_WORKERS = 2                             # plotters per case
 PLOT_TOTAL_MAX = 4                           # cap on plotters
+PLOT_TOTAL_MAX_IDLE = 8                      # cap on plotters once NOTHING is simulating (0 = PLOT_TOTAL_MAX)
 # simulation time
 FLAT_RUN_S = 25                               # s, no-fault run
 PRE_FAULT_S = 5                              # s before the fault
@@ -1250,6 +1251,19 @@ def _sim_core_budget(n_cases=2):
     if int(n_cases or 1) <= 1:
         return max(1, int(CORES_MAX))
     return max(1, int(CORES_MAX) - max(0, int(CORES_FOR_REPORTS or 0)))
+
+
+def _plot_idle_cap():
+    """The plot fleet once nothing is simulating: PLOT_TOTAL_MAX_IDLE, within
+       CORES_MAX. The 4-plotter cap exists to leave the simulations their cores;
+       with none running it left most of the machine idle through a replot.
+       The plot rounds still halve the fleet if the big files fail on memory."""
+    b = int(PLOT_TOTAL_MAX_IDLE or 0)
+    if b <= 0:
+        return None
+    if CORES_MAX:
+        b = min(b, int(CORES_MAX))
+    return max(1, b)
 
 
 def _plot_core_budget():
@@ -2834,9 +2848,21 @@ def _side_key(rdir):
     return os.path.normcase(os.path.normpath(str(rdir)))
 
 
-def where_of(fid, element):
+def _where_for(fid, proj=None):
+    """{element: (area, area name, hops, fault bus)} for one fault OF ONE
+       PROJECT. Every project numbers its faults F01, F02 ..., so keyed by the
+       id alone SantaFe's F27 took IronStar's hops and faulted bus. Without a
+       project it answers only when a single project has that id."""
+    fid = str(fid).strip()
+    if proj:
+        return _WHERE.get((str(proj), fid)) or {}
+    hits = [v for k, v in _WHERE.items() if isinstance(k, tuple) and k[1] == fid]
+    return hits[0] if len(hits) == 1 else {}
+
+
+def where_of(fid, element, proj=None):
     """'area 534 SPP-NORTH, 2 nodes from fault' for one element, or ''."""
-    got = (_WHERE.get(fid) or {}).get(str(element).strip())
+    got = _where_for(fid, proj).get(str(element).strip())
     if not got:
         return ""
     ar, nm, hp, fb = got
@@ -2854,9 +2880,9 @@ def where_of(fid, element):
     return ", ".join(bits)
 
 
-def where_short(fid, element):
+def where_short(fid, element, proj=None):
     """'534 / 2h' -- the same thing as a table cell."""
-    got = (_WHERE.get(fid) or {}).get(str(element).strip())
+    got = _where_for(fid, proj).get(str(element).strip())
     if not got:
         return ""
     ar, _nm, hp, _fb = got
@@ -2914,7 +2940,7 @@ def read_violations(rdir, proj):
                     _ar = (r.get("area") or "").strip()
                     _hp = (r.get("hops_from_fault") or "").strip()
                     if _ar or _hp:
-                        _WHERE.setdefault(fid, {})[el] = (
+                        _WHERE.setdefault((str(proj or ""), fid), {})[el] = (
                             _ar, (r.get("area_name") or "").strip(), _hp,
                             (r.get("fault_bus") or "").strip())
                     # WHEN, AND FOR HOW LONG -- per SIDE, because the same bus
@@ -3075,6 +3101,47 @@ _WANT_BUSES = {}
 
 def _want_buses(proj):
     return _WANT_BUSES.setdefault(str(proj or ""), set())
+
+
+_WANT_SEEDED = set()
+
+
+def _seed_wanted_buses(proj, mode):
+    """ONCE PER PROJECT: every bus any of its result folders' violation lists
+       names (both cases, every variant), into the want-list before the first
+       measurement read. The read is selective and re-reads the whole 100 MB
+       voltage table whenever the list has grown since -- and each later pair
+       (surplus, EGF, archived runs) grew it, so the base folder's table was
+       streamed four to six times a launch. Seeded, it is read once. Only
+       ever ADDS buses; each pair still records its own before reading."""
+    key = (str(proj or ""), str(mode or ""))
+    if key in _WANT_SEEDED:
+        return
+    _WANT_SEEDED.add(key)
+    w = _want_buses(proj)
+    for case in (CASE_BASE, CASE_TEST):
+        try:
+            dirs = _result_folders_for(case, proj, mode) or []
+        except Exception:
+            dirs = []
+        for d in dirs:
+            try:
+                csvp = rfile(d, "SPP_VIOLATIONS", "csv", proj)
+                if not csvp:
+                    continue
+                with csv_open(csvp) as fh:
+                    for r in csv.DictReader(fh):
+                        el = (r.get("element") or "").strip()
+                        if not el:
+                            continue
+                        try:
+                            b = _bus_of_element(el)
+                        except Exception:
+                            b = None
+                        if b is not None:
+                            w.add(str(b))
+            except Exception:
+                continue
 
 
 def _note_wanted_elements(proj, rows):
@@ -5039,6 +5106,7 @@ def compare_project(proj, mode, test_suffix="", base_case=None, base_suffix="",
     # what the same bus did in the base study whether or not it violated there.
     # The buses named by either side's violation lists are recorded first, so
     # the selective voltage read keeps the OTHER side's row for each of them.
+    _seed_wanted_buses(proj, mode)
     _note_wanted_elements(proj, rows)
     meas_b, meas_t = read_measurements(rb, proj), read_measurements(rt, proj)
     # THE CHANNEL NUMBERS, both studies in one file, for checking by hand.
@@ -6891,7 +6959,7 @@ def _bus_of_element(el):
     return int(m.group(0)) if m else None
 
 
-def _distance_cells(el, fid, bus_map, flt_map):
+def _distance_cells(el, fid, bus_map, flt_map, proj=None):
     """[bus_number, hops_from_fault] for one element of one fault.
 
        HOW FAR FROM THE FAULT is the question this answers: a bus over the limit
@@ -6923,7 +6991,7 @@ def _distance_cells(el, fid, bus_map, flt_map):
     # already keeps it, and it is measured on the same topology. Falling back
     # to it costs nothing and answers "how far from the fault" wherever the
     # study answered it -- which is the question this column exists for.
-    got = (_WHERE.get(str(fid).strip()) or {}).get(str(el).strip())
+    got = _where_for(fid, proj).get(str(el).strip())
     if got:
         _hp = got[2]
         if _hp not in ("", None):
@@ -6947,7 +7015,7 @@ def _distance_cells(el, fid, bus_map, flt_map):
     # whole topology) was sitting right there. The study records the faulted bus
     # on every violation row; _WHERE has kept it all along. Use it.
     if fb is None:
-        for _e2 in (_WHERE.get(str(fid).strip()) or {}).values():
+        for _e2 in _where_for(fid, proj).values():
             if len(_e2) > 3 and str(_e2[3]).strip():
                 try:
                     fb = int(float(str(_e2[3]).strip()))
@@ -7422,7 +7490,8 @@ def _report_rows(results):
                             _sec(measured_above(meas_b, r["fault"], el))
                         ab_t = _sec(xt[1]) if (xt and xt[1] != "") else \
                             _sec(measured_above(meas_t, r["fault"], el))
-                    _bn, _hp = _distance_cells(el, r["fault"], bus_map, flt_map)
+                    _bn, _hp = _distance_cells(el, r["fault"], bus_map, flt_map,
+                                               res["project"])
                     # HOPS FROM THE POI, from BUS_DISTANCE.csv (bus_map) -- a
                     # topology fact, so it is filled for every monitored bus
                     # whether or not that bus ever failed anything.
@@ -7854,7 +7923,7 @@ def _violation_cause(res, r):
         # to answer for. The short form keeps the cell readable when a fault has
         # a hundred of them.
         def _wsuf(_fid, _el):
-            _w = where_short(_fid, _el)
+            _w = where_short(_fid, _el, res.get("project"))
             return (" [%s]" % _w) if _w else ""
         _fid = str(r.get("fault") or r.get("fid") or "").strip()
         frag = ", ".join("%s=%s%s" % (el, _v(v), _wsuf(_fid, el))
@@ -7865,7 +7934,7 @@ def _violation_cause(res, r):
         _wk, _wel, _wv = scored[0]
         n_new = len(e.get("new") or [])
         n_pre = len(e.get("both") or [])
-        _ww = where_of(_fid, _wel)
+        _ww = where_of(_fid, _wel, res.get("project"))
         cause.append("%d element(s) past %s -- worst %s = %s%s%s"
                      % (len(els), _KIND_LIMIT_TXT.get(kind, kind),
                         _wel, _v(_wv),
@@ -8629,8 +8698,9 @@ def write_one_report(results, only_base, only_test):
             tv2, _lim2)
         _b2 = _bus_of_element(el2)
         _key = (_b2 if _b2 is not None else str(el2), fam2)
-        _w = _WHERE.get(str(r2["fault"]).strip(), {}).get(str(el2).strip())
-        _bno, _h2 = _distance_cells(el2, r2["fault"], *_dist_maps(_res2))
+        _w = _where_for(r2["fault"], _res2.get("project")).get(str(el2).strip())
+        _bno, _h2 = _distance_cells(el2, r2["fault"], *_dist_maps(_res2),
+                                    proj=_res2.get("project"))
         _e = _bus_roll.setdefault(_key, {"faults": set(), "worst": None,
                                          "amt": None, "area": "", "name": "",
                                          "hops": [], "new": False,
@@ -8817,17 +8887,22 @@ def write_one_report(results, only_base, only_test):
                     # and fine". The base study measured that bus; the number is
                     # in its measurements file. Same on the project side for an
                     # element that violated only in the base.
+                    # _res, THIS ROW'S PROJECT. "res" here was the last value
+                    # of an earlier loop -- the last project -- so with several
+                    # projects in one report every other project's element
+                    # took its measured value from that project's files.
                     if bv is None:
-                        bv = measured_value(res.get("meas_b"), fam,
+                        bv = measured_value(_res.get("meas_b"), fam,
                                             r["fault"], el)
                     if tv is None:
-                        tv = measured_value(res.get("meas_t"), fam,
+                        tv = measured_value(_res.get("meas_t"), fam,
                                             r["fault"], el)
                     # WHERE the element is, on the same line as what it did.
                     # "530555 exceeded 1.20 pu" is a bus number to go and look
                     # up; "530555 SANTAFE 345 kV, 2 hops from the POI and at the
                     # faulted bus" is the finding itself.
-                    bno, hflt = _distance_cells(el, r["fault"], bus_map, flt_map)
+                    bno, hflt = _distance_cells(el, r["fault"], bus_map, flt_map,
+                                                _res.get("project"))
                     # HOW FAR PAST THE LIMIT **THIS ELEMENT** IS, on the
                     # projects' side. The report already said how far past the
                     # WORST one was, once per fault, in AT A GLANCE; for every
@@ -8849,11 +8924,11 @@ def write_one_report(results, only_base, only_test):
                     # not violate -- which is most of what this table now shows.
                     # The measurements carry the area of every MONITORED bus,
                     # and BUS_MAP.csv carries it for every bus in the case.
-                    _area = _WHERE.get(str(r["fault"]).strip(), {}).get(
+                    _area = _where_for(r["fault"], _res.get("project")).get(
                         str(el).strip())
                     _area = ((_area[0] if _area else "")
-                             or measured_area(res.get("meas_t"), r["fault"], el)
-                             or measured_area(res.get("meas_b"), r["fault"], el)
+                             or measured_area(_res.get("meas_t"), r["fault"], el)
+                             or measured_area(_res.get("meas_b"), r["fault"], el)
                              or (_bmap_area_text(bno) if bno not in ("", None)
                                  else ""))
                     L.append(_rowfmt
@@ -14777,6 +14852,13 @@ def _push_settings(env, case):
     # their saved part files and write the OLD verdicts back out, so the run
     # produces exactly the report it was asked to replace.
     env["SPP_FORCE_RESCORE"] = "1" if FORCE_RESCORE else "0"
+    # ONE RESCORE STAMP FOR THE WHOLE LAUNCH. Every score written after this
+    # launch began -- by a plotter, a worker or a shard -- was made under the
+    # current rules, so no later pass of the same launch reads that .out again.
+    # Each launcher used to stamp its own report pass, and the shards then
+    # deleted and re-read every score the plot pass had just written.
+    if FORCE_RESCORE:
+        env["SPP_RESCORE_T0"] = repr(float(_LAUNCH_T0))
     # Report shards score without loading the case (32-bit memory fix). The
     # engine honours this only in the report role and only when BUS_MAP.csv is
     # present, so build/worker roles and first-ever runs are unaffected.
@@ -16767,15 +16849,19 @@ def _pdf_is_current(out_path, pdf_path):
        "every .out already has its PDF -- nothing to draw" and start no plotter."""
     if not os.path.isfile(pdf_path):
         return _plot_refused_here(out_path)
+    # A STALE PDF THE PLOTTER HAS ALREADY REFUSED THIS LAUNCH COUNTS AS DONE,
+    # exactly as a missing one does. Counted as "needs a PDF" it kept its folder
+    # busy for ever: every slot sent there drew nothing, was retired as
+    # "failing at startup", and later folders were left undrawn.
     try:
         if os.path.getmtime(pdf_path) + 1.0 < os.path.getmtime(out_path):
-            return False
+            return _plot_refused_here(out_path)
     except Exception:
         pass
     if FORCE_REPLOT:
         try:
             if os.path.getmtime(pdf_path) < float(_LAUNCH_T0):
-                return False
+                return _plot_refused_here(out_path)
         except Exception:
             pass
     return True
@@ -17943,8 +18029,13 @@ def verify_scoring_coverage(quiet=False):
                                            os.path.basename(rdir), len(missing),
                                            len(outs), ", ".join(missing[:12])
                                            + (" ..." if len(missing) > 12 else "")))
-                    # THE PARTS MAY ALREADY HOLD THEM -- merge and look again.
-                    if _merge_one_folder(case, rdir):
+                    # THE PARTS MAY ALREADY HOLD THEM -- merge and look again,
+                    # but ONLY when parts\ is newer than the report. Otherwise
+                    # the merge rebuilds the same report (every launch, for a
+                    # folder with an .out that can never be scored) and could
+                    # bring back a score older than a re-run .out.
+                    if (_report_behind_parts_by(rdir, proj) > STALE_REPORT_TOL_S
+                            and _merge_one_folder(case, rdir)):
                         _MEAS_CACHE.clear()
                         _SCEN_PART_CACHE.clear()
                         _OUT_SET_CACHE.clear()
@@ -22754,7 +22845,7 @@ def main():
     # With PIPELINE = "compare" there is nothing to wait for and it runs here.
     if pipeline == "compare":
         try:
-            plot_missing_everywhere(pipeline)
+            plot_missing_everywhere(pipeline, cap=_plot_idle_cap())
         except Exception as _e:
             print("[compare] plot-missing pass failed: %s" % _e)
     else:
@@ -23711,7 +23802,7 @@ def main():
     if pipeline in ("all", "missing"):
         _early_plots_wait()
         try:
-            plot_missing_everywhere(pipeline, after_runs=True)
+            plot_missing_everywhere(pipeline, after_runs=True, cap=_plot_idle_cap())
         except Exception as e:
             print("[compare] the catch-up plot pass failed (%s) -- the results "
                   "and the comparison are unaffected" % e)
@@ -23777,7 +23868,7 @@ def main():
     if pipeline in ("all", "missing") and _res_n and (
             SURPLUS_SCENARIOS or EGF_DYR_RUN or EGF_OFF_RUN or EGF_OFF_BASE_RUN):
         try:
-            plot_missing_everywhere(pipeline, after_runs=True)
+            plot_missing_everywhere(pipeline, after_runs=True, cap=_plot_idle_cap())
         except Exception as e:
             print("[compare] the catch-up plot pass for the extra runs failed (%s)" % e)
     # BASE | GIA | EACH SURPLUS SCENARIO | BASE EGF OFF, side by side, one

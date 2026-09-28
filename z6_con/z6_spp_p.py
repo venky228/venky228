@@ -5011,6 +5011,79 @@ if _START_DELAY_S > 0:
     time.sleep(_START_DELAY_S)
 import psspy, dyntools                                 # PSS/E 34 python API + channel reader
 
+# ---- ONE LICENCE REQUEST AT A TIME -------------------------------------------
+# "CodeMeter runtime system is currently busy" is what the runtime says when two
+# PSS/E sessions ask for a licence at the same moment. The launchers already
+# limit how many processes START per minute, but a process takes a variable time
+# to get from its start to psseinit(), so starts spaced 10 s apart could still
+# reach the licence request together -- base and project launchers included.
+# This lock, in the same folder the launchers' start gate uses (so both cases
+# share it), lets one process at a time into psseinit(). A holder older than
+# LICENCE_INIT_HOLD_S no longer blocks the next -- the checkout is at the start
+# of psseinit and the rest is memory allocation -- so the start rate is never
+# slower than the launchers' own gate, and a process that died holding the lock
+# can never wedge the others.
+LICENCE_INIT_HOLD_S = 10.0
+try:
+    LICENCE_INIT_HOLD_S = float((os.environ.get("SPP_LICENCE_INIT_HOLD_S") or "").strip()
+                                or LICENCE_INIT_HOLD_S)
+except Exception:
+    pass
+_LIC_INIT_LOCK = os.path.join(os.path.dirname(os.path.normpath(STUDY_DIR)),
+                              ".spp_licence_gate", "psseinit.lock")
+
+
+def _licence_init_lock(max_wait_s=600.0):
+    """Take the psseinit lock; returns this process's token, or "" if it went
+       ahead without one. Never raises and never blocks past max_wait_s."""
+    if LICENCE_INIT_HOLD_S <= 0:
+        return ""
+    token = "%d %.3f" % (os.getpid(), time.time())
+    try:
+        d = os.path.dirname(_LIC_INIT_LOCK)
+        if not os.path.isdir(d):
+            os.makedirs(d)
+    except Exception:
+        return ""
+    t_end = time.time() + max_wait_s
+    said = False
+    while time.time() < t_end:
+        try:
+            fd = os.open(_LIC_INIT_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, token.encode("ascii"))
+            finally:
+                os.close(fd)
+            return token
+        except Exception:
+            try:
+                if time.time() - os.path.getmtime(_LIC_INIT_LOCK) > LICENCE_INIT_HOLD_S:
+                    os.remove(_LIC_INIT_LOCK)       # the holder is past its checkout
+                    continue
+            except Exception:
+                pass
+            if not said:
+                said = True
+                print("[init] another PSS/E session is taking its licence -- waiting "
+                      "(one licence request at a time, both cases)")
+                sys.stdout.flush()
+            time.sleep(0.5)
+    return ""
+
+
+def _licence_init_unlock(token):
+    """Release the lock -- only if it is still this process's."""
+    if not token:
+        return
+    try:
+        with open(_LIC_INIT_LOCK) as fh:
+            if fh.read().strip() != token:
+                return
+        os.remove(_LIC_INIT_LOCK)
+    except Exception:
+        pass
+
+
 # UNIQUE CHANNEL IDENTIFIERS, ENFORCED AT THE API. Two channels with the same
 # identifier in one .out header is a file this build's dyntools cannot decode:
 # get_data() raises "sequence item 1: expected str instance, int found" on
@@ -5101,6 +5174,11 @@ def _up():
     return False
 
 _GUI = True if IN_PSSE_GUI is True else (False if IN_PSSE_GUI is False else _up())
+# A REAL, OPEN PSS/E GUI -- before the no-engine modes below also set _GUI.
+# Only then may the end of the run skip sys.exit(rc); a shard or plotter that
+# crashed must exit non-zero, or the launcher reads "finished cleanly" and
+# never relaunches it.
+_REAL_GUI = _GUI
 # THE PLOT CHILD DOES NOT NEED THE ENGINE.
 #
 # It reads .out files off the disk and draws them. dyntools parses the file
@@ -5163,9 +5241,12 @@ elif (_PLOT_ONLY or _MERGE_ONLY) and not _env_bool("SPP_PLOT_PSSE", False):
 elif _GUI:
     print("[init] PSS/E already running -- skipping psseinit()")
 else:
+    _lic_tok = _licence_init_lock()
     try:
         psspy.psseinit(150000)                        # 150000-bus engine (matches Run1/Run2)
+        _licence_init_unlock(_lic_tok)
     except Exception as e:
+        _licence_init_unlock(_lic_tok)
         _msg = str(e)
         if re.search(r"codemeter|licen[cs]e|start error|busy", _msg, re.I):
             # THE LICENCE RUNTIME REFUSED US. Nothing in this process can run,
@@ -25812,12 +25893,44 @@ def _score_now(scen_id, out_path, kind, tclear):
     # singleton, which is exactly the "ONE of them must" the comment above
     # requires, and it has just scored the scenario it drew.
     _is_plot_child = bool((os.environ.get("SPP_PLOT_MISSING") or "").strip())
-    if LIVE_REPORT and (WORKER_INDEX == LIVE_REPORT_WORKER or _is_plot_child):
+    if (LIVE_REPORT and (WORKER_INDEX == LIVE_REPORT_WORKER or _is_plot_child)
+            and _live_refresh_due()):
         try:
             refresh_live_report()
         except Exception as e:
             print("  [live] could not refresh the report (%s) -- the run is unaffected" % e)
     return verdict
+
+
+LIVE_REPORT_MIN_S = 120.0   # at most one live refresh per folder in this many seconds
+_LIVE_LIGHT = [False]       # True while refresh_live_report() writes the report
+
+
+def _live_refresh_due():
+    """May this process rewrite the live report now?
+
+       Each refresh reads every per-scenario part and rewrites the whole report
+       set, so once per scored scenario -- in every plotter of a fleet -- the
+       cost grew with the square of the scenario count and the plotters wrote
+       the same files at once. Now: never during a forced rescore (the report
+       pass rewrites everything from all parts), and otherwise at most once per
+       LIVE_REPORT_MIN_S per folder, through a stamp file every process shares."""
+    if _env_bool("SPP_FORCE_RESCORE", False):
+        return False
+    stamp = os.path.join(PARTS_DIR, ".live_refresh")
+    try:
+        if time.time() - os.path.getmtime(stamp) < LIVE_REPORT_MIN_S:
+            return False
+    except Exception:
+        pass                                # no stamp yet -- due
+    try:
+        if not os.path.isdir(PARTS_DIR):
+            os.makedirs(PARTS_DIR)
+        with open(stamp, "w") as fh:
+            fh.write("%.0f\n" % time.time())
+    except Exception:
+        pass
+    return True
 
 
 def _save_scen_part(scen_id, rows, verdict):
@@ -25897,7 +26010,15 @@ def refresh_live_report():
         rows, v = got[case]
         all_rows += rows
         verdicts[case] = v
-    write_criteria_report(all_rows, verdicts)
+    # LIGHT: the criteria, compliance and violations files only. This process
+    # holds the measurements of the scenarios IT scored, not the folder's, so
+    # writing the measurements workbook here replaced a complete one with a
+    # subset; the report pass writes it from every part.
+    _LIVE_LIGHT[0] = True
+    try:
+        write_criteria_report(all_rows, verdicts)
+    finally:
+        _LIVE_LIGHT[0] = False
     print("  [live] report refreshed -- %d scenario(s) scored so far" % len(verdicts))
 
 
@@ -26055,6 +26176,20 @@ def _scen_parts_since(t0):
     return read_scenario_parts(only=keep)
 
 
+def _scen_stale(f):
+    """True when a per-scenario part (SCEN_<id>.csv or SCEN_<id>_MEAS.csv) is
+       OLDER than its scenario's .out -- the scenario was simulated again after
+       it was scored, so these rows describe the previous run. Same 2 s margin
+       z6_main uses for the same question."""
+    try:
+        b = os.path.basename(f)
+        sid = b[5:-9] if b.endswith("_MEAS.csv") else b[5:-4]
+        op = os.path.join(OUT_DIR, sid + ".out")
+        return os.path.isfile(op) and os.path.getmtime(f) + 2.0 < os.path.getmtime(op)
+    except Exception:
+        return False
+
+
 def read_scenario_parts(only=None):
     """{case: (rows, verdict)} from the per-scenario files the workers wrote.
        Also refills SPP_VIOLATIONS for those cases.
@@ -26070,7 +26205,7 @@ def read_scenario_parts(only=None):
     else:
         files = sorted(_g.glob(os.path.join(PARTS_DIR, "SCEN_*.csv")))
     for f in files:
-        if f.endswith("_MEAS.csv") or not os.path.isfile(f):
+        if f.endswith("_MEAS.csv") or not os.path.isfile(f) or _scen_stale(f):
             continue
         try:
             rows, verdict, case = [], None, None
@@ -26368,10 +26503,15 @@ def merge_report_parts():
     # by a report SHARD leaves MEASURE_w<n>.csv. Reading only the shard files
     # gave a workbook holding the two scenarios the shards happened to score and
     # none of the eighteen the workers had already done.
-    _mfiles = ([f for f in (_part_path(i, "MEASURE") for i in range(_nsh))
-                if os.path.isfile(f)] if _nsh > 0
-               else sorted(_g.glob(os.path.join(PARTS_DIR, "MEASURE_w*.csv"))))
-    _mfiles += sorted(_g.glob(os.path.join(PARTS_DIR, "SCEN_*_MEAS.csv")))
+    # THE PER-SCENARIO FILE FIRST: every scorer writes it at the moment it
+    # scores, so it is never older than a shard's copy of the same case -- and
+    # a shard part restored on resume can still hold the previous run's rows.
+    # One older than its .out (re-simulated since) is left out.
+    _mfiles = [f for f in sorted(_g.glob(os.path.join(PARTS_DIR, "SCEN_*_MEAS.csv")))
+               if not _scen_stale(f)]
+    _mfiles += ([f for f in (_part_path(i, "MEASURE") for i in range(_nsh))
+                 if os.path.isfile(f)] if _nsh > 0
+                else sorted(_g.glob(os.path.join(PARTS_DIR, "MEASURE_w*.csv"))))
     _nm = 0
     _seen_mt = {}                # (case, table) -> the file it came from
     for f in _mfiles:
@@ -26423,15 +26563,22 @@ def merge_report_parts():
     #
     # Shard data wins where both exist; the SCEN parts only FILL GAPS, decided
     # per case before any row is taken, so nothing is double-counted.
+    # ...AND THE CURRENT PER-SCENARIO FILE IS THE CASE'S ELEMENT LIST. It
+    # replaces what the shard parts said for that case (a resumed shard part
+    # can carry the previous run's buses beside the new ones), and a current
+    # file with no violations clears them. A file older than its .out is not
+    # used at all.
     _nsv, _nsc = 0, 0
     for f in sorted(_g.glob(os.path.join(PARTS_DIR, "SCEN_*.csv"))):
-        if f.endswith("_MEAS.csv"):
+        if f.endswith("_MEAS.csv") or _scen_stale(f):
             continue
         try:
             _rows_v = {}
             _case_v = None
             with open(f) as fh:
                 for r in csv.reader(fh):
+                    if r and len(r) >= 2 and r[0] == "verdict":
+                        _case_v = _case_v or r[1]
                     if not r or len(r) < 3 or not str(r[0]).startswith("vio:"):
                         continue
                     _case_v = _case_v or r[1]
@@ -26445,15 +26592,17 @@ def merge_report_parts():
                         except ValueError:
                             vals.append(x)
                     _rows_v.setdefault(r[0][4:], []).append(tuple(vals))
-            if _case_v and _rows_v and _case_v not in SPP_VIOLATIONS:
+            if _case_v and _rows_v:
                 SPP_VIOLATIONS[_case_v] = _rows_v
                 _nsc += 1
                 _nsv += sum(len(v) for v in _rows_v.values())
+            elif _case_v:
+                SPP_VIOLATIONS.pop(_case_v, None)
         except Exception as e:
             print("[merge] could not read %s: %s" % (f, e))
     if _nsc:
-        print("[merge] %d violation row(s) for %d worker-scored scenario(s) "
-              "recovered from the per-scenario parts" % (_nsv, _nsc))
+        print("[merge] %d violation row(s) for %d scenario(s) taken from their "
+              "per-scenario parts" % (_nsv, _nsc))
 
     # DEDUPE. Belt and braces behind the two fixes above (shards partition the raw
     # file list; the merge reads only this run's parts). If a scenario still turns
@@ -26634,18 +26783,21 @@ def write_criteria_report(all_rows, verdicts):
                 _fh.write(traceback.format_exc())
         except Exception:
             pass
-    try:
-        write_measurements_workbook(cases, verdicts)
-    except Exception as e:
-        print("measurements workbook failed (non-fatal): %s" % e); traceback.print_exc()
-    try:
-        write_channel_list(cases)
-    except Exception as e:
-        print("channel list failed (non-fatal): %s" % e)
-    try:
-        write_run_times()
-    except Exception as e:
-        print("run times failed (non-fatal): %s" % e); traceback.print_exc()
+    if _LIVE_LIGHT[0]:
+        pass            # live refresh: measurements, channels, run times wait for the report pass
+    else:
+        try:
+            write_measurements_workbook(cases, verdicts)
+        except Exception as e:
+            print("measurements workbook failed (non-fatal): %s" % e); traceback.print_exc()
+        try:
+            write_channel_list(cases)
+        except Exception as e:
+            print("channel list failed (non-fatal): %s" % e)
+        try:
+            write_run_times()
+        except Exception as e:
+            print("run times failed (non-fatal): %s" % e); traceback.print_exc()
     try:
         write_event_table(all_rows, verdicts)
     except Exception as e:
@@ -32075,6 +32227,36 @@ def _rclaim_path(sid):
     return os.path.join(d, "%s.rclaim" % sid)
 
 
+PART_WRITE_EVERY_S = 120.0      # a shard's running part file: at most this often
+LIVE_REPORT_EVERY_S = 600.0     # a lone shard's running report: at most this often
+
+
+def _rclaim_fin(sid):
+    """Mark a claimed .out as DEALT WITH although it left no score -- excluded
+       (non-finite, no clearing time, unreadable) or a scoring error. Without
+       this its claim went "dead" when the shard exited, and every shard still
+       behind it in the queue took it over and read the whole .out again only
+       to reach the same exclusion. Cleared by _rclaim_clear, so the next pass
+       tries it once more."""
+    if not (DYNAMIC_WORK and N_WORKERS > 1):
+        return
+    try:
+        with open(_rclaim_path(sid) + ".fin", "w") as fh:
+            fh.write("%d\n" % os.getpid())
+    except Exception:
+        pass
+
+
+class _ExcludedList(list):
+    """nan_excluded: every scenario set aside is also marked dealt with."""
+    def append(self, item):
+        list.append(self, item)
+        try:
+            _rclaim_fin(item[0])
+        except Exception:
+            pass
+
+
 def _rclaim_mine(sid):
     """Take one .out to score, or leave it to whichever shard already has it."""
     if not (DYNAMIC_WORK and N_WORKERS > 1):
@@ -32083,6 +32265,8 @@ def _rclaim_mine(sid):
     try:
         fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except OSError:
+        if os.path.isfile(p + ".fin"):
+            return False                  # dealt with this pass, nothing to score
         _who = _claim_holder(p)
         if _who == "alive":
             return False                  # its owner is still running: leave it be
@@ -32132,6 +32316,7 @@ def _rclaim_clear():
        _rclaim_mine has always honoured it. This does now too."""
     kept = 0
     for p in (glob.glob(os.path.join(OUT_DIR, "rclaim", "*.rclaim"))
+              + glob.glob(os.path.join(OUT_DIR, "rclaim", "*.rclaim.fin"))
               + glob.glob(os.path.join(OUT_DIR, "rclaim", "*.stale*"))
               + glob.glob(os.path.join(OUT_DIR, "*.rclaim"))):
         try:
@@ -33580,7 +33765,9 @@ def finalize_report(produced, part=None, claim=False):
                 print("[score] the other %d will be read and scored here"
                       % (len(produced) - _have))
 
-        nan_excluded = []
+        nan_excluded = _ExcludedList()
+        _last_part_w = [0.0]
+        _last_live_w = [time.time()]
         # RESUME. A shard that was killed -- by a poison .out, or by the
         # launcher's watchdog -- has its finished rows in its part file. Load
         # them and skip those scenarios, so a relaunch continues instead of
@@ -33634,6 +33821,23 @@ def finalize_report(produced, part=None, claim=False):
                         continue
                     os.remove(_f)
                     _n_cleared += 1
+                except Exception:
+                    pass
+            # SHARD 0 ALSO REMOVES AN EARLIER PASS'S HIGHER-NUMBERED PARTS. A
+            # pass with fewer shards than the last one left CRITERIA/VERDICTS/
+            # VIOLATIONS/MEASURE_w<n> for n >= this pass's count, and every
+            # merge that runs without a shard count (the re-merge, the coverage
+            # check) put those old-rule rows back into the report.
+            if part == 0:
+                try:
+                    _t0s = float(os.environ.get("SPP_RESCORE_T0") or "0") or time.time()
+                    for _f in glob.glob(os.path.join(PARTS_DIR, "*_w*.csv")):
+                        _m = re.match(r"(CRITERIA|VERDICTS|VIOLATIONS|MEASURE|OUTSTAMP)_w(\d+)\.csv$",
+                                      os.path.basename(_f))
+                        if (_m and int(_m.group(2)) >= max(1, int(N_WORKERS or 1))
+                                and os.path.getmtime(_f) < _t0s):
+                            os.remove(_f)
+                            _n_cleared += 1
                 except Exception:
                     pass
             print("[score] FORCE_RESCORE: shard %s discarded %d saved part file(s) -- "
@@ -33954,16 +34158,21 @@ def finalize_report(produced, part=None, claim=False):
                         # put 98 buses over 1.20 pu is scored on that, and the
                         # divergence is added as its own failure on top.
                         if SCORE_DIVERGED_PREFIX:
-                            _pre = None
+                            # _cut, NOT _pre: _pre is the dict of scenarios
+                            # already scored, read at the top of every pass of
+                            # this loop. Reusing the name left it None or a
+                            # tuple, and the next scenario raised TypeError.
+                            _cut = None
                             try:
                                 _t0, _ch0 = load_out(p)
-                                _pre = _truncate_at_divergence(_t0, _ch0, tc)
+                                _cut = _truncate_at_divergence(_t0, _ch0, tc)
                             except Exception as _e:
                                 print("  [score] %s: the diverged prefix could "
                                       "not be read (%s) -- falling back to the "
                                       "divergence-only rows" % (_sid, _e))
-                            if _pre:
-                                _t2, _ch2, _icut, _tcut = _pre
+                            if _cut:
+                                _t2, _ch2, _icut, _tcut = _cut
+                                _cut = None
                                 _OUT_CACHE["path"] = p
                                 _OUT_CACHE["data"] = (_t2, _ch2)
                                 try:
@@ -34205,6 +34414,7 @@ def finalize_report(produced, part=None, claim=False):
                     print("  [%-4s] %-50s : %s" % (r["Result"], r["Criterion"], r["Detail"]))
             except Exception as e:
                 print("  SCORE ERROR %s: %s" % (p, e)); traceback.print_exc()
+                _rclaim_fin(_sid)
             sys.stdout.flush()      # keep the launcher's silence watchdog fed on a slow file
             # >>> WRITE THE PART AFTER EVERY SCENARIO, not once at the end.
             # A .out takes minutes to score, so a shard holds hours of work in
@@ -34214,7 +34424,15 @@ def finalize_report(produced, part=None, claim=False):
             # against minutes per scenario, so there is no reason to defer it.
             # The merge reads whatever is there, so a shard that dies part way
             # still contributes everything it had finished.
-            if part is not None:
+            # AT MOST EVERY PART_WRITE_EVERY_S, not after every scenario. The
+            # part carries every measurement row the shard holds, so rewriting
+            # it (and reading it back) per scenario grew with the square of the
+            # scenario count. Each scored scenario is on disk already in its
+            # own SCEN_<id>.csv / _MEAS.csv, so a crash loses nothing but the
+            # time since the last write, and the final write after the loop
+            # still saves everything.
+            if part is not None and time.time() - _last_part_w[0] >= PART_WRITE_EVERY_S:
+                _last_part_w[0] = time.time()
                 try:
                     write_report_part(part, all_rows, verdicts, quiet=True)
                 except Exception as e:
@@ -34230,7 +34448,11 @@ def finalize_report(produced, part=None, claim=False):
                 # the report on disk is then never more than one scenario behind
                 # and an interrupted pass still leaves a complete report for
                 # everything that finished.
-                if N_WORKERS <= 1 and all_rows:
+                # ...AT MOST EVERY LIVE_REPORT_EVERY_S: the measurement files
+                # it rewrites grow by thousands of rows per scenario.
+                if (N_WORKERS <= 1 and all_rows
+                        and time.time() - _last_live_w[0] >= LIVE_REPORT_EVERY_S):
+                    _last_live_w[0] = time.time()
                     try:
                         write_criteria_report(all_rows, verdicts)
                     except Exception as e:
@@ -36507,6 +36729,15 @@ def plot_missing_outs():
                 _done_and_scored = False
         except Exception:
             _done_and_scored = had_done
+        # REFUSED ALREADY, AND STILL NOTHING TO DRAW. An unfinished run with no
+        # PDF was put back in every plotter's list, read in full and refused
+        # again on the same policy -- and then retried in an isolated child
+        # that could only refuse it once more. The .plotted marker already
+        # says it was judged against this .out (and, under FORCE_REPLOT, in
+        # this launch); the panel's count treats it the same way.
+        if (not had_pdf and not had_done and not _only_one
+                and not _is_partial(sid) and _plot_only_current(sid, p)):
+            continue
         if had_pdf and (_done_and_scored or _plot_only_current(sid, p)):
             # NOTHING LEFT FOR THIS ONE.
             #
@@ -37095,9 +37326,13 @@ def plot_missing_outs():
             _already = False
             try:
                 _sp = _scen_part_path(sid)
+                # UNDER FORCE_RESCORE a part written since this launch began
+                # (SPP_RESCORE_T0) is already under the current rules.
                 _already = (os.path.isfile(_sp)
                             and os.path.getmtime(_sp) >= os.path.getmtime(p)
-                            and not _env_bool("SPP_FORCE_RESCORE", False))
+                            and (not _env_bool("SPP_FORCE_RESCORE", False)
+                                 or os.path.getmtime(_sp)
+                                 >= float(os.environ.get("SPP_RESCORE_T0") or "inf")))
             except Exception:
                 _already = False
             # A PARTIAL RUN IS SCORED LIKE A COMPLETE ONE (marked as such in
@@ -37360,7 +37595,12 @@ def plot_missing_outs():
         _depth = int(os.environ.get("SPP_REPLOT_CHAIN") or 0)
     except ValueError:
         _depth = 0
-    if _relaunch_for_next and MAKE_PLOTS and _rb_on and _left_here > 0 and _depth < 12:
+    # NOT FOR A FLEET PLOTTER: the panel refills its slot the moment it exits.
+    # A FORCE_REPLOT stamp (SPP_REPLOT_BEFORE) sent every fleet plotter down
+    # this chain instead -- up to 13 nested plotters per slot, outside the
+    # fleet's cap, and beyond the reach of the supervisor's kill.
+    if (_relaunch_for_next and MAKE_PLOTS and _rb_on and _left_here > 0 and _depth < 12
+            and not _env_bool("SPP_PLOT_FLEET", False)):
         try:
             import subprocess as _sp
             _env = dict(os.environ)
@@ -37509,8 +37749,8 @@ if __name__ == "__main__":
         print("Log: %s | Events: %s" % (LOG_FILE, EVENTS_LOG))
         try: sys.stdout = _ORIG_OUT; sys.stderr = _ORIG_ERR; _LOG_FH.flush(); _LOG_FH.close()
         except Exception: pass
-    if not _GUI:
-        if PAUSE_AT_END:
+    if not _REAL_GUI:
+        if PAUSE_AT_END and not _GUI:
             try: input("\nDone (rc=%d). Enter to close..." % rc)
             except Exception: pass
         sys.exit(rc)

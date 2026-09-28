@@ -4019,7 +4019,9 @@ def _run_report_sharded(n, selected=None):
         # stays on and SPP_RESCORE_RESUME=1 tells the shard to KEEP its part
         # (the scenarios it already re-scored) while still reading every
         # other .out afresh.
-        _e["SPP_RESCORE_T0"] = repr(_t0_pass)
+        # The launch's own stamp when z6_main sent one (every pass of the
+        # launch shares it); this pass's start otherwise.
+        _e["SPP_RESCORE_T0"] = _e.get("SPP_RESCORE_T0") or repr(_t0_pass)
         if launches[i] > 1 and _e.get("SPP_FORCE_RESCORE", "0") not in ("", "0", "false", "no", "off"):
             _e["SPP_RESCORE_RESUME"] = "1"
             print("[parallel] shard %d relaunch: FORCE_RESCORE stays ON -- it keeps the "
@@ -5795,7 +5797,18 @@ def _run_one_study():
         n_work = _cap
         _write_alive(n_work, force=True)
     _announce_work(selected, n_work)
-    ok = _run_workers(n_work, selected)
+    if selected == ["__ALL_ALREADY_DONE__"]:
+        # NOTHING TO SIMULATE: NO WORKER AND NO CATCH-UP PLOTTER. A worker here
+        # started PSS/E -- a licence checkout, often a snapshot rebuild -- to run
+        # nothing, and the catch-up plotter behind it drew the folder one file
+        # at a time for up to PLOT_CATCHUP_MAX_S before any scoring began. The
+        # report phase scores the folder and the panel's plot pass draws it.
+        print("[parallel] nothing to simulate -- no PSS/E worker and no catch-up "
+              "plotter for this folder; it goes straight to the report")
+        _write_alive(0, force=True)
+        ok = True
+    else:
+        ok = _run_workers(n_work, selected)
     if not ok:
         print("[parallel] WARNING: one or more workers did not fully finish -- the merged "
               "report will cover whatever completed.")
