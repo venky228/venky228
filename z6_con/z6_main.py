@@ -9391,19 +9391,32 @@ def compare_three_way(proj, mode):
     # project with the EGF off against it (both sides EGF off) as its own group.
     pairs = [(rb, d, "%s_%s_vs_BASE" % (proj, t)) for d, t in tests]
     rbo = rb + "_" + EGF_OFF_TAG
+    # PLAIN COLUMN NAMES in the one workbook: BASE | BASE_EGF_OFF | PROJECT_GIA
+    # | PROJECT_SGF_EGF_OFF (| any other surplus scenario by its tag).
+    names = {rb: "BASE", rt: "PROJECT_GIA"}
+    sbs_name = ""
     if glob.glob(os.path.join(rbo, "outs", "*.out")):
         pairs.append((rb, rbo, "%s_BASE_%s_vs_BASE" % (proj, EGF_OFF_TAG)))
+        names[rbo] = "BASE_EGF_OFF"
         psfx = _egf_project_off_suffix(proj, mode)
         if psfx:
             pairs.append((rbo, rt + psfx, "%s_%s_vs_BASE_%s" % (proj, psfx.lstrip("_"), EGF_OFF_TAG)))
+            names[rt + psfx] = "PROJECT_SGF_EGF_OFF"
+            sbs_name = "{proj}_ALL_4_SCENARIOS"
     import tempfile
     tmp = tempfile.mkdtemp(prefix="z6_3way_")
     pj, dj = os.path.join(tmp, "pairs.json"), os.path.join(tmp, "done.json")
+    tj = os.path.join(tmp, "tags.json")
     with open(pj, "w") as fh:
         json.dump([[b, d, re.sub(r"[^A-Za-z0-9_.-]+", "_", nm)] for b, d, nm in pairs], fh)
+    with open(tj, "w") as fh:
+        json.dump(names, fh)
     env = dict(os.environ)
     env["CMP_MULTI_PAIRS"] = pj
     env["CMP_MULTI_DONE"] = dj
+    env["CMP_MULTI_TAGS"] = tj
+    if sbs_name:
+        env["CMP_MULTI_SBS_NAME"] = sbs_name
     env["CMP_MULTI_FULL"] = "1"          # every value read, none left '-'
     _banner("%s: BASE | %s -- SIDE BY SIDE" % (proj, " | ".join(
         [t for _d, t in tests] + [nm[len(proj) + 1:] for _b, _d, nm in pairs[len(tests):]])))

@@ -25945,7 +25945,7 @@ def _score_in_child(scen_id, out_path):
         print("  [child] scoring %s exited rc=%s" % (scen_id, rc))
         return None
     try:
-        got = read_scenario_parts()
+        got = read_scenario_parts(only=[scen_id])
     except Exception as e:
         print("  [child] wrote no readable rows for %s (%s)" % (scen_id, e))
         return None
@@ -26052,16 +26052,26 @@ def _scen_parts_since(t0):
             pass
     if not keep:
         return {}
-    allp = read_scenario_parts()
-    return dict((k, v) for k, v in allp.items() if k in keep)
+    return read_scenario_parts(only=keep)
 
 
-def read_scenario_parts():
+def read_scenario_parts(only=None):
     """{case: (rows, verdict)} from the per-scenario files the workers wrote.
-       Also refills SPP_VIOLATIONS for those cases."""
+       Also refills SPP_VIOLATIONS for those cases.
+
+       only = the scenario ids to read (their SCEN_<id>.csv alone). The scoring
+       loop picks up ONE scenario another shard has just scored; reading every
+       file in the folder for it, per scenario, per shard, was the slow part of
+       a rescore. The _MEAS files are never read here -- they hold no verdict."""
     import glob as _g
     out = {}
-    for f in sorted(_g.glob(os.path.join(PARTS_DIR, "SCEN_*.csv"))):
+    if only is not None:
+        files = [_scen_part_path(s) for s in sorted(set(only))]
+    else:
+        files = sorted(_g.glob(os.path.join(PARTS_DIR, "SCEN_*.csv")))
+    for f in files:
+        if f.endswith("_MEAS.csv") or not os.path.isfile(f):
+            continue
         try:
             rows, verdict, case = [], None, None
             vio = {}          # this file's violations, kept out of the global
@@ -33756,7 +33766,7 @@ def finalize_report(produced, part=None, claim=False):
                     and os.path.isfile(_scen_part_path(_sid))
                     and os.path.isfile(_scen_meas_path(_sid))):
                 try:
-                    _pre.update(read_scenario_parts())
+                    _pre.update(read_scenario_parts(only=[_sid]))
                 except Exception:
                     pass
             # THE SHARED QUEUE, CLAIMED ONE FILE AT A TIME. A shard takes this
@@ -33776,7 +33786,7 @@ def finalize_report(produced, part=None, claim=False):
                     if (_t0p > 0 and os.path.isfile(_spp_)
                             and os.path.isfile(_scen_meas_path(_sid))
                             and os.path.getmtime(_spp_) >= _t0p):
-                        _pre.update(_scen_parts_since(_t0p))
+                        _pre.update(read_scenario_parts(only=[_sid]))
                 except Exception:
                     pass
             if claim and _sid not in _pre and not _rclaim_mine(_sid):

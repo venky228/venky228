@@ -302,11 +302,29 @@ def _prepare(z4, case, folder, suffix):
 _STD_PARENTS = ("results_base", "results_proj", "results", "base", "projects", "kv")
 
 
+def _given_tags():
+    """CMP_MULTI_TAGS (a JSON file of {folder: column name}), normalised; {}
+       when the variable is not set, as in every standalone run."""
+    p = os.environ.get("CMP_MULTI_TAGS")
+    if not p:
+        return {}
+    try:
+        with open(p) as fh:
+            return dict((_norm(k), re.sub(r"[^A-Za-z0-9_.-]+", "_", v))
+                        for k, v in json.load(fh).items())
+    except Exception:
+        return {}
+
+
 def _folder_tag(folder):
     """What tells this folder apart: its own suffix ('poi502', 'cap50'), and
        the folder it sits in when that is not one of the usual results roots
        -- so ...\Sep21_full gia\SantaFe_spp is 'Sep21_full_gia' and not
        'studied', which is what ...\results_proj\SantaFe_spp is called."""
+    # NAMES GIVEN BY THE CALLER (z6_main's 4-scenario report): {folder: tag}.
+    _given = _given_tags().get(_norm(folder))
+    if _given:
+        return _given
     _p, _m, sfx = _split_name(folder, None)
     bits = []
     parts = [x for x in re.split(r"[\\/]+", str(folder).strip().strip('"')) if x]
@@ -762,6 +780,11 @@ def _layout(group):
         if (r, s) in seen:
             continue                              # the same comparison listed twice
         seen.add((r, s))
+        if s in refs:
+            # A REFERENCE COMPARED AGAINST ANOTHER (base EGF off vs base): its
+            # values already have their own column as a reference, so it is
+            # not listed a second time as a run. Its pair report stands alone.
+            continue
         grp.append(g)
         if s not in ttag:
             t0 = g["tag"]
@@ -1966,7 +1989,9 @@ def write_side_by_side(z4, ref, group):
     rk = lay["refs"][0]
     ref = lay["ref_dir"][rk]
     out_root = OUT_DIR or os.path.join(z4.STUDY_ROOT, "comparison_pairs")
-    lab = re.sub(r"[^A-Za-z0-9_.-]+", "_", "%s_SIDE_BY_SIDE_vs_%s" % (proj, "_and_".join(lay["refs"])))
+    lab = re.sub(r"[^A-Za-z0-9_.-]+", "_",
+                 (os.environ.get("CMP_MULTI_SBS_NAME") or "").replace("{proj}", proj)
+                 or "%s_SIDE_BY_SIDE_vs_%s" % (proj, "_and_".join(lay["refs"])))
     d = os.path.join(out_root, proj, lab)          # beside that project's pair reports
     if not os.path.isdir(d):
         os.makedirs(d)
