@@ -140,30 +140,91 @@ def scmva(bus):
     ie = psspy.bsys(1, 0, [0.0, 0.0], 0, [], 1, [int(bus)], 0, [], 0, [])
     if ie:
         return None, "bsys ierr=%s" % ie
-    try:
-        r = pssarrays.ascc_currents(sid=1, all=0, flt3ph=1, fltlg=0, fltllg=0, fltll=0)
-    except TypeError:
-        r = pssarrays.ascc_currents(1, 0, 1)
-    except Exception as e:
-        return None, "ascc: %s" % e
+    # THE KEYWORDS DIFFER BETWEEN PSS/E BUILDS. PSS/E 34 takes sid and all by
+    # position and everything else only by keyword ("takes 2 positional
+    # arguments"), and an option it does not know is a TypeError -- so try the
+    # forms in turn, the fullest first.
+    r, err = None, ""
+    for kw in ({"flt3ph": 1, "fltlg": 0, "fltllg": 0, "fltll": 0},
+               {"flt3ph": 1, "fltlg": 0},
+               {"flt3ph": 1},
+               {}):
+        try:
+            r = pssarrays.ascc_currents(1, 0, **kw)
+            break
+        except Exception as e:
+            err = "%s" % e
+    if r is None:
+        return None, "ascc: %s" % err
+    _dump_once(r)
     if getattr(r, "ierr", 0):
         return None, "ascc ierr=%s" % r.ierr
     # THEVENIN IMPEDANCE FIRST: SCMVA = SBASE / |Z1|, independent of the
     # pre-fault voltage. The fault current is the fallback (pu, 1.0 pu pre-fault).
-    try:
-        z1 = r.thevzpu[0].z1
+    z1 = _first(r, ("thevzpu", "thevz", "zthev"), ("z1", "zpos", "z"))
+    if z1 is not None:
         if abs(z1) > 1e-9:
             return sbase / abs(z1), ""
         return None, "POI Thevenin impedance is zero"
-    except Exception:
-        pass
-    try:
-        i1 = r.flt3ph[0].ia1
-        if abs(i1) > 0:
-            return abs(i1) * sbase, ""
-    except Exception:
-        pass
+    i1 = _first(r, ("flt3ph", "fltcur3ph", "fltcur"), ("ia1", "i1", "ia"))
+    if i1 is not None and abs(i1) > 0:
+        # per unit when short_circuit_units(1) took; amps otherwise (large)
+        if abs(i1) > 1000.0:
+            try:
+                kv = psspy.busdat(int(bus), "BASE")[1]
+                return abs(i1) * float(kv) * 3 ** 0.5 / 1000.0, ""
+            except Exception:
+                return None, "fault current is in amps and the bus kV could not be read"
+        return abs(i1) * sbase, ""
     return None, "no short-circuit result (POI isolated?)"
+
+
+def _pick(x, names):
+    for n in names:
+        try:
+            v = x[n] if isinstance(x, dict) else getattr(x, n)
+            return v
+        except Exception:
+            continue
+    return None
+
+
+def _first(r, outer, inner):
+    """A complex number r.<outer>[0].<inner> (or dict / keyed forms), else None."""
+    o = _pick(r, outer)
+    if o is None:
+        return None
+    for el in ([o[0]] if isinstance(o, (list, tuple)) and o else []) + [o]:
+        try:
+            if isinstance(el, dict) and el and not any(k in el for k in inner):
+                el = list(el.values())[0]
+        except Exception:
+            pass
+        v = _pick(el, inner)
+        if isinstance(v, (list, tuple)) and v:
+            v = v[0]
+        if isinstance(v, (int, float, complex)):
+            return complex(v)
+    return None
+
+
+_DUMPED = [False]
+
+
+def _dump_once(r):
+    """What this PSS/E build returns, printed ONCE -- so a result the reader
+       above does not recognise can be read off the console."""
+    if _DUMPED[0]:
+        return
+    _DUMPED[0] = True
+    try:
+        names = [n for n in dir(r) if not n.startswith("_")]
+        print("[scr] ascc_currents returned: %s" % ", ".join(names))
+        for n in ("thevzpu", "flt3ph", "fltbus"):
+            if n in names:
+                print(("[scr]   %s = %r" % (n, getattr(r, n)))[:400])
+    except Exception:
+        pass
 
 
 # ---- ELEMENT STATUS ----------------------------------------------------------
