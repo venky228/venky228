@@ -33522,6 +33522,7 @@ def plot_missing_outs():
     _relaunch_for_next = False
     _left_here = 0
     for i, (sid, p, had_done, had_pdf) in enumerate(todo, 1):
+        _nonfinite = ""            # per scenario; set below when the .out holds NaN/inf
         # TAKE THIS FILE OR LEAVE IT. One claim per file with the owner's PID
         # inside, so plotters running side by side each take the next free file
         # -- exactly as the workers share the fault queue. A 7,800-panel PDF
@@ -34010,7 +34011,14 @@ def plot_missing_outs():
         # SPP_PLOT_ALL_IN_ONE=1 restores the old loop-until-done behaviour.
         # DRAWN, AND IT CANNOT BE SCORED. Remember that, or the next plotter
         # picks the same file again -- see _plot_only_current().
-        if not os.path.isfile(_state_path(sid, "done")) and not _is_partial(sid):
+        # A FINISHED RUN WITH NON-FINITE VALUES IS THE SAME CASE. It has a .done
+        # and never gets a SCEN part (it cannot be scored), so without this
+        # note it counted as work for ever: every plotter slot sent to its
+        # folder redrew it, the count did not fall, and the supervisor retired
+        # the slot as "failing at startup" -- F167 took a 375-file pass down
+        # to one plotter.
+        if _nonfinite or (not os.path.isfile(_state_path(sid, "done"))
+                          and not _is_partial(sid)):
             try:
                 _write_text(_state_path(sid, "plotted"),
                             "%s  PDF written; no .done (incomplete or non-finite run)"
