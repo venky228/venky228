@@ -78,7 +78,12 @@ The user asked for the first two to be v34-only. Ask before carrying any of them
     - All 70 modules came from the PSS/E, Python or Windows folders. The Intel runtimes (`libifcoremd` 2024.1, `libiomp5md` 5.0.2023.1212, `libmmd` 20.0) came from PSSBIN; `MSVCP140`/`VCOMP140` 14.50 came from System32; `VCRUNTIME140`/`_1` 14.38 came from Python's folder.
     - `SetDllDirectory(PSSBIN)`, pre-loading PSSBIN's runtimes, and a `python.exe` copy with `VCRUNTIME140` 14.50 all crashed the same way.
     - The machine: Windows 10.0.26200 (Windows 11), Intel Family 6 Model 198 with 24 logical CPUs. The environment has `IFORT_COMPILER15`, `INTEL_DEV_REDIST` and `INTEL_LICENSE_FILE` (Intel Composer XE 2015) and `PYTHONSTARTUP` (VS Code).
-    - v4 was sent next.
+  - **`INIT_CHECK.txt` (v4, 10:23): the PSS/E GUI crashes too.** `psse35.exe` 35.6.4.0 died after 5 s with `musteng.dll` 0xC0000005 at +0x7e0803, the same offset as the Python crashes.
+    - One thread, one processor and a clean environment all failed; there is no other Python with a PSSPY folder.
+    - CodeMeter runtime is 8.10.6237.502.
+    - PSS/E 35.6.4 does not run on this PC (Windows 11 build 26200; Intel Core Ultra 200S "Arrow Lake", Family 6 Model 198; 24 logical CPUs).
+    - Next steps are the user's: Siemens PTI support (with the event-log lines), a repair or newer 35.x patch, or trying another PC.
+    - v35 work is parked until PSS/E 35 itself starts. The study stays on PSS/E 34 with the v34 scripts.
   - The user asked whether the PSS/E 34.8 DLLs can be used with 35. No: they are 32-bit and PSS/E 35 is 64-bit. `dsusr.dll` is rebuilt by the build; vendor DLLs need their PSS/E 35 builds. v34 (`z7_con`) keeps working with them.
   - Also from the check:
     - All 84 `.dll` in each of `Base\` and `Projects\` are 32-bit PSS/E 34 builds: Vestas, SMA, ABB HVDC, PE, GE, `MyUsrdll.dll`, `dsusr.dll`, and more. Each model the deck uses needs its PSS/E 35 64-bit build.
