@@ -2,8 +2,8 @@
 
 ## Where things are
 - **Repo:** `venky228/venky228`, branch `claude/great-ramanujan-c0v50u`.
-- **v35 set:** `z7_psse35/`. It holds 13 scripts, each named `z7_*_v35.py`, and they reference each other by the `_v35` names.
-  - Root: `z7_main_v35.py`, `z7_spike_find_v35.py`, `z7_cmp_multi_v35.py`, `z7_fault_list_v35.py`, `z7_gt_report_v35.py`, `z7_poi_distance_v35.py`, `z7_probe_psse_v35.py`, `z7_scr_v35.py`, `z7_tidy_results_v35.py`
+- **v35 set:** `z7_psse35/`. It holds 14 scripts, each named `z7_*_v35.py`, and they reference each other by the `_v35` names.
+  - Root: `z7_main_v35.py`, `z7_spike_find_v35.py`, `z7_cmp_multi_v35.py`, `z7_fault_list_v35.py`, `z7_gt_report_v35.py`, `z7_poi_distance_v35.py`, `z7_probe_psse_v35.py`, `z7_scr_v35.py`, `z7_tidy_results_v35.py`, `z7_init_check_v35.py`
   - `Base\`: `z7_lch_b_v35.py`, `z7_spp_b_v35.py`
   - `Projects\`: `z7_lch_p_v35.py`, `z7_spp_p_v35.py`
 - **v34 (live study):** `z7_con/`, which is generated from `z6_con/` with `mk_z7.py`, a plain `z6_` to `z7_` rename. Edit v34 in `z6_con`, then regenerate `z7_con`.
@@ -26,7 +26,12 @@
    - In `z7_main_v35.py`, `DYR_COMPILE_BATS = ["MyCompile35.bat", "MyCload41.bat"]`.
 5. **Floating-point exception mask:** tries `ucrtbase` first (the C runtime of 64-bit Python and PSS/E 35).
 6. **Messages:** `taskkill /F /IM psse35.exe` hints, `C:\Python39\python.exe` in the run instructions, and "PSS/E 35 python API" in a comment.
-7. **Panel settings** in `z7_main_v35.py` are otherwise the user's v34 panel as of 7f943ad. The v35 set still has `PIPELINE = "all"`, `FORCE_RESCORE = True` and `PLOT_MISSING_OUTS = True`. The user later set those to `"compare"`, `False` and `False` in v34.
+7. **Panel settings** in `z7_main_v35.py` are the user's upload of 2026-09-28: `RUN_CASES = "base"`, `ONLY_FAULTS = ["F01-F04"]`, `FLAT_RUN_S = 5`, `PRE_FAULT_S = 3`, `SIM_END_S = 8`, `EGF_OFF_BASE_RUN = False`, `EGF_FIRST = False`, `FORCE_RESCORE = False`, `PLOT_MISSING_OUTS = False`; `PIPELINE` is still `"all"`.
+8. **DLL bitness guard** (`spp_b`, `spp_p`, the same patch in both). PSS/E 35 is 64-bit and loads `dsusr.dll` from the case folder inside `psseinit()`.
+   - At startup, before psspy is imported, a `dsusr.dll` of the wrong bitness is moved aside as `dsusr.dll.32bit`, and the build compiles a new one. If it cannot be moved, the process exits with rc=1 before PSS/E starts.
+   - After the compile, a 32-bit `dsusr.dll` (the `.bat` files still set up for PSS/E 34) is moved aside, the previous one is put back, and the build stops, naming the `.bat` files.
+   - Model DLLs named in `add_library.idv`, all `*.dll` (`load_user_dlls`), and the BESS DLLs are checked before `addmodellibrary`. A wrong one stops the run and is named. The BESS scan ignores wrong-bitness copies.
+9. **`z7_init_check_v35.py`** (study root, reads only): lists every `.dll` in `Base\` and `Projects\` with its bitness, and the PSSE3x paths in the `.bat` files. It starts PSS/E in separate processes (an empty folder; an empty folder with only `Base\dsusr.dll`; `Base\`; `Projects\`; `Base\` with redirect and tee as the study does), reads the Windows Application Error log, and writes `INIT_CHECK.txt`.
 
 ## v34 fixes made after the v35 set, NOT in v35
 The user asked for the first two to be v34-only. Ask before carrying any of them to v35.
@@ -42,9 +47,15 @@ The user asked for the first two to be v34-only. Ask before carrying any of them
 - Install discovery was tested on fake 34/35 folder trees: the order is correct for 32-bit and 64-bit Python, and `PSSE_ROOT` wins.
 - The psse35/psse34 fallback was tested.
 - An early fake-PSS/E e2e run of the four patched loader scripts, before the rename, reached the .sav-build stage (rc=0). It then stopped there, because the panel default stops after building the .sav files.
+- DLL guard: tested by importing the real `spp_b`/`spp_p` against a fake psspy. Covered: the `.idv` parsing (comments, quotes, spaces, absolute paths), stopping before any `addmodellibrary`/`runrspnsfile`, the BESS scan and pin, a 32-bit and a 64-bit compile result, startup with a 32-bit, 64-bit and non-DLL `dsusr.dll`, three processes racing, and a failed move.
+- `z7_init_check_v35.py`: tested with a fake install. Covered: a crash on dsusr.dll, a vendor DLL only, no PSS/E, PSS/E failing everywhere, a hang (timeout), and no case folders.
+- **First real PSS/E 35.6 run (2026-09-28)**, Python 3.11 at `C:\Users\conti\AppData\Local\Programs\Python\Python311`, found `PSSPY311`:
+  - The BASE build exited `rc=3221225477` (0xC0000005, access violation) on all 3 launches, inside `psseinit(150000)`, right after the copyright banner. That is before the case loads; "150000 BUS POWER SYSTEM SIMULATOR" never printed.
+  - Main suspect: a 32-bit PSS/E 34 `dsusr.dll` in `Base\`. Not confirmed yet: the user has `z7_init_check_v35.py` and will send `INIT_CHECK.txt`.
+  - The study sets `SetErrorMode(SEM_NOGPFAULTERRORBOX)`, so its crashes may not reach the Application event log. The check script's children do not set it.
 - **Not yet done:**
-  - A full e2e run of the renamed `_v35` set. The user cancelled it twice. The runner `scratchpad/emu/run_e2e_z7.py` expects `z7_*.py` names, so it needs adapting for `_v35`.
-  - Any run on real PSS/E 35.
+  - A full e2e run of the renamed `_v35` set. The user cancelled it twice.
+  - A run on real PSS/E 35 that gets past `psseinit`.
 
 ## User setup steps for v35 (on their machine)
 1. Install 64-bit Python 3.9 at `C:\Python39`. The scripts compile on 3.11 and use only the standard library.
@@ -63,6 +74,9 @@ The user asked for the first two to be v34-only. Ask before carrying any of them
 - **psspy APIs** used with fallbacks (`branch_chng_3`, `two_winding_chng_6/_5`, `three_wnd_imped_chng_4/_3`, `machine_chng_2`, `switched_shunt_chng_3`, `dist_bus_fault_2`, `ascc_currents`) are assumed to still exist in 35. Run `z7_probe_psse_v35.py` to check.
 - **Channel file type:** the scripts write and read `.out` files. Confirm that PSS/E 35 writes `.out` (not `.outx`) for the names given, and that `dyntools.CHNF` reads them.
 - **Comments and messages about 32-bit memory** are unchanged. They're harmless under 64-bit Python.
+
+## Cosmetic, seen in the first real run (not fixed)
+- With `RUN_CASES = "base"`, `z7_main` still prints "running BOTH studies at once -- 4 + 4 = 8 concurrent PSS/E session(s)" and "the other case is still running". `PROJ` shows rc=2 (not run).
 
 ## Standing user constraints (apply in the new thread)
 - Standard library only.

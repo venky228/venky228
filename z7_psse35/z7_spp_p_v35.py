@@ -4935,6 +4935,113 @@ open(EVENTS_LOG, "w").close()
 try: os.chdir(STUDY_DIR)
 except Exception as e: print("[init] chdir failed: %s" % e)
 
+# ---- A DLL OF THE WRONG BITNESS NEVER REACHES PSS/E ---------------------------
+# PSS/E 35 is 64-bit and PSS/E 34 is 32-bit; neither can load the other's DLLs.
+# psseinit() loads dsusr.dll from the working folder -- this one -- before any
+# case is read, so a dsusr.dll copied over from a PSS/E 34 study is loaded at
+# the start of every process. dsusr.dll is a build product (the compile step
+# makes it from conec/conet), so a wrong one is moved aside here, as
+# dsusr.dll.32bit, and the build compiles a new one. The vendor model DLLs
+# cannot be rebuilt here: each is checked where it would be loaded
+# (_model_dlls_or_stop) and a wrong one stops the run by name.
+def _pe_machine(path):
+    """The machine a Windows DLL was built for (0x14c 32-bit, 0x8664 64-bit), or
+       None when the file is not a DLL or cannot be read."""
+    import struct as _st
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+            if len(head) < 64 or head[:2] != b"MZ":
+                return None
+            fh.seek(_st.unpack("<I", head[60:64])[0])
+            sig = fh.read(6)
+        if len(sig) < 6 or sig[:4] != b"PE\0\0":
+            return None
+        return _st.unpack("<H", sig[4:6])[0]
+    except Exception:
+        return None
+
+
+def _pe_kind(m):
+    return {0x14c: "32-bit", 0x8664: "64-bit", 0xaa64: "ARM64"}.get(m, "machine 0x%04x" % (m or 0))
+
+
+def _pe_own_machine():
+    import struct as _st
+    return 0x8664 if _st.calcsize("P") == 8 else 0x14c
+
+
+def _dll_wrong_bitness(path):
+    """'32-bit' (or whatever it is) when THIS process cannot load the DLL, else ''."""
+    m = _pe_machine(path)
+    return _pe_kind(m) if m is not None and m != _pe_own_machine() else ""
+
+
+def _dsusr_wrong_bitness_aside():
+    dll = os.path.join(STUDY_DIR, "dsusr.dll")
+    kind = _dll_wrong_bitness(dll) if os.path.isfile(dll) else ""
+    if not kind:
+        return
+    aside = dll + "." + kind.replace("-", "")                # dsusr.dll.32bit
+    try:
+        os.replace(dll, aside)
+        print("[init] *** dsusr.dll in %s is %s: this PSS/E is %s and loads it inside "
+              "psseinit(). Moved aside to %s -- the build compiles a new one from "
+              "conec/conet (MyCompile35.bat and MyCload41.bat must point at PSS/E 35) ***"
+              % (STUDY_DIR, kind, _pe_kind(_pe_own_machine()), os.path.basename(aside)))
+    except Exception as e:
+        if os.path.isfile(dll) and _dll_wrong_bitness(dll):
+            print("[init] *** dsusr.dll in %s is %s and could not be moved aside (%s). "
+                  "PSS/E cannot load it -- delete it and run again ***" % (STUDY_DIR, kind, e))
+            sys.stdout.flush()
+            sys.exit(1)
+        # another process of this case moved it first
+
+
+_dsusr_wrong_bitness_aside()
+
+
+def _idv_dll_paths(idv):
+    """The .dll files an .idv names (ADDMODELLIBRARY lines and the like): as
+       written when absolute, else in this folder. '@!' comment lines are skipped;
+       a bare name that is not in this folder is PSS/E's to find, not checked."""
+    out = []
+    try:
+        with open(idv, "r", errors="ignore") as fh:
+            lines = fh.read().splitlines()
+    except Exception:
+        return out
+    for ln in lines:
+        if ln.strip().startswith("@!"):
+            continue
+        names = re.findall(r"'([^']*?\.dll)'|\"([^\"]*?\.dll)\"", ln, re.I)
+        rest = re.sub(r"'[^']*'|\"[^\"]*\"", " ", ln)
+        names = [a or b for a, b in names] + re.findall(r"[^\s'\",;]+\.dll\b", rest, re.I)
+        for n in names:
+            n = n.strip()
+            p = n if os.path.isabs(n) else os.path.join(STUDY_DIR, n)
+            if os.path.isfile(p) and p not in out:
+                out.append(p)
+    return out
+
+
+def _model_dlls_or_stop(paths, where):
+    """Stop, naming each one, if any of these DLLs is of a bitness this PSS/E
+       cannot load. addmodellibrary on one is at best a model that is silently
+       not there, and at worst an access violation inside PSS/E."""
+    bad = [(p, _dll_wrong_bitness(p)) for p in paths if os.path.isfile(p)]
+    bad = [(p, k) for p, k in bad if k]
+    if not bad:
+        return
+    print("  [dll] *** %d model DLL(s) %s are not %s -- this PSS/E cannot load them:"
+          % (len(bad), where, _pe_kind(_pe_own_machine())))
+    for p, k in bad:
+        print("  [dll]       %-7s %s" % (k, p))
+    print("  [dll]     Get the PSS/E 35 (64-bit) build of each from its vendor, or take it "
+          "out of %s and this folder if the deck does not use it. ***" % ADDLIB_IDV)
+    raise RuntimeError("%d model DLL(s) of the wrong bitness %s: %s"
+                       % (len(bad), where, ", ".join(os.path.basename(p) for p, _k in bad)))
+
 # ---- put PSS/E 34 or 35 on the Python path BEFORE importing psse34/35 ------
 # PSS/E 35: install folder C:\Program Files\PTI\PSSE35\35.x, 64-bit Python 3.7-3.11.
 # Run z7_main_v35.py with that Python (e.g. C:\Python39\python.exe); the launchers and
@@ -6975,7 +7082,9 @@ def load_user_dlls():
     if _DLLS_LOADED:
         print("  DLLs already loaded -- skipping"); return
     n = 0
-    for d in sorted(glob.glob(os.path.join(STUDY_DIR, "*.dll"))):
+    _all = sorted(glob.glob(os.path.join(STUDY_DIR, "*.dll")))
+    _model_dlls_or_stop(_all, "in %s" % STUDY_DIR)
+    for d in _all:
         try: psspy.addmodellibrary(d); n += 1
         except Exception as e: print("  [dll] %s: %s" % (os.path.basename(d), e))
     print("  loaded %d DLL(s)" % n)
@@ -8267,12 +8376,16 @@ def _abspath(f):
     return f if os.path.isabs(f) else os.path.join(STUDY_DIR, f)
 
 # ---- surplus-BESS builder (power flow + dynamics) --------------------------
-def _find_dlls_with_models(names):
+def _find_dlls_with_models(names, wrong_bitness=False):
     """Scan STUDY_DIR *.dll for libraries whose binary contains any of the given model-name
-       strings (the USRMDL model name is stored verbatim in the DLL). Returns [paths]."""
+       strings (the USRMDL model name is stored verbatim in the DLL). Returns [paths].
+       Only the DLLs this PSS/E can load -- or, with wrong_bitness=True, only the
+       ones it cannot, so a caller can name them."""
     needles = [n.encode("ascii", "ignore") for n in names]
     hits = []
     for d in sorted(glob.glob(os.path.join(STUDY_DIR, "*.dll"))):
+        if bool(_dll_wrong_bitness(d)) != bool(wrong_bitness):
+            continue
         try:
             with open(d, "rb") as fh:
                 blob = fh.read()
@@ -8294,8 +8407,16 @@ def load_bess_dlls():
     if not ENABLE_BESS or _BESS_DLLS_LOADED:
         return
     dlls = [d if os.path.isabs(d) else os.path.join(STUDY_DIR, d) for d in BESS_MODEL_DLLS]
+    _model_dlls_or_stop(dlls, "in BESS_MODEL_DLLS")
     if not dlls:
         dlls = _find_dlls_with_models(["REGCAU1", "REECAU1", "REPCAU1"])
+        if not dlls:
+            # A LIBRARY THAT HAS THE MODELS BUT CANNOT BE LOADED. The scan skips
+            # DLLs of the wrong bitness; if those were the only ones with the
+            # models, say so by name rather than "no DLL contains them".
+            _model_dlls_or_stop(_find_dlls_with_models(["REGCAU1", "REECAU1", "REPCAU1"],
+                                                       wrong_bitness=True),
+                                "holding REGCAU1/REECAU1/REPCAU1")
         if dlls:
             print("  [bess] DLL(s) containing REGCAU1/REECAU1/REPCAU1:")
             for d in dlls:
@@ -11658,6 +11779,21 @@ def _dyr_compile_user_models(changed):
             % (STUDY_DIR,
                (" (it left %s, so the link reached its final step)"
                 % ", ".join(_left)) if _left else ""))
+    # BUILT FOR THIS PSS/E? Batch files still set up for PSS/E 34 build a 32-bit
+    # dsusr.dll, and psseinit() in every worker would load it. Moved aside so
+    # nothing can, and the build stops by name.
+    _kind = _dll_wrong_bitness(dll)
+    if _kind:
+        try:
+            os.replace(dll, dll + "." + _kind.replace("-", ""))
+        except Exception:
+            pass
+        _restore()
+        raise RuntimeError(
+            "the compile produced a %s dsusr.dll, which this %s PSS/E cannot load -- "
+            "%s still build for PSS/E 34. Point them at PSS/E 35 (C:\\Program Files\\"
+            "PTI\\PSSE35\\35.x) and its 64-bit compiler set-up, then run again."
+            % (_kind, _pe_kind(_pe_own_machine()), " and ".join(bats)))
     if _stashed:
         try:
             os.remove(_stash)
@@ -16740,7 +16876,9 @@ def restore_and_init(snp=SNP_FILE, cnv=CNV_CASE):
         if psspy.rstr(snp) != 0: raise RuntimeError("rstr failed")
         if psspy.case(cnv) != 0: raise RuntimeError("case failed")
         psspy.fact(); psspy.tysl(0)
-        if os.path.isfile(_abspath(ADDLIB_IDV)): _apply_deck(ADDLIB_IDV, required=False)
+        if os.path.isfile(_abspath(ADDLIB_IDV)):
+            _model_dlls_or_stop(_idv_dll_paths(_abspath(ADDLIB_IDV)), "named in %s" % ADDLIB_IDV)
+            _apply_deck(ADDLIB_IDV, required=False)
         else: load_user_dlls()
         load_bess_dlls()          # the BESS model library must be loaded before strt_2
         # INIT dynamics params -- Run3 uses ACCEL 0.60, TOL 0.0000095 (build TOL 0.0001)

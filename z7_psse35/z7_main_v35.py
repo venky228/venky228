@@ -323,8 +323,8 @@ PROJECTS = ["SantaFe", "IronStar","EmpirePrairie","EastFork"]                   
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
 MODES = ["spp"]                              # fault set: spp | con | table | custom | manual
 PIPELINE = "all"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
-RUN_CASES = "both"                           # "both" | "base" | "proj" -- which case to simulate
-ONLY_FAULTS = []                    # [] = every fault | e.g. ["F01-F04"]
+RUN_CASES = "base"                           # "both" | "base" | "proj" -- which case to simulate
+ONLY_FAULTS = ["F01-F04"]                    # [] = every fault | e.g. ["F01-F04"]
 ONLY_EVENTS = []                             # [] = every event
 FRESH_START = False                          # True = start over (clears .done markers) -- set back to False after
 SKIP_DONE = True                             # True = skip scenarios that already have .done + .out
@@ -359,9 +359,9 @@ PLOT_WORKERS = 2                             # plotters per case
 PLOT_TOTAL_MAX = 4                           # cap on plotters
 PLOT_TOTAL_MAX_IDLE = 8                      # cap on plotters once NOTHING is simulating (0 = PLOT_TOTAL_MAX)
 # simulation time
-FLAT_RUN_S = 25                               # s, no-fault run
-PRE_FAULT_S = 5                              # s before the fault
-SIM_END_S = 25.2                               # s per fault
+FLAT_RUN_S = 5                               # s, no-fault run
+PRE_FAULT_S = 3                              # s before the fault
+SIM_END_S = 8                               # s per fault
 RUN_NPLT = 2                                 # write every N steps (1 = every step, huge)
 
 # ---- 3. GEN / CAP / LINE TEST --------------------------------------------------
@@ -647,9 +647,9 @@ DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is s
 EGF_DYR_EDITS_BY_PROJECT = {}                # {"SantaFe": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}
 EGF_DYR_RUN = False                          # True = run BOTH cases with those edits (_egf) and compare
 EGF_OFF_RUN = False                          # True = run BOTH cases with every existing machine OFF (_egfoff) and compare
-EGF_OFF_BASE_RUN = True                     # True = run the BASE case ONLY with every existing machine OFF (_egfoff);
+EGF_OFF_BASE_RUN = False                     # True = run the BASE case ONLY with every existing machine OFF (_egfoff);
                                              #   the PROJECT side of its comparisons is the surplus run s1_egfoff
-EGF_FIRST = True                             # True = the EGF runs above go FIRST, before the main runs, the
+EGF_FIRST = False                             # True = the EGF runs above go FIRST, before the main runs, the
                                              #   rescore/replot and the surplus steps (False = last, as before)
 EGF_PROJECTS = []                            # [] = every project of the launch (EGF_DYR_RUN: those with edits)
 EGF_FAULTS = "same"                          # "same" = ONLY_FAULTS | "all" | ["F01-F04"]
@@ -755,7 +755,7 @@ RESTORE_TRUNCATED_DONE = True
 OUT_EMPTY_BYTES = 1048576                    # .out under this = empty
 
 # ---- 17. SCORING ---------------------------------------------------------------
-FORCE_RESCORE = True                        # True = re-score everything every launch
+FORCE_RESCORE = False                        # True = re-score everything every launch
 RESCORE_STALE_REPORTS = True                 # re-score a report older than its .out
 STALE_REPORT_TOL_S = 120
 REPORT_COVERAGE_MIN = 0.90                   # re-score a report covering less than this
@@ -769,7 +769,7 @@ FAST_COMPARE_PARALLEL = 4                    # projects at once
 
 # ---- 18. PLOTS -----------------------------------------------------------------
 MAKE_PLOTS = None                            # None = draw | False = no PDFs (faster)
-PLOT_MISSING_OUTS = True                    # draw PDFs for .out files without one
+PLOT_MISSING_OUTS = False                    # draw PDFs for .out files without one
 FORCE_REPLOT = False                         # True = redraw every PDF
 PLOT_SCOPE = "compact"                       # "compact" | "full"
 PLOT_ONE_PROJECT_AT_A_TIME = True
