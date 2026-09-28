@@ -676,6 +676,14 @@ DYR_SWEEP_COMPARE = True                     # full comparison per value
 DYR_SWEEP_SKIP_DECK = True                   # skip a value the deck already has
 DYR_DECK_VALUES = {}                         # override the deck values read from the template
 
+# QUICK_DYR_TEST (section 0): the SWEEP STUDIES ONLY are simulated with these times.
+# Everything else in the launch keeps the study's own (FLAT_RUN_S / PRE_FAULT_S /
+# SIM_END_S), so the existing folders are checked and scored exactly as before --
+# and no existing folder is simulated into (see the end of section 15).
+QUICK_SIM_TIMES = {"FLAT_RUN_S": 5,          # s, no-fault run      (study: 25)
+                   "PRE_FAULT_S": 3,         # s before the fault   (study: 5)
+                   "SIM_END_S": 8}           # s per fault          (study: 25.2)
+
 # QUICK_DYR_TEST (section 0). Constant names as the project's BESS_MODEL_TEMPLATE
 # records name them (REECCU1 has no Thld -- that is REECA1). Deck: Kqv 0.5,
 # Volim 1.2, Khv 0.0, Vfrz 0.88. Every combination is one run.
@@ -693,9 +701,6 @@ if QUICK_DYR_TEST:
     RUN_CASES = "proj"
     ONLY_FAULTS = list(_QUICK_DYR[QUICK_DYR_TEST]["faults"])
     SKIP_DONE = True
-    FLAT_RUN_S = 5                           # s, no-fault run      (study: 25)
-    PRE_FAULT_S = 3                          # s before the fault   (study: 5)
-    SIM_END_S = 8                            # s per fault          (study: 25.2)
     DYR_SHOW = ["REECCU1", "REGCAU1", "REPCAU1"]     # prints the current values -- check them first
     DYR_SWEEP_BY_PROJECT = {QUICK_DYR_TEST: _QUICK_DYR[QUICK_DYR_TEST]["sweep"]}
     DYR_SWEEP_PROJECTS = [QUICK_DYR_TEST]
@@ -772,6 +777,20 @@ SWEEP_SKIP_DONE = True                       # True = swept runs resume
 PROJECT_OFF_RUN = False                      # True = extra study with the project machines off
 PROJECT_OFF_PROJECTS = []                    # [] = every project
 PROJECT_OFF_COMPARE = False
+
+# QUICK_DYR_TEST: ONLY the sweep simulates. The EGF-off base run and the surplus
+# runs launch into EXISTING folders, and so would the "missing" fill-in; at other
+# simulation times the launcher moves a finished run aside and runs it again.
+if QUICK_DYR_TEST:
+    EGF_DYR_RUN = False
+    EGF_OFF_RUN = False
+    EGF_OFF_BASE_RUN = False
+    SURPLUS_SCENARIOS = []
+    NEW_PLANT_RUN = False
+    PROJECT_OFF_RUN = False
+    CAPACITY_LEVELS = []
+    POI_P_LEVELS = []
+    POI_P_LEVELS_PCT = []
 
 # ---- 16. RESUME RULES ----------------------------------------------------------
 RUN_ONLY_MISSING_OUT = True                  # True = simulate only faults with no .out
@@ -10920,6 +10939,22 @@ def _dyr_sweep_dir(proj, mode, tag, cap_tag=""):
                         "%s_%s%s_%s" % (proj, mode, _cap_suffix(cap_tag), tag))
 
 
+def _quick_sim_env():
+    """QUICK_SIM_TIMES for a sweep study (QUICK_DYR_TEST), as the study reads them."""
+    t = QUICK_SIM_TIMES or {}
+    out = {}
+    for k in ("FLAT_RUN_S", "PRE_FAULT_S", "SIM_END_S"):
+        if t.get(k) is not None:
+            out["SPP_" + k] = repr(float(t[k]))
+    return out
+
+
+def _is_quick_folder(d):
+    """A .dyr sweep folder of a QUICK_DYR_TEST launch: simulated at QUICK_SIM_TIMES."""
+    return bool(QUICK_DYR_TEST) and "_dyr_" in os.path.basename(os.path.normpath(os.path.dirname(d)
+                                                                             if os.path.basename(d) == "outs" else d))
+
+
 def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
     """Run the project case once per DYR_SWEEP variant, at ONE capacity level.
 
@@ -10962,6 +10997,10 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
         print("[dyr-sweep] %s %s: nothing to sweep -- the project case scored no fault"
               % (proj, mode))
         return [], []
+    if QUICK_DYR_TEST:
+        print("[dyr-sweep] QUICK_DYR_TEST: these studies run at %s -- every other folder keeps the "
+              "study's own times" % ", ".join("%s %g s" % (k, v) for k, v in
+                                           sorted((QUICK_SIM_TIMES or {}).items())))
     print("[dyr-sweep] %s %s%s: %d value combination(s) x %d %s"
           % (proj, mode, _cap_note(cap_tag), len(variants), len(faults), what))
     for tag, edits in variants:
@@ -10985,6 +11024,8 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
         # read "scored the FLAT RUN and NO FAULT" with every fault simulated.
         env = {"SPP_DYR_EDITS_BY_PROJECT": json.dumps(_tbl),
                "SPP_RUN_TAG": tag, "SPP_DEFER_REPORTS": "0"}
+        if QUICK_DYR_TEST:
+            env.update(_quick_sim_env())
         # RESUME OR RE-SIMULATE -- see _sweep_resume_env(). This used to be
         # "always re-simulate", which on a second launch repeats every value
         # from nothing.
@@ -18420,6 +18461,12 @@ def _score_tagged_folder(case, proj, mode, rdir, missing):
         return None
     if rc not in (0, None):
         print("[coverage]     the scoring pass ended rc=%s -- what it scored is kept" % rc)
+        # NOT ASKED AFTER ALL: the next launch tries these again (see _SCORETRY_NEW)
+        for _sid, stamp, _omt in todo:
+            try:
+                os.remove(stamp)
+            except Exception:
+                pass
     # ITS REPORTS ARE THE _SELECTED ONES -- rebuild the full ones from every part.
     _merge_one_folder(case, rdir)
     _MEAS_CACHE.clear()
@@ -18942,6 +18989,23 @@ def retire_truncated_done(quiet=False):
         _t_full = None
     n_back = 0
     for case, od, _proj, _mode in folders:
+        if _is_quick_folder(od):
+            # A QUICK_DYR_TEST sweep folder: run at QUICK_SIM_TIMES on purpose. A
+            # compare at the study's own times (z6_main.py) renamed its markers
+            # .done.truncated -- give back the ones that reached the quick end.
+            try:
+                _qe = float((QUICK_SIM_TIMES or {}).get("SIM_END_S")) - 0.11
+            except (TypeError, ValueError):
+                _qe = None
+            for _tp in glob.glob(os.path.join(od, "*.done.truncated")):
+                _te = _marker_tend(_tp)
+                if _qe is not None and _te is not None and _te >= _qe:
+                    try:
+                        os.rename(_tp, _tp[:-len(".truncated")])
+                        n_back += 1
+                    except Exception:
+                        pass
+            continue
         sizes = {}
         for p in glob.glob(os.path.join(od, "*.out")):
             sid = os.path.splitext(os.path.basename(p))[0]
@@ -19094,6 +19158,31 @@ def retire_truncated_done(quiet=False):
         print("[compare]     Set RESCORE_STALE_REPORTS = True, or re-run those "
               "scenarios.")
     return n_moved + n_back
+
+
+# "ASKED ONCE" MARKERS WRITTEN THIS LAUNCH, per (case key, project). outs\<id>.scoretry
+# is written before the scoring pass starts; a pass that never ran -- the launcher
+# refused the Python (3.11 has no PSSPY311) and returned rc=2 at once -- left every
+# unscored fault marked as asked, and no later launch scored it again.
+_SCORETRY_NEW = {}
+
+
+def _scoretry_undo(case_key, projects, rc):
+    """The scoring pass for these projects did not finish cleanly: forget its
+       markers, so the next launch asks again."""
+    if rc in (0, None):
+        return
+    n = 0
+    for pj in projects or []:
+        for st in _SCORETRY_NEW.pop((case_key, pj), []):
+            try:
+                os.remove(st)
+                n += 1
+            except Exception:
+                pass
+    if n:
+        print("[compare] %s: the scoring pass ended rc=%s -- %d unscored run(s) will be "
+              "asked for again next launch" % (case_key, rc, n))
 
 
 def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
@@ -19292,6 +19381,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                     try:
                         with open(_stamp, "w") as _fh:
                             _fh.write(_omt)
+                        _SCORETRY_NEW.setdefault((case["key"], proj), []).append(_stamp)
                     except Exception:
                         pass
                 need.append(proj)
@@ -19412,6 +19502,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                 _env.update(env_add)
             _r = run_study(c, projects=_projs, modes=mode_list, extra_env=_env,
                            log_path=log_path)
+            _scoretry_undo(c["key"], _projs, _r)
             if _r not in (0, None) and _rc in (0, None):
                 _rc = _r
         return _rc
@@ -23749,7 +23840,12 @@ def main():
     # one of its faults comes out "scored on one side only", which is true and
     # useless. This runs exactly the side that is missing, for exactly the
     # projects that are missing it, and nothing else.
-    if pipeline == "missing":
+    if pipeline == "missing" and QUICK_DYR_TEST:
+        print("")
+        print("[compare] QUICK_DYR_TEST = %r: the existing folders are NOT filled in --"
+              % QUICK_DYR_TEST)
+        print("[compare]     only the .dyr sweep simulates, each value in its own folder.")
+    if pipeline == "missing" and not QUICK_DYR_TEST:
         # WHAT "MISSING" MEANS. It used to mean "a project that has a results
         # folder on one side and not the other" -- so a project with no folder
         # on EITHER side (IronStar, EmpirePrairie, never started) was not
