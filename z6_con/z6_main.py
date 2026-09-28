@@ -12158,6 +12158,10 @@ def _in_own_process(fn):
             _release_compare_memory()
             return fn(*a, **k)
         _release_compare_memory()
+        # the campaign plan's NOW RUNNING line: the child's banners do not
+        # reach this process, so name the step here and take its last one back
+        _PLAN_NOW[0] = "%s %s   (since %s)" % (name, " ".join(str(x) for x in a),
+                                               time.strftime("%Y-%m-%d %H:%M"))
         import tempfile
         tmp = tempfile.mkdtemp(prefix="z6_step_")
         rp = os.path.join(tmp, "result.json")
@@ -12184,6 +12188,8 @@ def _in_own_process(fn):
             res = {"ok": False, "error": "the separate Python ended rc=%s without "
                                          "a result -- see its lines above" % rc}
         shutil.rmtree(tmp, ignore_errors=True)
+        if res.get("plan_now"):
+            _PLAN_NOW[0] = res["plan_now"]
         if not res.get("ok"):
             raise RuntimeError(res.get("error") or "failed")
         return res.get("value")
@@ -12212,6 +12218,7 @@ def _run_extra_step(spec):
         except Exception:
             pass
         res = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    res["plan_now"] = _PLAN_NOW[0]
     try:
         with open(spec["result"], "w") as fh:
             json.dump(res, fh)
