@@ -1,0 +1,76 @@
+# PSS/E 35 (v35) script set: handoff
+
+## Where things are
+- **Repo:** `venky228/venky228`, branch `claude/great-ramanujan-c0v50u`.
+- **v35 set:** `z7_psse35/`. It holds 13 scripts, each named `z7_*_v35.py`, and they reference each other by the `_v35` names.
+  - Root: `z7_main_v35.py`, `z7_spike_find_v35.py`, `z7_cmp_multi_v35.py`, `z7_fault_list_v35.py`, `z7_gt_report_v35.py`, `z7_poi_distance_v35.py`, `z7_probe_psse_v35.py`, `z7_scr_v35.py`, `z7_tidy_results_v35.py`
+  - `Base\`: `z7_lch_b_v35.py`, `z7_spp_b_v35.py`
+  - `Projects\`: `z7_lch_p_v35.py`, `z7_spp_p_v35.py`
+- **v34 (live study):** `z7_con/`, which is generated from `z6_con/` with `mk_z7.py`, a plain `z6_` to `z7_` rename. Edit v34 in `z6_con`, then regenerate `z7_con`.
+- **Target machine:**
+  - v34 study: `C:\KV\ENGIE\CQ_MIT`, run with `C:\Python34\python.exe` (32-bit) and PSS/E 34 at `C:\Program Files (x86)\PTI\PSSE34`.
+  - PSS/E 35.6: installed at `C:\Program Files\PTI\PSSE35\35.6`. It has PSSPY27/37/38/39/311, PSSBIN, PSSBIN32 and DSUSR-2013/2017.
+  - v35 study: planned for a separate folder, `C:\KV\ENGIE\CQ_MIT_35`, so PSS/E 34 and 35 results are never mixed in one comparison.
+
+## How v35 differs from z7 (v34), as of commit 7f943ad
+1. **PSS/E path discovery** (`spp_b`, `spp_p`, `spike_find`, `fault_list`):
+   - `_psse_install_roots()` also searches one level down (`PSSE35\35.x`).
+   - It orders installs by the interpreter's bitness: 64-bit Python looks at Program Files first, 32-bit at Program Files (x86) first.
+   - The `PSSE_ROOT` environment variable always wins.
+2. **Loading PSS/E:**
+   - `_import_psse_shim()` tries `psse35`, then `psse34`.
+   - `_psse_dll_dir()` calls `os.add_dll_directory`, which Python 3.8+ needs to load the PSS/E DLLs.
+3. **Launchers** (`lch_b`, `lch_p`): `preflight_python` (the wrong-Python check) also sees `PSSE35\35.x\PSSPY##`, and suggests `C:\Program Files\Python##` and `py -3.9`.
+4. **User-model compile step:**
+   - `DYR_COMPILE_BAT_NAMES` looks for `MyCompile35.bat` first, then `MyCompile34.bat`.
+   - In `z7_main_v35.py`, `DYR_COMPILE_BATS = ["MyCompile35.bat", "MyCload41.bat"]`.
+5. **Floating-point exception mask:** tries `ucrtbase` first (the C runtime of 64-bit Python and PSS/E 35).
+6. **Messages:** `taskkill /F /IM psse35.exe` hints, `C:\Python39\python.exe` in the run instructions, and "PSS/E 35 python API" in a comment.
+7. **Panel settings** in `z7_main_v35.py` are otherwise the user's v34 panel as of 7f943ad. The v35 set still has `PIPELINE = "all"`, `FORCE_RESCORE = True` and `PLOT_MISSING_OUTS = True`. The user later set those to `"compare"`, `False` and `False` in v34.
+
+## v34 fixes made after the v35 set, NOT in v35
+The user asked for the first two to be v34-only. Ask before carrying any of them to v35.
+
+| Commit | Change | Files |
+|---|---|---|
+| b47d23a | **F167 plotter fix.** A drawn run that finished but holds non-finite values now gets a `.plotted` marker with `[endtime-checked]`, and `_nonfinite` is reset for each scenario. Before, such a run shut down plotter slots as "failing at startup". | `spp_b`, `spp_p` |
+| 0de52e0 | **PDF violations index headers.** "Quantity" became "Signal" and "What it broke" became "Violation". | `spp_b`, `spp_p` |
+| 117dfda | **Compare memory fix.** `_release_compare_memory()` clears `_MEAS_CACHE`, `_SCEN_PART_CACHE`, `_OUT_SET_CACHE` and `_PART_LAY_CACHE`, then runs `gc.collect()`, before `compare_surplus_scenarios`, `compare_egf_variants`, `compare_three_way` and `write_all_variants_overvoltage`. If no thread can be started, the 3-way child's output is drained in the main thread. It fixes the empty `()` errors and "can't start new thread" in 32-bit Python. It is less critical under 64-bit Python 3.9 (v35), but harmless. | `z7_main` |
+
+## Testing status of v35
+- All 13 scripts compile under Python 3.11.
+- Install discovery was tested on fake 34/35 folder trees: the order is correct for 32-bit and 64-bit Python, and `PSSE_ROOT` wins.
+- The psse35/psse34 fallback was tested.
+- An early fake-PSS/E e2e run of the four patched loader scripts, before the rename, reached the .sav-build stage (rc=0). It then stopped there, because the panel default stops after building the .sav files.
+- **Not yet done:**
+  - A full e2e run of the renamed `_v35` set. The user cancelled it twice. The runner `scratchpad/emu/run_e2e_z7.py` expects `z7_*.py` names, so it needs adapting for `_v35`.
+  - Any run on real PSS/E 35.
+
+## User setup steps for v35 (on their machine)
+1. Install 64-bit Python 3.9 at `C:\Python39`. The scripts compile on 3.11 and use only the standard library.
+2. Create `C:\KV\ENGIE\CQ_MIT_35`:
+   - Put the scripts in the layout above. `CQ_MIT_35_scripts.zip`, already sent, has that layout.
+   - Copy the `.sav`, `.dyr` and `.idv` files and `FAULT_LISTS_BPM\`.
+   - Do **not** copy the results folders, comparisons, `.snp`/`.cnv`/`.cnl` files, `dsusr.dll` or vendor `.dll` files.
+3. In `Base\` and `Projects\`:
+   - Create `MyCompile35.bat` from `MyCompile34.bat`, and update `MyCload41.bat`, changing the PSSE34 paths to `PSSE35\35.6`.
+   - Rebuild `dsusr.dll` as 64-bit.
+   - Get 64-bit PSS/E 35 versions of the vendor model DLLs. The scripts `addmodellibrary` every `*.dll` in the study folder.
+4. For the first launch, set `FRESH_START = True` and `FORCE_REBUILD = True` (then back to False), and `ONLY_FAULTS = ["F01-F03"]` with one project. Run `C:\Python39\python.exe z7_main_v35.py`.
+5. Expect `[init] PSS/E: C:\Program Files\PTI\PSSE35\35.6\PSSPY39` in the log. The CodeMeter licence must cover PSS/E 35.
+
+## Known risks / things to check on first real v35 run
+- **psspy APIs** used with fallbacks (`branch_chng_3`, `two_winding_chng_6/_5`, `three_wnd_imped_chng_4/_3`, `machine_chng_2`, `switched_shunt_chng_3`, `dist_bus_fault_2`, `ascc_currents`) are assumed to still exist in 35. Run `z7_probe_psse_v35.py` to check.
+- **Channel file type:** the scripts write and read `.out` files. Confirm that PSS/E 35 writes `.out` (not `.outx`) for the names given, and that `dyntools.CHNF` reads them.
+- **Comments and messages about 32-bit memory** are unchanged. They're harmless under 64-bit Python.
+
+## Standing user constraints (apply in the new thread)
+- Standard library only.
+- v34 must stay Python 3.4-compatible. v35 targets Python 3.9 (3.7–3.11).
+- Keep the user's panel settings exactly as in their last upload.
+- Test edge cases end to end and check that other scripts are not affected.
+- Concise replies.
+- Write "nodes", not "hops".
+- No model identifiers in commits.
+- Send full scripts via SendUserFile.
+- Commit to `claude/great-ramanujan-c0v50u`, with no PR unless asked and no untracked files.
