@@ -33,6 +33,12 @@ import os, sys, re, ast, csv, io, time
 
 # ---- SETTINGS -------------------------------------------------------------
 PROJECTS = []          # [] = PROJECTS from z6_main.py
+MW_BASIS = "both"      # which MW the SCR divides by:
+                       #   "project" = the BESS rating(s) of BESS_PROJECTS (502, 214, ...)
+                       #   "gia"     = the GIA capacity at the POI, POI_P_TARGET_MW in z6_main.py
+                       #               (984.2, 290.5, ...: BESS + existing together)
+                       #   "both"    = a column for each (a GIA equal to a BESS size is shown once)
+GIA_MW = {}            # {} = POI_P_TARGET_MW from z6_main.py; or set here, e.g. {"SantaFe": 984.2}
 USE_FAULTS = True      # False = no fault-list outages at all: intact system, POI_N1 and
                        #         EXTRA_OUTAGES only (a quick SCR at the POI)
 ONLY_FAULTS = []       # [] = every fault of the list. Otherwise only these, e.g.
@@ -476,11 +482,12 @@ def _flag(scr):
 # ---- ONE PROJECT -------------------------------------------------------------
 def run_project(proj, info, rows, L):
     poi, mws, feeders = info["poi"], info["mw"], set(info["feeders"])
+    tags = info.get("tag") or [""] * len(mws)
     sav = _base_sav(proj)
     L.append("")
     L.append("=" * 120)
     L.append(" %s   POI %d   project %s MW   case %s" % (
-        proj, poi, " / ".join("%.0f" % m for m in mws), os.path.basename(sav or "?")))
+        proj, poi, " / ".join("%.1f%s" % (m, " GIA" if t else "") for m, t in zip(mws, tags)), os.path.basename(sav or "?")))
     L.append("=" * 120)
     _load(sav)
     try:
@@ -493,8 +500,8 @@ def run_project(proj, info, rows, L):
     sets = outage_sets(proj, poi)
     print("[scr] %s: POI %d, %d outage set(s)" % (proj, poi, len(sets)))
     hdr = " %-38s %-14s" % ("outage", "state")
-    for m in mws:
-        hdr += " %9s %11s" % ("SCMVA", "SCR@%.0fMW" % m)
+    for m, t in zip(mws, tags):
+        hdr += " %9s %11s" % ("SCMVA", ("SCR@%.0f%s" % (m, "GIA" if t else "MW")))
     L.append(hdr + "  flag   faults")
     L.append(" " + "-" * 118)
     for state, off in (("all in", []), ("EGF off", egf)):
@@ -595,9 +602,26 @@ def main():
     projs = PROJECTS or _panel("PROJECTS", []) or sorted(info)
     rows, L = [], []
     L.append(" SCR AT THE POI -- %s" % time.strftime("%Y-%m-%d %H:%M"))
-    L.append(" SCMVA = SBASE/|Z1 Thevenin| at the POI (PSS/E ASCC, 3-phase); SCR = SCMVA / project MW")
+    L.append(" SCMVA = SBASE/|Z1 Thevenin| at the POI (PSS/E ASCC, 3-phase); SCR = SCMVA / MW")
+    L.append(" MW: BESS rating (SCR@...MW) and/or GIA capacity at the POI (SCR@...GIA) -- MW_BASIS = %r" % MW_BASIS)
     L.append(" all in = every existing machine in service; EGF off = the project's feeder machines out")
     L.append(" WEAK < %.1f, VERY WEAK < %.1f.  Base case (no new plant)." % (WEAK_SCR, VERY_WEAK_SCR))
+    gia = GIA_MW or _panel("POI_P_TARGET_MW", {}) or {}
+    for p in projs:
+        if p not in info:
+            continue
+        bess = list(info[p]["mw"])
+        g = gia.get(p) if isinstance(gia, dict) else None
+        g = float(g) if isinstance(g, (int, float)) else None
+        basis = (MW_BASIS or "both").strip().lower()
+        if basis == "gia" and g:
+            info[p]["mw"], info[p]["tag"] = [g], ["GIA"]
+        elif basis == "both" and g and all(abs(g - b) > 0.5 for b in bess):
+            info[p]["mw"], info[p]["tag"] = bess + [g], [""] * len(bess) + ["GIA"]
+        else:
+            if basis == "gia" and not g:
+                print("[scr] %s: no GIA MW in POI_P_TARGET_MW / GIA_MW -- the BESS rating is used" % p)
+            info[p]["tag"] = [""] * len(bess)
     nmw = max([len(info[p]["mw"]) for p in projs if p in info] or [1])
     for p in projs:
         if p not in info:
@@ -616,10 +640,13 @@ def main():
         w = csv.writer(fh, lineterminator="\n")
         w.writerow(["project", "poi", "state", "event", "outage", "faults", "scmva"] +
                    ["scr_size%d" % (k + 1) for k in range(nmw)] +
-                   ["delta_scmva_vs_intact", "flag", "note"])
+                   ["delta_scmva_vs_intact", "flag", "note", "scr_mw_basis"])
         for r in rows:
             k = len(r) - 10          # size columns this project has
-            w.writerow(r[:7] + r[7:7 + k] + [""] * (nmw - k) + r[7 + k:])
+            ip = info.get(r[0]) or {}
+            basis = " | ".join("size%d=%.1f MW%s" % (j + 1, m, " (GIA)" if t else "")
+                               for j, (m, t) in enumerate(zip(ip.get("mw", []), ip.get("tag", []))))
+            w.writerow(r[:7] + r[7:7 + k] + [""] * (nmw - k) + r[7 + k:] + [basis])
     print("\nwritten: SCR_AT_POI.txt / SCR_AT_POI.csv")
     return 0
 
