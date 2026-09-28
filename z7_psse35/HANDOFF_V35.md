@@ -53,6 +53,7 @@ The user asked for the first two to be v34-only. Ask before carrying any of them
 |---|---|---|
 | b47d23a | **F167 plotter fix.** A drawn run that finished but holds non-finite values now gets a `.plotted` marker with `[endtime-checked]`, and `_nonfinite` is reset for each scenario. Before, such a run shut down plotter slots as "failing at startup". | `spp_b`, `spp_p` |
 | 0de52e0 | **PDF violations index headers.** "Quantity" became "Signal" and "What it broke" became "Violation". | `spp_b`, `spp_p` |
+| 66986c7 | **Reused snapshot keeps its own DLL.** New `_dll_is_snapshots_own()`: with the snapshot reused, a worker keeps `dsusr.dll` when the snapshot's `.flx` record matches the DLL's record, the DLL is present, and it was not linked after its record. Before, every worker relinked when the conec/conet on disk differed, and the EmpirePrairie BASE_EGF_OFF rerun stopped on the cload4 failure. Made on top of the v34 session's b808045 (merged here). | `spp_b`, `spp_p` (z6, z7) |
 | 117dfda | **Compare memory fix.** `_release_compare_memory()` clears `_MEAS_CACHE`, `_SCEN_PART_CACHE`, `_OUT_SET_CACHE` and `_PART_LAY_CACHE`, then runs `gc.collect()`, before `compare_surplus_scenarios`, `compare_egf_variants`, `compare_three_way` and `write_all_variants_overvoltage`. If no thread can be started, the 3-way child's output is drained in the main thread. It fixes the empty `()` errors and "can't start new thread" in 32-bit Python. It is less critical under 64-bit Python 3.9 (v35), but harmless. | `z7_main` |
 
 ## Testing status of v35
