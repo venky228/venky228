@@ -8,20 +8,18 @@ Run it with the same Python as z7_main_v35.py, from the study root:
 It changes nothing. It
   1. counts the .dll in Base\\ and Projects\\ by bitness (PSS/E 35 is 64-bit and
      cannot load a 32-bit PSS/E 34 dsusr.dll or vendor model DLL);
-  2. lists the DLLs PSS/E ships in PSSBIN that another folder would supply first
-     inside python.exe -- Python's own folder or System32 -- with both versions;
+  2. prints the versions of PSS/E's own files and of the CodeMeter runtime;
   3. starts PSS/E in an empty folder, one process per test, and records which
-     DLLs that process had loaded, from where and in which version, when it
-     started or died:
+     DLLs that process had loaded when it started or died:
        1. as the study starts it;
-       2. with PSSBIN first in Windows' DLL search (SetDllDirectory), as it is
-          for the PSS/E GUI;
-       3. with PSS/E's own runtime DLLs (Intel Fortran / OpenMP, Visual C++)
-          loaded first, by full path;
-       4. from a copy of python.exe that has the newest Visual C++ runtime
-          beside it (only when there is one newer than Python's own);
+       2. on ONE thread (OMP_NUM_THREADS=1, MKL_NUM_THREADS=1);
+       3. on one thread and ONE processor;
+       4. with a clean environment (no Intel or Python variables, a short PATH);
+       5. with every other 64-bit Python that PSS/E has a PSSPY folder for;
      the first way that starts is tried again beside a copy of Base\\dsusr.dll;
-  4. reads the last Windows 'Application Error' entries.
+  4. starts the PSS/E GUI itself (psse35.exe) and closes it after 30 s -- a
+     PSS/E window opens and closes by itself;
+  5. reads the last Windows 'Application Error' entries.
 
 Writes INIT_CHECK.txt beside it -- send that file back.
 """
@@ -32,6 +30,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FOLDERS = [os.path.join(HERE, "Base"), os.path.join(HERE, "Projects")]
 BUSES = 150000                        # the study's psseinit(150000)
 TIMEOUT_S = 150                       # one start-up; a modal box counts as hung
+GUI_WAIT_S = 30                       # the GUI is closed after this if it is still up
+ONE_THREAD = {"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "KMP_AFFINITY": "disabled"}
+# What a clean environment keeps: Windows' own variables, nothing else.
+KEEP_ENV = ("SystemRoot", "SystemDrive", "windir", "TEMP", "TMP", "USERPROFILE", "APPDATA",
+            "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "USERNAME", "USERDOMAIN", "COMPUTERNAME",
+            "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles",
+            "CommonProgramFiles(x86)", "CommonProgramW6432", "ProgramData", "ALLUSERSPROFILE",
+            "PUBLIC", "OS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL",
+            "PROCESSOR_REVISION", "NUMBER_OF_PROCESSORS", "PATHEXT", "ComSpec", "DriverData")
 SYSROOT = os.environ.get("SystemRoot", r"C:\Windows")
 SYSTEM32 = os.path.join(SYSROOT, "System32")
 
@@ -39,12 +46,6 @@ SYSTEM32 = os.path.join(SYSROOT, "System32")
 RUNTIME = re.compile(r"^(vcruntime140(_1)?|msvcp140(_\w+)?|concrt140|vcomp140|ucrtbase|"
                      r"libiomp5md|libiompstubs5md|libifcoremd|libifportmd|libmmd|svml_dispmd|"
                      r"libimalloc|libirngmd|libicaf|mkl_\w+|tbb\w*|wibucm64|python3\d*)\.dll$", re.I)
-# Loaded first, in this order, by test 3 (a library's own dependencies before it).
-PRELOAD_ORDER = ["vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
-                 "concrt140.dll", "vcomp140.dll", "libmmd.dll", "svml_dispmd.dll", "libirngmd.dll",
-                 "libimalloc.dll", "libifcoremd.dll", "libifportmd.dll", "libiomp5md.dll",
-                 "libiompstubs5md.dll", "libicaf.dll"]
-
 LOG = []
 
 
@@ -219,21 +220,15 @@ for d in (pssbin, psspy_dir):          # what the study scripts do
         os.add_dll_directory(d)
     except Exception:
         pass
-if mode == "dlldir" and os.name == "nt":
+if mode == "onecpu" and os.name == "nt":
     import ctypes
     from ctypes import wintypes
     k32 = ctypes.WinDLL("kernel32")
-    k32.SetDllDirectoryW.argtypes = [wintypes.LPCWSTR]
-    k32.SetDllDirectoryW.restype = wintypes.BOOL
-    say("STEP  SetDllDirectoryW(PSSBIN) -> %s" % bool(k32.SetDllDirectoryW(pssbin)))
-if mode == "preload" and os.name == "nt":
-    import ctypes
-    for p in [x for x in os.environ.get("CHK_PRELOAD", "").split(os.pathsep) if x]:
-        try:
-            ctypes.WinDLL(p)
-            say("STEP  loaded first: %s" % p)
-        except Exception as e:
-            say("STEP  could not load %s first: %s" % (p, e))
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+    k32.SetProcessAffinityMask.restype = wintypes.BOOL
+    say("STEP  SetProcessAffinityMask(1) -> %s"
+        % bool(k32.SetProcessAffinityMask(k32.GetCurrentProcess(), 1)))
 say("STEP  import psse35")
 try:
     import psse35
@@ -336,11 +331,12 @@ def report_modules(mods, ctx):
         P("   | - %s" % describe(m, ctx))
 
 
-def start_psse(label, cwd, ctx, mode="study", exe=None, extra_env=None):
+def start_psse(label, cwd, ctx, mode="study", exe=None, extra_env=None, base_env=None,
+               psspy_dir=None):
     P("")
     P("-- %s" % label)
-    env = dict(os.environ)
-    env.update({"CHK_PSSPY": ctx.psspy_dir, "CHK_PSSBIN": ctx.pssbin, "CHK_MODE": mode,
+    env = dict(base_env if base_env is not None else os.environ)
+    env.update({"CHK_PSSPY": psspy_dir or ctx.psspy_dir, "CHK_PSSBIN": ctx.pssbin, "CHK_MODE": mode,
                 "CHK_BUSES": str(BUSES)})
     env.update(extra_env or {})
     t0 = time.time()
@@ -400,6 +396,85 @@ def start_psse(label, cwd, ctx, mode="study", exe=None, extra_env=None):
     return ok
 
 
+def start_gui(label, cwd, ctx):
+    """Start psse3x.exe itself; True if it is still up after GUI_WAIT_S (then closed)."""
+    P("")
+    P("-- %s" % label)
+    exes = [x for x in glob.glob(os.path.join(ctx.pssbin, "psse3*.exe"))
+            if re.match(r"^psse3\d\.exe$", os.path.basename(x), re.I)]
+    if not exes:
+        P("   no psse3x.exe in %s" % ctx.pssbin)
+        return None
+    exe = exes[0]
+    P("   %s -- a PSS/E window opens and is closed after %d s" % (exe, GUI_WAIT_S))
+    t0 = time.time()
+    try:
+        p = subprocess.Popen([exe], cwd=cwd)
+    except Exception as e:
+        P("   could not start it: %s" % e)
+        return None
+    mods = None
+    while time.time() - t0 < GUI_WAIT_S:
+        m = list_modules(p.pid)
+        if m:
+            mods = m
+        if p.poll() is not None:
+            break
+        time.sleep(0.5)
+    alive = p.poll() is None
+    if alive:
+        p.kill()
+        p.wait()
+    report_modules(mods, ctx)
+    if alive:
+        P("   exit: still running after %d s -- closed by this check" % GUI_WAIT_S)
+        P("   => THE GUI STARTS")
+        return True
+    rc = p.returncode
+    P("   exit: %s   (%.0f s)" % (rc_text(rc), time.time() - t0))
+    if rc == 0:
+        P("   => it ended by itself with code 0 -- if a PSS/E window is still open, it handed")
+        P("      over to another program; close that window")
+        return None
+    P("   => THE GUI CRASHED TOO")
+    return False
+
+
+def other_pythons(ctx):
+    """[(python.exe, 'xy', PSSPY folder)] -- the other 64-bit Pythons on this machine
+       that PSS/E has a PSSPY folder for."""
+    cands = []
+    try:
+        out = subprocess.check_output(["py", "-0p"], stderr=subprocess.STDOUT, timeout=30)
+        for ln in out.decode("mbcs" if os.name == "nt" else "utf-8", "replace").splitlines():
+            m = re.search(r"([A-Za-z]:\\.*?python\.exe)\s*$", ln.strip(), re.I)
+            if m:
+                cands.append(m.group(1))
+    except Exception:
+        pass
+    for pat in (r"C:\Python3*\python.exe", r"C:\Program Files\Python3*\python.exe",
+                os.path.join(os.environ.get("LOCALAPPDATA", "") or "?", "Programs", "Python",
+                             "Python3*", "python.exe")):
+        cands += glob.glob(pat)
+    seen = set([os.path.normcase(os.path.abspath(sys.executable))])
+    found = []
+    for exe in cands:
+        k = os.path.normcase(os.path.abspath(exe))
+        if k in seen or not os.path.isfile(exe):
+            continue
+        seen.add(k)
+        try:
+            v = subprocess.check_output(
+                [exe, "-c", "import sys, struct; print('%d%d %d' % (sys.version_info[0], "
+                            "sys.version_info[1], struct.calcsize('P') * 8))"],
+                stderr=subprocess.STDOUT, timeout=60).decode("ascii", "replace").split()
+        except Exception:
+            continue
+        if len(v) >= 2 and v[1] == "64" and os.path.isdir(os.path.join(ctx.root, "PSSPY" + v[0])):
+            found.append((exe, v[0], os.path.join(ctx.root, "PSSPY" + v[0])))
+    return found
+
+
 # ---- Windows' own record of the crash -----------------------------------------
 def event_log(n):
     P("")
@@ -442,7 +517,7 @@ def event_log(n):
 
 
 def main():
-    P("INIT CHECK v3 -- %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    P("INIT CHECK v4 -- %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
     P("Python   : %s" % sys.version.replace("\n", " "))
     P("           %d-bit, %s" % (struct.calcsize("P") * 8, sys.executable))
     P("Windows  : %s" % platform.platform())
@@ -452,6 +527,21 @@ def main():
     ctx = Ctx()
     ctx.root, ctx.psspy_dir, ctx.pssbin = find_psspy()
     P("PSS/E    : %s" % (ctx.psspy_dir or "*** no PSSPY%d%d folder found ***" % sys.version_info[:2]))
+    if ctx.pssbin:
+        vers = []
+        for n in ("psse35.exe", "GIC.dll", "MUSTENG.dll"):
+            f = os.path.join(ctx.pssbin, n)
+            if os.path.isfile(f):
+                vers.append("%s %s" % (n, file_version(f) or "?"))
+        for f in sorted(glob.glob(os.path.join(ctx.psspy_dir, "*.pyd")))[:3]:
+            vers.append("%s %s" % (os.path.basename(f), file_version(f) or "?"))
+        P("           %s" % (", ".join(vers) or "(no version information)"))
+    cm = [f for f in (os.path.join(SYSTEM32, "WibuCm64.dll"),
+                      os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "CodeMeter",
+                                   "Runtime", "bin", "CodeMeter.exe"),
+                      os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                                   "CodeMeter", "Runtime", "bin", "CodeMeter.exe")) if os.path.isfile(f)]
+    P("CodeMeter: %s" % (", ".join("%s %s" % (f, file_version(f) or "?") for f in cm) or "not found"))
     envs = sorted(k for k in os.environ if re.match(
         r"^(KMP_|OMP_|MKL_|INTEL|IFORT|ONEAPI|I_MPI|PSSE|PTI|CODEMETER|WIBU|PYTHON|TBB|CONDA|"
         r"__COMPAT_LAYER)", k, re.I))
@@ -518,56 +608,27 @@ def main():
     P("== starting PSS/E in an EMPTY folder, one process per test ==")
     results = []
     results.append(("study", start_psse("1. as the study starts it", empty, ctx), {}))
-    results.append(("dlldir", start_psse("2. PSSBIN first in the DLL search (SetDllDirectory), as for "
-                                         "the PSS/E GUI", empty, ctx, mode="dlldir"),
-                    {"mode": "dlldir"}))
-    pre = []
-    sys32 = dlls_in(SYSTEM32)
-    pyown = dlls_in(pydir)
-    for n in PRELOAD_ORDER:
-        if n in ctx.pssbin_dlls:
-            pre.append(ctx.pssbin_dlls[n])
-        elif n == "vcruntime140_1.dll" and n in sys32 and n in pyown and \
-                vtuple(file_version(sys32[n])) > vtuple(file_version(pyown[n])):
-            pre.append(sys32[n])
-    if pre:
-        results.append(("preload", start_psse("3. PSS/E's own runtime libraries loaded first: %s"
-                                              % ", ".join(os.path.basename(x) for x in pre),
-                                              empty, ctx, mode="preload",
-                                              extra_env={"CHK_PRELOAD": os.pathsep.join(pre)}),
-                        {"mode": "preload", "extra_env": {"CHK_PRELOAD": os.pathsep.join(pre)}}))
-    else:
+    kw = {"extra_env": dict(ONE_THREAD)}
+    results.append(("onethread", start_psse("2. one thread: %s" % ", ".join(
+        "%s=%s" % kv for kv in sorted(ONE_THREAD.items())), empty, ctx, **kw), kw))
+    kw = {"mode": "onecpu", "extra_env": dict(ONE_THREAD)}
+    results.append(("onecpu", start_psse("3. one thread on ONE processor (affinity)",
+                                         empty, ctx, **kw), kw))
+    keep = set(k.upper() for k in KEEP_ENV)
+    clean = dict((k, v) for k, v in os.environ.items() if k.upper() in keep)
+    clean["PATH"] = os.pathsep.join([SYSTEM32, SYSROOT, os.path.join(SYSTEM32, "Wbem"), pydir])
+    kw = {"base_env": clean}
+    results.append(("cleanenv", start_psse("4. a clean environment: Windows' own variables only, "
+                                           "PATH = System32, Windows, Python", empty, ctx, **kw), kw))
+    others = other_pythons(ctx)
+    if not others:
         P("")
-        P("-- 3. skipped: PSSBIN has none of the runtime libraries a test could load first")
-    # 4. a python.exe with the newest Visual C++ runtime beside it
-    best = {}
-    for n in ("vcruntime140.dll", "vcruntime140_1.dll"):
-        cands = [p for p in (ctx.pssbin_dlls.get(n), sys32.get(n)) if p]
-        cands.sort(key=lambda p: vtuple(file_version(p)), reverse=True)
-        if cands:
-            best[n] = cands[0]
-    own_v = file_version(pyown.get("vcruntime140.dll", ""))
-    new_v = file_version(best.get("vcruntime140.dll", ""))
-    if os.environ.get("CHK_FORCE_PYCOPY") or (own_v and new_v and vtuple(new_v) > vtuple(own_v)):
-        pyexe = os.path.join(ctx.tmp, "python_copy")
-        os.makedirs(pyexe)
-        try:
-            shutil.copy2(sys.executable, pyexe)
-            for f in glob.glob(os.path.join(pydir, "python3*.dll")):
-                shutil.copy2(f, pyexe)
-            for n, src in best.items():
-                shutil.copy2(src, os.path.join(pyexe, n))
-            exe = os.path.join(pyexe, os.path.basename(sys.executable))
-            kw = {"exe": exe, "extra_env": {"PYTHONHOME": sys.base_prefix}}
-            results.append(("vcrt", start_psse("4. a copy of python.exe with the Visual C++ runtime %s "
-                                               "beside it (Python's own is %s)"
-                                               % (new_v or "?", own_v or "?"), empty, ctx, **kw), kw))
-        except Exception as e:
-            P("")
-            P("-- 4. could not set up the python.exe copy: %s" % e)
-    else:
-        P("")
-        P("-- 4. skipped: no Visual C++ runtime newer than Python's own (%s)" % (own_v or "?"))
+        P("-- 5. no other 64-bit Python with a PSSPY folder in %s (Python 3.9 would use PSSPY39)"
+          % ctx.root)
+    for exe, xy, pdir in others:
+        kw = {"exe": exe, "psspy_dir": pdir}
+        results.append(("py" + xy, start_psse("5. Python %s.%s: %s" % (xy[0], xy[1:], exe),
+                                              empty, ctx, **kw), kw))
     dsusr = os.path.join(FOLDERS[0], "dsusr.dll")
     good = [(k, kw) for k, ok, kw in results if ok]
     if good and os.path.isfile(dsusr):
@@ -575,34 +636,45 @@ def main():
         os.makedirs(only)
         shutil.copy2(dsusr, only)
         k, kw = good[0]
-        results.append(("dsusr", start_psse("5. test '%s' again, beside a copy of Base\\dsusr.dll (%s)"
+        results.append(("dsusr", start_psse("again: test '%s' beside a copy of Base\\dsusr.dll (%s)"
                                             % (k, bitness(dsusr)), only, ctx, **kw), kw))
+    gui = start_gui("6. the PSS/E GUI itself", empty, ctx)
     shutil.rmtree(ctx.tmp, ignore_errors=True)
-    if not all(ok for _k, ok, _kw in results) and os.name == "nt":
+    if (gui is False or not all(ok for _k, ok, _kw in results)) and os.name == "nt":
         time.sleep(5)                     # Windows writes the crash record a moment later
-    event_log(8)
+    event_log(10)
 
     P("")
     P("== verdict ==")
     r = dict((k, ok) for k, ok, _kw in results)
+    py_ok = [k for k in r if k.startswith("py") and r[k]]
     if r.get("study"):
         P("   PSS/E starts the way the study starts it -- the crash is later than start-up.")
-    elif r.get("dlldir"):
-        P("   DLL SEARCH ORDER: PSS/E starts with PSSBIN first in the DLL search. A DLL in")
-        P("   System32 (listed above) was being used in place of PSS/E's own copy.")
-        P("   -> the study scripts can set PSSBIN first before they load PSS/E.")
-    elif r.get("preload"):
-        P("   RUNTIME LIBRARIES: PSS/E starts when its own runtime libraries are loaded first.")
-        P("   -> the study scripts can load them first before they load PSS/E.")
-    elif r.get("vcrt"):
-        P("   VISUAL C++ RUNTIME: PSS/E starts from a python.exe that has the newer Visual C++")
-        P("   runtime beside it. Python's own vcruntime140.dll is older than PSS/E needs.")
-        P("   -> copy %s and %s into %s"
-          % (best.get("vcruntime140.dll", "?"), best.get("vcruntime140_1.dll", "?"), pydir))
+    elif gui is False:
+        P("   THE PSS/E GUI CRASHES TOO. PSS/E 35.6 itself does not start on this PC -- not")
+        P("   Python, not the scripts. Repair or update PSS/E 35.6, check the CodeMeter licence")
+        P("   covers PSS/E 35, and send Siemens PTI support the event-log lines above with the")
+        P("   Windows and CPU lines at the top. Until then, PSS/E 34 and the v34 scripts work.")
+    elif r.get("onethread") or r.get("onecpu"):
+        P("   THREADS: PSS/E starts on %s and not with its threads as they are."
+          % ("one thread" if r.get("onethread") else "one thread on one processor"))
+        P("   -> the study scripts can set that before PSS/E starts.")
+    elif r.get("cleanenv"):
+        P("   ENVIRONMENT: PSS/E starts with a clean environment and not with this one.")
+        P("   A variable or a PATH entry is in the way (the Intel Composer XE 2015 ones are")
+        P("   the first suspects). -> the study scripts can start PSS/E with a clean one.")
+    elif py_ok:
+        P("   PYTHON VERSION: PSS/E starts from Python %s and not from %d.%d."
+          % (", ".join("%s.%s" % (k[2], k[3:]) for k in py_ok), sys.version_info[0],
+             sys.version_info[1]))
+        P("   -> run z7_main_v35.py with that Python.")
+    elif gui:
+        P("   The GUI starts; Python does not, in any of these ways. That is PSS/E 35.6's")
+        P("   Python interface on this PC. Try Python 3.9 (64-bit, PSSPY39) with this check,")
+        P("   and send Siemens PTI support the event-log lines above.")
     else:
-        P("   PSS/E does not start in any of these ways. The DLLs it uses are listed above.")
-        P("   Next: does the PSS/E 35.6 GUI start, and can it open the .sav? If the GUI fails")
-        P("   too, it is the install or the licence (repair PSS/E 35.6 / the CodeMeter runtime).")
+        P("   PSS/E does not start from Python in any of these ways, and the GUI test did not")
+        P("   decide it. Open the PSS/E 35.6 GUI by hand: does it start and open the .sav?")
     if r.get("dsusr") is False:
         P("   ALSO: it dies beside Base\\dsusr.dll -- that file must go (the study scripts now")
         P("   move a wrong-bitness dsusr.dll aside by themselves).")
