@@ -59,8 +59,8 @@ DISIS sheet, one radius for both, no duplicates, ordered outward from the POI.
      OUT_DIR\\FAULT_LIST_BPM_<project>.txt        what was kept, dropped and why
      OUT_DIR\\FAULT_LIST_LEVELS_<project>.csv     every bus: substation, level
 
-   Run with the PSS/E Python (3.4), from the folder z7_main.py is in:
-       python z7_fault_list.py
+   Run with the PSS/E Python (3.4), from the folder z7_main_v35.py is in:
+       python z7_fault_list_v35.py
 """
 import os
 import sys
@@ -73,7 +73,7 @@ import shutil
 # SETTINGS
 # ============================================================================
 PROJECTS = ["SantaFe", "IronStar", "EastFork", "EmpirePrairie"]
-# POI and plant feeder buses (as z7_spp_b.py BESS_PROJECTS)
+# POI and plant feeder buses (as z7_spp_b_v35.py BESS_PROJECTS)
 PROJECT_BUSES = {
     "SantaFe":       {"poi": 765911, "feeders": [765912, 765922, 765932, 765935]},
     "IronStar":      {"poi": 560080, "feeders": [587313, 587317]},
@@ -83,7 +83,7 @@ PROJECT_BUSES = {
     "EmpirePrairie": {"poi": 761383, "feeders": [761379, 761382, 761400, 761403]},
 }
 DISIS_SHEET = r"{root}\DISIS_CENTRAL_FAULTS.xlsx"     # SPP's DISIS event sheet (.xlsx / .csv)
-CASE = None                                  # None = the case z7_main.py builds the list from
+CASE = None                                  # None = the case z7_main_v35.py builds the list from
                                              #   (FAULT_LIST_FROM, BASE_SAV / BASE_SAV_BY_PROJECT)
 OUT_DIR = r"{root}\FAULT_LISTS_BPM"          # new lists + reports go here
 INSTALL = False                              # True = also copy each list over SHARED_FAULTS_CSV
@@ -151,11 +151,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 # ============================================================================
-# SETTINGS READ FROM z7_main.py (text only -- nothing there is run)
+# SETTINGS READ FROM z7_main_v35.py (text only -- nothing there is run)
 # ============================================================================
 def _main_setting(name, default):
     import ast
-    p = os.path.join(HERE, "z7_main.py")
+    p = os.path.join(HERE, "z7_main_v35.py")
     try:
         with open(p) as fh:
             for ln in fh:
@@ -334,7 +334,7 @@ class Net(object):
         self._screen = None
 
     def study_resolves(self, a, b, ck):
-        """The element the study (z7_spp_b _switch_branch) opens for "a-b ck":
+        """The element the study (z7_spp_b_v35 _switch_branch) opens for "a-b ck":
            a line, else a two-winding, else the FIRST three-winding in the case
            with both buses on that circuit. None = nothing."""
         a, b, ck = int(a), int(b), _ck(ck)
@@ -1383,7 +1383,7 @@ def to_row(lev, e):
 
 
 def phys_sig(r):
-    """What the study's run marker checks, without the con_id (z7_spp_b _fault_row_sig)."""
+    """What the study's run marker checks, without the con_id (z7_spp_b_v35 _fault_row_sig)."""
     def _el(s):
         out = set()
         for x in (s or "").split(";"):
@@ -1973,7 +1973,7 @@ def main():
         print("[faults] %-14s %4d event(s) -> %s" % (proj, len(rows), p_csv))
         if INSTALL and os.path.normcase(os.path.abspath(_shared_csv(proj))) \
                 == os.path.normcase(os.path.abspath(p_csv)):
-            print("[faults]   the study already reads this file (z7_main SHARED_FAULTS_CSV)")
+            print("[faults]   the study already reads this file (z7_main_v35 SHARED_FAULTS_CSV)")
         elif INSTALL:
             dst = _shared_csv(proj)
             if os.path.isfile(dst):

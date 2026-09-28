@@ -1,0 +1,655 @@
+# -*- coding: utf-8 -*-
+"""z7_scr_v35.py -- short-circuit ratio (SCR) at each project's POI, system intact
+and with the elements each fault of the study trips taken out.
+
+Run with the PSS/E Python, from the study root (beside z7_main_v35.py):
+
+    C:\\Python39\\python.exe z7_scr_v35.py
+
+Reads only -- the case is loaded, changed in memory and never saved.
+Writes SCR_AT_POI.txt and SCR_AT_POI.csv in the study root.
+
+WHAT IS CALCULATED
+  SCMVA  = three-phase short-circuit MVA at the POI bus = SBASE / |Z1th|, from
+           PSS/E's own short-circuit solution (ASCC, positive-sequence Thevenin
+           impedance at the POI). Z1th is an impedance, so the value does not
+           depend on the pre-fault voltage.
+  SCR    = SCMVA / project MW (every study size of the project, when it has two).
+  Two network states per project, both from the BASE case (no new plant in it):
+    all in      every existing machine in service
+    EGF off     the existing machines at the project's own feeder buses OUT --
+                the project replaces them (disable_existing), so this is the
+                SCR the new plant sees on its own
+  and, for each state, the intact system and every OUTAGE SET taken from the
+  project's fault list (trip_elements + trip_3wind + drop_machines +
+  pre_outage of each fault), plus any lines listed in EXTRA_OUTAGES below.
+  Faults that take out the same elements share one row.
+
+  SCR < 3 is flagged WEAK and SCR < 1.5 VERY WEAK (common planning screens;
+  set the limits below).
+"""
+from __future__ import print_function
+import os, sys, re, ast, csv, io, time
+
+# ---- SETTINGS -------------------------------------------------------------
+PROJECTS = []          # [] = PROJECTS from z7_main_v35.py
+MW_BASIS = "both"      # which MW the SCR divides by:
+                       #   "project" = the BESS rating(s) of BESS_PROJECTS (502, 214, ...)
+                       #   "gia"     = the GIA capacity at the POI, POI_P_TARGET_MW in z7_main_v35.py
+                       #               (984.2, 290.5, ...: BESS + existing together)
+                       #   "both"    = a column for each (a GIA equal to a BESS size is shown once)
+GIA_MW = {}            # {} = POI_P_TARGET_MW from z7_main_v35.py; or set here, e.g. {"SantaFe": 984.2}
+USE_FAULTS = True      # False = no fault-list outages at all: intact system, POI_N1 and
+                       #         EXTRA_OUTAGES only (a quick SCR at the POI)
+ONLY_FAULTS = []       # [] = every fault of the list. Otherwise only these, e.g.
+                       #   ["F01", "F10-F20"]                       (every project)
+                       #   {"SantaFe": ["F03", "F131"], "EastFork": ["F89"]}  (per project;
+                       #    a project not named here runs every fault)
+EXTRA_OUTAGES = []     # extra single outages, e.g. ["765911-531501-345-1"] (from-to-kV-ckt)
+POI_N1 = True          # also every line / transformer AT the POI bus, one at a time
+WEAK_SCR = 3.0         # SCR below this is flagged WEAK
+VERY_WEAK_SCR = 1.5    # ... and below this VERY WEAK
+MAX_FAULTS = 0         # 0 = every fault of the list; N = first N (a quick test)
+# ---------------------------------------------------------------------------
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+MAIN = os.path.join(HERE, "z7_main_v35.py")
+
+
+def _panel(name, default=None):
+    """A top-level setting of z7_main_v35.py, read without importing it."""
+    try:
+        src = io.open(MAIN, encoding="latin-1").read()
+        for node in ast.parse(src).body:
+            if isinstance(node, ast.Assign) and any(
+                    getattr(t, "id", None) == name for t in node.targets):
+                return ast.literal_eval(node.value)
+    except Exception:
+        pass
+    return default
+
+
+def _study_projects():
+    """BESS_PROJECTS of the project study script: name -> {poi, mw[], feeders}."""
+    folder = _panel("PROJ_FOLDER", "Projects")
+    d = folder if os.path.isabs(folder) else os.path.join(HERE, folder)
+    out = {}
+    for p in (os.path.join(d, "z7_spp_p_v35.py"), os.path.join(HERE, "z7_spp_p_v35.py")):
+        if not os.path.isfile(p):
+            continue
+        try:
+            for node in ast.parse(io.open(p, encoding="latin-1").read()).body:
+                if isinstance(node, ast.Assign) and any(
+                        getattr(t, "id", None) == "BESS_PROJECTS" for t in node.targets):
+                    for r in ast.literal_eval(node.value):
+                        mw = r.get("mw")
+                        mw = [float(x) for x in (mw if isinstance(mw, (list, tuple)) else [mw])]
+                        out[r["name"]] = {"poi": int(r["poi"]), "mw": mw,
+                                          "feeders": [int(b) for b in r.get("feeders") or []]}
+            if out:
+                return out
+        except Exception as e:
+            print("[scr] could not read BESS_PROJECTS from %s (%s)" % (p, e))
+    return out
+
+
+def _base_sav(proj):
+    folder = _panel("BASE_FOLDER", "Base")
+    d = folder if os.path.isabs(folder) else os.path.join(HERE, folder)
+    sav = (_panel("BASE_SAV_BY_PROJECT", {}) or {}).get(proj) or _panel("BASE_SAV")
+    if sav and not os.path.isabs(sav):
+        sav = os.path.join(d, sav)
+    return sav
+
+
+def _fault_list(proj):
+    t = _panel("SHARED_FAULTS_CSV") or r"{root}\FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"
+    p = t.replace("{root}", HERE).replace("{project}", proj).replace("\\", os.sep)
+    if os.path.isfile(p):
+        return p
+    alt = os.path.join(HERE, "FAULT_LISTS_BPM", "SPP_FAULTS_CON_%s.csv" % proj)
+    return alt if os.path.isfile(alt) else p
+
+
+# ---- PSS/E ------------------------------------------------------------------
+psspy = None
+_i = _f = None
+
+
+def _start_psse():
+    global psspy, _i, _f
+    import z7_spike_find_v35 as S                  # the same PSS/E path setup the tools use
+    psspy = S._psspy()
+    if psspy is None:
+        return False
+    _i, _f = psspy.getdefaultint(), psspy.getdefaultreal()
+    return True
+
+
+def _ie(r):
+    return r[0] if isinstance(r, (tuple, list)) else r
+
+
+def _load(sav):
+    ie = psspy.case(sav)
+    if ie:
+        raise RuntimeError("psspy.case(%s) ierr=%s" % (sav, ie))
+    for fn in ("short_circuit_units", "short_circuit_coordinates"):
+        try:
+            getattr(psspy, fn)(1)              # per unit, polar
+        except Exception:
+            pass
+
+
+def scmva(bus):
+    """Three-phase short-circuit MVA at one bus, or (None, reason)."""
+    import pssarrays
+    try:
+        sbase = float(psspy.sysmva())
+    except Exception:
+        sbase = 100.0
+    ie = psspy.bsys(1, 0, [0.0, 0.0], 0, [], 1, [int(bus)], 0, [], 0, [])
+    if ie:
+        return None, "bsys ierr=%s" % ie
+    # THE KEYWORDS DIFFER BETWEEN PSS/E BUILDS. PSS/E 34 takes sid and all by
+    # position and everything else only by keyword ("takes 2 positional
+    # arguments"), and an option it does not know is a TypeError -- so try the
+    # forms in turn, the fullest first.
+    r, err = None, ""
+    for kw in ({"flt3ph": 1, "fltlg": 0, "fltllg": 0, "fltll": 0},
+               {"flt3ph": 1, "fltlg": 0},
+               {"flt3ph": 1},
+               {}):
+        try:
+            r = pssarrays.ascc_currents(1, 0, **kw)
+            break
+        except Exception as e:
+            err = "%s" % e
+    if r is None:
+        return None, "ascc: %s" % err
+    _dump_once(r)
+    if getattr(r, "ierr", 0):
+        return None, "ascc ierr=%s" % r.ierr
+    # THEVENIN IMPEDANCE FIRST: SCMVA = SBASE / |Z1|, independent of the
+    # pre-fault voltage. The fault current is the fallback (pu, 1.0 pu pre-fault).
+    z1 = _first(r, ("thevzpu", "thevz", "zthev"), ("z1", "zpos", "z"))
+    if z1 is not None:
+        if abs(z1) > 1e-9:
+            return sbase / abs(z1), ""
+        return None, "POI Thevenin impedance is zero"
+    i1 = _first(r, ("flt3ph", "fltcur3ph", "fltcur"), ("ia1", "i1", "ia"))
+    if i1 is not None and abs(i1) > 0:
+        # per unit when short_circuit_units(1) took; amps otherwise (large)
+        if abs(i1) > 1000.0:
+            try:
+                kv = psspy.busdat(int(bus), "BASE")[1]
+                return abs(i1) * float(kv) * 3 ** 0.5 / 1000.0, ""
+            except Exception:
+                return None, "fault current is in amps and the bus kV could not be read"
+        return abs(i1) * sbase, ""
+    return None, "no short-circuit result (POI isolated?)"
+
+
+def _pick(x, names):
+    for n in names:
+        try:
+            v = x[n] if isinstance(x, dict) else getattr(x, n)
+            return v
+        except Exception:
+            continue
+    return None
+
+
+def _first(r, outer, inner):
+    """A complex number r.<outer>[0].<inner> (or dict / keyed forms), else None."""
+    o = _pick(r, outer)
+    if o is None:
+        return None
+    for el in ([o[0]] if isinstance(o, (list, tuple)) and o else []) + [o]:
+        try:
+            if isinstance(el, dict) and el and not any(k in el for k in inner):
+                el = list(el.values())[0]
+        except Exception:
+            pass
+        v = _pick(el, inner)
+        if isinstance(v, (list, tuple)) and v:
+            v = v[0]
+        if isinstance(v, (int, float, complex)):
+            return complex(v)
+    return None
+
+
+_DUMPED = [False]
+
+
+def _dump_once(r):
+    """What this PSS/E build returns, printed ONCE -- so a result the reader
+       above does not recognise can be read off the console."""
+    if _DUMPED[0]:
+        return
+    _DUMPED[0] = True
+    try:
+        names = [n for n in dir(r) if not n.startswith("_")]
+        print("[scr] ascc_currents returned: %s" % ", ".join(names))
+        for n in ("thevzpu", "flt3ph", "fltbus"):
+            if n in names:
+                print(("[scr]   %s = %r" % (n, getattr(r, n)))[:400])
+    except Exception:
+        pass
+
+
+# ---- ELEMENT STATUS ----------------------------------------------------------
+_W3 = {}
+
+
+def _three_wind_map():
+    if _W3:
+        return _W3
+    try:
+        ie, a = psspy.atr3int(-1, 1, 1, 1, 1, ["WIND1NUMBER", "WIND2NUMBER", "WIND3NUMBER"])
+        ie2, c = psspy.atr3char(-1, 1, 1, 1, 1, ["ID"])
+        for w1, w2, w3, ck in zip(a[0], a[1], a[2], c[0]):
+            ck = str(ck).strip()
+            t = (int(w1), int(w2), int(w3))
+            for x, y in ((w1, w2), (w1, w3), (w2, w3)):
+                _W3[(int(x), int(y), ck)] = t
+                _W3[(int(y), int(x), ck)] = t
+    except Exception:
+        pass
+    return _W3
+
+
+def switch(a, b, ck, st, c=None):
+    """Open (st=0) or close (st=1) a line, 2-winding or 3-winding transformer.
+       Returns "ok" (status changed), "purged" (the element was DELETED from the
+       in-memory case -- the case must be reloaded afterwards), or None.
+
+       THE TRANSFORMER STATUS CALLS DIFFER BETWEEN PSS/E BUILDS, and on this
+       one two_winding_chng_6 / three_wnd_imped_chng_4 took nothing: every GSU
+       and 3-winding transformer read "not found" while it was in the case. An
+       outage only needs the element GONE for the short-circuit solution, so
+       when no status call takes it, it is purged and the case reloaded."""
+    a, b, ck = int(a), int(b), str(ck).strip()
+    tries, purge = [], []
+    if c is None:
+        tries += [lambda: psspy.branch_chng_3(a, b, ck, [st] + [_i] * 5, [_f] * 12, [_f] * 12, ""),
+                  lambda: psspy.branch_chng(a, b, ck, [st] + [_i] * 5, [_f] * 12),
+                  lambda: psspy.two_winding_chng_6(a, b, ck, [st] + [_i] * 15, [_f] * 26,
+                                                   [_f] * 3, "", ""),
+                  lambda: psspy.two_winding_chng_5(a, b, ck, [st] + [_i] * 15, [_f] * 24,
+                                                   [_f] * 3, "")]
+        purge += [lambda: psspy.purg2wnd(a, b, ck), lambda: psspy.purgbrn(a, b, ck)]
+        w = _three_wind_map().get((a, b, ck))
+    else:
+        w = (a, b, int(c))
+    if w:
+        tries += [lambda: psspy.three_wnd_imped_chng_4(w[0], w[1], w[2], ck, [st] + [_i] * 11,
+                                                       [_f] * 30, [_f] * 3, ""),
+                  lambda: psspy.three_wnd_imped_chng_3(w[0], w[1], w[2], ck, [st] + [_i] * 11,
+                                                       [_f] * 28, [_f] * 3, "")]
+        purge += [lambda: psspy.purg3wnd(w[0], w[1], w[2], ck)]
+    for t in tries:
+        try:
+            if _ie(t()) in (0, None):
+                return "ok"
+        except Exception:
+            continue
+    if st == 0:
+        for t in purge:
+            try:
+                if _ie(t()) in (0, None):
+                    return "purged"
+            except Exception:
+                continue
+    return None
+
+
+def isolate_islands():
+    """Disconnect every island with no swing bus (PSS/E TREE), as the
+       short-circuit solution needs: an outage that splits off part of the
+       network otherwise stops ASCC with "No faults specified". Returns the
+       number of buses disconnected (the case must then be reloaded)."""
+    n = 0
+    try:
+        ie, nb = psspy.tree(1, 0)
+        guard = 0
+        while nb and nb > 0 and guard < 500:
+            n += int(nb)
+            ie, nb = psspy.tree(2, 1)          # 1 = disconnect this island, find the next
+            guard += 1
+    except Exception:
+        pass
+    return n
+
+
+def bus_dead(bus):
+    """True when the bus is disconnected (type 4) -- e.g. by isolate_islands()."""
+    try:
+        ie, t = psspy.busint(int(bus), "TYPE")
+        return ie == 0 and int(t) == 4
+    except Exception:
+        return False
+
+
+def machine(bus, mid, st):
+    try:
+        return _ie(psspy.machine_chng_2(int(bus), str(mid), [st] + [_i] * 5, [_f] * 17)) in (0, None)
+    except Exception:
+        return False
+
+
+def machines_at(buses):
+    """In-service machines [(bus, id)] at the given buses."""
+    out = []
+    try:
+        ie, n = psspy.amachint(-1, 1, ["NUMBER"])
+        ie2, ids = psspy.amachchar(-1, 1, ["ID"])
+        for b, i in zip(n[0], ids[0]):
+            if int(b) in buses:
+                out.append((int(b), str(i).strip()))
+    except Exception:
+        pass
+    return out
+
+
+def poi_branches(poi):
+    """Every in-service line / 2-winding transformer at the POI, as 'from-to-kV-ckt'."""
+    out = []
+    try:
+        ie, a = psspy.abrnint(-1, 1, 1, 3, 2, ["FROMNUMBER", "TONUMBER"])   # entry 2: both ends
+        ie2, c = psspy.abrnchar(-1, 1, 1, 3, 2, ["ID"])
+        for x, y, ck in zip(a[0], a[1], c[0]):
+            e = "%d-%d-0-%s" % (x, y, str(ck).strip())
+            if int(x) == poi and e not in out:
+                out.append(e)
+    except Exception:
+        pass
+    return out
+
+
+# ---- OUTAGE SETS -------------------------------------------------------------
+def _parse(txt, n):
+    """'a-b-kv-ck;...' (n=4) or 'a-b-c-ck;...' (3-wind, n=4) or 'bus-id;...' (n=2)."""
+    out = []
+    for part in (txt or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        f = part.split("-")
+        if len(f) < n:
+            continue
+        head, ck = f[:n - 1], "-".join(f[n - 1:])
+        try:
+            out.append(tuple(int(x) for x in head) + (ck.strip(),))
+        except ValueError:
+            continue
+    return out
+
+
+def _fnum(fid):
+    m = re.match(r"^[A-Za-z]*(\d+)$", str(fid).strip())
+    return int(m.group(1)) if m else None
+
+
+def _wanted(proj):
+    """None = every fault; else a test fid -> bool, from ONLY_FAULTS
+       ("F07", "F10-F20", "10-20"; a list for every project or a dict per project)."""
+    sel = ONLY_FAULTS
+    if isinstance(sel, dict):
+        sel = sel.get(proj)
+    if not sel:
+        return None
+    exact, ranges = set(), []
+    for s in (sel if isinstance(sel, (list, tuple)) else [sel]):
+        s = str(s).strip()
+        if "-" in s:
+            a, b = s.split("-", 1)
+            na, nb = _fnum(a), _fnum(b)
+            if na is not None and nb is not None:
+                ranges.append((min(na, nb), max(na, nb)))
+                continue
+        exact.add(s.upper())
+
+    def ok(fid):
+        if str(fid).strip().upper() in exact:
+            return True
+        n = _fnum(fid)
+        return n is not None and any(a <= n <= b for a, b in ranges)
+    return ok
+
+
+def outage_sets(proj, poi):
+    """[(key, label, branches[(a,b,ck)], wind3[(a,b,c,ck)], machines[(bus,id)], fault ids)]"""
+    sets, order = {}, []
+
+    def add(fid, br, w3, mc, what):
+        key = (tuple(sorted(br)), tuple(sorted(w3)), tuple(sorted(mc)))
+        if not any(key):
+            return
+        if key not in sets:
+            sets[key] = {"br": br, "w3": w3, "mc": mc, "ids": [], "what": what}
+            order.append(key)
+        if fid not in sets[key]["ids"]:
+            sets[key]["ids"].append(fid)
+
+    fl = _fault_list(proj)
+    n = 0
+    want = _wanted(proj)
+    if not USE_FAULTS:
+        print("[scr] %s: USE_FAULTS = False -- no fault-list outages" % proj)
+    elif os.path.isfile(fl):
+        with io.open(fl, encoding="utf-8", errors="replace") as fh:
+            for r in csv.DictReader(fh):
+                fid = (r.get("fault_id") or "").strip()
+                if not fid or fid.upper().startswith("FLAT"):
+                    continue
+                if want is not None and not want(fid):
+                    continue
+                n += 1
+                if MAX_FAULTS and n > MAX_FAULTS:
+                    break
+                br = [(a, b, ck) for a, b, _kv, ck in
+                      _parse(r.get("trip_elements"), 4) + _parse(r.get("pre_outage"), 4)]
+                w3 = _parse(r.get("trip_3wind"), 4)
+                mc = [(b, str(i)) for b, i in _parse(r.get("drop_machines"), 2)]
+                add(fid, br, w3, mc, "%s %s" % ((r.get("planning_event") or "").strip(),
+                                                (r.get("subtype") or "").strip()))
+    else:
+        print("[scr] %s: no fault list at %s -- intact system and extra outages only" % (proj, fl))
+    extra = list(EXTRA_OUTAGES) + (poi_branches(poi) if POI_N1 else [])
+    for e in extra:
+        p = _parse(e, 4)
+        if p:
+            a, b, _kv, ck = p[0]
+            add("N-1 %d-%d ck %s" % (a, b, ck), [(a, b, ck)], [], [], "N-1 line/xfmr")
+    return [(k, sets[k]["what"], sets[k]["br"], sets[k]["w3"], sets[k]["mc"], sets[k]["ids"])
+            for k in order]
+
+
+def _fmt_set(br, w3, mc):
+    s = ["%d-%d(%s)" % x for x in br] + ["3w %d-%d-%d(%s)" % x for x in w3] + \
+        ["gen %d '%s'" % x for x in mc]
+    return "; ".join(s)
+
+
+def _flag(scr):
+    if scr is None:
+        return ""
+    return "VERY WEAK" if scr < VERY_WEAK_SCR else ("WEAK" if scr < WEAK_SCR else "")
+
+
+# ---- ONE PROJECT -------------------------------------------------------------
+def run_project(proj, info, rows, L):
+    poi, mws, feeders = info["poi"], info["mw"], set(info["feeders"])
+    tags = info.get("tag") or [""] * len(mws)
+    sav = _base_sav(proj)
+    L.append("")
+    L.append("=" * 120)
+    L.append(" %s   POI %d   project %s MW   case %s" % (
+        proj, poi, " / ".join("%.1f%s" % (m, " GIA" if t else "") for m, t in zip(mws, tags)), os.path.basename(sav or "?")))
+    L.append("=" * 120)
+    _load(sav)
+    try:
+        nm = psspy.notona(poi)[1].strip()
+    except Exception:
+        nm = ""
+    egf = machines_at(feeders)
+    L.append(" POI bus %d %s | existing machines at the feeders (EGF): %s"
+             % (poi, nm, ", ".join("%d '%s'" % x for x in egf) or "none"))
+    sets = outage_sets(proj, poi)
+    print("[scr] %s: POI %d, %d outage set(s)" % (proj, poi, len(sets)))
+    hdr = " %-38s %-14s" % ("outage", "state")
+    for m, t in zip(mws, tags):
+        hdr += " %9s %11s" % ("SCMVA", ("SCR@%.0f%s" % (m, "GIA" if t else "MW")))
+    L.append(hdr + "  flag   faults")
+    L.append(" " + "-" * 118)
+    for state, off in (("all in", []), ("EGF off", egf)):
+        def _fresh():
+            _load(sav)
+            _W3.clear()
+            for b, i in off:
+                machine(b, i, 0)
+        _fresh()
+        base, why = scmva(poi)
+        cases = [("INTACT", "", [], [], [], [])] + [
+            ("set", what, br, w3, mc, ids) for _k, what, br, w3, mc, ids in sets]
+        for tag, what, br, w3, mc, ids in cases:
+            opened, missing, reload_ = [], [], False
+            # A WINDING PAIR OF A 3-WINDING TRANSFORMER THE SAME SET LISTS is
+            # taken out by that transformer's own entry -- not a missing element.
+            _w3sets = [set(x[:3]) for x in w3]
+            for a, b, ck in br:
+                r = switch(a, b, ck, 0)
+                if r:
+                    opened.append(("b", a, b, ck))
+                    reload_ = reload_ or r == "purged"
+                elif not any(set((a, b)) <= s for s in _w3sets):
+                    missing.append(("b", a, b, ck))
+            for a, b, c, ck in w3:
+                r = switch(a, b, ck, 0, c)
+                if r:
+                    opened.append(("w", a, b, c, ck))
+                    reload_ = reload_ or r == "purged"
+                else:
+                    missing.append(("w", a, b, c, ck))
+            for b, i in mc:
+                if (b, i) in off:
+                    continue
+                (opened if machine(b, i, 0) else missing).append(("m", b, i))
+            if tag == "INTACT":
+                v, why2 = base, why
+            else:
+                # ISLANDS OFF FIRST: an outage that splits the network stops
+                # ASCC ("No faults specified") until the swingless part is out.
+                cut = isolate_islands()
+                reload_ = reload_ or cut > 0
+                if bus_dead(poi):
+                    v, why2 = None, "POI ISLANDED -- this outage cuts the POI off from the grid"
+                else:
+                    v, why2 = scmva(poi)
+            # PUT IT BACK exactly as it was, so the next set starts from the same
+            # case: status back where a status call did it, a fresh load where
+            # anything was purged or islanded.
+            if reload_:
+                _fresh()
+            else:
+                for o in opened:
+                    if o[0] == "b":
+                        switch(o[1], o[2], o[3], 1)
+                    elif o[0] == "w":
+                        switch(o[1], o[2], o[4], 1, o[3])
+                    else:
+                        machine(o[1], o[2], 1)
+            label = "INTACT system" if tag == "INTACT" else _fmt_set(br, w3, mc)
+            line = " %-38s %-14s" % (label[:38], state)
+            scrs = []
+            for m in mws:
+                scr = (v / m) if (v and m) else None
+                scrs.append(scr)
+                line += " %9s %11s" % ("%.0f" % v if v else "-", "%.2f" % scr if scr else "-")
+            fl = _flag(min([s for s in scrs if s is not None] or [None]) if any(scrs) else None)
+            if why2.startswith("POI ISLANDED"):
+                fl = "ISLANDED"
+            note = why2 or ("not found: %s" % ", ".join(str(x[1:]) for x in missing) if missing else "")
+            L.append(line + "  %-9s %s%s" % (fl, ", ".join(ids[:6]) + (" +%d" % (len(ids) - 6) if len(ids) > 6 else ""),
+                                             ("   [%s]" % note) if note else ""))
+            if len(label) > 38:
+                L.append("   %s" % label)
+            dl = (v - base) if (v and base and tag != "INTACT") else None
+            rows.append([proj, poi, state, "INTACT" if tag == "INTACT" else what, label,
+                         " ".join(ids), "%.1f" % v if v else ""] +
+                        ["%.3f" % s if s else "" for s in scrs] +
+                        ["%.1f" % dl if dl is not None else "", fl, note])
+    # THE WORST, where a reader looks first.
+    worst = [r for r in rows if r[0] == proj and r[6]]
+    if worst:
+        w = min(worst, key=lambda r: float(r[6]))
+        L.append(" LOWEST SCMVA: %s MVA (%s, %s) -- faults %s" % (w[6], w[2], w[4] or "intact", w[5] or "-"))
+    isl = []
+    for r in rows:
+        if r[0] == proj and r[-2] == "ISLANDED" and r[2] == "all in":
+            isl.append(r[5] or r[4])
+    if isl:
+        L.append(" POI ISLANDED (the plant is cut off from the grid, no SCR) by: %s" % "; ".join(isl))
+
+
+def main():
+    if not _start_psse():
+        print("psspy NOT available -- run this with the PSS/E Python")
+        return 1
+    info = _study_projects()
+    projs = PROJECTS or _panel("PROJECTS", []) or sorted(info)
+    rows, L = [], []
+    L.append(" SCR AT THE POI -- %s" % time.strftime("%Y-%m-%d %H:%M"))
+    L.append(" SCMVA = SBASE/|Z1 Thevenin| at the POI (PSS/E ASCC, 3-phase); SCR = SCMVA / MW")
+    L.append(" MW: BESS rating (SCR@...MW) and/or GIA capacity at the POI (SCR@...GIA) -- MW_BASIS = %r" % MW_BASIS)
+    L.append(" all in = every existing machine in service; EGF off = the project's feeder machines out")
+    L.append(" WEAK < %.1f, VERY WEAK < %.1f.  Base case (no new plant)." % (WEAK_SCR, VERY_WEAK_SCR))
+    gia = GIA_MW or _panel("POI_P_TARGET_MW", {}) or {}
+    for p in projs:
+        if p not in info:
+            continue
+        bess = list(info[p]["mw"])
+        g = gia.get(p) if isinstance(gia, dict) else None
+        g = float(g) if isinstance(g, (int, float)) else None
+        basis = (MW_BASIS or "both").strip().lower()
+        if basis == "gia" and g:
+            info[p]["mw"], info[p]["tag"] = [g], ["GIA"]
+        elif basis == "both" and g and all(abs(g - b) > 0.5 for b in bess):
+            info[p]["mw"], info[p]["tag"] = bess + [g], [""] * len(bess) + ["GIA"]
+        else:
+            if basis == "gia" and not g:
+                print("[scr] %s: no GIA MW in POI_P_TARGET_MW / GIA_MW -- the BESS rating is used" % p)
+            info[p]["tag"] = [""] * len(bess)
+    nmw = max([len(info[p]["mw"]) for p in projs if p in info] or [1])
+    for p in projs:
+        if p not in info:
+            L.append("\n %s: not in BESS_PROJECTS -- skipped" % p)
+            continue
+        try:
+            run_project(p, info[p], rows, L)
+        except Exception as e:
+            L.append("\n %s: FAILED -- %s" % (p, e))
+            print("[scr] %s failed: %s" % (p, e))
+    txt = "\n".join(L)
+    print(txt)
+    with io.open(os.path.join(HERE, "SCR_AT_POI.txt"), "w", encoding="utf-8") as fh:
+        fh.write(txt + "\n")
+    with open(os.path.join(HERE, "SCR_AT_POI.csv"), "w") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(["project", "poi", "state", "event", "outage", "faults", "scmva"] +
+                   ["scr_size%d" % (k + 1) for k in range(nmw)] +
+                   ["delta_scmva_vs_intact", "flag", "note", "scr_mw_basis"])
+        for r in rows:
+            k = len(r) - 10          # size columns this project has
+            ip = info.get(r[0]) or {}
+            basis = " | ".join("size%d=%.1f MW%s" % (j + 1, m, " (GIA)" if t else "")
+                               for j, (m, t) in enumerate(zip(ip.get("mw", []), ip.get("tag", []))))
+            w.writerow(r[:7] + r[7:7 + k] + [""] * (nmw - k) + r[7 + k:] + [basis])
+    print("\nwritten: SCR_AT_POI.txt / SCR_AT_POI.csv")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

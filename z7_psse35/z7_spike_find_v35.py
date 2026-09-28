@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""z7_spike_find.py -- WHERE DO THE >1.2 PU OVERVOLTAGES COME FROM?
+"""z7_spike_find_v35.py -- WHERE DO THE >1.2 PU OVERVOLTAGES COME FROM?
 
-Python 3.4, stdlib only. Put it in the study root (beside z7_main.py)
+Python 3.4, stdlib only. Put it in the study root (beside z7_main_v35.py)
 and run:
 
-    C:\\Python34\\python.exe z7_spike_find.py
+    C:\\Python39\\python.exe z7_spike_find_v35.py
 
 PART A  (no PSS/E needed, seconds)
     Reads every 02_VIOLATIONS_<KIND>_<project>.csv the scoring already wrote
@@ -47,7 +47,7 @@ report files above).
 from __future__ import print_function
 import os, sys, re, csv, glob, time, json, subprocess
 
-VERSION = "2026-09-23l"      # z7_probe_psse.py checks this
+VERSION = "2026-09-23l"      # z7_probe_psse_v35.py checks this
 
 # =========================== SETTINGS ======================================
 ROOT          = ""            # "" = the folder this file is in (the study root)
@@ -82,7 +82,7 @@ NEAR_Q_REVIEW = True          # read each bad bus's WORST fault .out and review 
                               # generators' Q (before / during / after the fault) -> likely cause
 GEN_TOP       = 25            # generators listed per bus, closest (|Z|) first; the CSV has all
 LINE_CHG_MVAR = 20.0          # lines with at least this much charging are listed
-CASE_SAV      = {}            # {} = read BASE_SAV / PROJ_SAV from z7_main.py, e.g.
+CASE_SAV      = {}            # {} = read BASE_SAV / PROJ_SAV from z7_main_v35.py, e.g.
                               # {"base": r"C:\KV\Base\DIS2201-25SP-G03-CQ_Mitigated.sav"}
 CASE_DYR      = {}            # same, for the .dyr (machine model names: IBR / SYNC / SVC)
 # ===========================================================================
@@ -1079,7 +1079,7 @@ def _psspy():
 
 
 def _panel_setting(name):
-    p = os.path.join(_root(), "z7_main.py")
+    p = os.path.join(_root(), "z7_main_v35.py")
     if not os.path.isfile(p):
         return None
     rx = re.compile(r'^%s\s*=\s*r?["\']([^"\']*)["\']' % name)
