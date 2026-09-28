@@ -23190,7 +23190,7 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                     try:
                         _rel = ([a - b for a, b in zip(v, _sw_v)]
                                 if (_sw_v is not None and len(_sw_v) == len(v)) else v)
-                        _i0 = idx_after(_t_axis, tclear)
+                        _i0 = idx_after(_t_axis, tclear + (_REC_EXTRA[0] or 0.0))
                         _seg = _rel[_i0:] if _i0 is not None else []
                         if len(_seg) >= 3:
                             _dev = max(_seg) - min(_seg)
@@ -23834,28 +23834,31 @@ def _positive_peaks(s, min_prom):
     # it is run once per angle channel per scenario. Both quantities are running
     # minima, so they are built once, forwards and backwards, and read in O(1).
     # Measured 12.9 ms -> 0.85 ms per channel, same peaks.
-    pre = [0.0] * n                      # pre[i] == min(s[:i])   for i >= 1
-    m = s[0]
-    for i in range(1, n):
-        pre[i] = m
-        if s[i] < m:
-            m = s[i]
-    suf = [0.0] * n                      # suf[i] == min(s[i:])
-    m = s[n - 1]
-    for i in range(n - 1, -1, -1):
-        if s[i] < m:
-            m = s[i]
-        suf[i] = m
+    #
+    # TRUE PROMINENCE: each side is searched only as far as the first sample
+    # HIGHER than the candidate. The whole-trace minima used before let a small
+    # ripple hump on a large swing count as a positive peak -- it shifted the
+    # 1st / 2nd / 6th peak and moved SPPR1 / SPPR5 across 0.95 / 0.774. A walk
+    # stops as soon as its dip reaches min_prom, so on an oscillating trace it
+    # covers about half a period; a clean trace gives the same peaks as before.
     i = 1
     while i < n - 1:
         if s[i] >= s[i - 1] and s[i] > s[i + 1]:
-            lo_l = pre[i] if i else s[0]
-            j = i + 1
-            while j < n - 1 and s[j] >= s[j + 1]:
-                j += 1
-            lo_r = suf[i] if i < n else s[-1]
-            if s[i] - max(lo_l, lo_r) >= min_prom:
-                peaks.append((i, s[i]))
+            lim = s[i] - min_prom
+            ok_l = False
+            k = i - 1
+            while k >= 0 and s[k] <= s[i]:
+                if s[k] <= lim:
+                    ok_l = True
+                    break
+                k -= 1
+            if ok_l:
+                k = i + 1
+                while k < n and s[k] <= s[i]:
+                    if s[k] <= lim:
+                        peaks.append((i, s[i]))
+                        break
+                    k += 1
         i += 1
     return peaks
 
@@ -25489,8 +25492,18 @@ def evaluate_case(path, kind, tclear, kb):
         _isl_buses = set() if kind == "flat" else _event_island_buses(case)
     except Exception:
         _isl_buses = set()
+    # FROM THE FINAL CLEARING, as the 0.70 pu test. With a reclose the fault
+    # is applied a second time; the swing between the two clearings is forced,
+    # not the free oscillation SPPR measures, and read as the 1st positive peak.
+    _i_ang = idx_after(t, tclear + _t_rc) if _t_rc else i_clr
+    if _i_ang is None:
+        _i_ang = i_clr
+    if _t_rc and angles:
+        add("Rotor angle: measured from the FINAL clearing", None,
+            "%.3f s (reclose simulated; the first clearing was at %.3f s)"
+            % (tclear + _t_rc, tclear))
     for ti, v in angles:
-        seg = v[i_clr:]
+        seg = v[_i_ang:]
         if not len(seg):
             continue
         # "measured as absolute maximum peak to absolute minimum peak"
