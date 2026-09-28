@@ -665,7 +665,7 @@ FAST_COMPARE_PARALLEL = 4                    # projects at once
 # ---- 18. PLOTS -----------------------------------------------------------------
 MAKE_PLOTS = None                            # None = draw | False = no PDFs (faster)
 PLOT_MISSING_OUTS = True                    # draw PDFs for .out files without one
-FORCE_REPLOT = True                         # True = redraw every PDF
+FORCE_REPLOT = False                         # True = redraw every PDF
 PLOT_SCOPE = "compact"                       # "compact" | "full"
 PLOT_ONE_PROJECT_AT_A_TIME = True
 PLOT_SKIP_INCOMPLETE = True                  # True = do not draw a run that stopped early
