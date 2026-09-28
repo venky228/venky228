@@ -1701,8 +1701,30 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
             for t in tags:
                 spec.append((_rank_col(c, el4), "%s | %s" % (c, t), "pair", c, t))
     spec = [sp[1:] for _i, sp in sorted(enumerate(spec), key=lambda e: (e[1][0], e[0]))]
+    # THE TIME ABOVE 1.20 pu RIGHT AFTER ITS OWN VALUE, in cycles: base_value |
+    # BASE, cycles_above_1.20 | BASE, base_value | BASE_EGF_OFF, cycles ... then
+    # each project value with its cycles -- not seconds at the far end.
+    _secs_of = {"base_value": ("secs_above_1_20_base", "above_1.20_base_s"),
+                "project_value": ("secs_above_1_20_project", "above_1.20_project_s")}
+    _is_secs = set(x for v in _secs_of.values() for x in v)
+    cyc_pos = set()
+    if el4 and "criterion" in ix:
+        _rest = [sp for sp in spec if sp[2] not in _is_secs]
+        _secs = [sp for sp in spec if sp[2] in _is_secs]
+        spec = []
+        for sp in _rest:
+            spec.append(sp)
+            for sc in _secs:
+                if sc[2] in _secs_of.get(sp[2], ()) and sc[3] == sp[3]:
+                    cyc_pos.add(len(spec))
+                    spec.append(("cycles_above_1.20 | %s" % sp[3] if sp[3] else
+                                 "cycles_above_1.20", sc[1], sc[2], sc[3]))
+        for sc in _secs:                          # a seconds column with no value beside it
+            if not any(sp[2] == sc[2] and sp[3] == sc[3] for sp in spec):
+                spec.append(sc)
     header = list(keys) + [h for h, _kd, _c, _t in spec]
     widths = [10] * len(keys) + [14] * len(spec)
+    ix_crit = keys.index("criterion") if "criterion" in keys else 0
     cls_cols = [i for i, hh in enumerate(header)
                 if hh.split(" | ")[0] in ("classification", "element_classification",
                                           "fault_classification", "who_caused_it")]
@@ -1750,7 +1772,8 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
             row = list(k[:len(keys)])
             if el4:
                 row[2] = wl.get(tuple(k[:4]), row[2])
-            for _h, kind, c, t in spec:
+            _fam = z4._criterion_family(str(k[ix_crit])) if cyc_pos else ""
+            for _si, (_h, kind, c, t) in enumerate(spec):
                 if kind == "front":
                     row.append(_merge_get(mk if t is None else mr[t], c, z4))
                 elif kind == "ref":
@@ -1764,6 +1787,8 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
                     row.append("not in this run" if v is None else v)
                 else:
                     row.append(_per_test(z4, [(p, _val(p, c), own[p]) for p in lay["of_test"][t]]))
+                if _si in cyc_pos:
+                    row[-1] = _cycles(_fam, row[-1])
             yield [(z4.EMPTY_CELL if v in ("", None) else v) for v in row]
 
     def _style(row):
