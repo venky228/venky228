@@ -25225,12 +25225,35 @@ def evaluate_case(path, kind, tclear, kb):
     undamped_all, review_all = [], []
     skipped_async = []
     skipped_trip = []
+    skipped_island = []
+    try:
+        _isl_buses = set() if kind == "flat" else _event_island_buses(case)
+    except Exception:
+        _isl_buses = set()
     for ti, v in angles:
         seg = v[i_clr:]
         if not len(seg):
             continue
         # "measured as absolute maximum peak to absolute minimum peak"
         dev = max(seg) - min(seg)
+        if (_isl_buses and dev >= ISLAND_ANGLE_MIN_DEG
+                and _chan_bus(ti) in _isl_buses):
+            # ISLANDED BY THE EVENT. The fault's own trips leave this unit in a
+            # pocket with no path to the system (a P4 at 531445 opens S4 and S5
+            # GEN's step-up transformers), so its angle is a machine spinning
+            # alone -- 47,000 deg in SantaFe F177 -- not a swing of the system.
+            # Excluded, visibly, like a tripped unit. The run-away angle is
+            # required as well as the topology: the map has no circuit ids, and
+            # a parallel circuit left in service must not hide a real swing.
+            skipped_island.append((chan_label(ti), dev))
+            ang_rows.append([chan_label(ti), _chan_bus(ti),
+                             _machine_kind(ti) or "SYNC", dev, 0,
+                             None, None, None, None, None,
+                             None, None, None, None, None,
+                             None, None, 0, None,
+                             "ISLANDED BY THE EVENT -- no path to the system after "
+                             "the trips; not judged for damping"])
+            continue
         if chan_label(ti) in tripped_lbls:
             # A TRIPPED MACHINE HAS NO ROTOR ANGLE TO DAMP. When PSS/E
             # disconnects a unit its ANGL channel steps and freezes -- 584713
@@ -25392,6 +25415,14 @@ def evaluate_case(path, kind, tclear, kb):
             "generation tripping. Their frozen angle channels step %s"
             % (len(skipped_trip),
                "; ".join("%s %.0f deg" % (n, d) for n, d in skipped_trip[:6])))
+    if skipped_island:
+        skipped_island.sort(key=lambda r: -r[1])
+        add("Rotor angle: machines islanded by the event excluded", None,
+            "%d machine(s) are left with NO path to the system by this fault's own "
+            "trips, so their angle is a unit running alone, not a swing of the "
+            "system -- not judged on rotor-angle damping: %s"
+            % (len(skipped_island),
+               "; ".join("%s %.0f deg" % (n, d) for n, d in skipped_island[:6])))
     add("Rotor-angle damping SPPR1/SPPR5 (>= %.0f deg)" % ANGLE_DEV_DEG,
         not undamped,
         # "ALL ARE DAMPED" HAS TO MEAN ALL OF THEM. A machine moved to individual
@@ -28255,6 +28286,65 @@ def write_what_failed_report(cases, verdicts, rows, crit_rows=None):
         f.write("=" * W + "\n")
     print("What-failed      -> %s (%d violation row(s))" % (txt, len(recs)))
     return txt
+
+
+# ---- WHICH BUSES A FAULT'S OWN TRIPS LEAVE ISLANDED -------------------------
+# A machine behind them has no system to swing against: its rotor angle runs
+# away (S4/S5 GEN at 531445, 47,000 deg in SantaFe F177) and must not be scored
+# as a damping failure. ISLAND_ANGLE_MIN_DEG is the second condition -- see
+# the rotor-angle criterion.
+ISLAND_ANGLE_MIN_DEG = 360.0
+_EVENT_POCKETS = {}
+
+
+def _event_island_buses(scen_id):
+    """Buses this scenario's trips leave in a pocket of at most ISLAND_MAX_BUSES
+       buses with no other path to the system. Empty when it cannot be told
+       (no fault list, no network map) -- never a guess."""
+    if "_built" not in _EVENT_POCKETS:
+        _EVENT_POCKETS["_built"] = True
+        try:
+            faults = load_faults_csv(os.path.join(FAULTS_DIR, "SPP_FAULTS.csv"))
+        except Exception:
+            faults = []
+        for f in faults:
+            cut, ends = set(), []
+            for ln in (f.get("trip_lines") or []):
+                try:
+                    x = int(resolve_bus(ln[0], ln[2] if len(ln) > 2 else None) or 0)
+                    y = int(resolve_bus(ln[1], ln[2] if len(ln) > 2 else None) or 0)
+                except Exception:
+                    continue
+                if not x or not y:
+                    continue
+                cut.add((x, y))
+                cut.add((y, x))
+                ends += [x, y]
+            pocket, checked = set(), set()
+            for st in ends:
+                # A bus the map has no branch for is unknown, not islanded.
+                if st in checked or not _dist_nbrs(st):
+                    continue
+                seen, fr, isl = set([st]), [st], True
+                while fr:
+                    if len(seen) > ISLAND_MAX_BUSES:
+                        isl = False
+                        break
+                    nx = []
+                    for u in fr:
+                        for w in _dist_nbrs(u):
+                            if (u, w) in cut or w in seen:
+                                continue
+                            seen.add(w)
+                            nx.append(w)
+                    fr = nx
+                checked |= seen
+                if isl:
+                    pocket |= seen
+            if pocket:
+                _EVENT_POCKETS[str(f["id"]).strip().upper()] = pocket
+    s = str(scen_id).strip().upper()
+    return _EVENT_POCKETS.get(s) or _EVENT_POCKETS.get(re.split(r"[_\s]", s)[0]) or set()
 
 
 # ---- WHICH FAULTS DISCONNECT THE PROJECT ----------------------------------
