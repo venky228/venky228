@@ -11427,6 +11427,44 @@ def _user_models_mark():
               "next build will run the .bat files again" % e)
 
 
+def _compile_env():
+    """The environment the compile .bat files run in -- THIS Python first.
+
+       cload4 (PSS/E 34, called by MyCload41.bat) is a Python script, and it ran
+       under whatever Python the machine offered: the first 'python' on PATH,
+       or the py launcher / .py file association that a Python installer sets
+       up (and leaves behind when that Python is uninstalled). On one machine
+       that was Python 2.7, which cannot import PSS/E's psse_env_manager
+       ("No module named psse_env_manager") -- no dsusr.dll was linked, and
+       every worker of the case died at start.
+
+       This study runs under the Python PSS/E works with (it imported psspy),
+       so the .bat files get that one: its folder first on PATH, the py
+       launcher pointed at its version, and the PSSPY## / PSSBIN folders it
+       uses on PYTHONPATH. Returns (env, what to print)."""
+    env = dict(os.environ)
+    exe = sys.executable or ""
+    d = os.path.dirname(exe)
+    pre = [x for x in (d, os.path.join(d, "Scripts")) if x and os.path.isdir(x)]
+    tag = "PSSPY%d%d" % sys.version_info[:2]
+    psse = []
+    for q in sys.path:
+        b = os.path.basename(os.path.normpath(q or "")).upper()
+        if b in (tag, "PSSBIN") and os.path.isdir(q) and q not in psse:
+            psse.append(q)
+    env["PATH"] = os.pathsep.join(pre + psse + [env.get("PATH", "")])
+    old = [x for x in (env.get("PYTHONPATH") or "").split(os.pathsep) if x and x not in psse]
+    if psse or old:
+        env["PYTHONPATH"] = os.pathsep.join(psse + old)
+    env.pop("PYTHONHOME", None)
+    ver = "%d.%d" % sys.version_info[:2]
+    env["PY_PYTHON"] = ver                    # the py launcher's default version
+    env["PY_PYTHON%d" % sys.version_info[0]] = ver
+    note = "Python %s (%s)%s" % (ver, exe or "?", ("; PSS/E modules from " + ", ".join(
+        os.path.basename(os.path.normpath(x)) for x in psse)) if psse else "")
+    return env, note
+
+
 def _dyr_compile_user_models(changed):
     """Run the compile/link batch files. Raises if either fails.
 
@@ -11550,6 +11588,9 @@ def _dyr_compile_user_models(changed):
                 pass
 
     import subprocess
+    _cenv, _cnote = _compile_env()
+    print("  [dyr] the .bat files run with %s" % _cnote)
+    _bat_out = []
     for b in bats:
         print("  [dyr] compiling user models: %s" % b)
         sys.stdout.flush()
@@ -11559,6 +11600,7 @@ def _dyr_compile_user_models(changed):
             fh = None
         try:
             proc = subprocess.Popen([os.path.join(STUDY_DIR, b)], cwd=STUDY_DIR,
+                                    env=_cenv,
                                     stdin=fh, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT,
                                     universal_newlines=True, shell=False)
@@ -11572,6 +11614,7 @@ def _dyr_compile_user_models(changed):
                     fh.close()
             except Exception:
                 pass
+        _bat_out.append(out or "")
         for ln in (out or "").splitlines():
             print("  [dyr]   | %s" % ln.rstrip())
         # DOES THE OUTPUT SHOW A REAL FAILURE?
@@ -11615,14 +11658,24 @@ def _dyr_compile_user_models(changed):
         _left = [x for x in ("dsusr.def", "dsusr.exp", "dsusr.lib", "dsusr.map",
                              "dsusr.res")
                  if os.path.isfile(os.path.join(STUDY_DIR, x))]
+        _txt = "\n".join(_bat_out)
+        _py = ""
+        if "psse_env_manager" in _txt or ("cload4.py" in _txt and "Traceback" in _txt):
+            # cload4 is a Python script: a traceback from it means the Python
+            # that ran it is not one PSS/E's tools work with -- not a link error.
+            _py = (" cload4 (a Python script) FAILED TO START: the Python that ran it "
+                   "could not load PSS/E's modules. It was given %s; if the traceback "
+                   "above still shows another Python, the call inside the .bat names "
+                   "one explicitly -- run it from the 'PSS/E 34 Command Prompt' once, "
+                   "or send its first lines (type cload4.bat in PSSBIN)." % _cnote)
         raise RuntimeError(
             "the compile ran but produced no dsusr.dll in %s%s -- every scenario "
-            "would run the previous model set. Read the cload4 output above: "
+            "would run the previous model set.%s Read the cload4 output above: "
             "LNK1168 means the file was open in another process, LNK1104 means a "
             ".lib it links against is missing from this folder."
             % (STUDY_DIR,
-               (" (it left %s, so the link reached its final step)"
-                % ", ".join(_left)) if _left else ""))
+               (" (it left %s -- possibly from an earlier link)"
+                % ", ".join(_left)) if _left else "", _py))
     if _stashed:
         try:
             os.remove(_stash)
