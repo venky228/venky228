@@ -31,14 +31,18 @@
    - At startup, before psspy is imported, a `dsusr.dll` of the wrong bitness is moved aside as `dsusr.dll.32bit`, and the build compiles a new one. If it cannot be moved, the process exits with rc=1 before PSS/E starts.
    - After the compile, a 32-bit `dsusr.dll` (the `.bat` files still set up for PSS/E 34) is moved aside, the previous one is put back, and the build stops, naming the `.bat` files.
    - Model DLLs named in `add_library.idv`, all `*.dll` (`load_user_dlls`), and the BESS DLLs are checked before `addmodellibrary`. A wrong one stops the run and is named. The BESS scan ignores wrong-bitness copies.
-9. **`z7_init_check_v35.py`** (study root, reads only; v2). It counts the `.dll` in `Base\` and `Projects\` by bitness and reads the main-thread stack reserve of `python.exe` and `psse35.exe`. It starts PSS/E in an empty folder, one process per test:
-   - `psseinit(150000)`, as the study does;
-   - `psseinit()` at the default size;
-   - `psseinit(50000)`;
-   - `psseinit(150000)` on a 255 MB-stack thread;
-   - `psse35.py` setting up its own paths.
-
-   The first test that starts is repeated beside a copy of `Base\dsusr.dll`. It then reads the Windows Application Error log, prints a verdict (STACK / BUS SIZE / PATHS / install) and writes `INIT_CHECK.txt`.
+9. **`z7_init_check_v35.py`** (study root, reads only; v3).
+   - It counts the `.dll` in `Base\` and `Projects\` by bitness.
+   - It lists the DLLs PSS/E ships in `PSSBIN` that `python.exe` finds first in its own folder, `System32` or `Windows`, with both versions and the older copies first.
+   - It starts PSS/E in an empty folder, one process per test, running the child from a file (`python -u init_child.py`). With `-c`, PSS/E parses the command line and reports "Input error".
+   - The parent polls the child's module list (`EnumProcessModulesEx`, every 0.1 s). For each test it prints the runtime libraries used (path and version, flagging where `PSSBIN` has its own copy) and any DLL loaded from outside the PSS/E, Python and Windows folders.
+   - The tests:
+     1. as the study starts it;
+     2. `SetDllDirectoryW(PSSBIN)` first;
+     3. PSS/E's own runtime DLLs loaded first by full path (`PRELOAD_ORDER`, plus a newer `System32` `vcruntime140_1.dll`);
+     4. a temp copy of `python.exe` plus `python3*.dll` with the newest `vcruntime140*.dll` beside it and `PYTHONHOME` set to the real Python. This runs only when that runtime is newer than Python's own.
+   - The first test that starts is repeated beside a copy of `Base\dsusr.dll`.
+   - It then reads the Application Error log and prints a verdict: DLL SEARCH ORDER, RUNTIME LIBRARIES, VISUAL C++ RUNTIME, or none (then the PSS/E GUI or install is next). Everything goes to `INIT_CHECK.txt`.
 
 ## v34 fixes made after the v35 set, NOT in v35
 The user asked for the first two to be v34-only. Ask before carrying any of them to v35.
@@ -62,11 +66,14 @@ The user asked for the first two to be v34-only. Ask before carrying any of them
     - Windows log for each start: `GIC.dll` 0xC00000FD (stack overflow), then `MUSTENG.dll` 0xC0000005, then `ntdll.dll` 0xC0000005, all from `...\PSSE35\35.6\PSSBIN`.
     - Main suspect: `python.exe`'s ~2 MB main-thread stack.
     - The v2 check was sent to test it; result pending.
-  - **Prepared, not committed:** run PSS/E on a thread with a 255 MB stack.
-    - `spp_b`/`spp_p`: at the top, after `SetErrorMode`, `_run_on_big_stack()` reruns the file with `runpy.run_path(__file__, run_name="__main__", init_globals={"_ON_BIG_STACK": True})` on the big-stack thread, then `sys.exit(code)`.
-    - `spike_find` (including `--net`), `fault_list`, `scr`, `probe`: `main()` runs through `_on_big_stack(fn)`.
-    - `threading.stack_size(0)` is restored right after the thread starts. CPython passes the size as the initial commit, not a reservation.
-    - Tested with a fake psspy that crashes on the main thread: exit codes 0/5/7, exceptions give 1, and `sys.exit("msg")` behaves the same.
+  - `INIT_CHECK.txt` (v2, 09:47): PSS/E failed to start every way tried.
+    - Test cases: the default size, 50000 buses, `psse35.py` setting its own paths.
+    - On a 255 MB-stack thread there was no stack overflow, but an endless access-violation loop (38,812 before the 240 s kill).
+    - So the stack overflow is a side effect of recursive exception handling. The root is an access violation in `GIC.dll`/`MUSTENG.dll` (35.6.4.0, built 2024-11-05).
+    - `python.exe` reserves 1.9 MB of main-thread stack; `psse35.exe` reserves 7.6 MB.
+    - The big-stack change drafted earlier was dropped, never committed.
+  - Suspects for v3: another copy of a runtime DLL used in place of PSSBIN's; the CodeMeter runtime (GIC and MUST are licensed add-ons); the install. Ask whether the PSS/E 35.6 GUI starts.
+  - The user asked whether the PSS/E 34.8 DLLs can be used with 35. No: they are 32-bit and PSS/E 35 is 64-bit. `dsusr.dll` is rebuilt by the build; vendor DLLs need their PSS/E 35 builds. v34 (`z7_con`) keeps working with them.
   - Also from the check:
     - All 84 `.dll` in each of `Base\` and `Projects\` are 32-bit PSS/E 34 builds: Vestas, SMA, ABB HVDC, PE, GE, `MyUsrdll.dll`, `dsusr.dll`, and more. Each model the deck uses needs its PSS/E 35 64-bit build.
     - The folders have `MyCompile34.bat` and `MyCload4.bat`, which point at PSSE34 and `PSSE33.lib`. The panel's `DYR_COMPILE_BATS` names `MyCompile35.bat` and `MyCload41.bat`, which do not exist yet.
