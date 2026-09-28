@@ -1346,6 +1346,16 @@ def _el_rank(z4, cls):
     return 1
 
 
+def _rounded3(res):
+    """A sheet builder's (header, rows, widths, style) with every float cell
+       rounded to 3 decimals; rows may be a generator and stay one."""
+    header, rows, widths, style = res
+
+    def _r(v):
+        return round(v, 3) if isinstance(v, float) else v
+    return header, ([_r(v) for v in row] for row in rows), widths, style
+
+
 def _cycles(fam, secs):
     """Seconds above 1.20 pu as cycles (60 Hz), for an overvoltage row."""
     if fam != "overshoot":
@@ -2055,6 +2065,8 @@ def write_side_by_side(z4, ref, group):
              ("8 All detail", "DETAIL",
               lambda: _wide_sheet(z4, group, tags, "detail", z4._REPORT_COLS, rk, ctx)),
              ("9 Runs", "RUNS", lambda: _sbs_runs(z4, ref, group, tags, rk, lay))]
+    # EVERY DECIMAL TO 3 PLACES (1.07322835922 -> 1.073), on every sheet.
+    specs = [(nm, key, (lambda fn=fn: _rounded3(fn()))) for nm, key, fn in specs]
     counts, xp = _write_workbook_streamed(z4, xp, specs, d, lab, legend=z4._XL_LEGEND,
                                           title_rows=title)
     write_rerun_list(z4, os.path.join(d, "RERUN_%s.txt" % proj),
