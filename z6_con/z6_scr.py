@@ -33,6 +33,12 @@ import os, sys, re, ast, csv, io, time
 
 # ---- SETTINGS -------------------------------------------------------------
 PROJECTS = []          # [] = PROJECTS from z6_main.py
+USE_FAULTS = True      # False = no fault-list outages at all: intact system, POI_N1 and
+                       #         EXTRA_OUTAGES only (a quick SCR at the POI)
+ONLY_FAULTS = []       # [] = every fault of the list. Otherwise only these, e.g.
+                       #   ["F01", "F10-F20"]                       (every project)
+                       #   {"SantaFe": ["F03", "F131"], "EastFork": ["F89"]}  (per project;
+                       #    a project not named here runs every fault)
 EXTRA_OUTAGES = []     # extra single outages, e.g. ["765911-531501-345-1"] (from-to-kV-ckt)
 POI_N1 = True          # also every line / transformer AT the POI bus, one at a time
 WEAK_SCR = 3.0         # SCR below this is flagged WEAK
@@ -250,14 +256,24 @@ def _three_wind_map():
 
 def switch(a, b, ck, st, c=None):
     """Open (st=0) or close (st=1) a line, 2-winding or 3-winding transformer.
-       True when a call accepted it."""
+       Returns "ok" (status changed), "purged" (the element was DELETED from the
+       in-memory case -- the case must be reloaded afterwards), or None.
+
+       THE TRANSFORMER STATUS CALLS DIFFER BETWEEN PSS/E BUILDS, and on this
+       one two_winding_chng_6 / three_wnd_imped_chng_4 took nothing: every GSU
+       and 3-winding transformer read "not found" while it was in the case. An
+       outage only needs the element GONE for the short-circuit solution, so
+       when no status call takes it, it is purged and the case reloaded."""
     a, b, ck = int(a), int(b), str(ck).strip()
-    tries = []
+    tries, purge = [], []
     if c is None:
         tries += [lambda: psspy.branch_chng_3(a, b, ck, [st] + [_i] * 5, [_f] * 12, [_f] * 12, ""),
                   lambda: psspy.branch_chng(a, b, ck, [st] + [_i] * 5, [_f] * 12),
                   lambda: psspy.two_winding_chng_6(a, b, ck, [st] + [_i] * 15, [_f] * 26,
-                                                   [_f] * 3, "", "")]
+                                                   [_f] * 3, "", ""),
+                  lambda: psspy.two_winding_chng_5(a, b, ck, [st] + [_i] * 15, [_f] * 24,
+                                                   [_f] * 3, "")]
+        purge += [lambda: psspy.purg2wnd(a, b, ck), lambda: psspy.purgbrn(a, b, ck)]
         w = _three_wind_map().get((a, b, ck))
     else:
         w = (a, b, int(c))
@@ -266,13 +282,48 @@ def switch(a, b, ck, st, c=None):
                                                        [_f] * 30, [_f] * 3, ""),
                   lambda: psspy.three_wnd_imped_chng_3(w[0], w[1], w[2], ck, [st] + [_i] * 11,
                                                        [_f] * 28, [_f] * 3, "")]
+        purge += [lambda: psspy.purg3wnd(w[0], w[1], w[2], ck)]
     for t in tries:
         try:
             if _ie(t()) in (0, None):
-                return True
+                return "ok"
         except Exception:
             continue
-    return False
+    if st == 0:
+        for t in purge:
+            try:
+                if _ie(t()) in (0, None):
+                    return "purged"
+            except Exception:
+                continue
+    return None
+
+
+def isolate_islands():
+    """Disconnect every island with no swing bus (PSS/E TREE), as the
+       short-circuit solution needs: an outage that splits off part of the
+       network otherwise stops ASCC with "No faults specified". Returns the
+       number of buses disconnected (the case must then be reloaded)."""
+    n = 0
+    try:
+        ie, nb = psspy.tree(1, 0)
+        guard = 0
+        while nb and nb > 0 and guard < 500:
+            n += int(nb)
+            ie, nb = psspy.tree(2, 1)          # 1 = disconnect this island, find the next
+            guard += 1
+    except Exception:
+        pass
+    return n
+
+
+def bus_dead(bus):
+    """True when the bus is disconnected (type 4) -- e.g. by isolate_islands()."""
+    try:
+        ie, t = psspy.busint(int(bus), "TYPE")
+        return ie == 0 and int(t) == 4
+    except Exception:
+        return False
 
 
 def machine(bus, mid, st):
@@ -330,6 +381,38 @@ def _parse(txt, n):
     return out
 
 
+def _fnum(fid):
+    m = re.match(r"^[A-Za-z]*(\d+)$", str(fid).strip())
+    return int(m.group(1)) if m else None
+
+
+def _wanted(proj):
+    """None = every fault; else a test fid -> bool, from ONLY_FAULTS
+       ("F07", "F10-F20", "10-20"; a list for every project or a dict per project)."""
+    sel = ONLY_FAULTS
+    if isinstance(sel, dict):
+        sel = sel.get(proj)
+    if not sel:
+        return None
+    exact, ranges = set(), []
+    for s in (sel if isinstance(sel, (list, tuple)) else [sel]):
+        s = str(s).strip()
+        if "-" in s:
+            a, b = s.split("-", 1)
+            na, nb = _fnum(a), _fnum(b)
+            if na is not None and nb is not None:
+                ranges.append((min(na, nb), max(na, nb)))
+                continue
+        exact.add(s.upper())
+
+    def ok(fid):
+        if str(fid).strip().upper() in exact:
+            return True
+        n = _fnum(fid)
+        return n is not None and any(a <= n <= b for a, b in ranges)
+    return ok
+
+
 def outage_sets(proj, poi):
     """[(key, label, branches[(a,b,ck)], wind3[(a,b,c,ck)], machines[(bus,id)], fault ids)]"""
     sets, order = {}, []
@@ -346,11 +429,16 @@ def outage_sets(proj, poi):
 
     fl = _fault_list(proj)
     n = 0
-    if os.path.isfile(fl):
+    want = _wanted(proj)
+    if not USE_FAULTS:
+        print("[scr] %s: USE_FAULTS = False -- no fault-list outages" % proj)
+    elif os.path.isfile(fl):
         with io.open(fl, encoding="utf-8", errors="replace") as fh:
             for r in csv.DictReader(fh):
                 fid = (r.get("fault_id") or "").strip()
                 if not fid or fid.upper().startswith("FLAT"):
+                    continue
+                if want is not None and not want(fid):
                     continue
                 n += 1
                 if MAX_FAULTS and n > MAX_FAULTS:
@@ -410,32 +498,62 @@ def run_project(proj, info, rows, L):
     L.append(hdr + "  flag   faults")
     L.append(" " + "-" * 118)
     for state, off in (("all in", []), ("EGF off", egf)):
-        _load(sav)
-        _W3.clear()
-        for b, i in off:
-            machine(b, i, 0)
+        def _fresh():
+            _load(sav)
+            _W3.clear()
+            for b, i in off:
+                machine(b, i, 0)
+        _fresh()
         base, why = scmva(poi)
         cases = [("INTACT", "", [], [], [], [])] + [
             ("set", what, br, w3, mc, ids) for _k, what, br, w3, mc, ids in sets]
         for tag, what, br, w3, mc, ids in cases:
-            opened, missing = [], []
+            opened, missing, reload_ = [], [], False
+            # A WINDING PAIR OF A 3-WINDING TRANSFORMER THE SAME SET LISTS is
+            # taken out by that transformer's own entry -- not a missing element.
+            _w3sets = [set(x[:3]) for x in w3]
             for a, b, ck in br:
-                (opened if switch(a, b, ck, 0) else missing).append(("b", a, b, ck))
+                r = switch(a, b, ck, 0)
+                if r:
+                    opened.append(("b", a, b, ck))
+                    reload_ = reload_ or r == "purged"
+                elif not any(set((a, b)) <= s for s in _w3sets):
+                    missing.append(("b", a, b, ck))
             for a, b, c, ck in w3:
-                (opened if switch(a, b, ck, 0, c) else missing).append(("w", a, b, c, ck))
+                r = switch(a, b, ck, 0, c)
+                if r:
+                    opened.append(("w", a, b, c, ck))
+                    reload_ = reload_ or r == "purged"
+                else:
+                    missing.append(("w", a, b, c, ck))
             for b, i in mc:
                 if (b, i) in off:
                     continue
                 (opened if machine(b, i, 0) else missing).append(("m", b, i))
-            v, why2 = (base, why) if tag == "INTACT" else scmva(poi)
-            # PUT IT BACK exactly as it was, so the next set starts from the same case.
-            for o in opened:
-                if o[0] == "b":
-                    switch(o[1], o[2], o[3], 1)
-                elif o[0] == "w":
-                    switch(o[1], o[2], o[4], 1, o[3])
+            if tag == "INTACT":
+                v, why2 = base, why
+            else:
+                # ISLANDS OFF FIRST: an outage that splits the network stops
+                # ASCC ("No faults specified") until the swingless part is out.
+                cut = isolate_islands()
+                reload_ = reload_ or cut > 0
+                if bus_dead(poi):
+                    v, why2 = None, "POI ISLANDED -- this outage cuts the POI off from the grid"
                 else:
-                    machine(o[1], o[2], 1)
+                    v, why2 = scmva(poi)
+            # PUT IT BACK exactly as it was, so the next set starts from the same
+            # case: status back where a status call did it, a fresh load where
+            # anything was purged or islanded.
+            if reload_:
+                _fresh()
+            else:
+                for o in opened:
+                    if o[0] == "b":
+                        switch(o[1], o[2], o[3], 1)
+                    elif o[0] == "w":
+                        switch(o[1], o[2], o[4], 1, o[3])
+                    else:
+                        machine(o[1], o[2], 1)
             label = "INTACT system" if tag == "INTACT" else _fmt_set(br, w3, mc)
             line = " %-38s %-14s" % (label[:38], state)
             scrs = []
@@ -444,6 +562,8 @@ def run_project(proj, info, rows, L):
                 scrs.append(scr)
                 line += " %9s %11s" % ("%.0f" % v if v else "-", "%.2f" % scr if scr else "-")
             fl = _flag(min([s for s in scrs if s is not None] or [None]) if any(scrs) else None)
+            if why2.startswith("POI ISLANDED"):
+                fl = "ISLANDED"
             note = why2 or ("not found: %s" % ", ".join(str(x[1:]) for x in missing) if missing else "")
             L.append(line + "  %-9s %s%s" % (fl, ", ".join(ids[:6]) + (" +%d" % (len(ids) - 6) if len(ids) > 6 else ""),
                                              ("   [%s]" % note) if note else ""))
@@ -459,6 +579,12 @@ def run_project(proj, info, rows, L):
     if worst:
         w = min(worst, key=lambda r: float(r[6]))
         L.append(" LOWEST SCMVA: %s MVA (%s, %s) -- faults %s" % (w[6], w[2], w[4] or "intact", w[5] or "-"))
+    isl = []
+    for r in rows:
+        if r[0] == proj and r[-2] == "ISLANDED" and r[2] == "all in":
+            isl.append(r[5] or r[4])
+    if isl:
+        L.append(" POI ISLANDED (the plant is cut off from the grid, no SCR) by: %s" % "; ".join(isl))
 
 
 def main():
