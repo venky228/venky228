@@ -6696,6 +6696,9 @@ def _xl_col(n):
     return out
 
 
+_XL_LONGDEC = re.compile(r"^-?\d{1,9}\.\d{4,}$")
+
+
 def _xl_cell(col, row, value, style):
     ref = "%s%d" % (_xl_col(col), row)
     st = ' s="%d"' % style if style else ""
@@ -6704,6 +6707,12 @@ def _xl_cell(col, row, value, style):
     # NUMBERS AS NUMBERS. Stored as text, a voltage column sorts 1.2 above 1.19
     # and the filter offers "text filters" rather than "greater than" -- which
     # is most of the reason to produce a spreadsheet at all.
+    # EVERY DECIMAL TO 3 PLACES (1.07322835922 -> 1.073), whether it arrives as
+    # a number or as a long decimal read back from a CSV.
+    if isinstance(value, str) and _XL_LONGDEC.match(value.strip()):
+        value = float(value.strip())
+    if isinstance(value, float):
+        value = round(value, 3)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return '<c r="%s"%s><v>%s</v></c>' % (ref, st, repr(value))
     # EXCEL'S HARD LIMIT IS 32,767 CHARACTERS IN ONE CELL. One character over
