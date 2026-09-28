@@ -322,7 +322,7 @@ def _print_phase_times(total):
 # "EastFork" = run 1, "SantaFe" = run 2, None = normal study (every setting below as it was).
 # It sets PROJECTS, PIPELINE, RUN_CASES, ONLY_FAULTS, DYR_SHOW, DYR_SWEEP_BY_PROJECT /
 # _PROJECTS (see the end of section 12). New folders only: <proj>_spp_dyr_<tag>.
-QUICK_DYR_TEST = None            # "z6_main1.py" is the copy that runs the quick test
+QUICK_DYR_TEST = "EastFork"            # z7_main1.py = the QUICK .dyr TEST copy of z7_main.py
 
 # ---- 1. WHAT TO RUN ------------------------------------------------------------
 PROJECTS = ["SantaFe", "IronStar","EmpirePrairie","EastFork"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
@@ -374,7 +374,7 @@ RUN_NPLT = 2                                 # write every N steps (1 = every st
 # GEN_TEST = True runs ONLY this test (normal study skipped).
 # Results: comparison_scenarios\<project>\BASE_CASE\gen_test\  (all projects: comparison_scenarios\GEN_TEST_ALL_PROJECTS.txt)
 # Live, every project on one page: comparison_scenarios\GEN_TEST_STATUS_ALL.txt
-# Preview the plan without simulating:  python z6_gt_report.py
+# Preview the plan without simulating:  python z7_gt_report.py
 # -- 3a. on / off, projects, faults
 GEN_TEST = False                              # True = run this test only | False = normal study
 GEN_TEST_DRY_RUN = False                     # True = list the plan, simulate nothing
@@ -598,7 +598,7 @@ MAKE_FAULT_LIST = False                      # False: never build/copy a list he
 REGEN_FAULTS = None                          # "if-missing" | "always" | "never"
 NEW_FAULT_LIST = False                       # True = brand-new list (renumbers, retires old results)
 FAULT_LIST_FROM = "BASE"                     # "BASE" | "TEST" topology
-SHARED_FAULTS_CSV = r"{root}\FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"  # the lists z6_fault_list.py writes
+SHARED_FAULTS_CSV = r"{root}\FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"  # the lists z7_fault_list.py writes
                                              #   (old: r"{root}\SPP_FAULTS_CON_{project}.csv"); {root} = case folder
 SPP_FAULT_HOPS = None                        # levels out from the POI
 SPP_FAULT_KV_MIN = None                      # ignore below this kV
@@ -1755,13 +1755,13 @@ SEARCH_ROOT = STUDY_ROOT                   # the folder the cases sit in
 CASE_BASE = {
     "key":    "BASE",
     "dir":    BASE_DIR,
-    "script": "z6_lch_b.py",
+    "script": "z7_lch_b.py",
     "label":  "base case -- projects NOT modelled",
 }
 CASE_TEST = {
     "key":    "PROJ",
     "dir":    TEST_DIR,
-    "script": "z6_lch_p.py",
+    "script": "z7_lch_p.py",
     "label":  "one BESS project added to the base case, one project at a time",
 }
 
@@ -9616,12 +9616,12 @@ def run_surplus_scenarios(proj, mode):
 
 def compare_three_way(proj, mode):
     """Base | GIA | each SURPLUS scenario for one project, in ONE side-by-side
-       workbook (z6_cmp_multi.py, run for this project's folders only): every
+       workbook (z7_cmp_multi.py, run for this project's folders only): every
        fault with each run's verdict, worst criterion, values and POI power.
        Written to <root>\\comparison_pairs\\<project>\\."""
-    cm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "z6_cmp_multi.py")
+    cm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "z7_cmp_multi.py")
     if not os.path.isfile(cm):
-        print("[3-way] z6_cmp_multi.py is not beside %s -- no side-by-side"
+        print("[3-way] z7_cmp_multi.py is not beside %s -- no side-by-side"
               % os.path.basename(__file__))
         return False
     rb = results_dir(CASE_BASE, proj, mode)
@@ -9654,7 +9654,7 @@ def compare_three_way(proj, mode):
             names[rt + psfx] = "PROJECT_SGF_EGF_OFF"
             sbs_name = "{proj}_ALL_4_SCENARIOS"
     import tempfile
-    tmp = tempfile.mkdtemp(prefix="z6_3way_")
+    tmp = tempfile.mkdtemp(prefix="z7_3way_")
     pj, dj = os.path.join(tmp, "pairs.json"), os.path.join(tmp, "done.json")
     tj = os.path.join(tmp, "tags.json")
     with open(pj, "w") as fh:
@@ -9688,7 +9688,7 @@ def compare_three_way(proj, mode):
     if th is not None:
         th.join(timeout=5)
     if rc not in (0, None):
-        print("[3-way] *** %s: z6_cmp_multi ended rc=%s ***" % (proj, rc))
+        print("[3-way] *** %s: z7_cmp_multi ended rc=%s ***" % (proj, rc))
     return rc in (0, None)
 
 
@@ -10770,7 +10770,7 @@ def _dyr_sweep_variants(proj=None):
     variants = [("dyr_" + t, e) for t, e in out]
     # DROP ANY VARIANT THAT IS THE DECK AS IT STANDS. The deck values come from
     # the engine's BESS_MODEL_TEMPLATE automatically (they are already in
-    # z6_spp_p.py), overlaid by DYR_DECK_VALUES and the panel edits -- so no
+    # z7_spp_p.py), overlaid by DYR_DECK_VALUES and the panel edits -- so no
     # value need be typed twice. See DYR_DECK_VALUES / DYR_SWEEP_SKIP_DECK.
     if DYR_SWEEP_SKIP_DECK:
         kept, dropped = [], []
@@ -10795,7 +10795,7 @@ _ENGINE_DYR_DEFAULTS = [None]
 
 def _engine_dyr_defaults():
     """{model: {constant name: value}} read from BESS_MODEL_TEMPLATE in the
-       project engine (z6_spp_p.py) -- the deck defaults that are ALREADY in the
+       project engine (z7_spp_p.py) -- the deck defaults that are ALREADY in the
        file, so the guard needs no hand-typed DYR_DECK_VALUES.
 
        The template annotates every record: an "@!/ name name ..." line above a
@@ -10809,8 +10809,8 @@ def _engine_dyr_defaults():
     try:
         spp = _study_script_for(CASE_TEST)
         if not spp:
-            for _p in (os.path.join(TEST_DIR, "z6_spp_p.py"),
-                       _root_named("z6_spp_p.py")):
+            for _p in (os.path.join(TEST_DIR, "z7_spp_p.py"),
+                       _root_named("z7_spp_p.py")):
                 if os.path.isfile(_p):
                     spp = _p
                     break
@@ -12218,7 +12218,7 @@ def _in_own_process(fn):
         _PLAN_NOW[0] = "%s %s   (since %s)" % (name, " ".join(str(x) for x in a),
                                                time.strftime("%Y-%m-%d %H:%M"))
         import tempfile
-        tmp = tempfile.mkdtemp(prefix="z6_step_")
+        tmp = tempfile.mkdtemp(prefix="z7_step_")
         rp = os.path.join(tmp, "result.json")
         env = dict(os.environ)
         env[_EXTRA_STEP_ENV] = json.dumps({
@@ -15063,8 +15063,8 @@ def _push_settings(env, case):
     # arrangement exists to avoid.
     _say("[compare] %-4s deck : %s / %s%s"
           % (case.get("key", "?"),
-             _sav or "(z6_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
-             _dyr or "(z6_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
+             _sav or "(z7_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
+             _dyr or "(z7_spp_%s.py's own)" % ("b" if _this == "base" else "p"),
              ("   <- the INPUT deck (no project in it); the plant is built onto "
               "a copy and that copy is what runs"
               if _this == "project" and _sav and _sav == BASE_SAV else "")))
@@ -15075,7 +15075,7 @@ def _push_settings(env, case):
     # change the very case the comparison measures against -- so every difference
     # afterwards would be "the project, plus a base case we moved".
     #
-    # z6_spp_b.py implements none of this, so the variables were ignored there in
+    # z7_spp_b.py implements none of this, so the variables were ignored there in
     # any case. They are removed rather than left to be ignored: an environment
     # that carries a setting the process does not honour is a setting somebody
     # will later believe was applied.
@@ -16229,7 +16229,7 @@ def check_fault_lists():
         print("[compare]     %s  ->  %s + its study script"
               % (CASE_TEST["dir"], CASE_TEST["script"]))
         print("[compare]   This file (%s) sits in the folder ABOVE them."
-              % os.path.basename(__file__ if "__file__" in dir() else "z6_main.py"))
+              % os.path.basename(__file__ if "__file__" in dir() else "z7_main.py"))
         return False
 
     # BOTH GENERATING = two different fault sets, and nothing later can tell.
@@ -16356,7 +16356,7 @@ def check_feeder_ratings():
        equally across its feeders and ABORTS when a feeder would carry more
        than FEEDER_MAX_MW:  804 / 4 = 201.0 against a cap of 200.0.
 
-       That check is module-level code in z6_spp_p.py, so it raises on IMPORT,
+       That check is module-level code in z7_spp_p.py, so it raises on IMPORT,
        before main(). Every process of that project's PROJECT-case pass died the
        same way -- build, worker, report, plot -- the launcher retried the build
        three times and gave up, and the pass produced no results folder at all.
@@ -17029,7 +17029,7 @@ def _cases_to_run():
 
 
 def _study_script_for(case):
-    """The STUDY script for this case -- z6_spp_b.py / z6_spp_p.py.
+    """The STUDY script for this case -- z7_spp_b.py / z7_spp_p.py.
 
        NOT case["script"], which is the LAUNCHER. The launcher runs a whole
        study: build, simulate, report. It does not know SPP_PLOT_MISSING and
@@ -17039,7 +17039,7 @@ def _study_script_for(case):
        script itself, whose very first act under SPP_PLOT_MISSING is to draw
        what is on disk and exit before main() -- no PSS/E, no queue, no case."""
     lch = case.get("script") or ""
-    spp = os.path.basename(lch).replace("z6_lch_", "z6_spp_")
+    spp = os.path.basename(lch).replace("z7_lch_", "z7_spp_")
     p = os.path.join(case["dir"], spp)
     return p if os.path.isfile(p) else ""
 
@@ -18025,7 +18025,7 @@ def run_merge_only():
     """The merge step alone, for every project and both cases. Returns how many
        folders were rebuilt.
 
-       See MERGE_ONLY. This spawns the STUDY script (z6_spp_p.py / z6_spp_b.py)
+       See MERGE_ONLY. This spawns the STUDY script (z7_spp_p.py / z7_spp_b.py)
        with SPP_MERGE_ONLY=1, which is handled before main() -- so no PSS/E
        session is started, no case is loaded and no .out is opened. A folder
        with no parts\ is skipped and said so, rather than writing an empty
@@ -18218,7 +18218,7 @@ def _merge_one_folder(case, rdir):
     env = dict(os.environ)
     # THE SAME ENVIRONMENT THE RUN HAD. Without it the merge process fell back
     # to the study script's own deck names -- "DIS2201-25SP-G03-CQ.sav (this
-    # file -- z6_main.py did not name one)" -- could not find the
+    # file -- z7_main.py did not name one)" -- could not find the
     # _CQ_F_..._NEWPLANT_newplant_buses.txt the run had written, and rebuilt
     # the violations report with "PROJECT_GENS stays on the project's declared
     # feeder buses": the wrong machines labelled as the project's. The decks,
@@ -18862,7 +18862,7 @@ def mark_partial_runs(quiet=False):
         for sid, te in found:
             try:
                 with open(os.path.join(od, sid + ".partial"), "w") as fh:
-                    fh.write("tend=%.3f\nby=z6_main (time axis)\n" % te)
+                    fh.write("tend=%.3f\nby=z7_main (time axis)\n" % te)
                 n_new += 1
                 if not quiet:
                     print("[compare]     %-10s reached %.2f s of %.2f s" % (sid, te, _end))
@@ -19649,21 +19649,21 @@ _GT_NET = [None, False]
 
 
 def _gt_net():
-    """The case's network, read once (z6_spike_find's child process)."""
+    """The case's network, read once (z7_spike_find's child process)."""
     if _GT_NET[1]:
         return _GT_NET[0]
     here = os.path.dirname(os.path.abspath(__file__))
     for d in (here, STUDY_ROOT):
-        if os.path.isfile(os.path.join(d, "z6_spike_find.py")):
+        if os.path.isfile(os.path.join(d, "z7_spike_find.py")):
             if d not in sys.path:
                 sys.path.insert(0, d)
             break
     else:
-        print("[gen-test] *** z6_spike_find.py not found beside this panel -- it is used to")
+        print("[gen-test] *** z7_spike_find.py not found beside this panel -- it is used to")
         print("[gen-test]     read the network. Copy it here, or list GEN_TEST_GENS by hand ***")
         _GT_NET[1] = True
         return None
-    import z6_spike_find as S
+    import z7_spike_find as S
     kind = "base" if _gt_case() is CASE_BASE else "proj"
     _GT_NET[0] = S._load_net_via_child(kind)
     _GT_NET[1] = True
@@ -19681,7 +19681,7 @@ def _gt_cap_list(hops):
     net = _gt_net()
     if net is None:
         return None
-    import z6_spike_find as S
+    import z7_spike_find as S
     caps = []
     for b, h, z in S.nearby(net, GEN_TEST_POI, hops):
         for d in net["dev"].get(b, []):
@@ -19958,9 +19958,9 @@ def _gt_each_lines():
     net = _gt_net()
     if net is None or "brn" not in net:
         print("[gen-test] line-off runs skipped: the network (with its branch list) could not "
-              "be read -- is z6_spike_find.py the new one?")
+              "be read -- is z7_spike_find.py the new one?")
         return []
-    import z6_spike_find as S
+    import z7_spike_find as S
     near = dict((b, (h, z)) for b, h, z in S.nearby(net, GEN_TEST_POI, GEN_TEST_LINES_HOPS))
     want = None
     if GEN_TEST_LINES_LIST:
@@ -20062,7 +20062,7 @@ def _gt_find_gens():
     net = _gt_net()
     if net is None:
         return None
-    import z6_spike_find as S
+    import z7_spike_find as S
     if GEN_TEST_POI not in net["bus"]:
         print("[gen-test] *** POI bus %s is not in the case ***" % GEN_TEST_POI)
         return None
@@ -21143,7 +21143,7 @@ def _gt_env(sc, g, faults):
            "SPP_BUSES_DSCN": ";".join(str(b) for b in g.get("dscn") or []) if g else ""}
     if g and g.get("egf"):
         # the existing machines at the project's feeders, constants changed
-        # (z6_spp_*.py: egf_dyr_with_edits) -- nothing switched off
+        # (z7_spp_*.py: egf_dyr_with_edits) -- nothing switched off
         env["SPP_EGF_DYR_EDITS"] = json.dumps([[m, d] for m, d in g["egf"]])
     if it or acc:
         env["SPP_SOLVER_RETRY"] = "1"
@@ -24516,10 +24516,10 @@ if __name__ == "__main__":
 # HOW THE TWO SIDES STAY APART. They read the same file and write different
 # ones:
 #
-#   base case      ENABLE_BESS = False in z6_spp_b.py, so NO .sav is ever
+#   base case      ENABLE_BESS = False in z7_spp_b.py, so NO .sav is ever
 #                  saved -- it reads the deck, converts in memory, and writes
 #                  DIS2201-25SP-G03-CQ.cnv/.snp/.cnl into the Base folder
-#   project case   ENABLE_BESS = True in z6_spp_p.py, so the build writes
+#   project case   ENABLE_BESS = True in z7_spp_p.py, so the build writes
 #                  DIS2201-25SP-G03-CQ_BESS_<project>_<MW>MW.sav/.cnv/.snp
 #                  into the Projects folder -- one set per project, beside the
 #                  untouched original
@@ -25219,9 +25219,9 @@ if __name__ == "__main__":
 # ============================  CONTROL PANEL  ===============================
 # ============================================================================
 # EVERYTHING YOU NORMALLY CHANGE IS HERE. The rest of this file, and both
-# launchers, take their instructions from these -- z6_main.py passes
+# launchers, take their instructions from these -- z7_main.py passes
 # them down through the environment, so a run driven from here does not need
-# z6_lch_b.py or z6_lch_p.py to be edited at all. Anything set in
+# z7_lch_b.py or z7_lch_p.py to be edited at all. Anything set in
 # a launcher is OVERRIDDEN while this script is driving.
 #
 # Each setting keeps its full explanation further down, beside the code that
@@ -25239,9 +25239,9 @@ if __name__ == "__main__":
 # to another machine: put the five scripts and the two case folders on the new
 # PC, run this file from where it sits, and every path below follows it.
 #
-#   <ROOT>\                  z6_main.py    <- this file
-#     Base\                  z6_lch_b.py  z6_spp_b.py
-#     Projects\              z6_lch_p.py  z6_spp_p.py  + THE ONE DECK
+#   <ROOT>\                  z7_main.py    <- this file
+#     Base\                  z7_lch_b.py  z7_spp_b.py
+#     Projects\              z7_lch_p.py  z7_spp_p.py  + THE ONE DECK
 #
 # With SHARED_DECK on there is a single deck, in Projects\, and it is the BASE
 # CASE -- the system with none of the new BESS in it. The Base folder holds the

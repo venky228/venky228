@@ -322,7 +322,7 @@ def _print_phase_times(total):
 # "EastFork" = run 1, "SantaFe" = run 2, None = normal study (every setting below as it was).
 # It sets PROJECTS, PIPELINE, RUN_CASES, ONLY_FAULTS, DYR_SHOW, DYR_SWEEP_BY_PROJECT /
 # _PROJECTS (see the end of section 12). New folders only: <proj>_spp_dyr_<tag>.
-QUICK_DYR_TEST = None            # "z6_main1.py" is the copy that runs the quick test
+QUICK_DYR_TEST = "EastFork"            # z6_main1.py = the QUICK .dyr TEST copy of z6_main.py
 
 # ---- 1. WHAT TO RUN ------------------------------------------------------------
 PROJECTS = ["SantaFe", "IronStar","EmpirePrairie","EastFork"]                       # projects studied; others: "IronStar","EmpirePrairie","EastFork"
