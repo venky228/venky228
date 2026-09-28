@@ -531,6 +531,8 @@ EGF_DYR_RUN = False                          # True = run BOTH cases with those 
 EGF_OFF_RUN = False                          # True = run BOTH cases with every existing machine OFF (_egfoff) and compare
 EGF_OFF_BASE_RUN = True                     # True = run the BASE case ONLY with every existing machine OFF (_egfoff);
                                              #   the PROJECT side of its comparisons is the surplus run s1_egfoff
+EGF_FIRST = True                             # True = the EGF runs above go FIRST, before the main runs, the
+                                             #   rescore/replot and the surplus steps (False = last, as before)
 EGF_PROJECTS = []                            # [] = every project of the launch (EGF_DYR_RUN: those with edits)
 EGF_FAULTS = "same"                          # "same" = ONLY_FAULTS | "all" | ["F01-F04"]
 EGF_ONLY = True                              # True = a project WITH edits above runs ONLY its edited run (its as-is study
@@ -22940,6 +22942,23 @@ def main():
     # "(launch starting)" until the very end.
     _plan_stop = _sweep_plan_start()
 
+    # ---- THE EGF RUNS FIRST (EGF_FIRST) ------------------------------------
+    # They need nothing from the main runs, so they need not wait hours behind
+    # the rescore and replot. Their comparisons stay at the end, where the rest
+    # is on disk; the loop there skips what ran here.
+    _egf_first = []
+    if (EGF_FIRST and pipeline in ("all", "missing")
+            and (EGF_DYR_RUN or EGF_OFF_RUN or EGF_OFF_BASE_RUN)):
+        _banner("EGF RUNS FIRST (EGF_FIRST = True)")
+        for _p in list(_panel_projects() or []):
+            for _m in (list(MODES) or ["spp"]):
+                try:
+                    run_egf_variants(_p, _m)
+                except Exception as e:
+                    print("[egf] the existing-machine runs failed (%s) -- the rest "
+                          "of the launch continues" % e)
+                _egf_first.append((_p, _m))
+
     # ---- PHASE 1 -- SIMULATE BOTH CASES ------------------------------------
     # A case that was NOT RUN has no exit code. None, not 2: the check below
     # treats anything non-zero as "that study ended badly", and RUN_CASES =
@@ -23674,6 +23693,8 @@ def main():
                 _egf_pm.append((_p, _m))
     if _egf_pm and (EGF_DYR_RUN or EGF_OFF_RUN or EGF_OFF_BASE_RUN) and pipeline != "compare":
         for _p, _m in _egf_pm:
+            if (_p, _m) in _egf_first:
+                continue
             try:
                 run_egf_variants(_p, _m)
             except Exception as e:

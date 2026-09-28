@@ -33788,9 +33788,11 @@ def finalize_report(produced, part=None, claim=False):
                 print("[score] %d/%d  %s  ->  %s   (from the worker's score)"
                       % (n + 1, len(produced), _sid, _v))
                 sys.stdout.flush()
-                if part is not None:
-                    try: write_report_part(part, all_rows, verdicts, quiet=True)
-                    except Exception: pass
+                # NO PART-FILE WRITE HERE. Rewriting the whole part (tens of
+                # thousands of rows) once per already-scored scenario, in every
+                # shard, made a rescore of a finished folder take minutes of
+                # pure disk writing. The shard's final write saves these rows,
+                # and a shard that dies re-reads them from the SCEN_ files.
                 continue
             # Progress, flushed. A phase that reads tens of MB per file and prints
             # nothing is indistinguishable from a hung one.
