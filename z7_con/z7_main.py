@@ -18222,6 +18222,12 @@ def auto_remerge_stale_reports(quiet=False):
                     by = _report_behind_parts_by(rdir, proj)
                     if by > STALE_REPORT_TOL_S:
                         todo.append((case, proj, rdir, by))
+                    elif (not (rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj)
+                               or rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj))
+                          and glob.glob(os.path.join(rdir, "parts", "SCEN_*.csv"))):
+                        # SCORED PARTS AND NO MERGED REPORT AT ALL -- "behind"
+                        # reads 0 there, so it was never rebuilt.
+                        todo.append((case, proj, rdir, -1))
     if not todo:
         return 0
     print("")
@@ -18232,8 +18238,9 @@ def auto_remerge_stale_reports(quiet=False):
     print("[auto-merge] Rebuilding them from parts\\ first (merge only -- no .out is read).")
     n = 0
     for case, proj, rdir, by in todo:
-        print("[auto-merge] %-6s %-16s %-42s report is %s behind"
-              % (case["key"], proj, os.path.basename(rdir), _fmt_hms(by)))
+        print("[auto-merge] %-6s %-16s %-42s %s"
+              % (case["key"], proj, os.path.basename(rdir),
+                 "no merged report yet" if by < 0 else "report is %s behind" % _fmt_hms(by)))
         if _merge_one_folder(case, rdir):
             n += 1
     print("[auto-merge] %d of %d folder(s) rebuilt." % (n, len(todo)))
@@ -18296,6 +18303,79 @@ def _out_and_scored_sets(rdir, proj):
     return outs, scored
 
 
+def _tag_env(proj, tag):
+    """The run settings of an EGF / surplus tagged folder, or None for any other
+       tag (a sweep or capacity folder is scored by its own pass)."""
+    for sc in surplus_scenarios():
+        if sc["tag"] == tag:
+            return _surplus_env(sc)
+    for t, _label, venv in _egf_variants(proj):
+        if t == tag:
+            env = {"SPP_RUN_TAG": tag, "SPP_DEFER_REPORTS": "0"}
+            env.update(venv)
+            return env
+    return None
+
+
+def _score_tagged_folder(case, proj, mode, rdir, missing):
+    """Score the .out files of an EGF / surplus folder that have no verdict.
+       Returns the ids still unscored afterwards, or None when nothing was run."""
+    _p, _m, tag = _split_run_folder(rdir)
+    if not tag:
+        return None
+    env = _tag_env(proj, tag)
+    if env is None:
+        return None
+    od = os.path.join(rdir, "outs")
+    todo = []
+    for sid in missing:
+        q = os.path.join(od, sid + ".out")
+        if sid.upper().startswith("FLAT") or not os.path.isfile(q):
+            continue
+        if not (os.path.isfile(os.path.join(od, sid + ".done"))
+                or os.path.isfile(os.path.join(od, sid + ".partial"))):
+            continue                    # still running / never finished: not a scoring job
+        if os.path.isfile(q + ".badout"):
+            continue
+        stamp = os.path.join(od, sid + ".scoretry")
+        omt = "%.0f" % os.path.getmtime(q)
+        try:
+            if os.path.isfile(stamp) and open(stamp).read().strip() == omt:
+                continue                # asked once already for this .out
+        except Exception:
+            pass
+        todo.append((sid, stamp, omt))
+    if not todo:
+        return None
+    ids = [s for s, _st, _o in todo]
+    print("[coverage]     scoring %d of them now under the %s settings -- no simulation: %s"
+          % (len(ids), tag, ", ".join(ids[:12]) + (" ..." if len(ids) > 12 else "")))
+    for _sid, stamp, omt in todo:
+        try:
+            with open(stamp, "w") as fh:
+                fh.write(omt)
+        except Exception:
+            pass
+    env.update({"SPP_REPORT_ONLY": "1", "SPP_REPORT_FAULTS": ",".join(ids),
+                "SPP_ONLY_FAULTS": ""})
+    try:
+        rc = run_study(case, projects=[proj], modes=[mode], extra_env=env)
+    except Exception as e:
+        print("[coverage]     the scoring pass could not start (%s)" % e)
+        return None
+    if rc not in (0, None):
+        print("[coverage]     the scoring pass ended rc=%s -- what it scored is kept" % rc)
+    # ITS REPORTS ARE THE _SELECTED ONES -- rebuild the full ones from every part.
+    _merge_one_folder(case, rdir)
+    _MEAS_CACHE.clear()
+    _SCEN_PART_CACHE.clear()
+    _OUT_SET_CACHE.clear()
+    outs, scored = _out_and_scored_sets(rdir, proj)
+    after = sorted(outs - scored, key=_fault_key)
+    print("[coverage]     %d of %d now scored" % (len(missing) - len(after), len(missing)))
+    return after
+
+
 def verify_scoring_coverage(quiet=False):
     """Does every .out in every folder have a verdict? Run BEFORE comparing.
 
@@ -18337,7 +18417,13 @@ def verify_scoring_coverage(quiet=False):
                     # the merge rebuilds the same report (every launch, for a
                     # folder with an .out that can never be scored) and could
                     # bring back a score older than a re-run .out.
-                    if (_report_behind_parts_by(rdir, proj) > STALE_REPORT_TOL_S
+                    # A FOLDER WITH PARTS AND NO MERGED REPORT AT ALL is behind
+                    # its parts too -- _report_behind_parts_by() says 0 there, so
+                    # EmpirePrairie_spp_egfoff (246 scored parts, no report) was
+                    # never merged, launch after launch.
+                    _no_rep = not (rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj)
+                                   or rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj))
+                    if ((_no_rep or _report_behind_parts_by(rdir, proj) > STALE_REPORT_TOL_S)
                             and _merge_one_folder(case, rdir)):
                         _MEAS_CACHE.clear()
                         _SCEN_PART_CACHE.clear()
@@ -18348,6 +18434,16 @@ def verify_scoring_coverage(quiet=False):
                             print("[coverage]     merged from parts -- %d of those now "
                                   "scored" % (len(missing) - len(_after)))
                         missing = _after
+                    # EGF-OFF AND SURPLUS FOLDERS ARE SCORED HERE. ensure_reports()
+                    # scores the plain <proj>_<mode> folders only, so a tagged
+                    # folder whose own run died in its report phase kept its
+                    # unscored .out files for good (EmpirePrairie_spp_s1_egfoff:
+                    # 198 of 285). One pass restricted to those ids, under the
+                    # tag's own settings; asked once per version of each .out.
+                    if missing:
+                        _after = _score_tagged_folder(case, proj, mode, rdir, missing)
+                        if _after is not None:
+                            missing = _after
                     if missing:
                         still.append((case, proj, rdir, missing))
     if not still:
