@@ -15,6 +15,7 @@ Pairs (per project):
   GIA_s1_egfoff vs GIA           -- EGF effect with the project
 
 Writes into EXPORT_DIR\\compare:
+  COMPARE_4WAY_<proj>.csv    per fault: failed criteria in BASE, BASE_egfoff, GIA, GIA_s1_egfoff
   COMPARE_SUMMARY.txt        one line per project/pair + the gaps
   COMPARE_FAULTS.csv         per fault: verdicts, failed criteria added/cleared
   COMPARE_VIOLATIONS.csv     per violation (kind, element): new / cleared / worse / better
@@ -120,6 +121,87 @@ def load(d):
     return verdict, crit, vio, scen
 
 
+FOUR = ["BASE", "BASE_egfoff", "GIA", "GIA_s1_egfoff"]
+CRIT_SHORT = [("Rotor-angle damping", "DAMP"), ("Transient voltage", "TOV"),
+              ("generator tripping", "TRIP"), ("Steady-state voltage", "SSV"),
+              ("System stability", "STAB"), ("within scale", "SCALE"),
+              ("Record long enough", "REC"), ("Voltage recovery", "RECOV")]
+
+
+def _short(c):
+    for k, s in CRIT_SHORT:
+        if k in c:
+            return s
+    return c
+
+
+def _four_label(v):
+    """v = verdicts in FOUR order ('PASS'/'FAIL'/None) -> what changed."""
+    b, be, g, ge = v
+    out = []
+    for (x, y, on) in ((b, g, "EGF on"), (be, ge, "EGF off")):
+        if x == "PASS" and y == "FAIL":
+            out.append("new FAIL with project (%s)" % on)
+        elif x == "FAIL" and y == "PASS":
+            out.append("cleared by project (%s)" % on)
+    if b and be and b != be:
+        out.append("EGF off changes BASE (%s -> %s)" % (b, be))
+    if g and ge and g != ge:
+        out.append("EGF off changes GIA (%s -> %s)" % (g, ge))
+    if None in v:
+        out.append("not scored in " + ", ".join(s for s, x in zip(FOUR, v) if x is None))
+    return "; ".join(out)
+
+
+def write_four_way(out, proj, verdict, crit, vio):
+    """Per fault: verdict + failed criteria in all four scenarios side by side."""
+    faults = sorted(set(f for (p, s, f) in verdict if p == proj), key=_fkey)
+    rows, pat, tot = [], defaultdict(int), defaultdict(int)
+    for f in faults:
+        v = [verdict.get((proj, s, f)) for s in FOUR]
+        cells = []
+        for s, x in zip(FOUR, v):
+            if x is None:
+                cells.append("-")
+            elif x == "PASS":
+                cells.append("PASS")
+            else:
+                cs = sorted(set(_short(c) for c in crit[(proj, s, f)]))
+                for c in cs:
+                    tot[(s, c)] += 1
+                cells.append("+".join(cs) or "FAIL")
+        pat["".join("-" if x is None else x[0] for x in v)] += 1
+        nv = [len(vio[(proj, s, f)]) if x else "" for s, x in zip(FOUR, v)]
+        rows.append([f] + cells + nv + ["same" if len(set(cells)) == 1 else "differs",
+                                         _four_label(v)])
+    with open(os.path.join(out, "COMPARE_4WAY_%s.csv" % proj), "w", newline="",
+              encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["fault_id"] + FOUR + ["violations_" + s for s in FOUR] +
+                   ["criteria", "what changed"])
+        w.writerows(rows)
+    lines = ["", "%s -- 4 scenarios side by side (COMPARE_4WAY_%s.csv)" % (proj, proj),
+             "  faults with FAIL per criterion:"]
+    lines.append("    %-8s" % "" + "".join("%15s" % s for s in FOUR))
+    for _, c in CRIT_SHORT:
+        n = [tot[(s, c)] for s in FOUR]
+        if any(n):
+            lines.append("    %-8s" % c + "".join("%15d" % x for x in n))
+    n = [sum(1 for f in faults if verdict.get((proj, s, f)) == "FAIL") for s in FOUR]
+    lines.append("    %-8s" % "any" + "".join("%15d" % x for x in n))
+    lines.append("  verdict patterns (%s; P=PASS F=FAIL -=not scored):" % " ".join(FOUR))
+    for k in sorted(pat, key=lambda k: -pat[k]):
+        lines.append("    %s  %4d" % (k, pat[k]))
+    groups = defaultdict(list)
+    for r in rows:
+        for part in r[-1].split("; "):
+            if part and not part.startswith("not scored"):
+                groups[part].append(r[0])
+    for k in sorted(groups):
+        lines.append("  %-40s %s" % (k + " (%d)" % len(groups[k]), _ranges(groups[k])))
+    return lines
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     d = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, "violations_export")
@@ -208,6 +290,13 @@ def main():
               "P->F    = PASS in the 2nd scenario, FAIL in the 1st (F->P the reverse)",
               "new/cleared/worse/better = violations by (kind, element), 'review' left out",
               "crit+   = failed criteria that appear only in the 1st scenario", ""]
+    lines.append("DAMP=rotor-angle damping  TOV=transient voltage >1.20  TRIP=generator trip  "
+                 "SSV=steady-state voltage  STAB=system stability  SCALE=voltage out of scale  "
+                 "REC=record too short  RECOV=voltage recovery")
+    for proj in sorted(scen):
+        if all(s in scen[proj] for s in FOUR):
+            lines += write_four_way(out, proj, verdict, crit, vio)
+    lines.append("")
     gaps = [(k, v) for k, v in sorted(missing.items()) if v]
     if gaps:
         lines.append("GAPS (from MISSING.csv) -- rerun these for a full comparison:")
