@@ -4330,6 +4330,23 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
         _banner("worker %d: %s -- start failure %d/%d, relaunching in %s (no scenario attempt "
                 "charged)" % (i, why, lic_fails[i], int(MAX_LICENCE_FAILS), _fmt_hms(_wait)))
 
+    # CLAIMS LEFT BY AN EARLIER LAUNCH ARE CLEARED BEFORE ANY WORKER STARTS.
+    # No worker of this launch exists yet, so every .claim older than this
+    # launcher belongs to a run that has ended. Its PID is not a safe test:
+    # Windows reuses PIDs, and a reused one read as "alive" kept F10 and F70
+    # unclaimable while 20 of 22 workers ran out of work and stopped.
+    # Given-up scenarios stay given up through their .attempts count.
+    if not _round:
+        _n_stale = 0
+        for _cp in glob.glob(os.path.join(OUT_DIR, "*.claim")):
+            try:
+                if os.path.getmtime(_cp) < _LAUNCHER_T0 and _clear(_cp):
+                    _n_stale += 1
+            except Exception:
+                pass
+        if _n_stale:
+            print("[parallel] cleared %d scenario claim(s) left by an earlier launch" % _n_stale)
+
     _banner("PHASE 2/3: launching %d worker(s) IN PARALLEL -- each line below is tagged [W#]%s"
             % (n, ("  [GAVE-UP RETRY ROUND %d]" % _round) if _round else ""))
     for i in range(n):
@@ -4400,6 +4417,7 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
         _next_i = n
         launches[_next_i] = 0
         lic_fails[_next_i] = 0
+        start_fail[_next_i] = 0          # a grown worker's first early death must not KeyError
         _clear(_sentinel("_w%d" % _next_i))
         n = _next_i + 1
         start(_next_i, first=(LICENCE_STARTS_PER_MIN <= 0))

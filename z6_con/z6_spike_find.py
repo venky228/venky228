@@ -1159,13 +1159,14 @@ def load_network(psspy, sav, dyr):
     if ierr:
         raise RuntimeError("psspy.case(%s) ierr=%s" % (sav, ierr))
     net = {"bus": {}, "adj": {}, "dev": {}, "brn": []}
-    b = _arr(psspy.abusint, -1, 2, ["NUMBER", "AREA"])
+    b = _arr(psspy.abusint, -1, 2, ["NUMBER", "AREA", "TYPE"])
     br = _arr(psspy.abusreal, -1, 2, ["BASE", "PU"])
     bc = _arr(psspy.abuschar, -1, 2, ["NAME"])
     for i, n in enumerate(b.get("NUMBER", [])):
         net["bus"][n] = {"kv": br.get("BASE", [0] * (i + 1))[i], "pu": br.get("PU", [0] * (i + 1))[i],
                          "name": (bc.get("NAME", [""] * (i + 1))[i] or "").strip(),
-                         "area": b.get("AREA", [""] * (i + 1))[i]}
+                         "area": b.get("AREA", [""] * (i + 1))[i],
+                         "type": b.get("TYPE", [None] * (i + 1))[i]}
 
     def link(a, c, z, what):
         net["adj"].setdefault(a, []).append((c, z, what))

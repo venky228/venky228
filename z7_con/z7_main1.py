@@ -332,8 +332,6 @@ PIPELINE = "compare"                             # "all" simulate + compare | "m
 RUN_CASES = "both"                           # "both" | "base" | "proj" -- which case to simulate
 ONLY_FAULTS = []                    # [] = every fault | e.g. ["F01-F04"]
 ONLY_EVENTS = []                             # [] = every event
-FRESH_START = False                          # True = start over (clears .done markers) -- set back to False after
-SKIP_DONE = True                             # True = skip scenarios that already have .done + .out
 FORCE_REBUILD = None                         # True = rebuild the snapshot even if the flat run is done
 RUN_FLAT = None                              # no-fault initial-condition run (None = on)
 RUN_FAULTS = None                            # False = build and score only, simulate no fault
@@ -348,6 +346,19 @@ SAV_FIRST_TIMEOUT_S = 3600                   # a .sav build silent this long is 
 SAV_FIRST_BASE = False                       # True = also save the solved base case (deck + removals) per project
 SURPLUS_SIDE_BY_SIDE = True                  # True = one workbook per project: BASE | GIA | each SURPLUS scenario
 
+# ---- 1b. RE-RUN, RESCORE AND REPLOT -- what a launch does again -------------------
+# Every switch that decides whether finished work is simulated, scored or drawn
+# again, in one place. Set FORCE_RESCORE / FORCE_REPLOT back to False after the
+# launch that needed them.
+FRESH_START = False                          # True = start over (clears .done markers) -- set back to False after
+SKIP_DONE = True                             # True = skip scenarios that already have .done + .out
+SWEEP_SKIP_DONE = True                       # True = swept runs resume
+RUN_ONLY_MISSING_OUT = True                  # True = simulate only faults with no .out
+MAX_SCENARIO_ATTEMPTS = 3                    # give up after this many crashes
+FORCE_RESCORE = False                        # True = re-score everything every launch
+PLOT_MISSING_OUTS = False                    # draw PDFs for .out files without one
+FORCE_REPLOT = False                         # True = redraw every PDF
+
 # ---- 2. WORKERS, CORES AND SIMULATION TIME -------------------------------------
 RUN_IN_PARALLEL = True                       # True = base and project at once
 ONE_PROJECT_AT_A_TIME = True                 # with RUN_IN_PARALLEL False: base then project per project
@@ -358,12 +369,6 @@ CORES_FOR_REPORTS = 6                        # of CORES_MAX, for scoring + plots
 CORES_MAX_INCLUDES_REPORTS = True            # True = scoring shares the ceiling
 REPORT_WORKERS = "auto"                      # scoring shards per case: "auto" | 1..8
 DYNAMIC_WORK = True                          # True = shared queue of scenarios
-GEN_TEST_PARALLEL = "auto"                   # GEN TEST: "auto" | N runs at once | 1
-# plots
-PLOT_INRUN = 1                               # plotters per running folder
-PLOT_WORKERS = 2                             # plotters per case
-PLOT_TOTAL_MAX = 4                           # cap on plotters
-PLOT_TOTAL_MAX_IDLE = 8                      # cap on plotters once NOTHING is simulating (0 = PLOT_TOTAL_MAX)
 # simulation time
 FLAT_RUN_S = 25                               # s, no-fault run
 PRE_FAULT_S = 5                              # s before the fault
@@ -388,6 +393,7 @@ GEN_TEST_PROJECTS = ["SantaFe", "EmpirePrairie", "IronStar", "EastFork"]  # [] =
 GEN_TEST_PROJECT = "SantaFe"                 # the one project run when GEN_TEST_PROJECTS = []
 GEN_TEST_CASE = "base"                       # "base" | "proj"
 GEN_TEST_FAULTS = ["F01-F03"]                # same syntax as ONLY_FAULTS
+GEN_TEST_PARALLEL = "auto"                   # GEN TEST: "auto" | N runs at once | 1
 # -- 3b. per project: POI bus, machines always tested however far (EXTRA_GENS), and the
 # .dyr changes tried on the EXISTING gens at its feeders, BESS untouched (EGF_EDITS,
 # {} = none; each entry = one run). REGCA1 Khv only acts above Volim -- change both.
@@ -773,7 +779,6 @@ CAPACITY_LEVELS = []                         # [] = off | [0.75, 0.5] re-run at 
 CAPACITY_FAULTS = "all"                      # "all" | "failing"
 CAPACITY_COMPARE = True
 SWEEP_AT_CAPACITY_LEVELS = True              # repeat sweeps at every level
-SWEEP_SKIP_DONE = True                       # True = swept runs resume
 PROJECT_OFF_RUN = False                      # True = extra study with the project machines off
 PROJECT_OFF_PROJECTS = []                    # [] = every project
 PROJECT_OFF_COMPARE = False
@@ -793,8 +798,6 @@ if QUICK_DYR_TEST:
     POI_P_LEVELS_PCT = []
 
 # ---- 16. RESUME RULES ----------------------------------------------------------
-RUN_ONLY_MISSING_OUT = True                  # True = simulate only faults with no .out
-MAX_SCENARIO_ATTEMPTS = 3                    # give up after this many crashes
 RETRY_GAVE_UP_ROUNDS = 0                     # extra rounds for scenarios that gave up
 KEEP_PARTIAL_RUNS = True                     # True = keep a scorable partial run
 SCORE_PARTIAL_RUNS = True                    # score runs that reached PARTIAL_MIN_FRAC
@@ -805,7 +808,6 @@ RESTORE_TRUNCATED_DONE = True
 OUT_EMPTY_BYTES = 1048576                    # .out under this = empty
 
 # ---- 17. SCORING ---------------------------------------------------------------
-FORCE_RESCORE = False                        # True = re-score everything every launch
 RESCORE_STALE_REPORTS = True                 # re-score a report older than its .out
 STALE_REPORT_TOL_S = 120
 REPORT_COVERAGE_MIN = 0.90                   # re-score a report covering less than this
@@ -819,8 +821,11 @@ FAST_COMPARE_PARALLEL = 4                    # projects at once
 
 # ---- 18. PLOTS -----------------------------------------------------------------
 MAKE_PLOTS = None                            # None = draw | False = no PDFs (faster)
-PLOT_MISSING_OUTS = False                    # draw PDFs for .out files without one
-FORCE_REPLOT = False                         # True = redraw every PDF
+# plotter counts
+PLOT_INRUN = 1                               # plotters per running folder
+PLOT_WORKERS = 2                             # plotters per case
+PLOT_TOTAL_MAX = 4                           # cap on plotters
+PLOT_TOTAL_MAX_IDLE = 8                      # cap on plotters once NOTHING is simulating (0 = PLOT_TOTAL_MAX)
 PLOT_SCOPE = "compact"                       # "compact" | "full"
 PLOT_ONE_PROJECT_AT_A_TIME = True
 PLOT_SKIP_INCOMPLETE = True                  # True = do not draw a run that stopped early
@@ -17665,7 +17670,9 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=No
        exits. Safe to run while a study is going in another window."""
     if pipeline == "all" and not after_runs:
         return 0        # during a full run each scenario is plotted as it finishes
-    if not PLOT_MISSING_OUTS:
+    # FORCE_REPLOT ON ITS OWN IS ENOUGH: it asks for every PDF to be redrawn,
+    # and this pass is the only one that can do it for finished runs.
+    if not (PLOT_MISSING_OUTS or FORCE_REPLOT):
         return 0
     if pipeline in ("all", "missing") and after_runs:
         # ---- THE CATCH-UP PASS A FULL RUN NEEDED ALL ALONG ---------------
@@ -18374,6 +18381,17 @@ def _merge_one_folder(case, rdir):
     _sc = [x for x in surplus_scenarios() if x["tag"] == _tag] if _tag else []
     if _sc:
         env.update(_surplus_env(_sc[0]))       # SPP_RUN_TAG / SPP_EGF_OFF of that scenario
+    elif _tag:
+        # EVERY OTHER TAGGED FOLDER TOO (_egfoff, _egf, .dyr sweep, capacity,
+        # POI level). Without SPP_RUN_TAG the merge process rebuilt the PLAIN
+        # <proj>_<mode> folder's reports, and the tagged folder's own merged
+        # report was never written (EmpirePrairie_spp_egfoff: 284 faults
+        # "missing from the merged criteria report").
+        try:
+            _te = _tag_env(_proj, _tag)
+        except Exception:
+            _te = None
+        env.update(_te or {"SPP_RUN_TAG": _tag})
     try:
         rc = subprocess.call([sys.executable, os.path.abspath(spp)],
                              cwd=rdir, env=env)
@@ -18496,9 +18514,12 @@ def _tag_env(proj, tag):
     return None
 
 
-def _score_tagged_folder(case, proj, mode, rdir, missing):
+def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
     """Score the .out files of an EGF / surplus folder that have no verdict.
-       Returns the ids still unscored afterwards, or None when nothing was run."""
+       Returns the ids still unscored afterwards, or None when nothing was run.
+
+       force=True (FORCE_RESCORE): every finished .out of the folder is scored
+       again, once per launch, whatever the .scoretry stamps say."""
     _p, _m, tag = _split_run_folder(rdir)
     if not tag:
         return None
@@ -18518,6 +18539,8 @@ def _score_tagged_folder(case, proj, mode, rdir, missing):
             continue
         stamp = os.path.join(od, sid + ".scoretry")
         omt = "%.0f" % os.path.getmtime(q)
+        if force:
+            omt = "%s force=%.0f" % (omt, _LAUNCH_T0)
         try:
             if os.path.isfile(stamp) and open(stamp).read().strip() == omt:
                 continue                # asked once already for this .out
@@ -18527,6 +18550,9 @@ def _score_tagged_folder(case, proj, mode, rdir, missing):
     if not todo:
         return None
     ids = [s for s, _st, _o in todo]
+    if force:
+        print("[coverage] %-6s %-16s %-38s FORCE_RESCORE: scoring %d finished run(s) "
+              "again" % (case["key"], proj, os.path.basename(rdir), len(ids)))
     print("[coverage]     scoring %d of them now under the %s settings -- no simulation: %s"
           % (len(ids), tag, ", ".join(ids[:12]) + (" ..." if len(ids) > 12 else "")))
     for _sid, stamp, omt in todo:
@@ -18595,6 +18621,27 @@ def verify_scoring_coverage(quiet=False):
                     outs, scored = _out_and_scored_sets(rdir, proj)
                     if not outs:
                         continue
+                    # FORCE_RESCORE REACHES THE TAGGED FOLDERS TOO. ensure_reports()
+                    # rescores the plain <proj>_<mode> folders only; _egfoff and
+                    # _s1_egfoff were rescored only by their own runs, which a
+                    # PIPELINE = "compare" launch does not start. Skipped when the
+                    # folder's report was already rewritten during this launch.
+                    if FORCE_RESCORE and _split_run_folder(rdir)[2]:
+                        _rp = (rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj)
+                               or rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj))
+                        try:
+                            _fresh = bool(_rp) and os.path.getmtime(_rp) >= _LAUNCH_T0
+                        except Exception:
+                            _fresh = False
+                        if not _fresh:
+                            _after = _score_tagged_folder(
+                                case, proj, mode, rdir,
+                                sorted(outs, key=_fault_key), force=True)
+                            if _after is not None:
+                                _MEAS_CACHE.clear()
+                                _SCEN_PART_CACHE.clear()
+                                _OUT_SET_CACHE.clear()
+                                outs, scored = _out_and_scored_sets(rdir, proj)
                     missing = sorted(outs - scored, key=_fault_key)
                     if not missing:
                         continue
@@ -20278,6 +20325,17 @@ def _gt_find_gens():
     if GEN_TEST_POI not in net["bus"]:
         print("[gen-test] *** POI bus %s is not in the case ***" % GEN_TEST_POI)
         return None
+    # THE SWING MACHINE IS NEVER SWITCHED OFF. It is the rotor-angle reference
+    # (SPP Rev 3.0: deviations relative to the system swing machine) and the
+    # power-flow slack; a run without it measures no rotor angle at all and
+    # read as a new rotor-angle FAIL in every fault.
+    _sw = [x for x in net["bus"] if (net["bus"][x] or {}).get("type") == 3]
+    for _b in _sw:
+        for _d in net["dev"].get(_b, []):
+            excl.add((_b, str(_d.get("id") or "").strip()))
+    if _sw:
+        print("[gen-test] swing bus %s: its machine(s) are kept in service in every run"
+              % ", ".join(str(x) for x in sorted(_sw)))
     skip = ("LINE CHARGING", "SWITCHED SHUNT", "FIXED CAP", "FIXED REACTOR", "FACTS")
     gens = []
     for b, h, z in S.nearby(net, GEN_TEST_POI, GEN_TEST_HOPS):
@@ -21026,8 +21084,16 @@ def _gt_needs_replot(r, faults):
     rdir = r.get("rdir") or ""
     if not r.get("note") or not _gt_outs_ready(rdir, r["gen"], faults):
         return False
+    _fl = os.path.join(rdir, "flags", _GT_REPLOTTED)
+    if FORCE_REPLOT:
+        # FORCE_REPLOT REACHES THE GEN TEST: redrawn once per launch
+        try:
+            if os.path.getmtime(_fl) < _LAUNCH_T0:
+                return True
+        except Exception:
+            return True
     try:
-        with open(os.path.join(rdir, "flags", _GT_REPLOTTED)) as fh:
+        with open(_fl) as fh:
             return _gt_plot_sig() not in fh.read()
     except Exception:
         return True
@@ -21135,6 +21201,15 @@ def _gt_want_rescore(r, faults):
        missing is a real give-up, and a launch never loops on it."""
     if not r.get("note") or not _gt_outs_ready(r["rdir"], r["gen"], faults):
         return ""
+    # FORCE_RESCORE REACHES THE GEN TEST: every finished run is scored again,
+    # once per launch (its GT_RESCORED.flag is written by that pass).
+    if FORCE_RESCORE:
+        try:
+            _t = os.path.getmtime(os.path.join(r["rdir"], "flags", _GT_RESCORED))
+        except Exception:
+            _t = 0.0
+        if _t < _LAUNCH_T0:
+            return "FORCE_RESCORE"
     lost = _gt_lost(r, faults)
     why = ("%s simulated to the end but not scored" % ",".join(lost)) if lost else \
           ("no P90 / ripple / settled rows at the panel's levels" if _gt_lacks_prec(r, faults) else "")
@@ -23162,12 +23237,12 @@ def run_gen_test():
           % (len(runs), len(faults), ", ".join(faults), len(GEN_TEST_SCENARIOS), len(gens),
              ("  [best2: machine runs are added once the %d solver runs finish]"
               % len(GEN_TEST_SCENARIOS)) if (_gmode == "best2" and not base_ready) else ""))
-    if GEN_TEST_REPORT_ONLY and not (GEN_TEST_RESCORE_MISSING and any(
+    if GEN_TEST_REPORT_ONLY and not ((GEN_TEST_RESCORE_MISSING or FORCE_RESCORE) and any(
             _gt_want_rescore(r, faults) for r in runs)):
         # RE-RANK WHAT IS ON DISK: every report is rebuilt from each run's
         # criteria report, so a change in how runs are judged reaches the
         # finished ones without simulating anything
-        if GEN_TEST_REPLOT:
+        if GEN_TEST_REPLOT or FORCE_REPLOT:
             _gt_replot(runs, faults, max(1, _gt_parallel(len(faults))))
         _gt_write(runs, faults, gens)
         print("[gen-test] REPORT ONLY -- %d run(s) re-ranked from disk, nothing simulated "
@@ -23186,7 +23261,7 @@ def run_gen_test():
     # SCORED BEFORE THE POI POWER-RECOVERY ROW EXISTED: score those again from
     # their .out files (no simulation, no plots) so every run carries it
     n_rs = 0
-    if GEN_TEST_RESCORE_MISSING:
+    if GEN_TEST_RESCORE_MISSING or FORCE_RESCORE:
         for r in runs:
             _why = _gt_want_rescore(r, faults)
             if _why:
@@ -23247,7 +23322,7 @@ def run_gen_test():
             _gt_execute(more, runs, faults, gens, npar)
     finally:
         _gt_status_stop(_stat)
-    if GEN_TEST_REPLOT:
+    if GEN_TEST_REPLOT or FORCE_REPLOT:
         _gt_replot(runs, faults, npar)
     _gt_write(runs, faults, gens)
     print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, _gt_dir()))
