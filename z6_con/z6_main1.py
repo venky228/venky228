@@ -21135,6 +21135,11 @@ def _gt_replot(runs, faults, npar):
             try:
                 pr = _start_plotter(_gt_case(), GEN_TEST_PROJECT, GEN_TEST_MODE, 100 + k, rdir=r["rdir"],
                                     extra_env={"SPP_REPLOT_BEFORE": str(t_launch),
+                                               # NOT A FLEET PLOTTER: nothing refills
+                                               # this slot, so the engine chains its
+                                               # own successors until the run's last
+                                               # PDF is redrawn (one per run before)
+                                               "SPP_PLOT_FLEET": "0",
                                                # the flat run is redrawn too, when the run has one
                                                "SPP_PLOT_FAULTS": ",".join(
                                                    list(_gt_run_faults(r["gen"], faults))

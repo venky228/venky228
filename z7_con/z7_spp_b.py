@@ -19657,8 +19657,10 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                                 if (_sw_v is not None and len(_sw_v) == len(v)) else v)
                         _i0 = idx_after(_t_axis, tclear + (_REC_EXTRA[0] or 0.0))
                         _seg = _rel[_i0:] if _i0 is not None else []
+                        _if = idx_after(_t_axis, tclear)
+                        _full = _rel[_if:] if _if is not None else _seg
                         if len(_seg) >= 3:
-                            _dev = max(_seg) - min(_seg)
+                            _dev = max(_full) - min(_full)
                             if (_dev >= ANGLE_DEV_DEG
                                     and not (ANGLE_SKIP_ASYNC
                                              and _machine_kind(title) == "ASYNC")):
@@ -21958,15 +21960,20 @@ def evaluate_case(path, kind, tclear, kb):
     if _i_ang is None:
         _i_ang = i_clr
     if _t_rc and angles:
-        add("Rotor angle: measured from the FINAL clearing", None,
-            "%.3f s (reclose simulated; the first clearing was at %.3f s)"
+        add("Rotor angle: SPPR measured from the FINAL clearing", None,
+            "SPPR1 / SPPR5 from %.3f s (reclose simulated); the 16 deg range is taken "
+            "over the whole response from the first clearing at %.3f s"
             % (tclear + _t_rc, tclear))
     for ti, v in angles:
         seg = v[_i_ang:]
         if not len(seg):
             continue
-        # "measured as absolute maximum peak to absolute minimum peak"
-        dev = max(seg) - min(seg)
+        # "measured as absolute maximum peak to absolute minimum peak" -- over
+        # the whole response from the FIRST clearing, so a machine that swings
+        # 16 deg before a reclose is still evaluated. SPPR1 / SPPR5 and the
+        # convergence test use seg: the free oscillation after the final clearing.
+        _full = v[i_clr:] if (i_clr is not None and 0 <= i_clr < len(v)) else seg
+        dev = max(_full) - min(_full)
         if (_isl_buses and dev >= ISLAND_ANGLE_MIN_DEG
                 and _chan_bus(ti) in _isl_buses):
             # ISLANDED BY THE EVENT. The fault's own trips leave this unit in a
