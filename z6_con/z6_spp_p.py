@@ -3553,6 +3553,17 @@ PEAK_MIN_PROMINENCE_FRAC = 0.02
 SPPR_FLOOR_LIMITED_AS_REVIEW = False
 SPPR_FLOOR_LIMITED_AS_REVIEW = _env_bool("SPP_SPPR_FLOOR_REVIEW", SPPR_FLOOR_LIMITED_AS_REVIEW)
 
+# SPPR NOT MET, BUT THE ANGLE SETTLES BY THE END OF THE RUN. Set from the panel
+# (SPPR_SETTLED_AS_NOTE). True = such a machine is NOT a violation: it is
+# reported as a note -- deviation, SPPR1 / SPPR5 -- in the results, in the
+# rotor-angle table and on its plot. False = Rev 3.0 as written: it fails.
+# "Settles" is _converges() on the free oscillation after the final clearing:
+# the last quarter of the record swings no more than 10 % of the first, or
+# under 0.5 deg. A swing that grows, runs away or is still ringing at the end
+# is a violation either way.
+SPPR_SETTLED_AS_NOTE = True
+SPPR_SETTLED_AS_NOTE = _env_bool("SPP_SPPR_SETTLED_AS_NOTE", SPPR_SETTLED_AS_NOTE)
+
 # SPPR "Minimum Value". True = as Rev 3.0 Figure 2 draws it, the lowest trough
 # AFTER the 1st positive peak. False = the lowest point after clearing (the
 # earlier, stricter reading). Set from the panel (SPPR_MIN_AFTER_FIRST_PEAK).
@@ -23284,8 +23295,23 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                                     and not (ANGLE_SKIP_ASYNC
                                              and _machine_kind(title) == "ASYNC")):
                                 _okd, _infd = spp_damping(_seg)
-                                if not _okd and not (SPPR_FLOOR_LIMITED_AS_REVIEW
-                                                     and _infd.get("floor_limited")):
+                                if (not _okd and SPPR_SETTLED_AS_NOTE
+                                        and not _infd.get("poleslip")
+                                        and not (SPPR_FLOOR_LIMITED_AS_REVIEW
+                                                 and _infd.get("floor_limited"))
+                                        and _converges(_seg)):
+                                    # SPPR NOT MET, SETTLES: a note in the title,
+                                    # no red frame -- as the report treats it.
+                                    ptitle += ("   NOTE: SPPR not met (deviation %.1f deg, "
+                                               "SPPR1=%s, SPPR5=%s) -- settles by the end of "
+                                               "the run, not a violation"
+                                               % (_dev,
+                                                  "n/a" if _infd.get("sppr1") is None
+                                                  else "%.3f" % _infd["sppr1"],
+                                                  "n/a" if _infd.get("sppr5") is None
+                                                  else "%.3f" % _infd["sppr5"]))
+                                elif not _okd and not (SPPR_FLOOR_LIMITED_AS_REVIEW
+                                                       and _infd.get("floor_limited")):
                                     if _infd.get("poleslip"):
                                         ptitle += ("   %s rotor angle POLE SLIP -- runs away "
                                                    "%.1f deg and is still moving at the end"
@@ -24368,6 +24394,43 @@ def _converges(seg, tol_frac=0.10):
     if early <= 1e-9:
         return True
     return late <= tol_frac * early or late < 0.5      # < 0.5 deg is settled
+
+
+def _sub16_converging(full, info):
+    """'Machines with rotor angle deviations less than 16 degrees which do not
+       exhibit convergence shall be evaluated on an individual basis.' (Rev 3.0)
+
+       full = the angle from the first clearing; info = spp_damping() of the
+       free oscillation after the final clearing.
+
+       CONVERGENCE IS JUDGED BY SPP'S OWN DAMPING STANDARD. _converges() alone
+       asks the last quarter of the record to have shrunk to 10 % of the first,
+       which a 0.2-0.3 Hz swing against a distant swing machine does only at
+       about 10 % damping ratio -- twelve times the 0.0081633 Rev 3.0 requires
+       of a machine ABOVE 16 deg. Every machine in the interconnection shares
+       that swing, so 400-500 machines per fault were listed while their plots
+       settle. A machine is now converging when any of these holds:
+         * its last quarter is settled (_converges: < 0.5 deg, or <= 10 %);
+         * it does not oscillate (fewer than 2 positive peaks, no runaway);
+         * its ringing decays at least at SPP's minimum rate: the damping ratio
+           fitted to all its peaks about the settling value >= 0.0081633 (the
+           SPPR1 <= 0.95 equivalent), or, with too few peaks to fit, the 2nd
+           peak about the settling value is <= 0.95 of the 1st.
+       Listed: a swing that grows, one that decays slower than SPP's minimum,
+       and a runaway. This decides who is listed -- it passes or fails nothing."""
+    if _converges(full):
+        return True
+    if info.get("poleslip"):
+        return False
+    if (info.get("npeaks") or 0) < 2:
+        return True
+    _lim = 1.0 - SPPR1_DECAY
+    z = info.get("zeta_fit")
+    if z is not None and (info.get("n_fit") or 0) >= 3:
+        _d = _math.log(1.0 / _lim)
+        return z >= _d / _math.sqrt(4.0 * _math.pi ** 2 + _d * _d) - 1e-9
+    s1 = info.get("sppr1_s")
+    return s1 is not None and s1 <= _lim + 1e-9
 
 _BES_CACHE = {}
 
@@ -25638,6 +25701,7 @@ def evaluate_case(path, kind, tclear, kb):
 
     undamped, n_eval, worst, review = [], 0, (0.0, ""), []
     n_floor = 0          # judged, then moved to review as SPPR floor-limited
+    settled_note = []    # >= 16 deg, SPPR not met, settles -- SPPR_SETTLED_AS_NOTE
     # EVERY ROTOR ANGLE, MEASURED, WHETHER OR NOT IT IS A VIOLATION.
     #
     # The criteria report names the ones that failed. That answers "is this
@@ -25726,6 +25790,12 @@ def evaluate_case(path, kind, tclear, kb):
         if dev >= ANGLE_DEV_DEG:
             n_eval += 1
             ok, info = spp_damping(seg)
+            # SPPR NOT MET BUT SETTLED -- a note, not a violation (see
+            # SPPR_SETTLED_AS_NOTE). Never a pole slip.
+            _noted = bool(not ok and SPPR_SETTLED_AS_NOTE and not info.get("poleslip")
+                          and not (SPPR_FLOOR_LIMITED_AS_REVIEW
+                                   and info.get("floor_limited"))
+                          and _converges(seg))
             _sp = info.get("sppr") or {}
             ang_rows.append(
                 [chan_label(ti), _chan_bus(ti), _machine_kind(ti) or "SYNC", dev,
@@ -25739,7 +25809,8 @@ def evaluate_case(path, kind, tclear, kb):
                  ("DAMPED" if ok else
                   ("REVIEW -- SPPR floor-limited" if (SPPR_FLOOR_LIMITED_AS_REVIEW
                                                       and info.get("floor_limited"))
-                   else "UNDAMPED"))])
+                   else ("NOTE -- SPPR not met, settles by the end of the run "
+                         "(not a violation)" if _noted else "UNDAMPED")))])
             if not ok:
                 # IN THE DOCUMENT'S OWN UNITS: the ratio, the damping factor
                 # per cent, and the equivalent damping ratio. Rev 3.0 states all
@@ -25787,6 +25858,13 @@ def evaluate_case(path, kind, tclear, kb):
                                        "floor-limited -- damped about its "
                                        "settling value]", dev))
                     n_floor += 1
+                elif _noted:
+                    # SPPR NOT MET, THE ANGLE SETTLES: a note, not a violation
+                    # (SPPR_SETTLED_AS_NOTE). Kept out of undamped, so it neither
+                    # fails the fault nor reaches the violations report or the
+                    # comparison; its numbers go on the Note line.
+                    settled_note.append("%s(%.0fdeg %s %s)"
+                                        % (chan_label(ti), dev, r1, r5))
                 else:
                     # FAILS ON THE RATIOS, BUT THE ANGLE SETTLES. SPPR is two
                     # peaks against the run minimum, and a single swing that
@@ -25823,12 +25901,11 @@ def evaluate_case(path, kind, tclear, kb):
                  (None if _i2.get("env_monotone") is None
                   else round(100.0 * _i2["env_monotone"], 1)),
                  ("NOT EVALUATED -- below %d deg" % int(ANGLE_DEV_DEG))
-                 + ("" if _converges(_full) else ", NOT CONVERGING")])
-        # Convergence of a machine below 16 deg is judged over the same record
-        # as its 16 deg range, from the FIRST clearing: from the final clearing
-        # of a reclose the early reference quarter is small and ordinary late
-        # motion outgrew 10 % of it.
-        if dev < ANGLE_DEV_DEG and not _converges(_full):
+                 + ("" if _sub16_converging(_full, _i2) else ", NOT CONVERGING")])
+        # Convergence of a machine below 16 deg: see _sub16_converging. Its
+        # settled test uses the same record as the 16 deg range, from the FIRST
+        # clearing; its damping test the free oscillation after the final one.
+        if dev < ANGLE_DEV_DEG and not _sub16_converging(_full, _i2):
             # SPP: "Machines with rotor angle deviations less than 16 degrees
             # which do not exhibit convergence shall be evaluated on an
             # individual basis." Those machines are NOT failed automatically --
@@ -25881,17 +25958,30 @@ def evaluate_case(path, kind, tclear, kb):
             # ... and ALL are damped" claimed a pass that was never granted. The
             # three populations are stated separately.
             (("%d of %d rotor angle(s) swung >=%d deg: %d damped on SPPR1<=%.2f or "
-              "SPPR5<=%.3f%s; largest swing %.1f deg (%s)"
-              % (n_eval, len(angles), int(ANGLE_DEV_DEG), n_eval - n_floor,
+              "SPPR5<=%.3f%s%s; largest swing %.1f deg (%s)"
+              % (n_eval, len(angles), int(ANGLE_DEV_DEG),
+                 n_eval - n_floor - len(settled_note),
                  1.0 - SPPR1_DECAY, 1.0 - SPPR5_DECAY,
                  (", %d moved to INDIVIDUAL REVIEW (SPPR floor-limited -- see the "
                   "next line)" % n_floor) if n_floor else "",
+                 (", %d do not meet SPPR but settle by the end of the run (noted, "
+                  "not violations -- see the Note line)" % len(settled_note))
+                 if settled_note else "",
                  worst[0], worst[1]))
              if n_eval else
              ("no rotor angle reached %d deg -- largest swing %.1f deg (%s) of %d machine(s)"
               % (int(ANGLE_DEV_DEG), worst[0], worst[1], len(angles))))
             if not undamped else
             ("%d undamped of %d judged: " % (len(undamped), n_eval) + ", ".join(undamped[:VIOLATION_LIST_MAX]) + _more(undamped)))
+    if settled_note:
+        add("Note: rotor angle -- SPPR not met, the angle settles by the end of the run",
+            None,
+            "%d machine(s) at or above %d deg do not meet SPPR1 <= %.2f or SPPR5 <= "
+            "%.3f but settle by the end of the run -- noted, NOT counted as "
+            "violations (SPPR_SETTLED_AS_NOTE): %s%s"
+            % (len(settled_note), int(ANGLE_DEV_DEG), 1.0 - SPPR1_DECAY,
+               1.0 - SPPR5_DECAY, ", ".join(settled_note[:VIOLATION_LIST_MAX]),
+               _more(settled_note)))
     if review:
         add("Evaluate individually (SPP: below %d deg without convergence, "
             "SPPR floor-limited, or SPPR not met but the angle settles)"

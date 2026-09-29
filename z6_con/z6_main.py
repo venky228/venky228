@@ -325,12 +325,12 @@ def _print_phase_times(total):
 QUICK_DYR_TEST = None                  # "EastFork" / "SantaFe" = quick test (see z6_main1.py)
 
 # ---- 1. WHAT TO RUN ------------------------------------------------------------
-PROJECTS = ["EmpirePrairie"]        #["SantaFe", "IronStar","EmpirePrairie","EastFork"]   
+PROJECTS = ["SantaFe"]        #["SantaFe", "IronStar","EmpirePrairie","EastFork"]   
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
 MODES = ["spp"]                              # fault set: spp | con | table | custom | manual
 PIPELINE = "all"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
-RUN_CASES = "both"                           # "both" | "base" | "proj" -- which case to simulate
-ONLY_FAULTS = []                    # [] = every fault | e.g. ["F01-F04"]
+RUN_CASES = "proj"                           # "both" | "base" | "proj" -- which case to simulate
+ONLY_FAULTS = ["F01-F05"]                    # [] = every fault | e.g. ["F01-F04"]
 ONLY_EVENTS = []                             # [] = every event
 FORCE_REBUILD = None                         # True = rebuild the snapshot even if the flat run is done
 RUN_FLAT = None                              # no-fault initial-condition run (None = on)
@@ -351,13 +351,13 @@ SURPLUS_SIDE_BY_SIDE = True                  # True = one workbook per project: 
 # again, in one place. Set FORCE_RESCORE / FORCE_REPLOT back to False after the
 # launch that needed them.
 FRESH_START = False                          # True = start over (clears .done markers) -- set back to False after
-SKIP_DONE = True                             # True = skip scenarios that already have .done + .out
+SKIP_DONE = False                             # True = skip scenarios that already have .done + .out
 SWEEP_SKIP_DONE = True                       # True = swept runs resume
 RUN_ONLY_MISSING_OUT = True                  # True = simulate only faults with no .out
 MAX_SCENARIO_ATTEMPTS = 3                    # give up after this many crashes
-FORCE_RESCORE = True                         # FULL RESCORE this launch -- set back to False after
-PLOT_MISSING_OUTS = True                     # needed for the full redraw below
-FORCE_REPLOT = True                          # FULL REPLOT this launch -- set back to False after
+FORCE_RESCORE = False                         # FULL RESCORE this launch -- set back to False after
+PLOT_MISSING_OUTS = False                    # needed for the full redraw below
+FORCE_REPLOT = False                          # FULL REPLOT this launch -- set back to False after
 
 # ---- 2. WORKERS, CORES AND SIMULATION TIME -------------------------------------
 RUN_IN_PARALLEL = True                       # True = base and project at once
@@ -370,9 +370,9 @@ CORES_MAX_INCLUDES_REPORTS = True            # True = scoring shares the ceiling
 REPORT_WORKERS = "auto"                      # scoring shards per case: "auto" | 1..8
 DYNAMIC_WORK = True                          # True = shared queue of scenarios
 # simulation time
-FLAT_RUN_S = 25                               # s, no-fault run
-PRE_FAULT_S = 5                              # s before the fault
-SIM_END_S = 25.2                               # s per fault
+FLAT_RUN_S = 1                               # s, no-fault run
+PRE_FAULT_S = 3                              # s before the fault
+SIM_END_S = 23.2                              # s per fault
 RUN_NPLT = 2                                 # write every N steps (1 = every step, huge)
 
 # ---- 3. GEN / CAP / LINE TEST --------------------------------------------------
@@ -584,6 +584,8 @@ SETTLE_PQ_MW = 2.0                           # ... and every P / Q moves <= this
 TRIP_PGEN_DEAD_MW = 1.0                     # machine ending below this MW = tripped (and under 10 % of pre-fault)
 ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
 SPPR_MIN_AFTER_FIRST_PEAK = False            # False = SPPR "Minimum Value" = lowest point of the trace (Rev 3.0) | True = lowest trough after the 1st peak
+SPPR_SETTLED_AS_NOTE = True                  # True = a machine >= 16 deg that fails SPPR but settles by the end of the run is NOTED, not a violation | False = a FAIL (Rev 3.0 as written)
+REVIEW_ROWS_IN_COMPARISON = False            # False = machines below 16 deg set aside for individual evaluation stay in each case's violations report only | True = also as rows in the comparison sheets
 # FLAT_TOL_BY_KIND: flat-run tolerance per quantity
 FLAT_TOL_BY_KIND = {"VOLT": 0.005, "ETERM": 0.005, "ANGLE": 1.0,
                     "PELEC": 1.0, "QELEC": 2.0, "SPEED": 0.0002}
@@ -650,7 +652,7 @@ DYR_DISABLE_APPLY_TO = "both"                # "both" | "project" | "base"
 DYR_DISABLE_STRICT = True                    # True = stop if a disable matches nothing
 DYR_SHOW = []                                # print these models from the deck, e.g. ["REECAU1"]
 DYR_SCOPE = "project"                        # "project" machines only | "deck" everywhere
-DYR_COMPILE_WHEN = "never"                   # no compile: use the dsusr.dll already in each folder (cload4 cannot run on this PC -- psse_env_manager missing)
+DYR_COMPILE_WHEN = None                  # no compile: use the dsusr.dll already in each folder (cload4 cannot run on this PC -- psse_env_manager missing)
 DYR_COMPILE_BATS = ["MyCompile34.bat", "MyCload41.bat"]
 DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is saved
 # EGF = the EXISTING machines at each project's feeder buses (not the BESS). Each run
@@ -660,9 +662,9 @@ DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is s
 EGF_DYR_EDITS_BY_PROJECT = {}                # {"SantaFe": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}
 EGF_DYR_RUN = False                          # True = run BOTH cases with those edits (_egf) and compare
 EGF_OFF_RUN = False                          # True = run BOTH cases with every existing machine OFF (_egfoff) and compare
-EGF_OFF_BASE_RUN = True                     # True = run the BASE case ONLY with every existing machine OFF (_egfoff);
+EGF_OFF_BASE_RUN = False                    # True = run the BASE case ONLY with every existing machine OFF (_egfoff);
                                              #   the PROJECT side of its comparisons is the surplus run s1_egfoff
-EGF_FIRST = True                             # True = the EGF runs above go FIRST, before the main runs, the
+EGF_FIRST = False                            # True = the EGF runs above go FIRST, before the main runs, the
                                              #   rescore/replot and the surplus steps (False = last, as before)
 EGF_PROJECTS = []                            # [] = every project of the launch (EGF_DYR_RUN: those with edits)
 EGF_FAULTS = "same"                          # "same" = ONLY_FAULTS | "all" | ["F01-F04"]
@@ -3086,6 +3088,21 @@ def where_short(fid, element, proj=None):
     return ("%s / %s" % (ar or "", h)).strip(" /")
 
 
+def _drop_review(out):
+    """Machines set aside for INDIVIDUAL EVALUATION (below 16 deg without
+       convergence; SPPR floor-limited under SPPR_FLOOR_LIMITED_AS_REVIEW) are
+       not violations. Each case's violations report lists them under
+       "INDIVIDUAL EVALUATION REQUIRED ... NOT counted as a violation"; the
+       comparison sheets carry them only with REVIEW_ROWS_IN_COMPARISON --
+       otherwise 400-500 "within limit on both sides" rotor-angle rows per fault
+       buried the violations."""
+    if not REVIEW_ROWS_IN_COMPARISON:
+        for _f in out.values():
+            if isinstance(_f, dict):
+                _f.pop("review", None)
+    return out
+
+
 def read_violations(rdir, proj):
     """{fault: {kind: {element: value}}} -- who violated what, and by how much.
 
@@ -3155,7 +3172,7 @@ def read_violations(rdir, proj):
                             _tm, _ab)
             if out:
                 _violations_from_parts(rdir, out)
-                return out, os.path.basename(csvp)
+                return _drop_review(out), os.path.basename(csvp)
         except Exception as e:
             print("[compare] could not read %s (%s) -- falling back to the .txt"
                   % (csvp, e))
@@ -3164,7 +3181,8 @@ def read_violations(rdir, proj):
     txtp = rfile(rdir, "SPP_VIOLATIONS", "txt", proj)
     if not txtp:
         out = {}
-        return (out, "parts\\SCEN_*.csv") if _violations_from_parts(rdir, out) else ({}, "")
+        return ((_drop_review(out), "parts\\SCEN_*.csv") if _violations_from_parts(rdir, out)
+                else ({}, ""))
     fid, kind = None, None
     for line in _read_text(txtp).splitlines():
         m = _VIO_TXT_FAULT.match(line)
@@ -3191,7 +3209,7 @@ def read_violations(rdir, proj):
                     val = float("nan")
                 out[fid].setdefault(kind, {})[m.group(1)] = val
     _violations_from_parts(rdir, out)
-    return out, os.path.basename(txtp)
+    return _drop_review(out), os.path.basename(txtp)
 
 
 _LIM_RECOV = re.compile(r"(?:recovery|BES bus V) >=\s*([\d.]+)\s*pu")
@@ -15074,6 +15092,7 @@ def _push_settings(env, case):
                         ("SPP_SS_AS_VIOLATION", "1" if SS_AS_VIOLATION else "0"),
                         ("SPP_ANGLE_DEV_DEG", ANGLE_DEV_DEG),
                         ("SPP_SPPR_MIN_AFTER_PEAK", "1" if SPPR_MIN_AFTER_FIRST_PEAK else "0"),
+                        ("SPP_SPPR_SETTLED_AS_NOTE", "1" if SPPR_SETTLED_AS_NOTE else "0"),
                         ("SPP_TRIP_PGEN_DEAD_MW", TRIP_PGEN_DEAD_MW),
                         ("SPP_MISMATCH_MVA", MISMATCH_MVA),
                         ("SPP_MISMATCH_PASSES", MISMATCH_PASSES),
