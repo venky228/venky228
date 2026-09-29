@@ -24320,19 +24320,50 @@ def is_damped(seg):
     return ok
 
 
+def _detrended_pp(w):
+    """Peak-to-peak of w about its least-squares quadratic: the oscillation
+       left once a slow drift (governor response, a small power imbalance) is
+       taken out. A 0.2-2 Hz rotor swing is several cycles over a quarter of the
+       record and survives the fit; a drift of a few degrees does not."""
+    n = len(w)
+    if n < 5:
+        return (max(w) - min(w)) if n else 0.0
+    xs = [(2.0 * i / (n - 1)) - 1.0 for i in range(n)]
+    s0 = float(n); s1 = sum(xs); s2 = sum(x * x for x in xs)
+    s3 = sum(x ** 3 for x in xs); s4 = sum(x ** 4 for x in xs)
+    t0 = sum(w); t1 = sum(x * y for x, y in zip(xs, w))
+    t2 = sum(x * x * y for x, y in zip(xs, w))
+    m = [[s0, s1, s2, t0], [s1, s2, s3, t1], [s2, s3, s4, t2]]
+    for c in range(3):                                  # Gauss-Jordan, 3x3
+        p = max(range(c, 3), key=lambda r: abs(m[r][c]))
+        m[c], m[p] = m[p], m[c]
+        if abs(m[c][c]) < 1e-12:
+            return max(w) - min(w)
+        for r in range(3):
+            if r != c:
+                f = m[r][c] / m[c][c]
+                m[r] = [a - f * b for a, b in zip(m[r], m[c])]
+    a0, a1, a2 = (m[k][3] / m[k][k] for k in range(3))
+    res = [y - (a0 + a1 * x + a2 * x * x) for x, y in zip(xs, w)]
+    return max(res) - min(res)
+
+
 def _converges(seg, tol_frac=0.10):
     """Rough convergence test for the machines SPP says to look at individually:
        'Machines with rotor angle deviations less than 16 degrees which do not
        exhibit convergence shall be evaluated on an individual basis.'
 
-       Converging = the swing in the LAST quarter of the window is no more than
-       tol_frac of the swing in the first quarter. This does not pass or fail
-       anything -- it decides which machines get listed for a human to look at."""
+       Converging = the OSCILLATION in the last quarter of the window (slow drift
+       removed) is no more than tol_frac of the swing in the first quarter, or
+       under 0.5 deg. Without the drift removal a machine drifting 1-2 deg
+       against the swing machine as governors respond read as 'not converging'
+       -- about 450 machines per fault. This does not pass or fail anything --
+       it decides which machines get listed for a human to look at."""
     if len(seg) < 8:
         return True
     q = max(2, len(seg) // 4)
     early = max(seg[:q]) - min(seg[:q])
-    late  = max(seg[-q:]) - min(seg[-q:])
+    late = _detrended_pp(list(seg[-q:]))
     if early <= 1e-9:
         return True
     return late <= tol_frac * early or late < 0.5      # < 0.5 deg is settled
@@ -25790,8 +25821,12 @@ def evaluate_case(path, kind, tclear, kb):
                  (None if _i2.get("env_monotone") is None
                   else round(100.0 * _i2["env_monotone"], 1)),
                  ("NOT EVALUATED -- below %d deg" % int(ANGLE_DEV_DEG))
-                 + ("" if _converges(seg) else ", NOT CONVERGING")])
-        if dev < ANGLE_DEV_DEG and not _converges(seg):
+                 + ("" if _converges(_full) else ", NOT CONVERGING")])
+        # Convergence of a machine below 16 deg is judged over the same record
+        # as its 16 deg range, from the FIRST clearing: from the final clearing
+        # of a reclose the early reference quarter is small and ordinary late
+        # motion outgrew 10 % of it.
+        if dev < ANGLE_DEV_DEG and not _converges(_full):
             # SPP: "Machines with rotor angle deviations less than 16 degrees
             # which do not exhibit convergence shall be evaluated on an
             # individual basis." Those machines are NOT failed automatically --
