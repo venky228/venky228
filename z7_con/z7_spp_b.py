@@ -19744,7 +19744,8 @@ def _panel_list(ch, kb, fault_bus=None, tclear=None, taxis=None):
                                     and not (ANGLE_SKIP_ASYNC
                                              and _machine_kind(title) == "ASYNC")):
                                 _okd, _infd = spp_damping(_seg)
-                                if not _okd and not _infd.get("floor_limited"):
+                                if not _okd and not (SPPR_FLOOR_LIMITED_AS_REVIEW
+                                                     and _infd.get("floor_limited")):
                                     if _infd.get("poleslip"):
                                         ptitle += ("   %s rotor angle POLE SLIP -- runs away "
                                                    "%.1f deg and is still moving at the end"
@@ -22190,7 +22191,8 @@ def evaluate_case(path, kind, tclear, kb):
                  (None if info.get("env_monotone") is None
                   else round(100.0 * info["env_monotone"], 1)),
                  ("DAMPED" if ok else
-                  ("REVIEW -- SPPR floor-limited" if info.get("floor_limited")
+                  ("REVIEW -- SPPR floor-limited" if (SPPR_FLOOR_LIMITED_AS_REVIEW
+                                                      and info.get("floor_limited"))
                    else "UNDAMPED"))])
             if not ok:
                 # IN THE DOCUMENT'S OWN UNITS: the ratio, the damping factor
@@ -33625,6 +33627,11 @@ def _plot_pending_count():
             _done = os.path.isfile(_state_path(_s, "done"))
             if not _done and PLOT_ONLY_DONE:
                 continue
+            try:
+                if not _done and time.time() - os.path.getmtime(_o) < 120.0:
+                    continue                # still being written -- see the pass
+            except Exception:
+                pass
             if not _done and PLOT_SKIP_GAVEUP:
                 try:
                     if _read_int(_state_path(_s, "attempts")) >= MAX_SCENARIO_ATTEMPTS:
@@ -34156,6 +34163,20 @@ def plot_missing_outs():
                 age = 1e9
             if age < 90.0:
                 print("[plot-missing] %-10s in progress (claim heartbeat) -- left alone" % sid)
+                continue
+        # STILL GROWING? A worker on a fixed slice of faults holds no claim, so
+        # the heartbeat above never sees it. An .out with no .done that PSS/E
+        # wrote to in the last 2 minutes is a run in progress: past 80 % of
+        # SIM_END_S it passed the length test, and was scored and drawn at
+        # 21.1 s of 25.2. A run that died stops growing and is taken after that.
+        if not had_done:
+            try:
+                _oage = time.time() - os.path.getmtime(p)
+            except Exception:
+                _oage = 1e9
+            if _oage < 120.0:
+                print("[plot-missing] %-10s .out still being written (%.0f s ago, no "
+                      ".done) -- left alone" % (sid, _oage))
                 continue
         todo.append((sid, p, had_done, had_pdf))
 
