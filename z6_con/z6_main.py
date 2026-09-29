@@ -16961,12 +16961,9 @@ def _early_scorer_start(pjs, t_go):
        same folder at the same time."""
     if not (SCORE_WHILE_SIMULATING and REPORTS_AFTER_ALL_PROJECTS and pjs):
         return lambda: None
-    if FORCE_RESCORE:
-        # The final pass rescores every project anyway -- scoring them here too
-        # would do each one twice.
-        print("[early-score] off for this launch: FORCE_RESCORE scores every project "
-              "in the final pass")
-        return lambda: None
+    # ON UNDER FORCE_RESCORE TOO. Every pass carries SPP_RESCORE_T0 (the launch
+    # time, _push_settings), so a score made here is kept by the final pass --
+    # turning it off left the idle cores idle and the whole rescore to the end.
     stop = threading.Event()
     busy = {"score": 0, "plot": 0}          # shards scoring + plotters drawing
     lock = threading.Lock()
@@ -17253,8 +17250,20 @@ def _start_plotter(case, proj, mode, slot, rdir=None, extra_env=None):
     # ..._cap50_dyr_Kqv2 must be handed exactly the tags that folder was written
     # with. They are read back off the folder name -- the one place the run and
     # the folder are guaranteed to agree.
+    _te = None
     if rdir:
-        _sfx = os.path.basename(rdir)[len("%s_%s" % (proj, mode)):].lstrip("_")
+        # ONE "_" ONLY: lstrip("_") made the archive <proj>_<mode>__run3 read
+        # as the tag "run3", and its plotter drew into a live-looking folder
+        _sfx = os.path.basename(rdir)[len("%s_%s" % (proj, mode)):]
+        if _sfx.startswith("_"):
+            _sfx = _sfx[1:]
+        # AN EGF / SURPLUS FOLDER IS DRAWN WITH ITS OWN RUN SETTINGS, as its
+        # scoring pass is (_score_tagged_folder) -- not the plain run's
+        if _sfx:
+            try:
+                _te = _tag_env(proj, _sfx)
+            except Exception:
+                _te = None
         if _sfx:
             _cap = ""
             if _sfx.startswith("cap"):
@@ -17284,6 +17293,15 @@ def _start_plotter(case, proj, mode, slot, rdir=None, extra_env=None):
     # base SantaFe, 210 in IronStar, gone in seconds, while the project side --
     # which had work selected -- kept every one of its own.
     env["SPP_FRESH_START"] = "0"
+    if isinstance(_te, dict):
+        try:
+            _te = dict(_te)
+            # a plotter never defers reports, nor narrows to the scoring's faults
+            for k in ("SPP_DEFER_REPORTS", "SPP_ONLY_FAULTS", "SPP_REPORT_FAULTS"):
+                _te.pop(k, None)
+            env.update(_te)
+        except Exception:
+            pass
     if extra_env:
         env.update(extra_env)
     ld = _plot_log_dir(case, proj)
@@ -17967,7 +17985,11 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=No
                 # seconds apart, and show the tail of its log, before deciding
                 # it cannot start.
                 sl["quick"] = sl.get("quick", 0) + 1
-                if sl["quick"] <= PLOT_QUICK_EXITS and todo_here > 0:
+                # ANOTHER LIVE SLOT ON THE SAME FOLDER: the claim race is the
+                # likely cause, and a retry there races again -- move it now
+                _shared = any(_s4 is not sl and _s4["proc"] is not None
+                              and _s4["rdir"] == sl["rdir"] for _s4 in slots)
+                if sl["quick"] <= PLOT_QUICK_EXITS and todo_here > 0 and not _shared:
                     print("[compare] plotter %s/%s slot %d exited in %s (code %s) without drawing "
                           "-- retry %d/%d in %ds"
                           % (sl["case"].get("key", "?"), sl["proj"] or "-", sl["slot"],
@@ -18003,12 +18025,39 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=No
                         print("[compare]     %-22s FIX: %s" % ("", _fix))
                 else:
                     print("[compare] plotter %s/%s slot %d died in %s (code %s) -- it is "
-                          "failing at startup, not while drawing; leaving it down. See "
+                          "failing at startup, not while drawing; not retried there. See "
                           "logs\\PLOTTER_*.log"
                           % (sl["case"].get("key", "?"), sl["proj"] or "-", sl["slot"],
                              _fmt_hms(up), rc))
                     _plotter_log_tail(sl, 20)
-                sl["proc"] = None
+                # MOVED, NOT RETIRED -- as the no-gain rule below does. Left
+                # down, the slot was lost to the pass while other folders
+                # still had files to draw. Parked only when there is nowhere else.
+                _taken3 = {}
+                for _s3 in slots:
+                    if _s3["proc"] is not None and _s3 is not sl:
+                        _taken3[_s3["rdir"]] = _taken3.get(_s3["rdir"], 0) + 1
+                _taken3[sl["rdir"]] = 99            # anywhere but here
+                _j3 = _busiest(_taken3)
+                if _j3 is None or _j3[3] == sl["rdir"]:
+                    sl["proc"] = None
+                    continue
+                print("[compare] plotter slot %d -- moving it from %s/%s to %s/%s"
+                      % (sl["slot"], sl["case"].get("key", "?"), sl["proj"] or "-",
+                         _j3[0].get("key", "?"), _j3[1] or "-"))
+                sl["case"], sl["proj"], sl["mode"], sl["rdir"] = _j3
+                sl["quick"] = 0
+                sl["nogain"] = 0
+                try:
+                    sl["proc"] = _start_plotter(sl["case"], sl["proj"], sl["mode"],
+                                                sl["slot"], rdir=sl["rdir"])
+                except Exception as e:
+                    print("[compare]   could not start it there: %s" % e)
+                    sl["proc"] = None
+                sl["since"] = time.time()
+                sl["todo0"] = _count_unplotted(sl["rdir"])
+                if sl["proc"] is not None:
+                    alive += 1
                 continue
             if sl["restarts"] >= PLOT_RESTART_MAX:
                 print("[compare] plotter %s/%s slot %d exited (code %s) and has been "
@@ -18293,6 +18342,10 @@ def _result_folders_for(case, proj, mode):
         for n in sorted(os.listdir(base)):
             if n == pref or n.startswith(pref + "_"):
                 if _side_folder(n):
+                    continue
+                # ARCHIVED, NOT LIVE: <run>__run<N> and folders moved aside
+                # (_prev_, .old) are kept records -- the plotter drained them
+                if re.search(r"__run\d+$", n) or _GT_ASIDE_RX.search(n):
                     continue
                 d = os.path.join(base, n)
                 if os.path.isdir(d):
@@ -21018,8 +21071,51 @@ def _gt_done(rdir, faults, g=None):
             and any(m[f]["verdict"] in ("PASS", "FAIL") for f in need)
             and (os.path.isfile(os.path.join(rdir, "flags", _GT_RESCORED))
                  or not _gt_outs_ready(rdir, g, faults))):
-        ok = True
+        # A FAULT NEVER RUN IS NOT A GIVE-UP: every unscored fault must have
+        # its .out AND .done, or have used up MAX_SCENARIO_ATTEMPTS. One with
+        # no .out was never simulated (a worker wrote ALL_DONE while another
+        # was stopped) -- the run is resumed, not moved aside: the ALL_DONE
+        # flags are dropped and the launcher simulates the missing faults.
+        _miss = [f for f in need if m[f]["verdict"] not in ("PASS", "FAIL")
+                 and not _gt_fault_settled(rdir, f)]
+        if _miss:
+            _gt_drop_all_done(rdir, _miss)
+        else:
+            ok = True
     return ok, m
+
+
+_GT_RESUME = set()     # run folders resumed in place (_gt_reset keeps them)
+
+
+def _gt_fault_settled(rdir, f):
+    """The fault ran to its end (.out AND .done), or the launcher gave up on
+       it (MAX_SCENARIO_ATTEMPTS). A missing .out is never settled by a .done."""
+    od = os.path.join(rdir, "outs")
+    if os.path.isfile(os.path.join(od, "%s.out" % f)) and os.path.isfile(os.path.join(od, "%s.done" % f)):
+        return True
+    try:
+        with open(os.path.join(od, "%s.attempts" % f)) as fh:
+            return int(fh.read().strip().split()[0]) >= int(MAX_SCENARIO_ATTEMPTS)
+    except Exception:
+        return False
+
+
+def _gt_drop_all_done(rdir, miss):
+    """Drop the run's ALL_DONE flags so the launcher resumes it in place (its
+       folder is kept -- _gt_reset does not move a folder in _GT_RESUME)."""
+    n = 0
+    for fp in glob.glob(os.path.join(rdir, "flags", "ALL_DONE*.flag")):
+        try:
+            os.remove(fp)
+            n += 1
+        except Exception:
+            pass
+    if rdir not in _GT_RESUME:
+        _GT_RESUME.add(rdir)
+        print("[gen-test] %s: %s never simulated to the end -- resumed in place%s"
+              % (os.path.basename(rdir), ",".join(miss),
+                 (" (%d ALL_DONE flag(s) dropped)" % n) if n else ""))
 
 
 _GT_RESCORED = "GT_RESCORED.flag"      # the gen test's own scoring pass ran in this folder
@@ -21045,8 +21141,10 @@ def _gt_rescorable(r, faults):
         return os.path.isdir(rdir) and _gt_outs_ready(rdir, g, faults)
     if g and g.get("egf") and _gt_egf_mismatch(rdir, g):
         return False               # a run of OTHER .dyr values: simulate again, do not score it
+    # UP TO _GT_RESCORE_TRIES PASSES, not one: a pass whose report shard died
+    # left the flag behind and the run was never scored again
     return (os.path.isdir(rdir) and _gt_outs_ready(rdir, g, faults)
-            and not os.path.isfile(os.path.join(rdir, "flags", _GT_RESCORED)))
+            and _gt_passes(rdir) < _GT_RESCORE_TRIES)
 
 
 def _push_records(env):
@@ -21482,6 +21580,12 @@ def _gt_reset(r):
             pass
     rdir = r.get("rdir")
     if not rdir or not os.path.isdir(rdir):
+        return
+    # RESUMED IN PLACE: a finished run with faults never simulated keeps its
+    # folder (its ALL_DONE flags were dropped by _gt_done); only those run
+    if rdir in _GT_RESUME:
+        print("[gen-test] %s: resumed in place -- only its missing faults run"
+              % os.path.basename(rdir))
         return
     # MOVED ASIDE, NEVER DELETED. The folder is cleared because a run about to
     # start is judged unfinished -- but that judgement can be wrong (a folder
@@ -24219,7 +24323,7 @@ def main():
             print("[compare] WHAT EACH PROJECT HAS, BEFORE COMPARING")
             print("[compare] " + "=" * 70)
             print("[compare]   %-16s %-6s %8s %9s   %s"
-                  % ("project", "case", ".out", "expected", "state"))
+                  % ("project", "case", "done", "expected", "state"))
             for _pj in (compare_projects() or [""]):
                 for _md in (list(MODES) or ["spp"]):
                     for _cs, _lbl in ((CASE_BASE, "BASE"), (CASE_TEST, "PROJ")):
@@ -24228,17 +24332,29 @@ def main():
                         if _cs is CASE_TEST and RUN_CASES not in ("both", "proj"):
                             continue
                         _d = results_dir(_cs, _pj, _md)
+                        # THE SELECTED PLAN, NOT THE FILE'S LINES: ONLY_FAULTS /
+                        # ONLY_EVENTS apply, the flat run is not a fault, and a
+                        # fault counts once it has its .done (or .partial) -- a
+                        # half-written .out of a stopped run is not a result
                         try:
-                            _n = len(glob.glob(os.path.join(_d, "outs", "*.out")))
+                            _ids = _plan_expected_ids(_pj, _md, [(_pj, _md, None, None, {"dir": _d})])
                         except Exception:
-                            _n = 0
-                        _exp = 0
+                            _ids = set()
+                        _od = os.path.join(_d, "outs")
+                        _fin = set()
                         try:
-                            _fp = os.path.join(_d, "faults", "SPP_FAULTS.csv")
-                            if os.path.isfile(_fp):
-                                _exp = max(0, len(_read_text(_fp).splitlines()) - 1)
+                            for _mk in (glob.glob(os.path.join(_od, "*.done"))
+                                        + glob.glob(os.path.join(_od, "*.partial"))):
+                                _fid = os.path.splitext(os.path.basename(_mk))[0]
+                                if _fid and not _fid.upper().startswith("FLAT"):
+                                    _fin.add(_fid)
                         except Exception:
-                            _exp = 0
+                            pass
+                        if _ids:
+                            _n = len(_fin & _ids)
+                        else:
+                            _n = len([f for f in _fin if _id_selected(f)])
+                        _exp = len(_ids)
                         if _n == 0:
                             _state = "NOT RUN"
                         elif _exp and _n < _exp:
