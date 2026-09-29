@@ -10278,6 +10278,9 @@ def _compile_diag(env):
             pass
 
 
+_CLOAD4_NATIVE = [False]   # True = cload4 left to PSS/E's own cload4.bat (see _cload4_shim)
+
+
 def _cload4_shim():
     """(path of a cload4.bat written into the study folder or "", what to print).
 
@@ -10340,6 +10343,14 @@ def _cload4_shim():
                 py = hits[0][0]
         except Exception:
             pass
+        if py == sys.executable:
+            # NO PYTHON HERE CAN IMPORT psse_env_manager, so forcing cload4.py
+            # onto this one is certain to fail. Leave cload4 to PSS/E's own
+            # PSSBIN\cload4.bat, as a hand-run MyCload41.bat does -- that is
+            # the path that builds the .dll when the .bat is run by hand.
+            _CLOAD4_NATIVE[0] = True
+            return "", ("no Python here imports psse_env_manager -- cload4 is left to "
+                        "PSS/E's own cload4.bat, with the plain Windows environment")
     try:
         with open(here, "w") as fh:
             fh.write("@echo off\n")
@@ -10486,6 +10497,12 @@ def _dyr_compile_user_models(changed):
         print("  [dyr] the .bat files run with %s" % _cnote)
         _compile_diag(_cenv)
         _shim, _snote = _cload4_shim()
+        if _CLOAD4_NATIVE[0]:
+            # AS IF RUN BY HAND: none of the study's Python settings, which would
+            # steer PSS/E's cload4.bat onto the interpreter that cannot run it
+            _cenv = dict(os.environ)
+            for _k in ("PYTHONPATH", "PYTHONHOME", "PY_PYTHON"):
+                _cenv.pop(_k, None)
         if _snote:
             print("  [dyr] %s" % _snote)
         _bat_out = []
