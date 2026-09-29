@@ -5002,6 +5002,11 @@ def out_is_poison(path):
 # obvious alternative and the wrong one -- the loop has half a dozen `continue`
 # paths, and every one of them would have had to remember to stop its thread.
 _HB_CUR = {"sid": None, "t": 0.0}
+# ...BUT NOT FOR EVER. A read that has gone on past SCORE_ONE_MAX_S is not
+# honest work any more, it is a hang, and a heartbeat that keeps printing hides
+# it from the launcher's stall watchdog -- which is the one thing that can end
+# it. Past the limit the heartbeat goes quiet and the watchdog decides.
+SCORE_ONE_MAX_S = float(os.environ.get("SPP_SCORE_ONE_MAX_S") or 2400)
 
 
 def _heartbeat_start():
@@ -5016,6 +5021,8 @@ def _heartbeat_start():
             sid, t0 = _HB_CUR.get("sid"), _HB_CUR.get("t") or 0.0
             if not sid:
                 continue
+            if time.time() - t0 > SCORE_ONE_MAX_S:
+                continue                      # past the limit: let the watchdog see silence
             try:
                 print("  [alive] still scoring %s -- %s on this one"
                       % (sid, _fmt_hms(time.time() - t0)))
@@ -5347,9 +5354,20 @@ def _apply_solver_recipe(niter, accel):
     _dsp_or_stop(ints, reals, "MAXITER %s / ACCEL %s" % (niter, accel))
     return True
 
+class ScenarioSkipped(Exception):
+    """A scenario this case cannot run (a fault bus it does not have), already
+       recorded by _skip_scenario. NOT a failure: raised so _run_one can tell it
+       from "no output produced", which is also what a diverged solve returns --
+       and the (None, None) it replaced was counted FAILED and handed back to
+       the queue."""
+    pass
+
+
 def _run_with_solver_retry(scen_id, runner):
     """Run one scenario; if the network does not converge, re-run it with each recipe in
-       turn until it does. Returns (out, tclear) from the attempt that was kept."""
+       turn until it does. Returns (out, tclear) from the attempt that was kept.
+       ScenarioSkipped goes straight through, untouched: no recipe can place a
+       bus the case does not have."""
     if not SOLVER_RETRY_ON_NONCONV:
         return runner()
     tried, best = [], (None, None)
@@ -5386,7 +5404,10 @@ def _run_with_solver_retry(scen_id, runner):
                      SOLV_DELT))
             sys.stdout.flush()
         mark = _log_mark()
-        out, tc = runner()
+        try:
+            out, tc = runner()
+        except ScenarioSkipped:
+            raise
         n, worst, wbus = _noconv_since(mark)
         tried.append((label, n, worst, wbus))
         if out and n <= SOLVER_RETRY_MAX_NONCONV:
@@ -14137,7 +14158,9 @@ def fault_run(fault, idx=None, total=None):
               "is built from one case's topology and read by both; see "
               "00_FAULTS_NOT_IN_THIS_CASE.txt) ***" % fbus)
         _skip_scenario(fid, "fault bus %s is not in this case" % fbus)
-        return None, None
+        # RAISED, so _run_one counts it SKIPPED and keeps the claim -- a
+        # (None, None) here read as a failed run and went back to the queue.
+        raise ScenarioSkipped("fault bus %s is not in this case" % fbus)
     # >>> ALWAYS PLOT THE FAULTED BUS: give it its own voltage channel, named so the
     #     plot filter can recognise it. Channels must exist BEFORE strt_2 writes the
     #     .out headers, which is why this sits here and not in add_channels(): the
@@ -14200,6 +14223,12 @@ def fault_run(fault, idx=None, total=None):
     ftype  = (fault.get("type") or "3PH").upper()
     fault_cyc = float(fault.get("cycles", 16))
     t_now = PRE_FAULT_S                              # sim clock; autotune advances it slightly
+    # NO FAULT: an OPEN event (P1.1 loss of a generator, P2.1 line opened) is
+    # SWITCHING ONLY. Applying the SLG/3PH default to it put a fault on a bus
+    # SPP's event never faults. No fault, no autotune, no run-to-clear, no
+    # clear, no reclose: the elements are switched at t_now and that is the
+    # "clearing" every criterion counts from.
+    _nf = bool(fault.get("no_fault")) or ftype == "OPEN"
     if PSSE_FAULT_LOG:
         try:
             _fd = os.path.join(LOG_DIR, "psse")
@@ -14217,7 +14246,10 @@ def fault_run(fault, idx=None, total=None):
             print("  [%s] PSS/E output SILENCED for the fault window (PSSE_SILENT_RUNS=True; "
                   "guards the switching-capture writer)" % _ts()); sys.stdout.flush()
         _silence_psse(True)
-    if ftype == "SLG":
+    if _nf:
+        print("  [%s] NO FAULT (%s) -- switching only at t=%.3fs"
+              % (_ts(), ftype, t_now)); sys.stdout.flush()
+    elif ftype == "SLG":
         target_v = float(fault.get("retained_v", SLG_TARGET_VPU))
         if DIAG_MILD_FAULT:
             target_v = 0.85
@@ -14250,16 +14282,20 @@ def fault_run(fault, idx=None, total=None):
             chk(_apply_shunt_fault(fbus, x), "3PH @%s(%d) fixed Xf=%.4f pu" % (fb_in, fbus, x))
         else:
             t_now = _apply_retained_fault(fbus, tgt3, t_now, "3PH @%s(%d)" % (fb_in, fbus))
-    print("  [%s] fault applied ~t=%.3fs -- running to clear (%g cycles)"
-          % (_ts(), t_now, fault_cyc)); sys.stdout.flush()
-    tclear = t_now + fault_cyc * CYC
-    _set_sim_clock(t_now)     # autotune may have advanced the real clock -- resync
-    _set_out(out); chk(_run_to(tclear, SIM_END_S, "%s to-clear" % fid), "run to clear")
-    vf = _read_vpu(fbus)                            # confirm the fault held the bus down (but > 0)
-    print("  [%s] faulted-bus voltage during fault = %s pu (depressed but > 0 -> no Inf overflow)"
-          % (_ts(), ("%.3f" % vf) if vf is not None else "n/a")); sys.stdout.flush()
+    if _nf:
+        tclear = t_now
+        _set_sim_clock(t_now)
+    else:
+        print("  [%s] fault applied ~t=%.3fs -- running to clear (%g cycles)"
+              % (_ts(), t_now, fault_cyc)); sys.stdout.flush()
+        tclear = t_now + fault_cyc * CYC
+        _set_sim_clock(t_now)     # autotune may have advanced the real clock -- resync
+        _set_out(out); chk(_run_to(tclear, SIM_END_S, "%s to-clear" % fid), "run to clear")
+        vf = _read_vpu(fbus)                            # confirm the fault held the bus down (but > 0)
+        print("  [%s] faulted-bus voltage during fault = %s pu (depressed but > 0 -> no Inf overflow)"
+              % (_ts(), ("%.3f" % vf) if vf is not None else "n/a")); sys.stdout.flush()
 
-    chk(_clear_bus_fault(fbus), "clear")
+        chk(_clear_bus_fault(fbus), "clear")
     for ln in fault.get("trip_lines", []):
         kv = ln[2] if len(ln) > 2 else fault.get("kv")
         ck = str(ln[3]) if len(ln) > 3 else "1"
@@ -14272,6 +14308,12 @@ def fault_run(fault, idx=None, total=None):
     for (frm, to, ck) in fault.get("trips", []):
         chk_branch(_switch_branch(int(frm), int(to), str(ck), False)[0],
                    "trip %s-%s" % (frm, to), int(frm), int(to), str(ck))
+    # ---- LOSS OF A GENERATOR, NO FAULT (P1.1): the unit IS the event --------
+    if (_nf and not (fault.get("trip_lines") or fault.get("trips"))
+            and fault.get("gen_id")):
+        chk(psspy.dist_machine_trip(int(fbus), str(fault["gen_id"])), "trip unit")
+        print("  [%s] tripped unit %d '%s' (no fault)"
+              % (_ts(), int(fbus), str(fault["gen_id"]))); sys.stdout.flush()
     # ---- machines the event says to drop WITH the elements -----------------
     for (mbus, mid) in (fault.get("drop_machines") or []):
         _mb = resolve_bus(mbus, None)
@@ -14361,7 +14403,8 @@ def fault_run(fault, idx=None, total=None):
     #      back INTO a re-applied fault (same reactance) -> the "unsuccessful" reclose;
     #   d. leave the fault on for the clear-cycles, then trip the element(s) again and clear.
     # This produces the real SECOND voltage dip on the plot. tclear (returned) stays the FIRST clear.
-    if SIMULATE_RECLOSE and fault.get("reclose") and (fault.get("trip_lines") or fault.get("trips")):
+    if (not _nf and SIMULATE_RECLOSE and fault.get("reclose")
+            and (fault.get("trip_lines") or fault.get("trips"))):
         rc_wait = float(fault.get("reclose_wait", RECLOSE_WAIT_CYCLES))
         t_dead  = tclear + rc_wait * CYC                       # c. dead time
         _set_sim_clock(tclear)
@@ -16616,7 +16659,20 @@ def _chan_unit(title):
     try:
         core = re.sub(r"^[^A-Za-z]+", "", chan_core(title)).upper()
         m = re.match(r"[A-Z]*\d{4,}_([A-Z0-9]{1,2})_[A-Z]", core)
-        return m.group(1) if m else ""
+        if m:
+            return m.group(1)
+        # PSS/E'S OWN MACHINE TITLES (chsb): "POWR 587313[NAME 34.500]1" --
+        # the machine id follows the bus bracket. ONE bracket only: a branch
+        # title ("POWR 101[..]102[..]1") ends in a CIRCUIT id, and a bus
+        # channel ("VOLT 560080[..]") or a swing channel ends without one.
+        _cc = chan_core(title)
+        if _cc.count("[") != 1:
+            return ""
+        m2 = re.search(r"\]\s*([A-Za-z0-9]{1,2})\s*$", _cc)
+        if not m2:
+            return ""
+        u = m2.group(1).upper()
+        return "" if u == "1" else u
     except Exception:
         return ""
 
@@ -20974,6 +21030,9 @@ def evaluate_case(path, kind, tclear, kb):
                                 ("PASS" if ok else "FAIL")), "Detail": detail})
 
     if kind == "flat":
+        # MACHINE P / Q IN MW / MVAr (_plot_units), the units FLAT_TOL_BY_KIND
+        # is written in -- judged in system-base pu, its 1 MW was SYS_MVA_BASE MW.
+        ch = _plot_units(ch)
         drift, checked = [], 0
         for k, (ti, v) in ch.items():
             cat = categorize(ti)
@@ -21519,6 +21578,30 @@ def evaluate_case(path, kind, tclear, kb):
             % (len(ss_pre_ok), V_SS_LOW, V_SS_HIGH, SS_PRE_RETURN_PU,
                ", ".join(ss_pre_ok[:VIOLATION_LIST_MAX]) + _more(ss_pre_ok)))
 
+    # THE EVENT'S ISLAND, ONCE, BEFORE THE TRIP TEST. A unit the fault's own
+    # trips leave with no path to the system (see _event_island_buses) spins
+    # alone: its P and ETERM read as a trip, its angle runs away, and neither
+    # is a response of the system. The same set is used by the tripping gate
+    # (event-removed, not judged), the damping skip and the System-stability
+    # row, so the three never disagree. The run-away angle is required as
+    # well as the topology, as in the damping skip below.
+    try:
+        _isl_buses = set() if kind == "flat" else _event_island_buses(case)
+    except Exception:
+        _isl_buses = set()
+    _isl_lbls = set()
+    if _isl_buses:
+        for ti, v in angles:
+            try:
+                if _chan_bus(ti) not in _isl_buses:
+                    continue
+                _full = v[i_clr:] if (i_clr is not None and 0 <= i_clr < len(v)) else v
+                _full = [x for x in _full if x == x and x not in (_INF, -_INF)]
+                if _full and (max(_full) - min(_full)) >= ISLAND_ANGLE_MIN_DEG:
+                    _isl_lbls.add(chan_label(ti))
+            except Exception:
+                pass
+
     # GENERATOR TRIPPING. A machine counts as tripped if it was carrying load
     # before the fault and is delivering essentially nothing at the end.
     # PROJECT machines are called out separately: the project tripping is the
@@ -21714,7 +21797,7 @@ def evaluate_case(path, kind, tclear, kb):
     except Exception:
         _gone_part = set()
     _ev_out = []
-    if _evd or _isl or _gone_part:
+    if _evd or _isl or _gone_part or _isl_lbls:
         def _bus_of(_s):
             _mb = re.search(r"\d{3,}", _s.split("(")[0])
             return int(_mb.group(0)) if _mb else None
@@ -21750,6 +21833,9 @@ def evaluate_case(path, kind, tclear, kb):
         def _dropped(_s):
             # THE UNIT, NOT THE BUS: the event dropping unit 2 of a bus does not
             # excuse unit 1 of the same bus tripping.
+            # ISLANDED BY THE EVENT (see _isl_lbls): removed by the event.
+            if _s.split("(")[0].strip() in _isl_lbls:
+                return True
             _mm = re.search(r"(\d{3,})(?:-([A-Z0-9]{1,2}))?\s*$", _s.split("(")[0].strip())
             if not _mm:
                 return False
@@ -21764,7 +21850,8 @@ def evaluate_case(path, kind, tclear, kb):
             return _b in _evd
         _ev_out = [x for x in trips if _dropped(x)]
         trips = [x for x in trips if not _dropped(x)]
-        _ev_p = [x for x in proj_trips if _isl or _bus_of(x) in _evd or _bus_of(x) in _pbus]
+        _ev_p = [x for x in proj_trips if _isl or _bus_of(x) in _evd or _bus_of(x) in _pbus
+                 or x.split("(")[0].strip() in _isl_lbls]
         proj_trips = [x for x in proj_trips if x not in _ev_p]
         _ev_out += _ev_p
         # THE VIOLATIONS LIST MUST AGREE WITH THE VERDICT: units the event takes
@@ -21775,7 +21862,10 @@ def evaluate_case(path, kind, tclear, kb):
     if _ev_out:
         add("Generator tripping: units the EVENT removes (not judged)", None,
             "%d unit(s) go offline because the event takes them (%s): %s"
-            % (len(_ev_out), "drop_machines of the fault" if _evd and not _isl else
+            % (len(_ev_out),
+               "the event's trips island them (no path to the system)"
+               if (_isl_lbls and not _evd and not _isl and not _gone_part) else
+               "drop_machines of the fault" if _evd and not _isl else
                "the event disconnects the project from the POI" if (not _evd and _isl) else
                "the event disconnects part of the project" if not _evd else
                "drop_machines / project disconnected", ", ".join(_ev_out[:VIOLATION_LIST_MAX])
@@ -21949,10 +22039,7 @@ def evaluate_case(path, kind, tclear, kb):
     skipped_async = []
     skipped_trip = []
     skipped_island = []
-    try:
-        _isl_buses = set() if kind == "flat" else _event_island_buses(case)
-    except Exception:
-        _isl_buses = set()
+    # _isl_buses / _isl_lbls: computed once, before the trip test.
     # FROM THE FINAL CLEARING, as the 0.70 pu test. With a reclose the fault
     # is applied a second time; the swing between the two clearings is forced,
     # not the free oscillation SPPR measures, and read as the 1st positive peak.
@@ -21974,8 +22061,9 @@ def evaluate_case(path, kind, tclear, kb):
         # convergence test use seg: the free oscillation after the final clearing.
         _full = v[i_clr:] if (i_clr is not None and 0 <= i_clr < len(v)) else seg
         dev = max(_full) - min(_full)
-        if (_isl_buses and dev >= ISLAND_ANGLE_MIN_DEG
-                and _chan_bus(ti) in _isl_buses):
+        if (chan_label(ti) in _isl_lbls
+                or (_isl_buses and dev >= ISLAND_ANGLE_MIN_DEG
+                    and _chan_bus(ti) in _isl_buses)):
             # ISLANDED BY THE EVENT. The fault's own trips leave this unit in a
             # pocket with no path to the system (a P4 at 531445 opens S4 and S5
             # GEN's step-up transformers), so its angle is a machine spinning
@@ -22380,7 +22468,8 @@ def evaluate_case(path, kind, tclear, kb):
             if _win is None:
                 add(_sc, None, "not measured -- under 0.5 s of record after the final clearing")
             else:
-                add(_sc, None, _settled_detail(t, ch, kb, _win[0], _win[1],
+                # MW / MVAr for the machine P and Q, as SETTLE_PQ_MW is.
+                add(_sc, None, _settled_detail(t, _plot_units(ch), kb, _win[0], _win[1],
                                                _poi_volt_series(list(volts) + list(nonbes)),
                                                _prec_src, _qsrc))
         except Exception as _e:
@@ -22407,8 +22496,16 @@ def evaluate_case(path, kind, tclear, kb):
         _unstable.append("%d bus voltage channel(s) off-scale above 5 pu (%s)"
                          % (len(offscale),
                             ", ".join(chan_label(_ti) for _ti, _pk in offscale[:4])))
+    # NOT THE SYSTEM'S SOLUTION: a unit islanded by the event, a tripped unit
+    # and an excluded asynchronous channel are already accounted for above --
+    # their frozen or free-running angle is not part of the network losing
+    # its solution.
+    _stab_skip = set(_isl_lbls) | set(tripped_lbls)
+    _stab_skip |= set(_l for _l, _d in skipped_async)
     for _ti, _v in list(angles) + list(bus_angles):
-        _fin = [x for x in _v if x == x and x not in (_INF, -_INF)]
+        if chan_label(_ti) in _stab_skip:
+            continue
+        _fin =[x for x in _v if x == x and x not in (_INF, -_INF)]
         if _fin and (max(_fin) - min(_fin)) > 720.0:
             _unstable.append("%s angle spans %.0f deg -- lost synchronism, or no "
                              "solution at that bus"
@@ -23353,12 +23450,23 @@ def merge_report_parts():
     # for good in between left those scenarios in their own SCEN_<id>.csv only.
     # Current files only (read_scenario_parts skips one older than its .out),
     # for a scenario whose .out is still in the folder and in the selection.
+    # THE SCEN PART WINS OVER A SHARD PART. It is written the moment the
+    # scenario is scored, while a shard part is rewritten only every
+    # PART_WRITE_EVERY_S -- so a scenario re-scored since holds its OLD rows
+    # and verdict in the shard part. The case's rows and verdict are REPLACED
+    # by the SCEN part's, never added beside them.
     try:
-        _gap = []
+        _gap, _repl = [], []
+        _in_rows = set(r["Case"] for r in all_rows)
         for _c, (_rw, _v) in read_scenario_parts().items():
-            if (_c not in verdicts and _rw and _wanted(_c)
-                    and os.path.isfile(os.path.join(OUT_DIR, _c + ".out"))
-                    and (os.path.isfile(_state_path(_c, "done")) or _is_partial(_c))):
+            if not (_rw and _wanted(_c)
+                    and os.path.isfile(os.path.join(OUT_DIR, _c + ".out"))):
+                continue
+            if _c in verdicts or _c in _in_rows:
+                all_rows = [r for r in all_rows if r["Case"] != _c] + list(_rw)
+                verdicts[_c] = _v
+                _repl.append(_c)
+            elif os.path.isfile(_state_path(_c, "done")) or _is_partial(_c):
                 all_rows += _rw
                 verdicts[_c] = _v
                 _gap.append(_c)
@@ -23366,6 +23474,10 @@ def merge_report_parts():
             print("[merge] %d scenario(s) not in any shard part were taken from their "
                   "per-scenario parts: %s" % (len(_gap), ", ".join(sorted(_gap)[:8])
                                               + (" ..." if len(_gap) > 8 else "")))
+        if _repl:
+            print("[merge] %d scenario(s) taken from their per-scenario parts over the "
+                  "shard parts: %s" % (len(_repl), ", ".join(sorted(_repl)[:8])
+                                       + (" ..." if len(_repl) > 8 else "")))
     except Exception as e:
         print("[merge] could not read the per-scenario parts (%s)" % e)
     # rebuild SPP_VIOLATIONS so the violations report is written from the shards
@@ -25105,7 +25217,16 @@ def _event_island_buses(scen_id):
         _known = [0]
         for f in faults:
             cut, ends = set(), []
-            for ln in (f.get("trip_lines") or []):
+            # A THREE-WINDING TRANSFORMER IS ONE ELEMENT WITH THREE LEGS. The
+            # list names it by two winding buses, and tripping it removes all
+            # three windings -- cutting only the named pair left the map a path
+            # round through the third winding, and the pocket behind it was
+            # never found. The fault row's own trip_3wind says which three
+            # buses it is; failing that, the case's (_three_wind_of). The
+            # prior outages (pre_outage) are cut too: the event's network is
+            # the one without them.
+            _t3row = list(f.get("trip_3wind") or [])
+            for ln in (list(f.get("trip_lines") or []) + list(f.get("pre_outage") or [])):
                 try:
                     x = int(resolve_bus(ln[0], ln[2] if len(ln) > 2 else None) or 0)
                     y = int(resolve_bus(ln[1], ln[2] if len(ln) > 2 else None) or 0)
@@ -25113,9 +25234,37 @@ def _event_island_buses(scen_id):
                     continue
                 if not x or not y:
                     continue
-                cut.add((x, y))
-                cut.add((y, x))
-                ends += [x, y]
+                _ck = str(ln[3]).strip() if len(ln) > 3 else "1"
+                _legs = [(x, y)]
+                _w = None
+                for _t in _t3row:
+                    try:
+                        if (x in _t[:3] and y in _t[:3]
+                                and str(_t[3] if len(_t) > 3 else "1").strip().upper()
+                                == _ck.upper()):
+                            _w = tuple(int(z) for z in _t[:3])
+                            break
+                    except Exception:
+                        continue
+                if _w is None:
+                    try:
+                        _w = _three_wind_of(x, y, _ck)
+                    except Exception:
+                        _w = None
+                    # NO CASE IN THIS PROCESS: an empty map must not be kept,
+                    # or a case loaded later would see no transformers at all.
+                    try:
+                        if not _3W_CACHE.get("map"):
+                            _3W_CACHE["map"] = None
+                    except Exception:
+                        pass
+                if _w:
+                    _legs = [(int(_w[0]), int(_w[1])), (int(_w[0]), int(_w[2])),
+                             (int(_w[1]), int(_w[2]))]
+                for (p, q) in _legs:
+                    cut.add((p, q))
+                    cut.add((q, p))
+                    ends += [p, q]
             pocket, checked = set(), set()
             for st in ends:
                 # A bus the map has no branch for is unknown, not islanded.
@@ -25940,6 +26089,20 @@ def load_faults_csv(path):
                     f[_k] = _v2
             if (r.get("con_id") or "").strip():
                 f["con_id"] = r["con_id"].strip()
+            # THE THREE-WINDING TRANSFORMERS THE EVENT TRIPS, "w1-w2-w3-ckt;..."
+            # (see _enc_3wind) -- carried so _event_island_buses can cut all
+            # three legs in a process that has no case to ask.
+            _t3w = []
+            for _e3 in (r.get("trip_3wind") or "").split(";"):
+                _b3 = [x.strip() for x in _e3.split("-")]
+                if len(_b3) >= 3:
+                    try:
+                        _t3w.append((int(_b3[0]), int(_b3[1]), int(_b3[2]),
+                                     (_b3[3] if len(_b3) > 3 and _b3[3] else "1")))
+                    except ValueError:
+                        continue
+            if _t3w:
+                f["trip_3wind"] = _t3w
             if (r.get("subtype") or "").strip():
                 f["subtype"] = r["subtype"].strip()
             if f.get("planning_event") == "P1.3" and f.get("subtype") == "line":
@@ -26102,6 +26265,43 @@ def _stale_aside(out_dir, sid, why):
     return moved
 
 _FAULT_SIG = {}      # fault id -> _fault_row_sig of the row this run loaded
+_FAULT_SIG_LOADED = [False]
+
+
+def _ensure_fault_sigs():
+    """Fill _FAULT_SIG from the fault list, once per process.
+
+       A PROCESS THAT NEVER READ THE LIST WROTE .done WITHOUT ITS sig= LINE.
+       Only load_faults_csv fills _FAULT_SIG, and a worker that ran its
+       scenarios from a list it got another way marked them done with no
+       fingerprint -- so a later run with a renumbered list resumed them as the
+       same fault. Read in the order _island_fault_rows uses (FAULTS_CSV, then
+       FAULTS_DIR\\SPP_FAULTS.csv, the first with rows); an id already known
+       keeps the signature this run loaded. Never raises."""
+    if _FAULT_SIG_LOADED[0]:
+        return
+    _FAULT_SIG_LOADED[0] = True
+    try:
+        _keep = dict(_FAULT_SIG)
+        lists = []
+        try:
+            if FAULTS_CSV:
+                lists.append(FAULTS_CSV)
+        except Exception:
+            pass
+        try:
+            lists.append(os.path.join(FAULTS_DIR, "SPP_FAULTS.csv"))
+        except Exception:
+            pass
+        for p in lists:
+            try:
+                if p and os.path.isfile(p) and load_faults_csv(p):
+                    break
+            except Exception:
+                continue
+        _FAULT_SIG.update(_keep)
+    except Exception:
+        pass
 
 
 def _mark_done(scen_id, tclear, tend=None):
@@ -26114,6 +26314,8 @@ def _mark_done(scen_id, tclear, tend=None):
        holding two channel sets (14-area and 20-area monitoring) had every
        complete 90 MB run retired as a truncated 111 MB one. With the end time
        written here, completeness is read from the marker, not guessed."""
+    if scen_id not in _FAULT_SIG:
+        _ensure_fault_sigs()
     txt = "" if tclear is None else repr(tclear)
     if scen_id in _FAULT_SIG:
         txt += "\nsig=%s" % _FAULT_SIG[scen_id]
@@ -26140,6 +26342,8 @@ def _mark_partial(scen_id, tend, tclear=None):
        fault criterion is measured from that instant, and a marker without it
        left the report phase with tclear=None -- which excluded the file, or
        raised inside evaluate_case and took the whole scoring shard with it."""
+    if scen_id not in _FAULT_SIG:
+        _ensure_fault_sigs()
     if tclear is None:
         try:
             tclear = _tclear_from_faultlist(scen_id)
@@ -30781,6 +30985,22 @@ def finalize_report(produced, part=None, claim=False):
         # The parts are cleared rather than ignored, so the merge cannot pick
         # the old rows up either.
         _done_cases = set()
+        # SHARD 0 REMOVES AN EARLIER PASS'S HIGHER-NUMBERED PARTS -- ALWAYS, not
+        # only under FORCE_RESCORE. A pass with fewer shards than the last one
+        # left CRITERIA/VERDICTS_w<k> for k >= this pass's count, and every merge
+        # that runs without a shard count (the re-merge, the coverage check)
+        # put those old rows and verdicts back into the report.
+        if part == 0:
+            try:
+                for _f in glob.glob(os.path.join(PARTS_DIR, "*_w*.csv")):
+                    _m = re.match(r"(CRITERIA|VERDICTS|VIOLATIONS|MEASURE|OUTSTAMP)_w(\d+)\.csv$",
+                                  os.path.basename(_f))
+                    if _m and int(_m.group(2)) >= max(1, int(N_WORKERS or 1)):
+                        os.remove(_f)
+                        print("[score] shard 0 removed %s -- left by an earlier pass "
+                              "with more shards" % os.path.basename(_f))
+            except Exception:
+                pass
         # SPP_RESCORE_RESUME: the launcher relaunched this shard after a crash
         # inside a forced rescore. The rows in its part were written by THIS
         # pass under the current rules; keep them, re-read the rest.
@@ -33013,6 +33233,7 @@ def main():
         _progress_record(scen_id, "RUNNING", att, "attempt %d/%d" % (att, MAX_SCENARIO_ATTEMPTS))
         _scenario_log_open(scen_id)          # everything below also goes to RUN_<id>.log
         _keeper = None
+        _skipped = False
         try:
             _claim_touch(scen_id)                # still alive, still working on it
             globals()["_CLAIM_ALIVE"] = scen_id   # ...and keep saying so, from the heartbeat
@@ -33065,6 +33286,15 @@ def main():
                              ("solver: %s" % SOLVER_FIX[scen_id][0])
                              if scen_id in SOLVER_FIX else "no output produced")
             fail_n += 1; return None, None
+        except ScenarioSkipped as e:
+            # NOT RUNNABLE HERE, AND NOT A FAILURE -- see _skip_scenario, which
+            # has already recorded it. The claim stays, so no other worker
+            # spends an attempt on it.
+            print("  [skip] %s: %s" % (scen_id, e))
+            _skipped = True
+            _claim_release(scen_id, keep=True)
+            skip_n += 1
+            return None, None
         except Exception as e:
             _progress_record(scen_id, "ERROR", att, str(e)[:150])
             fail_n += 1; print("%s ERROR: %s" % (scen_id, e)); traceback.print_exc(); return None, None
@@ -33076,7 +33306,7 @@ def main():
             # worker so the cap still holds.
             globals()["_CLAIM_ALIVE"] = None   # nothing for the heartbeat to refresh
             _claim_keeper_stop(_keeper)
-            _claim_release(scen_id, keep=os.path.isfile(_state_path(scen_id, "done")))
+            _claim_release(scen_id, keep=(_skipped or os.path.isfile(_state_path(scen_id, "done"))))
             _scenario_log_close()            # runs on every exit path, including return
 
     if eff_run_flat:
@@ -34067,6 +34297,13 @@ def plot_missing_outs():
                     _refused.append((sid, why,
                                      "delete %s.badout to try it again"
                                      % os.path.basename(p)))
+                    # SAY SO ON DISK, with the token -- see _plot_only_current.
+                    try:
+                        _write_text(_state_path(sid, "plotted"),
+                                    "%s  NOT drawn: %s  [endtime-checked]"
+                                    % (time.strftime("%Y-%m-%d %H:%M:%S"), why))
+                    except Exception:
+                        pass
                     continue
                 # LOOK BEFORE OPENING IT.
                 #
@@ -34196,6 +34433,15 @@ def plot_missing_outs():
                                      "process, taking every scenario behind it. "
                                      "If the values do reach past clearing, "
                                      "re-run with RUN_ONLY_FAULTS=[\"%s\"]." % sid))
+                    # SAY SO ON DISK, with the token -- see _plot_only_current.
+                    # A re-simulated .out is newer than the marker and is
+                    # looked at again.
+                    try:
+                        _write_text(_state_path(sid, "plotted"),
+                                    "%s  NOT drawn: %s  [endtime-checked]"
+                                    % (time.strftime("%Y-%m-%d %H:%M:%S"), _skipped))
+                    except Exception:
+                        pass
                     continue
                 # WRITE IT DOWN BEFORE OPENING IT. A floating-point trap in
                 # dyntools kills the process outright -- no exception, no
@@ -34241,6 +34487,14 @@ def plot_missing_outs():
                                          % (_nf, OUT_READ_STRIKES),
                                          "delete %s and %s.badout to try it again"
                                          % (os.path.basename(_rf), os.path.basename(p))))
+                        # SAY SO ON DISK, with the token -- see _plot_only_current.
+                        try:
+                            _write_text(_state_path(sid, "plotted"),
+                                        "%s  NOT drawn: CONDEMNED -- %d process(es) died "
+                                        "reading it  [endtime-checked]"
+                                        % (time.strftime("%Y-%m-%d %H:%M:%S"), _nf))
+                        except Exception:
+                            pass
                         continue
                     _nf = 0          # the strikes were never about this file
                 try:
@@ -34471,6 +34725,23 @@ def plot_missing_outs():
                             % time.strftime("%Y-%m-%d %H:%M:%S"))
                 print("[plot-missing] %s has its PDF but cannot be scored -- marked "
                       ".plotted so it is not picked again" % sid)
+            except Exception:
+                pass
+        else:
+            # DONE, DRAWN, AND STILL NO VERDICT. _plot_only_current re-reads a
+            # finished run with no SCEN part once, and only the token stops it
+            # -- without this note a .done scenario this pass could not score
+            # was drawn, picked again and drawn again by every plotter.
+            try:
+                if ((had_done or os.path.isfile(_state_path(sid, "done")))
+                        and SCORE_AT_RUN_TIME
+                        and not os.path.isfile(_scen_part_path(sid))):
+                    _write_text(_state_path(sid, "plotted"),
+                                "%s  PDF written; not scorable here  [endtime-checked]"
+                                % time.strftime("%Y-%m-%d %H:%M:%S"))
+                    print("[plot-missing] %s has its PDF and .done but no verdict "
+                          "from this pass -- marked .plotted so it is not picked "
+                          "again" % sid)
             except Exception:
                 pass
         if not _only_one and not _env_bool("SPP_PLOT_ALL_IN_ONE", False):
