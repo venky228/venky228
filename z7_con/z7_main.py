@@ -329,7 +329,7 @@ PROJECTS = ["SantaFe", "IronStar", "EmpirePrairie", "EastFork"]   #["SantaFe", "
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
 MODES = ["spp"]                              # fault set: spp | con | table | custom | manual
 PIPELINE = "all"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
-RUN_CASES = "proj"                           # "both" | "base" | "proj" -- which case to simulate
+RUN_CASES = "both"                           # "both" | "base" | "proj" -- which case to simulate
 ONLY_FAULTS = ["F01-F05"]                    # [] = every fault | e.g. ["F01-F04"]
 ONLY_EVENTS = []                             # [] = every event
 FORCE_REBUILD = None                         # True = rebuild the snapshot even if the flat run is done
@@ -681,10 +681,10 @@ ADJUSTMENTS_REPORT = True                    # list every non-project change in 
 # one study per value, each compared with the base
 DYR_SWEEP = {}                               # e.g. {"REECCU1": {"Kqv": [0.0, 2.0]}}
 DYR_SWEEP_BY_PROJECT = {
-    "SantaFe":       {"REGCAU1": {"Volim": [1.1], "Khv": [0.7, 2.0]}, "REECCU1": {"Kqv": [0.0, 2.0]}},
-    "IronStar":      {"REGCAU1": {"Volim": [1.1], "Khv": [0.7, 2.0]}, "REECCU1": {"Kqv": [0.0, 2.0]}},
-    "EmpirePrairie": {"REGCAU1": {"Volim": [1.1], "Khv": [0.7, 2.0]}, "REECCU1": {"Kqv": [0.0, 2.0]}},
-    "EastFork":      {"REGCAU1": {"Volim": [1.1], "Khv": [0.7, 2.0]}, "REECCU1": {"Kqv": [0.0, 2.0]}},
+    "SantaFe":       {"REGCAU1": {"Volim": [1.1], "Khv": [ 2.0]}, "REECCU1": {"Kqv": [ 2.0]}},
+    "IronStar":      {"REGCAU1": {"Volim": [1.1], "Khv": [ 2.0]}, "REECCU1": {"Kqv": [ 2.0]}},
+    "EmpirePrairie": {"REGCAU1": {"Volim": [1.1], "Khv": [ 2.0]}, "REECCU1": {"Kqv": [ 2.0]}},
+    "EastFork":      {"REGCAU1": {"Volim": [1.1], "Khv": [ 2.0]}, "REECCU1": {"Kqv": [ 2.0]}},
 }
 DYR_SWEEP_PROJECTS = []                      # [] = every project
 DYR_SWEEP_FAULTS = "failing"                 # "all" | "failing" | "crashed"   (4 runs per project)
@@ -14110,7 +14110,9 @@ def _shared_list_for(proj):
     if not proj:
         return ""
     try:
-        return shared_faults_path(proj, _shared_template())
+        p = shared_faults_path(proj, _shared_template())
+        # a template written with "\\" names no file off Windows
+        return p.replace("\\", "/") if (p and os.sep == "/") else p
     except Exception:
         return ""
 

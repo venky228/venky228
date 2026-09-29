@@ -1038,7 +1038,16 @@ class _member_scope(object):
             for b in (self.row.get("feeders") or []):
                 _HOLD_EXCLUDE_BUSES.add(int(b))
         for k, v in self.saved.items():
+            # A SINGLE PROJECT KEEPS ITS MACHINES. Nothing was pointed anywhere on
+            # entry, so restoring PROJECT_GENS here only undid what the body set:
+            # the new plant's "machines are now 999001", reverted to the declared
+            # feeders -- and the build's .dyr edits for PROJECT then looked for
+            # the BESS models on the wrong buses and stopped the first build.
+            if not self.together and k in ("PROJECT_GENS", "PROJECT_GEN_BUSES"):
+                continue
             g[k] = v
+        if not self.together:
+            g["PROJECT_GEN_BUSES"] = [int(b) for b, _m in (g.get("PROJECT_GENS") or [])]
         _MEMBER_ACTIVE[0] = None
         if self.together:
             _t = _together_row()
