@@ -2561,6 +2561,10 @@ SETTLE_PQ_MW    = float(_env_num("SPP_SETTLE_PQ_MW", 2.0))     # MW / MVAr peak-
 V_OVERSHOOT_PU = float(_env_num("SPP_V_OVERSHOOT_PU", V_OVERSHOOT_PU))
 V_SS_LOW       = float(_env_num("SPP_V_SS_LOW", V_SS_LOW))
 V_SS_HIGH      = float(_env_num("SPP_V_SS_HIGH", V_SS_HIGH))
+# THE STEADY-STATE BAND IS NOT AN SPP REV 3.0 CRITERION (Rev 3.0: rotor-angle
+# damping, 0.70 pu recovery, 1.20 pu overvoltage). False = it is measured and
+# NOTED in the results, but never fails a scenario or lists a violation.
+SS_AS_VIOLATION = _env_bool("SPP_SS_AS_VIOLATION", False)
 ANGLE_DEV_DEG  = float(_env_num("SPP_ANGLE_DEV_DEG", ANGLE_DEV_DEG))
 SPPR1_DECAY    = 0.05
 SPPR5_DECAY    = 0.226
@@ -18964,7 +18968,9 @@ def _volt_violation_worst(v, tclear=None, taxis=None):
     if mn is not None and mn < V_RECOVERY_PU:
         out.append(("rec", V_RECOVERY_PU - mn,
                     "no recovery %.3f pu < %.2f pu" % (mn, V_RECOVERY_PU)))
-    if avg < V_SS_LOW:
+    if not SS_AS_VIOLATION:
+        pass                                  # noted in the report, not tagged on plots
+    elif avg < V_SS_LOW:
         out.append(("ss", V_SS_LOW - avg,
                     "steady state %.3f pu < %.2f pu" % (avg, V_SS_LOW)))
     elif avg > V_SS_HIGH:
@@ -21531,7 +21537,7 @@ def evaluate_case(path, kind, tclear, kb):
                 _flags.append("OVERSHOOT-EXEMPT")
             _so = _ss_out(ssv, v)
             if _so:
-                _flags.append("STEADY-STATE")
+                _flags.append("STEADY-STATE" if SS_AS_VIOLATION else "STEADY-STATE-NOTED")
             elif _so is None:
                 _flags.append("STEADY-STATE-AT-PRE-FAULT-LEVEL")
             _b = _chan_bus(ti)
@@ -21563,7 +21569,18 @@ def evaluate_case(path, kind, tclear, kb):
     ss_all.sort(key=lambda r: r[1])
     if "ss" in _nojudge:
         ss_bad, ss_all = [], []
-    add("Steady-state voltage %.2f-%.2f pu" % (V_SS_LOW, V_SS_HIGH),
+    if not SS_AS_VIOLATION and "ss" not in _nojudge:
+        # NOTED, NOT JUDGED: the values stay in the report; no FAIL, no violation
+        add("Note: steady-state voltage %.2f-%.2f pu (not an SPP Rev 3.0 criterion)"
+            % (V_SS_LOW, V_SS_HIGH), None,
+            ("all %d bus(es) within the band -- last %.1fs average spans %.3f (%s) to %.3f (%s)"
+             % (len(volts), SS_WINDOW_S, ss_lo[0], ss_lo[1], ss_hi[0], ss_hi[1]))
+            if not ss_bad else
+            ("noted, not a violation -- %d bus(es) end outside: " % len(ss_bad))
+            + ", ".join(ss_bad[:VIOLATION_LIST_MAX]) + _more(ss_bad))
+        ss_all = []
+    else:
+      add("Steady-state voltage %.2f-%.2f pu" % (V_SS_LOW, V_SS_HIGH),
         None if "ss" in _nojudge else not ss_bad,
         _nj_txt if "ss" in _nojudge else
         ("OK -- last %.1fs average over %d bus(es) spans %.3f (%s) to %.3f (%s)"

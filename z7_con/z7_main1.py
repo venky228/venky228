@@ -573,6 +573,7 @@ V_OVERSHOOT_PU = 1.20                        # no swing above this
 OVERSHOOT_SPIKE_S = 2.0 / 60.0               # above the limit <= this = SPIKE, longer = SWING
 V_SS_LOW = 0.90                              # post-fault steady-state band, low
 V_SS_HIGH = 1.10                             # and high
+SS_AS_VIOLATION = False                      # False = steady-state band NOTED in the results only (not in SPP Rev 3.0) | True = a FAIL
 # records beside the criteria (INFO, no PASS/FAIL) -- changing one re-scores finished gen-test runs
 POI_P_RECOVERY_FRAC = 0.90                   # POI power back to this fraction of pre-fault (and held +/- 1-this)
 RIPPLE_WINDOW_S = 2.0                        # ripple: the last this many s of each fault run
@@ -4512,7 +4513,7 @@ def _criterion_family(criterion):
     # one, and read as one they would hand the overshoot or angle delta a
     # number that belongs to no limit.
     if c.startswith(("transient voltage:", "rotor angle:", "generator tripping:", "***",
-                     "back at the pre-fault level")):
+                     "back at the pre-fault level", "note:")):
         return ""
     # BEFORE the "swing" test below: "Rotor angles measured relative to the
     # system swing machine" is a yes/no statement, and matched "swing" first --
@@ -15070,6 +15071,7 @@ def _push_settings(env, case):
                         ("SPP_V_OVERSHOOT_PU", V_OVERSHOOT_PU),
                         ("SPP_V_SS_LOW", V_SS_LOW),
                         ("SPP_V_SS_HIGH", V_SS_HIGH),
+                        ("SPP_SS_AS_VIOLATION", "1" if SS_AS_VIOLATION else "0"),
                         ("SPP_ANGLE_DEV_DEG", ANGLE_DEV_DEG),
                         ("SPP_SPPR_MIN_AFTER_PEAK", "1" if SPPR_MIN_AFTER_FIRST_PEAK else "0"),
                         ("SPP_TRIP_PGEN_DEAD_MW", TRIP_PGEN_DEAD_MW),
