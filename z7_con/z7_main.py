@@ -14000,7 +14000,9 @@ def _plan_runs(projects, modes):
     out = []
     for proj in projects:
         for mode in modes:
-            out.append((proj, mode, "baseline (as studied)", ""))
+            _dco = DYR_CHANGES_ONLY and proj in _egf_only_projects([proj])
+            out.append((proj, mode, "baseline (as studied)%s"
+                        % (" -- reference, not re-run" if _dco else ""), ""))
             # The capacity levels the sweep itself produces.
             for lv in sorted(set(float(x) for x in (CAPACITY_LEVELS or [])),
                              reverse=True):
@@ -14014,10 +14016,17 @@ def _plan_runs(projects, modes):
                     for tag, edits in _dyr_sweep_variants(proj):
                         sfx = "%s_%s" % (_cap_suffix(ctag), tag)
                         out.append((proj, mode,
-                                    "%s%s" % (_dyr_edits_text(edits),
-                                              (" @ %s" % _cap_label(ctag))
-                                              if ctag else ""),
+                                    "%s%s%s" % ("GIA " if _dco else "",
+                                                _dyr_edits_text(edits),
+                                                (" @ %s" % _cap_label(ctag))
+                                                if ctag else ""),
                                     sfx))
+                        # DYR_CHANGES_ONLY: PROJECT_SGF at the same value
+                        if _dco and not ctag:
+                            for sc in surplus_scenarios():
+                                out.append((proj, mode, "SGF %s %s"
+                                            % (sc["tag"], _dyr_edits_text(edits)),
+                                            sfx + "_" + sc["tag"]))
             # Every POI total, each a complete study of its own.
             for _mw in _poi_levels(proj):
                 if _poi_is_baseline(proj, _mw):
@@ -14031,6 +14040,7 @@ def _plan_runs(projects, modes):
                 out.append((proj, mode, "project machines OFF",
                             "_" + PROJECT_OFF_TAG))
             # THE SURPLUS SCENARIOS (project case, compared with the plain base).
+            # DYR_CHANGES_ONLY: they are on disk, not re-run -- listed as the reference.
             for sc in surplus_scenarios():
                 out.append((proj, mode, "PROJECT %s (%s)" % (sc["tag"], sc["label"]),
                             "_" + sc["tag"]))
@@ -14038,7 +14048,8 @@ def _plan_runs(projects, modes):
             # carries _PLAN_BASE so the plan reads the right folder.
             if not EGF_PROJECTS or proj in EGF_PROJECTS:
                 _vars = []
-                if EGF_DYR_RUN and (EGF_DYR_EDITS_BY_PROJECT or {}).get(proj):
+                if (EGF_DYR_RUN and (EGF_DYR_EDITS_BY_PROJECT or {}).get(proj)
+                        and not (_dco and _dyr_sweep_for(proj))):     # else inside the sweep
                     _vars.append((EGF_TAG, "existing machines EDITED"))
                 if EGF_OFF_RUN or EGF_OFF_BASE_RUN:
                     _vars.append((EGF_OFF_TAG, "existing machines OFF"))
@@ -14064,6 +14075,8 @@ def _plan_where(sfx):
         return CASE_BASE, sfx[len(_PLAN_BASE):], None
     if sfx and sfx.lstrip("_") in [sc["tag"] for sc in surplus_scenarios()]:
         return CASE_TEST, sfx, ""
+    if DYR_CHANGES_ONLY and sfx.startswith("_dyr_"):
+        return CASE_TEST, sfx, ""       # compared with the base as it is
     return CASE_TEST, sfx, sfx
 
 
