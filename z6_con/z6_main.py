@@ -582,7 +582,7 @@ SETTLE_V_PU = 0.01                           # settled: over the same last RIPPL
 SETTLE_PQ_MW = 2.0                           # ... and every P / Q moves <= this many MW / MVAr p-p (GEN_TEST_ANSWER_<proj>.txt)
 TRIP_PGEN_DEAD_MW = 1.0                     # machine ending below this MW = tripped (and under 10 % of pre-fault)
 ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
-SPPR_MIN_AFTER_FIRST_PEAK = True             # True = SPPR "Minimum Value" as SPP Figure 2 (lowest trough after 1st peak) | False = lowest point after clearing
+SPPR_MIN_AFTER_FIRST_PEAK = False            # False = SPPR "Minimum Value" = lowest point of the trace (Rev 3.0) | True = lowest trough after the 1st peak
 # FLAT_TOL_BY_KIND: flat-run tolerance per quantity
 FLAT_TOL_BY_KIND = {"VOLT": 0.005, "ETERM": 0.005, "ANGLE": 1.0,
                     "PELEC": 1.0, "QELEC": 2.0, "SPEED": 0.0002}

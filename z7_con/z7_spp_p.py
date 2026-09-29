@@ -3552,7 +3552,7 @@ SPPR_FLOOR_LIMITED_AS_REVIEW = _env_bool("SPP_SPPR_FLOOR_REVIEW", SPPR_FLOOR_LIM
 # SPPR "Minimum Value". True = as Rev 3.0 Figure 2 draws it, the lowest trough
 # AFTER the 1st positive peak. False = the lowest point after clearing (the
 # earlier, stricter reading). Set from the panel (SPPR_MIN_AFTER_FIRST_PEAK).
-SPPR_MIN_AFTER_FIRST_PEAK = True
+SPPR_MIN_AFTER_FIRST_PEAK = False
 SPPR_MIN_AFTER_FIRST_PEAK = _env_bool("SPP_SPPR_MIN_AFTER_PEAK", SPPR_MIN_AFTER_FIRST_PEAK)
 
 # The smallest ring amplitude about the settling value that may serve as the
