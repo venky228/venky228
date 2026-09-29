@@ -2260,7 +2260,9 @@ def _resolve_keyword(word):
     word = word.upper().strip()
     if ":" in word and word.split(":", 1)[0].strip() in _SELECT_ARG_KEYWORDS:
         head, arg = [x.strip() for x in word.split(":", 1)]
-        ids = _fault_ids()
+        # A FRESH FOLDER HAS NO LOCAL SPP_FAULTS.csv YET -- the BUILD writes it.
+        # Fall back to the SHARED list so FIRST:N / EVERY:N still select.
+        ids = _fault_ids() or _shared_fault_ids()
         try:
             n = int(arg)
         except ValueError:
@@ -2277,11 +2279,12 @@ def _resolve_keyword(word):
         return ids[::n]
     rows = _summary_rows()
     if word == "ALL":
-        return [s for s in _fault_ids()]
+        # local list, else the shared one (fresh folder -- see FIRST/EVERY above)
+        return [s for s in (_fault_ids() or _shared_fault_ids())]
     if word == "NOTDONE":
         # markers are authoritative and exist even without a RUN_SUMMARY
         out = []
-        for sid in _fault_ids():
+        for sid in (_fault_ids() or _shared_fault_ids()):
             if not os.path.isfile(os.path.join(OUT_DIR, "%s.done" % sid)):
                 out.append(sid)
         return out
@@ -2442,6 +2445,12 @@ def _apply_skip_done(selected):
        Called after the id/event selection so it narrows THAT, never widens it."""
     global SKIP_DONE_SELECTED
     SKIP_DONE_SELECTED = False     # this pass's own answer, not the last project's
+    # AN EMPTY SELECTION STAYS EMPTY. A keyword or id list that matched nothing
+    # must not fall through to `selected or _fault_ids()` below and come back as
+    # every unfinished id -- that would run the whole list when you asked for
+    # none of it.
+    if (RUN_ONLY_FAULTS or ONLY_EVENTS) and not selected:
+        return selected
     if not SKIP_DONE:
         return selected
     # FRESH_START MEANS START OVER, AND IT HAS TO WIN HERE.
@@ -4005,9 +4014,13 @@ def _run_report_sharded(n, selected=None):
         print("[parallel] no selection -- every .out in the folder will be scored, "
               "split across %d shard(s)" % n)
     procs, threads, launches = {}, {}, {}
+    t_launch  = {}                    # i -> time of its current launch
+    lic_fails = {i: 0 for i in range(n)}
+    pending   = {}                    # i -> time at which to relaunch it (licence backoff)
 
     def _start(i):
         launches[i] = launches.get(i, 0) + 1
+        pending.pop(i, None)
         key = "rep%d" % i
         _LAST_ACTIVITY[key] = time.time()
         # Each shard gets its OWN slice of the selection, so the shards divide
@@ -4039,6 +4052,11 @@ def _run_report_sharded(n, selected=None):
             _e["SPP_RESCORE_RESUME"] = "1"
             print("[parallel] shard %d relaunch: FORCE_RESCORE stays ON -- it keeps the "
                   "scenarios it already re-scored and reads the rest from the .out" % i)
+        # THROUGH THE LICENCE GATE, LIKE EVERY OTHER PSS/E START. A shard takes
+        # a PSS/E session too; six of them started in the same second were
+        # refused by the licence runtime and burned their MAX_LAUNCHES_REPORT.
+        _licence_gate("shard %d" % i)
+        t_launch[i] = time.time()
         procs[i] = subprocess.Popen([PYTHON, "-u", STUDY_SCRIPT], cwd=STUDY_DIR,
                                     env=_e,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -4063,8 +4081,13 @@ def _run_report_sharded(n, selected=None):
     while len(done) < n:
         time.sleep(POLL_SECS)
         now = time.time()
+        # --- relaunches that were put off by the licence backoff
+        for i in list(pending):
+            if i not in done and now >= pending[i]:
+                _start(i)
+        now = time.time()
         for i in range(n):
-            if i in done:
+            if i in done or i in pending:
                 continue
             rc = procs[i].poll()
             if rc is None:
@@ -4086,7 +4109,30 @@ def _run_report_sharded(n, selected=None):
             if rc == 0:
                 done.add(i)
                 print("[parallel] shard %d finished cleanly" % i)
-            elif launches[i] < MAX_LAUNCHES_REPORT:
+                continue
+            # A LICENCE REFUSAL IS NOT A SHARD FAILURE. PSS/E never started, so
+            # nothing was scored: the launch is not charged against
+            # MAX_LAUNCHES_REPORT and the shard is relaunched after the same
+            # backoff _run_workers uses (LICENCE_BACKOFF_S doubling, capped at
+            # LICENCE_BACKOFF_MAX_S). Past MAX_LICENCE_FAILS in a row it is
+            # treated as an ordinary failure below.
+            # (a licence box only counts while the shard was still starting --
+            # _DIALOG_HITS is never pruned, same guard as _run_workers)
+            _lic = (rc == EXIT_LICENCE_BUSY
+                    or ((now - t_launch.get(i, now)) < STARTUP_DEAD_S
+                        and _licence_hit("shard%d" % i, t_launch.get(i, 0))))
+            if _lic and lic_fails[i] < MAX_LICENCE_FAILS:
+                lic_fails[i] += 1
+                launches[i] -= 1
+                _w = min(LICENCE_BACKOFF_S * (2 ** (lic_fails[i] - 1)), LICENCE_BACKOFF_MAX_S)
+                pending[i] = time.time() + _w
+                print("[parallel] shard %d: PSS/E could not take a licence (rc=%s) -- start "
+                      "failure %d/%d, relaunching in %s (no launch charged)"
+                      % (i, rc, lic_fails[i], int(MAX_LICENCE_FAILS), _fmt_hms(_w)))
+                continue
+            if not _lic:
+                lic_fails[i] = 0
+            if launches[i] < MAX_LAUNCHES_REPORT:
                 print("[parallel] shard %d exited rc=%s -- relaunch %d/%d (it will skip "
                       "whatever killed it and resume from its part file)"
                       % (i, rc, launches[i] + 1, MAX_LAUNCHES_REPORT))
@@ -4612,6 +4658,10 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                 % (PLOT_CATCHUP_STALL_S, PLOT_CATCHUP_MAX_S))
         _pe = _env("work", 9, 1)
         _pe["SPP_PLOT_MISSING"] = "1"
+        # PER-FILE .pclaim CLAIMS ON. The during-run plotter may still be
+        # drawing when this pass starts; without the claim both drew the same
+        # scenario. With it, a file the other plotter holds is skipped.
+        _pe["SPP_PLOT_CLAIMS"] = "1"
         _pe.pop("SPP_ONLY", None)
         _pp = subprocess.Popen([PYTHON, "-u", STUDY_SCRIPT], cwd=STUDY_DIR, env=_pe,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -5719,10 +5769,14 @@ def _run_one_study():
         print("[parallel]     To RESUME instead, set FRESH_START = False.")
         print("")
     selected = _apply_skip_done(selected)
-    if RUN_ONLY_FAULTS and not selected:
-        print("[parallel] *** RUN_ONLY_FAULTS resolved to NOTHING -- stopping rather than "
-              "running the whole study by accident. ***")
-        return 1
+    if (RUN_ONLY_FAULTS or ONLY_EVENTS) and not selected:
+        # NOTHING MATCHES -- NOTHING TO RUN. Not a failure: the selection simply
+        # names no scenario in this case's list, so exit 0 and let a queue with
+        # STOP_ON_FAILED_PROJECT carry on to the next project. (Finished ids come
+        # back as __ALL_ALREADY_DONE__, not empty, so this is only a no-match.)
+        print("[parallel] *** RUN_ONLY_FAULTS/ONLY_EVENTS resolved to NOTHING -- nothing "
+              "matches, nothing to run (the whole study is NOT run by accident). ***")
+        return 0
     if selected:
         _banner("SELECTIVE RUN -- %d scenario(s): %s" % (len(selected), ", ".join(selected)))
         selected = _check_selection(selected)
