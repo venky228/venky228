@@ -21082,6 +21082,15 @@ def _gt_done(rdir, faults, g=None):
             _gt_drop_all_done(rdir, _miss)
         else:
             ok = True
+    # FAULTS ADDED SINCE THE RUN (GEN_TEST_FAULTS widened): the scored faults
+    # are kept and the folder is resumed in place, on every launch until they
+    # have run -- not only on the one that still found its ALL_DONE flags.
+    if not ok and rdir not in _GT_RESUME and any(
+            m[f]["verdict"] in ("PASS", "FAIL") for f in need):
+        _nr = [f for f in need if m[f]["verdict"] not in ("PASS", "FAIL", "SKIP")]
+        if _nr and all(not os.path.isfile(os.path.join(rdir, "outs", "%s.out" % f))
+                       for f in _nr):
+            _gt_drop_all_done(rdir, _nr)
     return ok, m
 
 
@@ -23402,7 +23411,9 @@ def run_gen_test():
     # AND A LAUNCH THAT FINDS NOTHING DONE WHEN THE FOLDERS SAY OTHERWISE IS
     # POINTED AT THE WRONG PLACE, OR CANNOT READ THEM: stop and say so rather
     # than re-run (and move aside) everything
+    # (a run RESUMED IN PLACE for faults added since it ran is expected here)
     _had = [r for r in todo if os.path.isdir(r["rdir"]) and not r.get("force_score")
+            and r["rdir"] not in _GT_RESUME
             and glob.glob(os.path.join(r["rdir"], "reports", "SPP_CRITERIA_REPORT*.csv"))]
     if todo and len(_had) >= 3 and len(runs) - len(todo) == 0:
         print("[gen-test] *** %d run folder(s) hold a criteria report, yet NONE counts as done."
