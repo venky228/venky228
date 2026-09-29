@@ -9894,6 +9894,9 @@ def _egf_edits_for(proj):
     return out
 
 
+_EGF_NOTED = set()      # projects already told their EGF edits run inside the sweep
+
+
 def _egf_variants(proj):
     """[(tag, label, env)] the panel asks for, for one project."""
     if EGF_PROJECTS and proj not in EGF_PROJECTS:
@@ -9902,8 +9905,10 @@ def _egf_variants(proj):
     _in_sweep = (DYR_CHANGES_ONLY and bool(_dyr_sweep_for(proj))
                  and proj in _dyr_sweep_projects([proj]))
     if EGF_DYR_RUN and _in_sweep:
-        print("[egf] %s: DYR_CHANGES_ONLY -- the EGF edits run inside each .dyr sweep "
-              "value (no separate _egf case)" % proj)
+        if proj not in _EGF_NOTED:
+            _EGF_NOTED.add(proj)
+            print("[egf] %s: DYR_CHANGES_ONLY -- the EGF edits run inside each .dyr sweep "
+                  "value (no separate _egf case)" % proj)
     elif EGF_DYR_RUN:
         ed = _egf_edits_for(proj)
         if ed:
@@ -24185,7 +24190,31 @@ def main():
             print("[compare] two studies are not comparable -- set PROJECTS here to force")
             print("[compare] the same list on both sides.")
         if _no_main:
-            pass
+            # DYR_CHANGES_ONLY: THE BASE IS THE REFERENCE every .dyr run is
+            # compared with. A project whose selected faults have no base .out
+            # on disk gets its base study now -- resumed, so only the missing
+            # faults are simulated. RUN_CASES = "proj" leaves the base alone.
+            _need_b = []
+            if DYR_CHANGES_ONLY and RUN_CASES in ("both", "base"):
+                for _p in _egf_skip:
+                    for _m in (list(MODES) or ["spp"]):
+                        _od = os.path.join(results_dir(CASE_BASE, _p, _m), "outs")
+                        _ids = _plan_expected_ids(_p, _m, [])
+                        if not _ids or [f for f in _ids
+                                        if not os.path.isfile(os.path.join(_od, f + ".out"))]:
+                            _need_b.append(_p)
+                            break
+            if _need_b:
+                _banner("BASE CASE FOR %s -- the reference of the .dyr runs"
+                        % ", ".join(_need_b))
+                _benv = {} if FRESH_START else {"SPP_SKIP_DONE": "1", "SPP_FRESH_START": "0"}
+                _rcb = run_study(CASE_BASE, projects=_need_b, modes=list(MODES) or None,
+                                 extra_env=_benv)
+                if _rcb not in (0, None):
+                    print("[dyr] the base run ended with rc=%s -- the .dyr runs are "
+                          "compared with whatever it scored" % _rcb)
+            elif DYR_CHANGES_ONLY and RUN_CASES in ("both", "base"):
+                print("[dyr] every project's base results are on disk -- the base is not re-run")
         elif RUN_IN_PARALLEL:
             # SAY THE SESSION COUNT OUT LOUD. Two studies at N_WORKERS each is
             # twice the PSS/E sessions of a single run, and the failure when
@@ -24994,7 +25023,12 @@ def main():
                     print("[runs] run-against-run failed (%s) -- the comparison above "
                           "is unaffected" % e)
 
-    if not results:
+    if not results and DYR_CHANGES_ONLY and _egf_skip:
+        print("")
+        print("[dyr] DYR_CHANGES_ONLY: the as-is comparison is not part of this launch.")
+        print("[dyr] The .dyr runs are compared with the base in comparison\\<project>\\dyr_<value>\\")
+        print("[dyr] and side by side in comparison_pairs\\<project>\\<project>_DYR_ALL_SCENARIOS\\.")
+    elif not results:
         print("")
         print("[compare] *** nothing was compared. Here is what is on disk. ***")
         print_inventory()
