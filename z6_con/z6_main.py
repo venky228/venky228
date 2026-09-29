@@ -325,7 +325,7 @@ def _print_phase_times(total):
 QUICK_DYR_TEST = None                  # "EastFork" / "SantaFe" = quick test (see z6_main1.py)
 
 # ---- 1. WHAT TO RUN ------------------------------------------------------------
-PROJECTS = ["SantaFe"]        #["SantaFe", "IronStar","EmpirePrairie","EastFork"]   
+PROJECTS = ["SantaFe", "IronStar", "EmpirePrairie", "EastFork"]   #["SantaFe", "IronStar","EmpirePrairie","EastFork"]
 PROJECTS_RUN = "each"                        # "each" one study per project | "together" all in one case | "both"
 MODES = ["spp"]                              # fault set: spp | con | table | custom | manual
 PIPELINE = "all"                             # "all" simulate + compare | "missing" finish what is not done | "compare" disk only
@@ -659,8 +659,10 @@ DYR_COMPILE_AFTER_SNAP = True                # compile again after the .snp is s
 # below goes into its own <proj>_<mode>_egf / _egfoff folders in BOTH cases; the main
 # results are never touched. Set the RUN switch False to turn a variant off -- the
 # edits stay written here, and its folders and comparisons stay on disk.
-EGF_DYR_EDITS_BY_PROJECT = {}                # {"SantaFe": [("REGCA1", {"Volim": 1.2, "Khv": 0.7, "Accel": 0.7})]}
-EGF_DYR_RUN = False                          # True = run BOTH cases with those edits (_egf) and compare
+EGF_DYR_EDITS_BY_PROJECT = {"EmpirePrairie": [("REGCA1", {"Volim": 1.1, "Khv": 2.0})],
+                            "SantaFe":       [("REGCA1", {"Volim": 1.1, "Khv": 2.0})],
+                            "EastFork":      [("REGCAU1", {"Volim": 1.1, "Khv": 2.0})]}
+EGF_DYR_RUN = True                           # True = run BOTH cases with those edits (_egf) and compare (DYR_CHANGES_ONLY: project case only)
 EGF_OFF_RUN = False                          # True = run BOTH cases with every existing machine OFF (_egfoff) and compare
 EGF_OFF_BASE_RUN = False                    # True = run the BASE case ONLY with every existing machine OFF (_egfoff);
                                              #   the PROJECT side of its comparisons is the surplus run s1_egfoff
@@ -678,9 +680,17 @@ ADJUSTMENTS_REPORT = True                    # list every non-project change in 
 # ---- 12. .dyr SWEEP ------------------------------------------------------------
 # one study per value, each compared with the base
 DYR_SWEEP = {}                               # e.g. {"REECCU1": {"Kqv": [0.0, 2.0]}}
-DYR_SWEEP_BY_PROJECT = {}                    # {"SantaFe": {"REECCU1": {"Kqv": [0.5, 1.5]}}}
+DYR_SWEEP_BY_PROJECT = {
+    "SantaFe":       {"REGCAU1": {"Volim": [1.1], "Khv": [0.7, 2.0]}, "REECCU1": {"Kqv": [0.0, 2.0]}},
+    "IronStar":      {"REGCAU1": {"Volim": [1.1], "Khv": [0.7, 2.0]}, "REECCU1": {"Kqv": [0.0, 2.0]}},
+    "EmpirePrairie": {"REGCAU1": {"Volim": [1.1], "Khv": [0.7, 2.0]}, "REECCU1": {"Kqv": [0.0, 2.0]}},
+    "EastFork":      {"REGCAU1": {"Volim": [1.1], "Khv": [0.7, 2.0]}, "REECCU1": {"Kqv": [0.0, 2.0]}},
+}
 DYR_SWEEP_PROJECTS = []                      # [] = every project
-DYR_SWEEP_FAULTS = "all"                     # "all" | "failing" | "crashed"
+DYR_SWEEP_FAULTS = "failing"                 # "all" | "failing" | "crashed"   (4 runs per project)
+DYR_CHANGES_ONLY = True                      # True = run ONLY the .dyr changes above (each sweep value and the EGF edits),
+                                             #   PROJECT case only: no as-is study, no base run, no other extra run; the
+                                             #   results on disk are the reference (no as-is results: the selected faults)
 DYR_SWEEP_COMPARE = True                     # full comparison per value
 DYR_SWEEP_SKIP_DECK = True                   # skip a value the deck already has
 DYR_DECK_VALUES = {}                         # override the deck values read from the template
@@ -9682,7 +9692,27 @@ def run_surplus_scenarios(proj, mode):
                   "scored" % (sc["tag"], rc))
 
 
-def compare_three_way(proj, mode):
+def _dyr_side_by_side(proj, mode, variants):
+    """DYR_CHANGES_ONLY: BASE | PROJECT_GIA and PROJECT_SGF as they are (when on
+       disk) | PROJECT_GIA and PROJECT_SGF at each .dyr value -- one workbook,
+       every scenario side by side, each against the BASE as it is."""
+    rt = results_dir(CASE_TEST, proj, mode)
+    tests = [(rt, "PROJECT_GIA")]
+    tests += [(rt + "_" + sc["tag"], "PROJECT_SGF_" + sc["tag"]) for sc in surplus_scenarios()]
+    for tag, _e in variants:
+        v = tag[len("dyr_"):] if tag.startswith("dyr_") else tag
+        tests.append((rt + "_" + tag, "GIA_" + v))
+        tests += [(rt + "_" + tag + "_" + sc["tag"], "SGF_%s_%s" % (v, sc["tag"]))
+                  for sc in surplus_scenarios()]
+    try:
+        return compare_three_way(proj, mode, tests=tests,
+                                 sbs_name="{proj}_DYR_ALL_SCENARIOS")
+    except Exception as e:
+        print("[dyr-sweep] %s: the all-scenarios side-by-side failed (%s)" % (proj, e))
+        return False
+
+
+def compare_three_way(proj, mode, tests=None, sbs_name=""):
     """Base | GIA | each SURPLUS scenario for one project, in ONE side-by-side
        workbook (z6_cmp_multi.py, run for this project's folders only): every
        fault with each run's verdict, worst criterion, values and POI power.
@@ -9694,7 +9724,9 @@ def compare_three_way(proj, mode):
         return False
     rb = results_dir(CASE_BASE, proj, mode)
     rt = results_dir(CASE_TEST, proj, mode)
-    tests = [(rt, "GIA")] + [(rt + "_" + sc["tag"], sc["tag"]) for sc in surplus_scenarios()]
+    _given = tests is not None
+    if not _given:
+        tests = [(rt, "GIA")] + [(rt + "_" + sc["tag"], sc["tag"]) for sc in surplus_scenarios()]
     if not glob.glob(os.path.join(rb, "outs", "*.out")):
         print("[3-way] %s: no base folder (%s) -- no side-by-side" % (proj, rb))
         return False
@@ -9712,8 +9744,12 @@ def compare_three_way(proj, mode):
     # PLAIN COLUMN NAMES in the one workbook: BASE | BASE_EGF_OFF | PROJECT_GIA
     # | PROJECT_SGF_EGF_OFF (| any other surplus scenario by its tag).
     names = {rb: "BASE", rt: "PROJECT_GIA"}
-    sbs_name = ""
-    if glob.glob(os.path.join(rbo, "outs", "*.out")):
+    if _given:
+        # THE CALLER'S COLUMNS (the .dyr sweep): its own names, no EGF-off base
+        names.update(dict((d, t) for d, t in tests))
+    if _given:
+        pass
+    elif glob.glob(os.path.join(rbo, "outs", "*.out")):
         pairs.append((rb, rbo, "%s_BASE_%s_vs_BASE" % (proj, EGF_OFF_TAG)))
         names[rbo] = "BASE_EGF_OFF"
         psfx = _egf_project_off_suffix(proj, mode)
@@ -9823,11 +9859,23 @@ _EGF_SKIP = []          # projects whose as-is study this launch does NOT simula
 def _egf_only_projects(projects):
     """EGF_ONLY: of `projects`, those with EGF_DYR_EDITS_BY_PROJECT values (and
        in EGF_PROJECTS, when that is set) -- each runs only its edited run."""
-    if not (EGF_ONLY and EGF_DYR_RUN):
-        return []
-    return [p for p in projects
-            if (EGF_DYR_EDITS_BY_PROJECT or {}).get(p)
-            and (not EGF_PROJECTS or p in EGF_PROJECTS)]
+    out = []
+    if EGF_ONLY and EGF_DYR_RUN:
+        out = [p for p in projects
+               if (EGF_DYR_EDITS_BY_PROJECT or {}).get(p)
+               and (not EGF_PROJECTS or p in EGF_PROJECTS)]
+    # DYR_CHANGES_ONLY: every project with a .dyr change -- EGF edits or a sweep
+    # -- runs only its changed studies, project case only.
+    if DYR_CHANGES_ONLY:
+        for p in projects:
+            if p in out:
+                continue
+            _egf = (EGF_DYR_RUN and (EGF_DYR_EDITS_BY_PROJECT or {}).get(p)
+                    and (not EGF_PROJECTS or p in EGF_PROJECTS))
+            _swp = bool(_dyr_sweep_for(p)) and p in _dyr_sweep_projects([p])
+            if _egf or _swp:
+                out.append(p)
+    return out
 
 
 def _egf_edits_for(proj):
@@ -9851,7 +9899,12 @@ def _egf_variants(proj):
     if EGF_PROJECTS and proj not in EGF_PROJECTS:
         return []
     out = []
-    if EGF_DYR_RUN:
+    _in_sweep = (DYR_CHANGES_ONLY and bool(_dyr_sweep_for(proj))
+                 and proj in _dyr_sweep_projects([proj]))
+    if EGF_DYR_RUN and _in_sweep:
+        print("[egf] %s: DYR_CHANGES_ONLY -- the EGF edits run inside each .dyr sweep "
+              "value (no separate _egf case)" % proj)
+    elif EGF_DYR_RUN:
         ed = _egf_edits_for(proj)
         if ed:
             out.append((EGF_TAG, "existing machines EDITED: " + "; ".join(
@@ -9890,6 +9943,8 @@ def _egf_cases(tag):
        for by EGF_OFF_BASE_RUN alone (base case only)."""
     if tag == EGF_OFF_TAG and EGF_OFF_BASE_RUN and not EGF_OFF_RUN:
         return [CASE_BASE]
+    if tag == EGF_TAG and DYR_CHANGES_ONLY:
+        return [CASE_TEST]              # the edited PROJECT only -- no base run
     return [CASE_BASE, CASE_TEST]
 
 
@@ -10002,6 +10057,14 @@ def compare_egf_variants(proj, mode):
              "%s -- PROJECT with the change vs PROJECT as it is" % what,
              dict(test_suffix=psfx, base_case=CASE_TEST, base_suffix=""),
              (results_dir(CASE_TEST, proj, mode), dt))]
+        if not os.path.isdir(db):
+            # NO BASE RUN WITH THE CHANGE (DYR_CHANGES_ONLY): the edited project
+            # against the base as it is, so the change is still read against
+            # the reference every other comparison uses.
+            pairs.append(("PROJECT_VS_BASE/%s_vs_base_as_is" % nm,
+                          "%s -- PROJECT with the change vs BASE as it is" % what,
+                          dict(test_suffix=psfx, base_suffix=""),
+                          (results_dir(CASE_BASE, proj, mode), dt)))
         for sub, label, kw, dirs in pairs:
             miss = [d for d in dirs if not os.path.isdir(d)]
             if miss:
@@ -11063,6 +11126,16 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
     # pass counts had the wrong denominator. Filter here, once, the same way
     # compare_project() does.
     faults = [f for f in faults if _id_selected(f)]
+    if not faults and not read_criteria(results_dir(CASE_TEST, proj, mode), proj)[0]:
+        # NO AS-STUDIED PROJECT RESULTS TO READ (DYR_CHANGES_ONLY on a project
+        # never run as is): which faults fail cannot be known, so the selected
+        # faults of the project's own list are swept directly.
+        faults = sorted(_plan_expected_ids(proj, mode, []), key=_fault_key)
+        if faults:
+            print("[dyr-sweep] %s %s: no as-studied project results on disk -- sweeping "
+                  "the %d selected fault(s) directly" % (proj, mode, len(faults)))
+            if _scope == "crashed":
+                _scope = "failing"      # run exactly this list
     if not faults:
         print("[dyr-sweep] %s %s: nothing to sweep -- the project case scored no fault"
               % (proj, mode))
@@ -11118,6 +11191,10 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
         # read "scored the FLAT RUN and NO FAULT" with every fault simulated.
         env = {"SPP_DYR_EDITS_BY_PROJECT": json.dumps(_tbl),
                "SPP_RUN_TAG": tag, "SPP_DEFER_REPORTS": "0"}
+        # DYR_CHANGES_ONLY: the existing machines' EGF edits go into the same
+        # PROJECT_GIA run -- every .dyr change together, no separate _egf case.
+        if DYR_CHANGES_ONLY and EGF_DYR_RUN and _egf_edits_for(proj):
+            env["SPP_EGF_DYR_EDITS"] = json.dumps(_egf_edits_for(proj))
         if QUICK_DYR_TEST:
             env.update(_quick_sim_env())
         # RESUME OR RE-SIMULATE -- see _sweep_resume_env(). This used to be
@@ -11162,6 +11239,23 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
         if rc not in (0, None):
             print("[dyr-sweep] %s ended with rc=%s -- reading whatever it scored"
                   % (tag, rc))
+        # DYR_CHANGES_ONLY: each SURPLUS scenario (PROJECT_SGF) with the same
+        # .dyr values, into <folder>_<value>_<scenario>. The EGF edits are left
+        # out where the scenario switches the existing machines off.
+        if DYR_CHANGES_ONLY:
+            for _sc in surplus_scenarios():
+                _banner("DYR SWEEP -- %s -- %s : %s"
+                        % (proj, _sc["label"], _dyr_edits_text(edits)))
+                _env2 = dict(env)
+                _env2.update(_surplus_env(_sc))
+                _env2["SPP_RUN_TAG"] = "%s_%s" % (tag, _sc["tag"])
+                if _sc["egf_off"]:
+                    _env2.pop("SPP_EGF_DYR_EDITS", None)
+                _rc2 = run_study(CASE_TEST, projects=[proj], modes=[mode],
+                                 extra_env=_env2)
+                if _rc2 not in (0, None):
+                    print("[dyr-sweep] %s_%s ended with rc=%s -- reading whatever it "
+                          "scored" % (tag, _sc["tag"], _rc2))
         rdir = _dyr_sweep_dir(proj, mode, tag, cap_tag)
         ct, _src = read_criteria(rdir, proj)
         per_tag[tag] = dict((f, (ct.get(f, {}).get("verdict") or "?").upper())
@@ -23676,7 +23770,12 @@ def main():
     # and none of its other extra runs; every other project runs as normal.
     _egf_skip = _egf_only_projects(list(_panel_projects() or [])) if pipeline != "compare" else []
     _EGF_SKIP[:] = _egf_skip
-    if _egf_skip:
+    if _egf_skip and DYR_CHANGES_ONLY:
+        print("[dyr] DYR_CHANGES_ONLY: %s run ONLY their .dyr changes (each sweep value,"
+              % ", ".join(_egf_skip))
+        print("[dyr]           GIA and SGF, with the EGF edits in the GIA runs), PROJECT case")
+        print("[dyr]           only; the as-is studies and the base are read from disk.")
+    elif _egf_skip:
         print("[egf] EGF_ONLY: %s run ONLY the edited run (own values each); the as-is"
               % ", ".join(_egf_skip))
         print("[egf]           study of %s is not simulated -- read from disk. Every other"
@@ -24062,7 +24161,8 @@ def main():
             pjs = [x for x in pjs if x not in _egf_skip]
         _no_main = bool(_egf_skip) and not pjs
         if _no_main:
-            print("[compare] every project has EGF edits -- no as-is study is simulated")
+            print("[compare] every project runs only its %s -- no as-is study is simulated"
+                  % (".dyr changes" if DYR_CHANGES_ONLY else "EGF edits"))
         elif pjs:
             print("[compare] both cases will run: %s" % ", ".join(pjs))
         else:
@@ -24598,8 +24698,16 @@ def main():
     # Same placement and the same reason as the capacity sweep below: it runs
     # full studies, so it belongs to the one-shot path in main() and not to
     # compare_now(), which the live-refresh thread calls on a timer.
-    if _res_n and (DYR_SWEEP or DYR_SWEEP_BY_PROJECT) and pipeline != "compare":
-        _sweep_pj = _dyr_sweep_projects([r["project"] for r in _res_n])
+    # DYR_CHANGES_ONLY: the projects whose as-is study was skipped are swept too
+    # (_res_n leaves them out of every OTHER extra run).
+    _sweep_res = list(_res_n)
+    if DYR_CHANGES_ONLY and pipeline != "compare":
+        for _p in _egf_skip:
+            for _m in (list(MODES) or ["spp"]):
+                if not any(r["project"] == _p and r["mode"] == _m for r in _sweep_res):
+                    _sweep_res.append({"project": _p, "mode": _m})
+    if _sweep_res and (DYR_SWEEP or DYR_SWEEP_BY_PROJECT) and pipeline != "compare":
+        _sweep_pj = _dyr_sweep_projects([r["project"] for r in _sweep_res])
         # ONE PASS PER CAPACITY LEVEL. ("", None) first, so the ordinary
         # full-output sweep is complete and written before a single reduced-
         # output study starts -- an extra level that fails must not cost the
@@ -24608,7 +24716,7 @@ def main():
             if _ctag:
                 _banner("REPEATING THE .dyr SWEEP AT %s PROJECT OUTPUT"
                         % _cap_label(_ctag))
-            for res in [r for r in _res_n if r["project"] in _sweep_pj]:
+            for res in [r for r in _sweep_res if r["project"] in _sweep_pj]:
                 try:
                     rows, variants = run_dyr_sweep(res["project"], res["mode"],
                                                    cap_tag=_ctag, cap_scale=_cscale)
@@ -24624,6 +24732,8 @@ def main():
                     if DYR_SWEEP_COMPARE:
                         write_dyr_sweep_comparisons(res["project"], res["mode"],
                                                     variants, cap_tag=_ctag)
+                    if DYR_CHANGES_ONLY and not _ctag and variants:
+                        _dyr_side_by_side(res["project"], res["mode"], variants)
                 except Exception as e:
                     print("[dyr-sweep] sweep%s failed (%s) -- the comparison above "
                           "is unaffected" % (_cap_note(_ctag), e))
