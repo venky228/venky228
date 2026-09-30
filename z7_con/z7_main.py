@@ -3602,17 +3602,52 @@ def poi_measured_ids(rdir, proj):
     return ids
 
 
+_MEMERR = [0]       # MemoryErrors met so far -- read_measurements reads again after one
+
+
 def _err_text(e):
     """str(e) -- except that a MemoryError's str() is EMPTY, which is how a
        32-bit python running out of address space printed as 'could not read
        ... ()' and went unread for a week."""
     if isinstance(e, MemoryError):
+        _MEMERR[0] += 1
         return ("MemoryError -- this 32-bit python (%s) ran out of its 2 GB address "
                 "space reading it" % os.path.basename(sys.executable))
     return "%s: %s" % (type(e).__name__, e) if str(e) else type(e).__name__
 
 
 def read_measurements(rdir, proj, full=False):
+    """_read_measurements_once, read AGAIN after freeing the comparison caches
+       when it ran out of memory.
+
+       A 32-bit Python (2 GB for everything) holding the other folders'
+       measurements in its caches could fail on the next folder: the read died
+       partway, and that SHORT read was then cached and served to every later
+       step of the run, so values were missing with nothing on disk wrong. The
+       caches only save re-reading a CSV; freeing them is usually all the
+       second read needs, and a read cut short by memory is never kept."""
+    _n0 = _MEMERR[0]
+    out = _read_measurements_once(rdir, proj, full)
+    if _MEMERR[0] == _n0:
+        return out
+    out = None
+    _MEAS_CACHE.pop(_side_key(rdir), None)
+    print("[compare] ran out of memory reading %s -- freeing the comparison caches "
+          "and reading it again" % os.path.basename(rdir))
+    _release_compare_memory()
+    _n1 = _MEMERR[0]
+    out = _read_measurements_once(rdir, proj, full)
+    if _MEMERR[0] == _n1:
+        print("[compare]   %s read in full the second time" % os.path.basename(rdir))
+    else:
+        _MEAS_CACHE.pop(_side_key(rdir), None)
+        print("[compare]   *** %s still ran out of memory -- its values are missing where "
+              "marked; set LIVE_COMPARE_EVERY = 0 or compare fewer projects at once ***"
+              % os.path.basename(rdir))
+    return out
+
+
+def _read_measurements_once(rdir, proj, full=False):
     """{"volts": {(fault, bus): (rec_min, ov_max, ov_t, settled, above_s)},
         "angles": {(fault, bus): deviation}, "src": [files]} for one study.
 
@@ -4190,7 +4225,7 @@ def read_unswitched(rdir, proj):
                 else:
                     out[cur].append(s.strip())
     except Exception as e:
-        print("[compare] could not read %s (%s)" % (p, e))
+        print("[compare] could not read %s (%s)" % (p, _err_text(e)))
     return dict((k, "; ".join(v) if v else "a trip or reclose did not take")
                 for k, v in out.items())
 
@@ -7115,7 +7150,7 @@ def _cmp_bus_map():
             print("[compare] topology read from %s (now %d bus(es), %d with links)"
                   % (p, len(_CMP_BMAP["kv"]), len(_CMP_BMAP["adj"])))
         except Exception as e:
-            print("[compare] could not read %s (%s)" % (p, e))
+            print("[compare] could not read %s (%s)" % (p, _err_text(e)))
     if not _nread:
         print("[compare] no BUS_MAP.csv in any results folder -- area and node columns "
               "will read 'no path'")
@@ -9779,15 +9814,12 @@ def compare_three_way(proj, mode, tests=None, sbs_name=""):
                          universal_newlines=True, bufsize=1)
     th = threading.Thread(target=_pump, args=("[3-way]", p))
     th.daemon = True
-    try:
-        th.start()
-    except Exception as _e:
-        # "can't start new thread": a 32-bit process short of address space
-        # for one more stack. The child still needs its pipe drained, and
-        # this process is only waiting for it anyway -- so drain it here.
-        print("[3-way] no thread for the child's output (%s) -- reading it here" % _e)
+    # "can't start new thread": a 32-bit process short of address space for
+    # one more stack. The child still needs its pipe drained, and this process
+    # is only waiting for it anyway -- so with no thread it is drained here.
+    if not _thread_start(th, "the 3-way comparison's output",
+                         inline=lambda: _pump("[3-way]", p)):
         th = None
-        _pump("[3-way]", p)
     rc = p.wait()
     if th is not None:
         th.join(timeout=5)
@@ -12401,6 +12433,43 @@ def _release_compare_memory():
         pass
 
 
+_PY32 = sys.maxsize <= 2 ** 32      # PSS/E 34's Python: 2 GB of address space
+
+
+def _thread_start(th, what="", inline=None):
+    """th.start() that survives "can't start new thread".
+
+       A 32-bit Python has 2 GB of address space for everything, and every
+       thread needs room for its stack. When that room is gone start() raises
+       RuntimeError -- and, unhandled, that took the whole launch down after
+       hours of work (the scoring pass, once the simulations had finished).
+       Here the comparison caches are freed and the start tried once more.
+       Still no thread: inline, when given, does the same work in THIS thread
+       (slower, nothing lost); without it the caller goes on without an
+       optional helper (a live refresh, a heartbeat). True = it is running."""
+    for _n in (1, 2):
+        try:
+            th.start()
+            return True
+        except RuntimeError as e:
+            if "once" in str(e):         # "threads can only be started once" is a bug, not memory
+                raise
+            if _n == 1:
+                print("[memory] no thread for %s (%s) -- freeing the comparison caches "
+                      "and trying again" % (what or "a task", _err_text(e)))
+                _release_compare_memory()
+    if inline is None:
+        print("[memory] still no thread for %s -- going on without it" % (what or "it"))
+        return False
+    print("[memory] still no thread for %s -- doing it in this thread instead "
+          "(slower; nothing is lost)" % (what or "it"))
+    try:
+        inline()
+    except Exception as e:
+        print("[memory] *** %s failed here too: %s ***" % (what or "it", _err_text(e)))
+    return False
+
+
 # EMPTYING THE CACHES WAS NOT ENOUGH. A 32-bit Python does not get its
 # address space back in one piece: after the main comparison IronStar's
 # surplus run still could not be read (365,000 voltage rows for its base
@@ -14713,7 +14782,7 @@ def _sweep_plan_start():
 
     th = threading.Thread(target=_loop)
     th.daemon = True
-    th.start()
+    _thread_start(th, "the sweep plan refresh")
     return stop.set
 
 
@@ -15746,7 +15815,12 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False,
                              universal_newlines=True, bufsize=1)
         th = threading.Thread(target=_pump, args=("[%s]" % case["key"], p))
         th.daemon = True
-        th.start()
+        _t_in = time.time()
+        if not _thread_start(th, "%s's output" % case["key"],
+                             inline=lambda: _pump("[%s]" % case["key"], p)):
+            th = None
+            print("[compare] %s ran for %s with its output read in this thread"
+                  % (case["key"], _fmt_hms(time.time() - _t_in)))
     t0 = time.time()
     while True:
         rc = p.poll()
@@ -15918,9 +15992,12 @@ def make_shared_fault_list(case, dest, proj=None):
                          universal_newlines=True, bufsize=1)
     th = threading.Thread(target=_pump, args=("[build]", p))
     th.daemon = True
-    th.start()
+    if not _thread_start(th, "the fault-list build's output",
+                         inline=lambda: _pump("[build]", p)):
+        th = None
     rc = p.wait()
-    th.join(timeout=5)
+    if th is not None:
+        th.join(timeout=5)
     src = os.path.join(results_dir(case, proj, MODES[0]), "faults", "SPP_FAULTS.csv")
     if rc not in (0, None):
         print("[compare] *** the fault-list build for %s exited rc=%s ***"
@@ -16090,7 +16167,12 @@ def build_all_savs():
            for _ in range(max(1, min(int(SAV_FIRST_WORKERS or 1), len(runs))))]
     for i, t in enumerate(ths):
         t.daemon = True
-        t.start()
+        # NO THREAD: fewer builders at once. With none running, this thread
+        # does the builds; a later one is simply not needed -- the builders
+        # share one list.
+        if not _thread_start(t, ".sav builder %d" % (i + 1),
+                             inline=None if i else _worker):
+            break
         if i + 1 < len(ths):
             time.sleep(float(LAUNCH_STAGGER_S or 0))     # licence start-up, as the runs do
     for t in ths:
@@ -16953,23 +17035,32 @@ def _live_compare_start():
 
     def _loop():
         while not stop.wait(LIVE_COMPARE_EVERY):
+            got = None
             try:
                 got, _b, _t = compare_now(quiet=True)
+                if got:
+                    n = sum(len(r["rows"]) for r in got)
+                    new = sum(1 for r in got for x in r["rows"]
+                              if x["class"] == CLS_NEW or x["hidden_new"])
+                    print("[compare] live: %d scenario(s) comparable so far, %d introduced "
+                          "by the projects -> %s"
+                          % (n, new, cmp_path("COMPARISON_SUMMARY", "txt")))
+                    sys.stdout.flush()
             except Exception:
-                continue
-            if not got:
-                continue
-            n = sum(len(r["rows"]) for r in got)
-            new = sum(1 for r in got for x in r["rows"]
-                      if x["class"] == CLS_NEW or x["hidden_new"])
-            print("[compare] live: %d scenario(s) comparable so far, %d introduced "
-                  "by the projects -> %s"
-                  % (n, new, cmp_path("COMPARISON_SUMMARY", "txt")))
-            sys.stdout.flush()
+                pass
+            # NOTHING HELD BETWEEN REFRESHES in a 32-bit Python. The caches
+            # only save re-reading a CSV; kept for the whole simulation they
+            # filled the 2 GB this process shares with the scoring and plotting
+            # threads, reads failed with MemoryError and the next thread could
+            # not start.
+            got = None
+            if _PY32:
+                _release_compare_memory()
 
     th = threading.Thread(target=_loop)
     th.daemon = True
-    th.start()
+    if not _thread_start(th, "the live comparison"):
+        return None
     print("[compare] live comparison every %ds -> %s"
           % (LIVE_COMPARE_EVERY, COMPARE_DIR))
 
@@ -17207,14 +17298,16 @@ def _early_scorer_start(pjs, t_go):
 
     th = threading.Thread(target=_loop)
     th.daemon = True
-    th.start()
+    # OPTIONAL HELPERS: with no thread for one, the final scoring and the
+    # catch-up plot pass do its work after the simulations instead.
+    _thread_start(th, "early scoring")
     _plot_th = threading.Thread(target=_plot_loop)
     _plot_th.daemon = True
-    _plot_th.start()
-    _EARLY_PLOT_THREADS.append(_plot_th)
+    if _thread_start(_plot_th, "early plotting"):
+        _EARLY_PLOT_THREADS.append(_plot_th)
     hb = threading.Thread(target=_beat)
     hb.daemon = True
-    hb.start()
+    _thread_start(hb, "the early-score heartbeat")
     print("[early-score] on: each project is scored as soon as both cases have "
           "simulated it, on the cores the workers leave idle")
 
@@ -19924,17 +20017,10 @@ def _ensure_reports_run(jobs, _run_case):
                 finally:
                     _case_thread_end(c["key"])
             th = threading.Thread(target=_go)
-            try:
-                th.start()
-            except RuntimeError as _e:
-                # NO ROOM FOR ANOTHER THREAD (a 32-bit Python near its 2 GB):
-                # score this case here instead of losing the whole pass.
-                print("[compare] could not start a scoring thread (%s) -- scoring "
-                      "%s in this thread instead" % (_e, case["key"]))
-                _release_compare_memory()
-                _go()
-                continue
-            ths.append(th)
+            # NO ROOM FOR ANOTHER THREAD (a 32-bit Python near its 2 GB):
+            # score this case here instead of losing the whole pass.
+            if _thread_start(th, "scoring %s" % case["key"], inline=_go):
+                ths.append(th)
         for th in ths:
             th.join()
         rcs = list(res.items())
@@ -22981,7 +23067,7 @@ def _gt_status_start(runs, faults, npar):
                 pass
     th = threading.Thread(target=_loop)
     th.daemon = True
-    th.start()
+    _thread_start(th, "the gen-test status file")
     stat["th"] = th
     stat["runs"], stat["faults"], stat["npar"] = runs, faults, npar
     return stat
@@ -23089,7 +23175,7 @@ def _gt_run_parallel(todo, runs, faults, gens, npar):
             th = threading.Thread(target=_go)
             th.daemon = True
             t0 = time.time()
-            th.start()
+            _thread_start(th, "gen-test run %s" % tag, inline=_go)   # no thread: run here
             live[tag] = (th, r, t0, box)
             r["state"], r["t0"], r["log"] = "RUNNING", t0, lp
             if not only:
@@ -24283,8 +24369,8 @@ def main():
                             print("[compare]     indistinguishable from 'finished' out here.")
                         print("")
                 th = threading.Thread(target=_go)
-                th.start()
-                ths.append(th)
+                if _thread_start(th, "the %s study" % case["key"], inline=_go):
+                    ths.append(th)
             _es_stop = _early_scorer_start(pjs, t_go)
             try:
                 for th in ths:
@@ -24455,8 +24541,8 @@ def main():
                     finally:
                         _case_thread_end(k)
                 th = threading.Thread(target=_go)
-                th.start()
-                _ths.append(th)
+                if _thread_start(th, "the %s study" % key, inline=_go):
+                    _ths.append(th)
             for th in _ths:
                 th.join()
             for k, rc in _res.items():
