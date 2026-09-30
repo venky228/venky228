@@ -29717,9 +29717,15 @@ def _claim_mine(scen_id):
 
        Three ways to be told no: someone holds it, it is finished, or it has
        already been given up. Each is a normal outcome of a shared queue, not an
-       error."""
-    if not (DYNAMIC_WORK and SPP_ROLE == "work" and N_WORKERS > 1):
-        return True                       # single worker, or not sharing: it is mine
+       error.
+
+       A LONE WORKER CLAIMS TOO. The launcher can add workers while this one
+       runs (HANDOVER, when the other case or a scoring pass frees cores), and
+       a first worker that claimed nothing was invisible to them: the worker
+       added next to it ran the very faults it was running, two PSS/E sessions
+       on one .out."""
+    if not (DYNAMIC_WORK and SPP_ROLE == "work"):
+        return True                       # not sharing a queue: it is mine
     p = _claim_path(scen_id)
     tag = _claim_tag()
     try:
@@ -29785,7 +29791,7 @@ def _claim_mine(scen_id):
 def _claim_touch(scen_id):
     """Say the holder is still alive. Called as a scenario runs, so a long run is
        never mistaken for a dead worker."""
-    if not (DYNAMIC_WORK and SPP_ROLE == "work" and N_WORKERS > 1):
+    if not (DYNAMIC_WORK and SPP_ROLE == "work"):
         return
     try:
         os.utime(_claim_path(scen_id), None)
@@ -29797,7 +29803,7 @@ def _claim_release(scen_id, keep):
     """Let go. keep=True leaves the claim in place (the scenario is finished or
        given up, and nobody should pick it up again); keep=False removes it, so a
        scenario this worker could not complete is offered back to the queue."""
-    if not (DYNAMIC_WORK and SPP_ROLE == "work" and N_WORKERS > 1):
+    if not (DYNAMIC_WORK and SPP_ROLE == "work"):
         return
     if keep:
         return
@@ -33509,7 +33515,7 @@ def main():
                 _run_one(ft["id"], "fault", (lambda f=ft, i=idx: fault_run(f, i, n_faults)))
                 status("PROGRESS %d/%d done -- %d ok, %d failed, %d skipped so far"
                        % (done, n_total, ok_n, fail_n, skip_n))
-            if not (DYNAMIC_WORK and SPP_ROLE == "work" and N_WORKERS > 1):
+            if not (DYNAMIC_WORK and SPP_ROLE == "work"):
                 break
             if ran_n == _before:
                 break                      # nothing left that this worker can take
