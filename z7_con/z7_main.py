@@ -576,7 +576,7 @@ V_SS_HIGH = 1.10                             # and high
 SS_AS_VIOLATION = False                      # False = steady-state band NOTED in the results only (not in SPP Rev 3.0) | True = a FAIL
 # -- rotor angle (SPP Rev 3.0 damping) --
 ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
-SPPR_MIN_AFTER_FIRST_PEAK = False            # False = SPPR "Minimum Value" = lowest point of the trace (Rev 3.0) | True = lowest trough after the 1st peak
+SPPR_MIN_AFTER_FIRST_PEAK = True             # True = SPPR "Minimum Value" = the trough after the 1st positive peak (Rev 3.0 Figure 2) | False = lowest point of the judged trace (stricter; drift can fail a damped machine)
 SPPR_SETTLED_AS_NOTE = True                  # True = a machine >= 16 deg that fails SPPR but settles by the end of the run is NOTED, not a violation | False = a FAIL (Rev 3.0 as written)
 SPPR_FLOOR_REVIEW = False                    # True = a machine >= 16 deg failing SPPR only because it rings onto a floor (settles above its minimum) goes to INDIVIDUAL REVIEW | False = a FAIL (Rev 3.0 as written)
 REVIEW_ROWS_IN_COMPARISON = False            # False = machines below 16 deg set aside for individual evaluation stay in each case's violations report only | True = also as rows in the comparison sheets
