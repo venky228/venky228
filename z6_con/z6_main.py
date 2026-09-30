@@ -9546,6 +9546,36 @@ def _failing_faults(proj, mode):
             if (ct[fid].get("verdict") or "").upper() == "FAIL"]
 
 
+def _failing_or_unjudged(proj, mode, rdir):
+    """{ids} that FAIL in an as-is folder's criteria report, plus the selected
+       faults (_plan_expected_ids) with NO verdict there -- not run, or not
+       scored. Empty when the folder has no report at all (the caller's own
+       fallback covers that)."""
+    ct, _src = read_criteria(rdir, proj)
+    if not ct:
+        return set()
+    out = set(f for f in ct if (ct[f].get("verdict") or "").upper() == "FAIL")
+    out |= set(f for f in _plan_expected_ids(proj, mode, [])
+               if norm_verdict((ct.get(f) or {}).get("verdict")) is None)
+    return out
+
+
+def _sweep_failing_ids(proj, mode, sc_tag="", gia=None):
+    """DYR_SWEEP_FAULTS = "failing": the faults one value run simulates.
+
+       The GIA run: what FAILS as is, and every selected fault with no as-is
+       verdict -- unknown is swept, not dropped (F04/F05 missing from the
+       report were silently never swept). A surplus scenario's run (sc_tag):
+       the GIA list (gia, when the caller has it) plus what fails, or has no
+       verdict, in THAT scenario's as-is folder -- F03 passing in the GIA but
+       failing in the SGF was never run."""
+    rt = results_dir(CASE_TEST, proj, mode)
+    out = set(_failing_or_unjudged(proj, mode, rt) if gia is None else gia)
+    if sc_tag:
+        out |= _failing_or_unjudged(proj, mode, rt + "_" + sc_tag)
+    return sorted([f for f in out if _id_selected(f)], key=_fault_key)
+
+
 def _crashed_faults(proj, mode):
     """The faults the as-studied PROJECT run never finished: an .out on disk
        and no .done -- the launcher gave up on them after MAX_SCENARIO_ATTEMPTS.
@@ -9602,7 +9632,17 @@ def _crashed_faults(proj, mode):
 
 
 def _sweep_resume_env():
-    """SPP_SKIP_DONE / SPP_FRESH_START for a sweep run, from SWEEP_SKIP_DONE.
+    """SPP_SKIP_DONE / SPP_FRESH_START / SPP_ONLY_MISSING_OUT for a sweep run
+       (and every other extra run: surplus, EGF, capacity, POI-P, MW, new
+       plant, project off), from SWEEP_SKIP_DONE.
+
+       FRESH_START WINS: the run starts over and skips nothing, as the as-is
+       study does -- after a deck change the old values were otherwise resumed
+       and compared as new. (The gen test keeps its own rule: _gt_env.)
+
+       RUN_ONLY_MISSING_OUT FOLLOWS THIS SWITCH: it applies only while the run
+       resumes (SWEEP_SKIP_DONE = True). With SWEEP_SKIP_DONE = False the
+       run's faults are simulated again even where an .out is on disk.
 
        EVERY SWEEP RUN USED TO RE-SIMULATE, unconditionally: the three functions
        that launch one -- run_dyr_sweep, run_capacity_sweep, run_project_off --
@@ -9632,8 +9672,17 @@ def _sweep_resume_env():
        False, when anything but the swept value has changed."""
     # ITS OWN REPORT TOO: every caller reads the folder's verdicts straight
     # after the run, so a report deferred to "after all projects" never exists.
+    # FRESH_START REACHES THESE RUNS: this always said "0", overwriting the
+    # panel's, so a fresh start re-ran the as-is study and reused every value.
+    if FRESH_START:
+        return {"SPP_SKIP_DONE": "0", "SPP_FRESH_START": "1",
+                "SPP_ONLY_MISSING_OUT": "0", "SPP_DEFER_REPORTS": "0"}
+    # THE MISSING-OUT RULE GOES WITH THE RESUME SWITCH: inherited from the
+    # panel, it kept every .out, and SWEEP_SKIP_DONE = False re-ran nothing.
     return {"SPP_SKIP_DONE": "1" if SWEEP_SKIP_DONE else "0",
-            "SPP_FRESH_START": "0", "SPP_DEFER_REPORTS": "0"}
+            "SPP_FRESH_START": "0",
+            "SPP_ONLY_MISSING_OUT": "1" if (SWEEP_SKIP_DONE and RUN_ONLY_MISSING_OUT) else "0",
+            "SPP_DEFER_REPORTS": "0"}
 
 
 def _cap_levels():
@@ -11147,16 +11196,21 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
     if not variants:
         return [], []
     _scope = (DYR_SWEEP_FAULTS or "all").strip().lower()
+    _rt = results_dir(CASE_TEST, proj, mode)
     if _scope == "failing":
-        faults = _failing_faults(proj, mode)
-        what = "failing fault(s)"
+        # WHAT FAILS AS IS, AND WHAT HAS NO AS-IS VERDICT (not run, not
+        # scored): unknown is swept, not dropped -- see _sweep_failing_ids
+        faults = _sweep_failing_ids(proj, mode)
+        what = "failing (or never scored as is) fault(s)"
     elif _scope == "crashed":
         # ONLY WHAT WOULD NOT RUN. Each value gets its own folder holding just
         # these, so the as-studied results are not touched and the sweep table
         # answers "does this value get them through" and nothing else.
         faults = _crashed_faults(proj, mode)
         what = "crashed / gave-up scenario(s) of the as-studied run"
-        if not faults:
+        # NOTHING CRASHED IS AN ANSWER ONLY WHEN THE AS-IS RUN IS ON DISK: with
+        # no as-is results this returned before the "selected faults" fallback
+        if not faults and (read_criteria(_rt, proj)[0] or _out_faults_in(_rt)):
             print("[dyr-sweep] %s %s: DYR_SWEEP_FAULTS = \"crashed\" and the as-studied "
                   "project run has no crashed scenario -- nothing to sweep" % (proj, mode))
             return [], []
@@ -11172,7 +11226,7 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
     # pass counts had the wrong denominator. Filter here, once, the same way
     # compare_project() does.
     faults = [f for f in faults if _id_selected(f)]
-    if not faults and not read_criteria(results_dir(CASE_TEST, proj, mode), proj)[0]:
+    if not faults and not read_criteria(_rt, proj)[0]:
         # NO AS-STUDIED PROJECT RESULTS TO READ (DYR_CHANGES_ONLY on a project
         # never run as is): which faults fail cannot be known, so the selected
         # faults of the project's own list are swept directly.
@@ -11182,6 +11236,27 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
                   "the %d selected fault(s) directly" % (proj, mode, len(faults)))
             if _scope == "crashed":
                 _scope = "failing"      # run exactly this list
+    # THE SURPLUS-SCENARIO (SGF) RUN OF EACH VALUE: DYR_CHANGES_ONLY, FULL
+    # OUTPUT ONLY -- the plan and the side-by-side cover no capacity level, so
+    # a _capNN_dyr_<v>_<scenario> study was simulated and never reported.
+    _sgf_runs = surplus_scenarios() if (DYR_CHANGES_ONLY and not cap_tag) else []
+    if DYR_CHANGES_ONLY and cap_tag and surplus_scenarios():
+        print("[dyr-sweep] %s%s: the surplus-scenario runs of each value are made at full "
+              "output only" % (proj, _cap_note(cap_tag)))
+    # "failing" FOR AN SGF RUN IS READ FROM ITS OWN AS-IS FOLDER TOO (plus the
+    # GIA list): it inherited the GIA's, so an SGF-only failure was never run
+    _sgf_faults = {}
+    if _scope == "failing":
+        for _sc in _sgf_runs:
+            _sgf_faults[_sc["tag"]] = _sweep_failing_ids(proj, mode, _sc["tag"], gia=faults)
+        if not faults and any(_sgf_faults.values()):
+            # NOTHING TO SWEEP IN THE GIA, SOMETHING IN A SURPLUS SCENARIO: the
+            # value's GIA run takes those faults too, so the project is swept
+            faults = sorted(set(f for _v in _sgf_faults.values() for f in _v), key=_fault_key)
+            for _t in list(_sgf_faults):
+                _sgf_faults[_t] = sorted(set(_sgf_faults[_t]) | set(faults), key=_fault_key)
+            print("[dyr-sweep] %s %s: nothing fails in the GIA as is, %s in a surplus "
+                  "scenario -- the GIA runs sweep them too" % (proj, mode, ", ".join(faults)))
     if not faults:
         print("[dyr-sweep] %s %s: nothing to sweep -- the project case scored no fault"
               % (proj, mode))
@@ -11192,6 +11267,10 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
                                            sorted((QUICK_SIM_TIMES or {}).items())))
     print("[dyr-sweep] %s %s%s: %d value combination(s) x %d %s"
           % (proj, mode, _cap_note(cap_tag), len(variants), len(faults), what))
+    for _t in sorted(_sgf_faults):
+        if _sgf_faults[_t] != list(faults):
+            print("[dyr-sweep]   %s runs: %s (its own as-is failures too)"
+                  % (_t, ", ".join(_sgf_faults[_t])))
     for tag, edits in variants:
         print("[dyr-sweep]   %-22s %s" % (tag, _dyr_edits_text(edits)))
 
@@ -11288,20 +11367,22 @@ def run_dyr_sweep(proj, mode, cap_tag="", cap_scale=None):
         # DYR_CHANGES_ONLY: each SURPLUS scenario (PROJECT_SGF) with the same
         # .dyr values, into <folder>_<value>_<scenario>. The EGF edits are left
         # out where the scenario switches the existing machines off.
-        if DYR_CHANGES_ONLY:
-            for _sc in surplus_scenarios():
-                _banner("DYR SWEEP -- %s -- %s : %s"
-                        % (proj, _sc["label"], _dyr_edits_text(edits)))
-                _env2 = dict(env)
-                _env2.update(_surplus_env(_sc))
-                _env2["SPP_RUN_TAG"] = "%s_%s" % (tag, _sc["tag"])
-                if _sc["egf_off"]:
-                    _env2.pop("SPP_EGF_DYR_EDITS", None)
-                _rc2 = run_study(CASE_TEST, projects=[proj], modes=[mode],
-                                 extra_env=_env2)
-                if _rc2 not in (0, None):
-                    print("[dyr-sweep] %s_%s ended with rc=%s -- reading whatever it "
-                          "scored" % (tag, _sc["tag"], _rc2))
+        # (_sgf_runs: none at a capacity level -- see above)
+        for _sc in _sgf_runs:
+            _banner("DYR SWEEP -- %s -- %s : %s"
+                    % (proj, _sc["label"], _dyr_edits_text(edits)))
+            _env2 = dict(env)
+            _env2.update(_surplus_env(_sc))
+            _env2["SPP_RUN_TAG"] = "%s_%s" % (tag, _sc["tag"])
+            if _sc["tag"] in _sgf_faults:
+                _env2["SPP_ONLY_FAULTS"] = ",".join(_sgf_faults[_sc["tag"]])
+            if _sc["egf_off"]:
+                _env2.pop("SPP_EGF_DYR_EDITS", None)
+            _rc2 = run_study(CASE_TEST, projects=[proj], modes=[mode],
+                             extra_env=_env2)
+            if _rc2 not in (0, None):
+                print("[dyr-sweep] %s_%s ended with rc=%s -- reading whatever it "
+                      "scored" % (tag, _sc["tag"], _rc2))
         rdir = _dyr_sweep_dir(proj, mode, tag, cap_tag)
         ct, _src = read_criteria(rdir, proj)
         per_tag[tag] = dict((f, (ct.get(f, {}).get("verdict") or "?").upper())
@@ -11392,13 +11473,31 @@ def _edits_from_folder(rdir, tagbits):
     return [(model or "(model per DYR_EDITS.txt)", d)] if d else []
 
 
+def _dyr_scenario_tails():
+    """The folder endings a .dyr value's OTHER runs carry: each surplus
+       scenario (_s1_egfoff) and the EGF runs (_egf, _egfoff)."""
+    return [sc["tag"] for sc in surplus_scenarios()] + [EGF_TAG, EGF_OFF_TAG]
+
+
+def _dyr_scenario_sfx(sfx, tails=None):
+    """True for <proj>_<mode>[_capNN]_dyr_<value>_<scenario>: that value run in
+       a surplus scenario or an EGF variant -- not a .dyr value of its own.
+       \\w+ took _dyr_Khv2_Kqv2_Volim1p1_s1_egfoff as the value
+       "Khv2_Kqv2_Volim1p1_s1_egfoff" (with a bogus s=1), its own column."""
+    if not re.match(r"^(?:_cap\d+)?_dyr_", sfx or ""):
+        return False
+    return any(t and sfx.endswith("_" + t)
+               for t in (_dyr_scenario_tails() if tails is None else tails))
+
+
 def _dyr_variants_on_disk(proj, mode):
     """[(cap_tag, [(tag, edits), ...]), ...] from the results folders -- full
        output first, then each capacity level high to low."""
     by = {}
+    _tails = _dyr_scenario_tails()
     for sfx in _run_suffixes(proj, mode):
         m = re.match(r"^(?:_cap(\d+))?_dyr_(\w+)$", sfx)
-        if not m:
+        if not m or _dyr_scenario_sfx(sfx, _tails):
             continue
         cap = m.group(1) or ""
         tag = "dyr_" + m.group(2)
@@ -13069,6 +13168,7 @@ def _run_suffixes(proj, mode):
        in name, which is what makes one table over all of them possible."""
     base = _run_path(CASE_TEST, proj, "%s_%s" % (proj, mode))
     out = []
+    _tails = _dyr_scenario_tails()
     for d in glob.glob(base + "*"):
         if not os.path.isdir(d):
             continue
@@ -13092,6 +13192,10 @@ def _run_suffixes(proj, mode):
                         or sfx == "_" + NEW_PLANT_TAG
                         or sfx == "_" + PROJECT_OFF_TAG
                         or sfx in ("_" + EGF_TAG, "_" + EGF_OFF_TAG)):
+            continue
+        # A VALUE RUN IN A SURPLUS SCENARIO OR EGF VARIANT (_dyr_<v>_s1_egfoff)
+        # IS NOT A VALUE: _dyr_\w+ read it as one, labelled "..., s=1, egfoff"
+        if _dyr_scenario_sfx(sfx, _tails):
             continue
         out.append(sfx)
 
@@ -14295,7 +14399,9 @@ def _plan_state(proj, mode, sfx, _dir=None, _base_run=None):
     try:
         _scope = (DYR_SWEEP_FAULTS or "all").strip().lower()
         if "_dyr_" in str(sfx) and _scope in ("failing", "crashed"):
-            _sel = (_failing_faults(proj, mode) if _scope == "failing"
+            # the list the sweep runs: an SGF value folder's own as-is failures too
+            _st = [sc["tag"] for sc in surplus_scenarios() if str(sfx).endswith("_" + sc["tag"])]
+            _sel = (_sweep_failing_ids(proj, mode, _st[0] if _st else "") if _scope == "failing"
                     else _crashed_faults(proj, mode))
             if _sel:
                 n_want = len(_sel)
@@ -21380,11 +21486,12 @@ def _gt_done(rdir, faults, g=None):
         # its .out AND .done, or have used up MAX_SCENARIO_ATTEMPTS. One with
         # no .out was never simulated (a worker wrote ALL_DONE while another
         # was stopped) -- the run is resumed, not moved aside: the ALL_DONE
-        # flags are dropped and the launcher simulates the missing faults.
+        # flags are dropped as it starts (_gt_reset) and the launcher
+        # simulates the missing faults.
         _miss = [f for f in need if m[f]["verdict"] not in ("PASS", "FAIL")
                  and not _gt_fault_settled(rdir, f)]
         if _miss:
-            _gt_drop_all_done(rdir, _miss)
+            _gt_mark_resume(rdir, _miss)
         else:
             ok = True
     # FAULTS ADDED SINCE THE RUN (GEN_TEST_FAULTS widened): the scored faults
@@ -21395,7 +21502,7 @@ def _gt_done(rdir, faults, g=None):
         _nr = [f for f in need if m[f]["verdict"] not in ("PASS", "FAIL", "SKIP")]
         if _nr and all(not os.path.isfile(os.path.join(rdir, "outs", "%s.out" % f))
                        for f in _nr):
-            _gt_drop_all_done(rdir, _nr)
+            _gt_mark_resume(rdir, _nr)
     return ok, m
 
 
@@ -21415,9 +21522,23 @@ def _gt_fault_settled(rdir, f):
         return False
 
 
-def _gt_drop_all_done(rdir, miss):
-    """Drop the run's ALL_DONE flags so the launcher resumes it in place (its
-       folder is kept -- _gt_reset does not move a folder in _GT_RESUME)."""
+def _gt_mark_resume(rdir, miss):
+    """The run is to be resumed in place: _gt_reset keeps its folder and drops
+       its ALL_DONE flags when the run starts.
+
+       NOTHING ON DISK CHANGES HERE. This is reached while the plan is built,
+       so a dry run, a report-only launch or z6_gt_report.py dropped the flags,
+       and the next real launch then moved the folder aside and simulated every
+       fault again (and a running gen test lost its workers' sentinels)."""
+    if rdir not in _GT_RESUME:
+        _GT_RESUME.add(rdir)
+        print("[gen-test] %s: %s never simulated to the end -- resumed in place when it runs"
+              % (os.path.basename(rdir), ",".join(miss)))
+
+
+def _gt_drop_all_done(rdir):
+    """Drop the run's ALL_DONE flags so the launcher resumes it in place.
+       Called only as the run starts (_gt_reset). Returns how many."""
     n = 0
     for fp in glob.glob(os.path.join(rdir, "flags", "ALL_DONE*.flag")):
         try:
@@ -21425,11 +21546,7 @@ def _gt_drop_all_done(rdir, miss):
             n += 1
         except Exception:
             pass
-    if rdir not in _GT_RESUME:
-        _GT_RESUME.add(rdir)
-        print("[gen-test] %s: %s never simulated to the end -- resumed in place%s"
-              % (os.path.basename(rdir), ",".join(miss),
-                 (" (%d ALL_DONE flag(s) dropped)" % n) if n else ""))
+    return n
 
 
 _GT_RESCORED = "GT_RESCORED.flag"      # the gen test's own scoring pass ran in this folder
@@ -21855,6 +21972,14 @@ def _gt_env(sc, g, faults):
     else:
         env["SPP_SOLVER_RETRY"] = "0"
     env.update(_sweep_resume_env())
+    # A GEN-TEST RUN RESUMES BY ITS MARKERS, NEVER BY "AN .out IS THERE": a run
+    # resumed in place holds the half-written .out of the fault it was stopped
+    # in, and RUN_ONLY_MISSING_OUT took that as a result, so it never ran again.
+    # FRESH_START is not the gen test's either (as before): a finished run is
+    # kept, and one resumed in place runs only its missing faults.
+    env["SPP_ONLY_MISSING_OUT"] = "0"
+    env["SPP_FRESH_START"] = "0"
+    env["SPP_SKIP_DONE"] = "1" if (SWEEP_SKIP_DONE or _gt_rdir(_gt_tag(sc, g)) in _GT_RESUME) else "0"
     return env
 
 
@@ -21896,10 +22021,12 @@ def _gt_reset(r):
     if not rdir or not os.path.isdir(rdir):
         return
     # RESUMED IN PLACE: a finished run with faults never simulated keeps its
-    # folder (its ALL_DONE flags were dropped by _gt_done); only those run
+    # folder (_gt_done marked it); only those run. ITS ALL_DONE FLAGS ARE
+    # DROPPED HERE, as it starts -- never while the plan is read.
     if rdir in _GT_RESUME:
-        print("[gen-test] %s: resumed in place -- only its missing faults run"
-              % os.path.basename(rdir))
+        n = _gt_drop_all_done(rdir)
+        print("[gen-test] %s: resumed in place -- only its missing faults run%s"
+              % (os.path.basename(rdir), (" (%d ALL_DONE flag(s) dropped)" % n) if n else ""))
         return
     # MOVED ASIDE, NEVER DELETED. The folder is cleared because a run about to
     # start is judged unfinished -- but that judgement can be wrong (a folder
@@ -22837,15 +22964,20 @@ def _gt_write(runs, faults, gens):
     print("[gen-test] -> %s" % txt)
 
 
+def _gt_usable():
+    """The PSS/E sessions a lone case may use: cores - CORES_SPARE, at most CORES_MAX."""
+    usable = _cpu_count() - max(0, int(CORES_SPARE))
+    if CORES_MAX:
+        usable = min(usable, int(CORES_MAX))
+    return max(1, usable)
+
+
 def _gt_parallel(nf):
     """How many runs at once: GEN_TEST_PARALLEL, "auto" = the cores a lone
        case may use (cores - CORES_SPARE, at most CORES_MAX) // faults per run."""
     v = GEN_TEST_PARALLEL
     if isinstance(v, str) and v.strip().lower() == "auto":
-        usable = _cpu_count() - max(0, int(CORES_SPARE))
-        if CORES_MAX:
-            usable = min(usable, int(CORES_MAX))
-        return max(1, usable // max(1, int(nf)))
+        return max(1, _gt_usable() // max(1, int(nf)))
     try:
         want = max(1, int(v))
     except Exception:
@@ -22854,14 +22986,28 @@ def _gt_parallel(nf):
     # too, its report shards -- holds one session per fault. 18 at once x 3
     # faults = 54 on this machine, and the scoring passes of that launch lost
     # a fault in about 15 EmpirePrairie runs.
-    cap = max(1, _cpu_count() // max(1, int(nf)))
+    # THE SAME CEILING AS "auto": a number ignored CORES_SPARE and CORES_MAX
+    # ("max PSS/E sessions"), so 6 x 3 faults ran 18 sessions against 12.
+    cap = max(1, _gt_usable() // max(1, int(nf)))
     if want > cap:
         if not _GT_PAR_SAID:
             _GT_PAR_SAID.append(1)
-            print("[gen-test] GEN_TEST_PARALLEL = %d x %d fault(s) = %d PSS/E sessions > %d cores: "
-                  "%d run(s) at once instead" % (want, nf, want * nf, _cpu_count(), cap))
+            print("[gen-test] GEN_TEST_PARALLEL = %d x %d fault(s) = %d PSS/E sessions > %d usable "
+                  "(cores - CORES_SPARE, at most CORES_MAX): %d run(s) at once instead"
+                  % (want, nf, want * nf, _gt_usable(), cap))
         return cap
     return want
+
+
+def _gt_replot_procs():
+    """How many redraw processes at once (GEN_TEST_REPLOT / FORCE_REPLOT):
+       every usable core -- nothing simulates during a replot -- within the
+       idle plot cap (PLOT_TOTAL_MAX_IDLE; 0 = PLOT_TOTAL_MAX)."""
+    n = _gt_usable()
+    cap = _plot_idle_cap() or int(PLOT_TOTAL_MAX or 0)
+    if cap:
+        n = min(n, int(cap))
+    return max(1, n)
 
 
 _GT_PAR_SAID = []
@@ -23650,8 +23796,11 @@ def run_gen_test():
               % (" + ".join(sc[0] for sc in pick), len(GEN_TEST_SCENARIOS)))
         return [r for r in (add(sc, g) for g in gens for sc in pick) if r and not r["note"]]
 
-    for r in runs:
-        _gt_readme(r, faults)                     # GEN_TEST_RUN.txt: what each run took out
+    # A DRY RUN / REPORT ONLY (z6_gt_report.py) WRITES NOTHING INTO A RUN
+    # FOLDER: a gen test may be running in them at the same time
+    if not (GEN_TEST_DRY_RUN or GEN_TEST_REPORT_ONLY):
+        for r in runs:
+            _gt_readme(r, faults)                 # GEN_TEST_RUN.txt: what each run took out
     _GT_LAST[GEN_TEST_PROJECT] = (runs, faults)   # for the all-projects summary
     base_ready = all(r["note"] for r in runs if not r["gen"])
     if _gmode == "best2" and base_ready:
@@ -23666,7 +23815,7 @@ def run_gen_test():
         # criteria report, so a change in how runs are judged reaches the
         # finished ones without simulating anything
         if GEN_TEST_REPLOT or FORCE_REPLOT:
-            _gt_replot(runs, faults, max(1, _gt_parallel(len(faults))))
+            _gt_replot(runs, faults, _gt_replot_procs())
         _gt_write(runs, faults, gens)
         print("[gen-test] REPORT ONLY -- %d run(s) re-ranked from disk, nothing simulated "
               "(%d not finished). Set GEN_TEST_REPORT_ONLY = False to run them."
@@ -23741,14 +23890,19 @@ def run_gen_test():
     print("[gen-test] live status of every run -> %s" % _stat["path"])
     try:
         _gt_execute(todo, runs, faults, gens, npar)
-        if _gmode == "best2" and not base_ready:
+        # REPORT ONLY SIMULATES NOTHING: its rescore pass came through here,
+        # and the best2 machine-off runs were then started as new simulations
+        if (_gmode == "best2" and not base_ready
+                and not GEN_TEST_REPORT_ONLY and not GEN_TEST_DRY_RUN):
             more = add_best2()
             print("[gen-test] %d machine-off run(s) added" % len(more))
             _gt_execute(more, runs, faults, gens, npar)
     finally:
         _gt_status_stop(_stat)
     if GEN_TEST_REPLOT or FORCE_REPLOT:
-        _gt_replot(runs, faults, npar)
+        # ONE PLOTTER PER RUN, SIZED FROM THE FREE CORES: npar is the runs a
+        # simulation may hold at once (cores // faults), and 3 of 10 cores drew
+        _gt_replot(runs, faults, _gt_replot_procs())
     _gt_write(runs, faults, gens)
     print("[gen-test] finished. Read GEN_TEST_%s.txt in %s" % (GEN_TEST_PROJECT, _gt_dir()))
     return 0
@@ -24373,7 +24527,10 @@ def main():
                     for _m in (list(MODES) or ["spp"]):
                         _od = os.path.join(results_dir(CASE_BASE, _p, _m), "outs")
                         _ids = _plan_expected_ids(_p, _m, [])
-                        if not _ids or [f for f in _ids
+                        # FRESH_START RE-RUNS THE BASE: gated on "an .out is
+                        # missing", a fresh start with every .out on disk
+                        # simulated nothing, and old-deck results were compared
+                        if FRESH_START or not _ids or [f for f in _ids
                                         if not os.path.isfile(os.path.join(_od, f + ".out"))]:
                             _need_b.append(_p)
                             break
@@ -24927,6 +25084,7 @@ def main():
     # DYR_CHANGES_ONLY: the projects whose as-is study was skipped are swept too
     # (_res_n leaves them out of every OTHER extra run).
     _sweep_res = list(_res_n)
+    _swept = []                # the projects swept now (the cross-value workbook below)
     if DYR_CHANGES_ONLY and pipeline != "compare":
         for _p in _egf_skip:
             for _m in (list(MODES) or ["spp"]):
@@ -24934,6 +25092,7 @@ def main():
                     _sweep_res.append({"project": _p, "mode": _m})
     if _sweep_res and (DYR_SWEEP or DYR_SWEEP_BY_PROJECT) and pipeline != "compare":
         _sweep_pj = _dyr_sweep_projects([r["project"] for r in _sweep_res])
+        _swept = [r for r in _sweep_res if r["project"] in _sweep_pj]
         # ONE PASS PER CAPACITY LEVEL. ("", None) first, so the ordinary
         # full-output sweep is complete and written before a single reduced-
         # output study starts -- an extra level that fails must not cost the
@@ -25040,9 +25199,14 @@ def main():
     # its tables per project and per value and nothing over all of them. The
     # matrix and per-value folders are rebuilt from disk only when this launch
     # did not just write them.
-    if results:
+    # THE PROJECTS SWEPT NOW TOO: a DYR_CHANGES_ONLY project with no as-is
+    # results has no comparison result, so its values had no rows here -- and
+    # with none of them having one, the workbook was not written at all.
+    _wb_res = list(results) + [r for r in _swept if not any(
+        x["project"] == r["project"] and x["mode"] == r["mode"] for x in results)]
+    if _wb_res:
         try:
-            compare_dyr_sweeps_on_disk(results, tables=(pipeline == "compare"), quiet=True)
+            compare_dyr_sweeps_on_disk(_wb_res, tables=(pipeline == "compare"), quiet=True)
         except Exception as e:
             print("[dyr-sweep] the cross-value workbook failed (%s) -- everything "
                   "above is unaffected" % e)
