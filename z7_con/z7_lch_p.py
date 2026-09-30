@@ -2451,7 +2451,11 @@ def _apply_skip_done(selected):
     # none of it.
     if (RUN_ONLY_FAULTS or ONLY_EVENTS) and not selected:
         return selected
-    if not SKIP_DONE:
+    # RUN_ONLY_MISSING_OUT IS A SKIP TOO. "Simulate only faults with no .out"
+    # was honoured only with SKIP_DONE on: with SKIP_DONE = False every selected
+    # fault had its markers cleared and was simulated again over the .out
+    # already on disk -- hours of repeated work the panel said would not happen.
+    if not SKIP_DONE and not ONLY_MISSING_OUT:
         return selected
     # FRESH_START MEANS START OVER, AND IT HAS TO WIN HERE.
     #
@@ -2597,7 +2601,9 @@ def _apply_skip_done(selected):
         # "no selection", i.e. run everything -- the opposite of what is true.
         print("[parallel] SKIP_DONE: all %d selected scenario(s) are already done."
               % len(done))
-        print("[parallel] Nothing to run. Set SKIP_DONE = False to run them again.")
+        print("[parallel] Nothing to run. Set %s to run them again."
+              % ("RUN_ONLY_MISSING_OUT = False and SKIP_DONE = False" if ONLY_MISSING_OUT
+                 else "SKIP_DONE = False"))
         # THIS RETURN IS A SKIP-DONE SELECTION TOO. It did not say so, so the
         # marker-clearing branch downstream treated the sentinel as an explicit
         # choice -- the one case the flag exists to tell apart.

@@ -24206,6 +24206,9 @@ def main():
                   "BOTH cases")
         elif SKIP_DONE:
             print("[compare] start:    RESUME -- finished scenarios are skipped in both cases")
+        elif RUN_ONLY_MISSING_OUT:
+            print("[compare] start:    RESUME -- a fault with an .out on disk is not simulated "
+                  "again (RUN_ONLY_MISSING_OUT)")
         else:
             print("[compare] start:    RESUME -- markers kept, but SKIP_DONE is off, so "
                   "every scenario is dealt out and skips itself")
