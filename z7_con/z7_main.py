@@ -19849,7 +19849,14 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                 _gap = []
                 _rd2 = results_dir(case, proj, md)
                 _od = os.path.join(_rd2, "outs")
-                _verd = read_criteria(_rd2, proj)[0] or {}
+                # THE FOLDER'S OWN REPORT (parts=False). A scenario a worker
+                # scored while simulating has its verdict in parts\SCEN_<id>.csv,
+                # which the comparison reads -- but when it finished after the
+                # workers last rewrote the report, the report pass the launcher
+                # deferred to this script is what puts it (and the merged
+                # measurement files) in the folder. Counted with the parts, that
+                # pass was never started. It re-reads no .out a worker scored.
+                _verd = read_criteria(_rd2, proj, parts=False)[0] or {}
                 for _q in glob.glob(os.path.join(_od, "*.out")):
                     _sid = os.path.splitext(os.path.basename(_q))[0]
                     if _sid.upper().startswith("FLAT"):
@@ -19940,7 +19947,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
         if gaps:
             print("")
             print("[compare] %s: %d folder(s) hold finished or partial runs that have NO "
-                  "verdict yet:" % (case["key"], len(gaps)))
+                  "verdict in their report yet:" % (case["key"], len(gaps)))
             for proj, ids in gaps:
                 print("[compare]     %-16s %d scenario(s): %s%s"
                       % (proj, len(ids), ", ".join(sorted(ids)[:10]),
