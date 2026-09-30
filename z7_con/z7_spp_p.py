@@ -37794,9 +37794,13 @@ def plot_missing_outs():
         # PRODUCES, and these were never produced). A finished run with no
         # verdict is read once more; _plot_only_current's token then stops it
         # being read again if that read still cannot score it.
-        _done_and_scored = had_done
+        # A SCORED PARTIAL RUN IS FINISHED TOO. It has no .done and no .plotted
+        # note, so once drawn it matched no test below: every plotter picked
+        # it first, redrew it and exited, and the rest of the folder waited.
+        _fin = had_done or _is_partial(sid)
+        _done_and_scored = _fin
         try:
-            if had_done and SCORE_AT_RUN_TIME and not os.path.isfile(_scen_part_path(sid)):
+            if _fin and SCORE_AT_RUN_TIME and not os.path.isfile(_scen_part_path(sid)):
                 _done_and_scored = False
         except Exception:
             _done_and_scored = had_done
