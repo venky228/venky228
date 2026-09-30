@@ -9556,18 +9556,52 @@ def _failing_faults(proj, mode):
             if (ct[fid].get("verdict") or "").upper() == "FAIL"]
 
 
+def _skipped_in(rdir):
+    """{ids} whose latest progress row in rdir is SKIPPED -- the fault's bus or
+       branch is not in that case, so no run of it can ever give a verdict."""
+    latest = {}
+    for p in glob.glob(os.path.join(rdir, "logs", "PROGRESS*.csv")):
+        try:
+            with open(p, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    sid = (r.get("scenario") or "").strip()
+                    tm = (r.get("time") or "").strip()
+                    if sid and (sid not in latest or tm >= latest[sid][0]):
+                        latest[sid] = (tm, (r.get("status") or "").strip().upper())
+        except Exception:
+            continue
+    return set(k for k, v in latest.items() if v[1] == "SKIPPED")
+
+
 def _failing_or_unjudged(proj, mode, rdir):
     """{ids} that FAIL in an as-is folder's criteria report, plus the selected
        faults (_plan_expected_ids) with NO verdict there -- not run, or not
        scored. Empty when the folder has no report at all (the caller's own
-       fallback covers that)."""
+       fallback covers that). A fault SKIPPED there as not in the case is not
+       unknown: sweeping it only started a build to skip it again."""
     ct, _src = read_criteria(rdir, proj)
     if not ct:
         return set()
     out = set(f for f in ct if (ct[f].get("verdict") or "").upper() == "FAIL")
+    _skip = _skipped_in(rdir)
     out |= set(f for f in _plan_expected_ids(proj, mode, [])
-               if norm_verdict((ct.get(f) or {}).get("verdict")) is None)
+               if norm_verdict((ct.get(f) or {}).get("verdict")) is None and f not in _skip)
     return out
+
+
+def _sweep_fault_plan(proj, mode):
+    """DYR_SWEEP_FAULTS = "failing": (GIA list, {surplus tag: list}) -- ONE rule
+       for run_dyr_sweep() and the plan's completeness test. Nothing failing in
+       the GIA but something in a surplus scenario: the GIA runs take those too."""
+    gia = _sweep_failing_ids(proj, mode)
+    sgf = {}
+    for _sc in (surplus_scenarios() if DYR_CHANGES_ONLY else []):
+        sgf[_sc["tag"]] = _sweep_failing_ids(proj, mode, _sc["tag"], gia=gia)
+    if not gia and any(sgf.values()):
+        gia = sorted(set(f for _v in sgf.values() for f in _v), key=_fault_key)
+        for _t in list(sgf):
+            sgf[_t] = sorted(set(sgf[_t]) | set(gia), key=_fault_key)
+    return gia, sgf
 
 
 def _sweep_failing_ids(proj, mode, sc_tag="", gia=None):
@@ -14411,8 +14445,11 @@ def _plan_state(proj, mode, sfx, _dir=None, _base_run=None):
         if "_dyr_" in str(sfx) and _scope in ("failing", "crashed"):
             # the list the sweep runs: an SGF value folder's own as-is failures too
             _st = [sc["tag"] for sc in surplus_scenarios() if str(sfx).endswith("_" + sc["tag"])]
-            _sel = (_sweep_failing_ids(proj, mode, _st[0] if _st else "") if _scope == "failing"
-                    else _crashed_faults(proj, mode))
+            if _scope == "failing":
+                _g, _s = _sweep_fault_plan(proj, mode)
+                _sel = _s.get(_st[0], _g) if _st else _g
+            else:
+                _sel = _crashed_faults(proj, mode)
             if _sel:
                 n_want = len(_sel)
     except Exception:
@@ -19100,6 +19137,11 @@ def _note_forced_pass(case, projects, modes, env, rc):
         _rf = (env.get("SPP_REPORT_FAULTS") or "").strip()
         if _rf and _rf != ",".join(ONLY_FAULTS or []):
             return
+        # A RUN NARROWED TO A FEW FAULTS (a .dyr value's failing ones) scored
+        # those alone; older .out files in its folder are still the old rule's.
+        _of = (env.get("SPP_ONLY_FAULTS") or "").strip()
+        if _of and _of != ",".join(ONLY_FAULTS or []):
+            return
         _cap = (env.get("SPP_CAP_TAG") or "").strip()
         _tag = (env.get("SPP_RUN_TAG") or "").strip()
         for p in projects:
@@ -19202,6 +19244,44 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
     return after
 
 
+# SET BY main() WHEN THIS LAUNCH RUNS THE .dyr SWEEP AFTER THE COVERAGE CHECK.
+_SWEEP_RUNS_LATER = [False]
+_DEFERRED_FORCE = []           # (case, proj, mode, rdir) left to after the sweep
+
+
+def _sweep_rescores_later(proj, rdir):
+    """A .dyr sweep folder whose forced pass waits until the sweep has run:
+       its own sweep run rescores it, and force-scoring it first scored every
+       file twice. force_score_deferred() takes the ones the sweep did not."""
+    return bool(_SWEEP_RUNS_LATER[0] and "_dyr_" in os.path.basename(rdir))
+
+
+def force_score_deferred():
+    """FORCE_RESCORE for the .dyr folders deferred above that no sweep run
+       rescored in this launch (a value no longer swept, nothing failing now,
+       a level not run): one forced pass each, as verify_scoring_coverage()
+       would have run."""
+    todo = [x for x in _DEFERRED_FORCE if _forced_key(x[3]) not in _FORCE_SCORED]
+    del _DEFERRED_FORCE[:]
+    for case, proj, mode, rdir in todo:
+        try:
+            outs, scored = _out_and_scored_sets(rdir, proj)
+            if not outs:
+                continue
+            if _tagged_scoring_env(proj, _split_run_folder(rdir)[2], rdir) is None:
+                print("[coverage] FORCE_RESCORE did NOT rescore %s %s -- its run settings "
+                      "cannot be read off its name" % (case["key"], os.path.basename(rdir)))
+                continue
+            print("[coverage] %-6s %s: not rescored by this launch's sweep -- one forced "
+                  "scoring pass" % (case["key"], os.path.basename(rdir)))
+            _score_tagged_folder(case, proj, mode, rdir, sorted(outs, key=_fault_key), force=True)
+        except Exception as e:
+            print("[coverage] forced pass for %s failed: %s" % (os.path.basename(rdir), e))
+    _MEAS_CACHE.clear()
+    _SCEN_PART_CACHE.clear()
+    _OUT_SET_CACHE.clear()
+
+
 def verify_scoring_coverage(quiet=False):
     """Does every .out in every folder have a verdict? Run BEFORE comparing.
 
@@ -19239,6 +19319,10 @@ def verify_scoring_coverage(quiet=False):
                     # not when its report is merely new: the auto-merge above
                     # rewrites it from the old parts (see _FORCE_SCORED).
                     _tg = _split_run_folder(rdir)[2]
+                    if (FORCE_RESCORE and _tg and _forced_key(rdir) not in _FORCE_SCORED
+                            and _sweep_rescores_later(proj, rdir)):
+                        _DEFERRED_FORCE.append((case, proj, mode, rdir))
+                        _tg = ""       # its own sweep run below rescores it once
                     if FORCE_RESCORE and _tg and _forced_key(rdir) not in _FORCE_SCORED:
                         if _tagged_scoring_env(proj, _tg, rdir) is None:
                             unreached.append("%s %s" % (case["key"], os.path.basename(rdir)))
@@ -25168,6 +25252,7 @@ def main():
     except Exception as _e:
         print("[auto-merge] the staleness check failed (%s) -- comparing what is "
               "on disk" % _e)
+    _SWEEP_RUNS_LATER[0] = bool(pipeline != "compare" and (DYR_SWEEP or DYR_SWEEP_BY_PROJECT))
     try:
         if not _fast:
             verify_scoring_coverage()
@@ -25408,6 +25493,11 @@ def main():
     # THE PROJECTS SWEPT NOW TOO: a DYR_CHANGES_ONLY project with no as-is
     # results has no comparison result, so its values had no rows here -- and
     # with none of them having one, the workbook was not written at all.
+    if _DEFERRED_FORCE:
+        try:
+            force_score_deferred()
+        except Exception as e:
+            print("[coverage] deferred forced passes failed: %s" % e)
     _wb_res = list(results) + [r for r in _swept if not any(
         x["project"] == r["project"] and x["mode"] == r["mode"] for x in results)]
     if _wb_res:

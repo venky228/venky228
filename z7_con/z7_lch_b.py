@@ -1987,6 +1987,48 @@ def _pid_holds_claim(pid):
     return False
 
 
+def _drop_claims_of(pid, slot=None):
+    """Remove the claims an EXITED worker left on scenarios with no .done.
+       Returns the ids freed.
+
+       A DEAD WORKER'S CLAIM IS FREED BY THE LAUNCHER, WHICH KNOWS IT IS DEAD.
+       Left to the PID test, a reused PID read as "alive" kept the scenario
+       unclaimable, and a lone worker then wrote its sentinel with it never run.
+       Renamed, read back, then removed: a worker may re-take it in between."""
+    try:
+        # SLOT AND PID TOGETHER: the PID alone matched a new worker that
+        # Windows had given the dead one's number.
+        pat = (re.compile(r"^\s*w%d pid%d\b" % (int(slot), int(pid))) if slot is not None
+               else re.compile(r"\bpid%d\b" % int(pid)))
+    except Exception:
+        return []
+    freed = []
+    for p in glob.glob(os.path.join(OUT_DIR, "*.claim")):
+        sid = os.path.basename(p)[:-len(".claim")]
+        try:
+            with open(p, "r", errors="replace") as fh:
+                txt = fh.read(300) or ""
+            if not pat.search(txt):
+                continue
+            _host = [t[5:] for t in txt.split() if t.startswith("host=")]
+            if _host and _host[0] != _HOSTNAME:
+                continue                                # another machine's pid
+            if os.path.isfile(os.path.join(OUT_DIR, "%s.done" % sid)):
+                continue
+            tmp = "%s.drop%d" % (p, os.getpid())
+            os.rename(p, tmp)
+            with open(tmp, "r", errors="replace") as fh:
+                same = (fh.read(300) or "") == txt
+            if same:
+                os.remove(tmp)
+                freed.append(sid)
+            else:
+                os.rename(tmp, p)
+        except Exception:
+            continue
+    return freed
+
+
 
 _SCEN_SCAN = {"t": 0.0, "rows": {}}
 
@@ -2032,10 +2074,14 @@ def _worker_scenario_age(i, since=0.0):
 def _gave_up_ids(ids=None):
     """Scenarios that GAVE UP (or errored) and have no finished .out."""
     prog = _progress_rows()
+    # NOT IN THIS CASE IS NOT GIVEN UP -- see _skipped_not_in_case.
+    _skipped = _skipped_not_in_case()
     out = []
     for sid in (ids or _fault_ids() or []):
         if (os.path.isfile(os.path.join(OUT_DIR, "%s.done" % sid))
                 and os.path.isfile(os.path.join(OUT_DIR, "%s.out" % sid))):
+            continue
+        if sid in _skipped:
             continue
         st = (prog.get(sid) or ("",))[0]
         if st in ("GAVE-UP", "ERROR", "FAILED") or _read_attempts(sid) >= _max_attempts_now():
@@ -2397,7 +2443,7 @@ def _timing_changed(out_dir, sid):
         mp = os.path.join(out_dir, "%s.%s" % (sid, ext))
         if not os.path.isfile(mp):
             continue
-        tclear = tend = None
+        tclear = tend = m_pre = m_end = None
         try:
             with open(mp) as fh:
                 lines = fh.read().splitlines()
@@ -2409,11 +2455,24 @@ def _timing_changed(out_dir, sid):
             for ln in lines:
                 if ln.startswith("tend="):
                     tend = float(ln[5:].strip())
+                elif ln.startswith("pre="):
+                    m_pre = float(ln[4:].strip())
+                elif ln.startswith("end="):
+                    m_end = float(ln[4:].strip())
         except Exception:
             continue
         if pre is not None and tclear is not None and not (pre < tclear <= pre + 1.0):
             return ("cleared at %.3f s -- the fault is now applied at %.2f s (PRE_FAULT_S)"
                     % (tclear, pre))
+        # NO CLEARING TIME ON LINE 1: THE pre= / end= LINES SAY IT. z7_main's
+        # time-axis .partial records the times it was run with; a marker
+        # without them is accepted as before.
+        if tclear is None:
+            if pre is not None and m_pre is not None and abs(m_pre - pre) > 1e-3:
+                return ("run with the fault at %.3f s -- it is now applied at %.2f s (PRE_FAULT_S)"
+                        % (m_pre, pre))
+            if end is not None and m_end is not None and abs(m_end - end) > 1e-3:
+                return "run for SIM_END_S %.2f s -- SIM_END_S is now %.2f s" % (m_end, end)
         if ext == "done" and end is not None and tend is not None and abs(tend - end) > 0.11:
             return "ran to %.2f s -- SIM_END_S is now %.2f s" % (tend, end)
     return ""
@@ -2428,7 +2487,10 @@ def _stale_aside(out_dir, sid, why):
     # the fault list was renumbered comes back carrying the previous list's
     # attempts -- at the cap it is refused on sight and reported GAVE-UP
     # without ever being simulated.
-    for ext in ("out", "done", "attempts", "hangs", "plotted", "readfail", "badout", "partial"):
+    # THE STUDY'S POISON MARKERS ARE <sid>.out.badout / .out.readfail: left
+    # behind, they condemn the new .out before it is ever read.
+    for ext in ("out", "done", "attempts", "hangs", "plotted", "readfail", "badout", "partial",
+                "out.badout", "out.readfail"):
         p = os.path.join(out_dir, "%s.%s" % (sid, ext))
         if os.path.isfile(p):
             try:
@@ -2437,6 +2499,128 @@ def _stale_aside(out_dir, sid, why):
             except Exception:
                 pass
     return moved
+
+
+def _fresh_aside(sids, partials):
+    """FRESH_START: move each id's old .out (and its markers) aside as
+       .stale_<stamp> and remove the given .partial markers. An .out that
+       cannot be moved is listed for _report_locked. Returns the ids moved."""
+    n = 0
+    for sid in sids:
+        op = os.path.join(OUT_DIR, "%s.out" % sid)
+        if not os.path.isfile(op):
+            continue
+        _stale_aside(OUT_DIR, sid, "fresh")
+        if os.path.isfile(op):
+            _LOCKED.append((op, "the old .out could not be moved aside -- the in-run "
+                                "plotter would mark it done again"))
+        else:
+            n += 1
+    for p in partials:
+        _clear(p)
+    return n
+
+
+def _out_has_data(sid):
+    """<sid>.out holds at least OUT_MIN_BYTES: a result, not a bare header."""
+    try:
+        return os.path.getsize(os.path.join(OUT_DIR, "%s.out" % sid)) >= OUT_MIN_BYTES
+    except Exception:
+        return False
+
+
+def _was_interrupted(sid, prog):
+    """True when <sid>.out is a run CUT OFF with attempts still left: no .done
+       or .partial (mark_partial_runs has already marked one that ran far
+       enough), its latest progress row RUNNING (the launch was stopped) or
+       INCOMPLETE / ERROR / FAILED, attempts under the cap, the .out written by
+       that attempt, and no live holder. Kept, it was never scored."""
+    for ext in ("done", "partial"):
+        if os.path.isfile(os.path.join(OUT_DIR, "%s.%s" % (sid, ext))):
+            return False
+    row = prog.get(sid) or ("", "", "", "", "")
+    if (row[0] or "").strip() not in ("RUNNING", "INCOMPLETE", "ERROR", "FAILED"):
+        return False
+    if _read_attempts(sid) >= _max_attempts_now():
+        return False
+    try:
+        # AN .out OLDER THAN THAT ATTEMPT is an earlier result it never reached
+        ts = time.mktime(time.strptime(row[3], "%Y-%m-%d %H:%M:%S"))
+        if os.path.getmtime(os.path.join(OUT_DIR, "%s.out" % sid)) < ts - 2.0:
+            return False
+    except Exception:
+        return False
+    cp = os.path.join(OUT_DIR, "%s.claim" % sid)
+    if os.path.isfile(cp) and _claim_holder(cp) == "alive":
+        return False                       # a process is still writing it
+    return True
+
+
+def _case_sav():
+    """The .sav this case is built from (SPP_SOURCE_CASE[_BY_PROJECT]), or ""
+       when this launcher cannot tell."""
+    raw = ""
+    _tbl = (os.environ.get("SPP_SOURCE_CASE_BY_PROJECT") or "").strip()
+    if _tbl:
+        try:
+            import json
+            _tbl = json.loads(_tbl) or {}
+        except Exception:
+            return ""
+        if _tbl and not _CUR_PROJECT:
+            return ""                      # the study picks its own entry
+        for k, v in _tbl.items():
+            if v and str(k).strip().lower() == str(_CUR_PROJECT).strip().lower():
+                raw = str(v).strip()
+                break
+    raw = raw or (os.environ.get("SPP_SOURCE_CASE") or "").strip()
+    if not raw:
+        return ""
+    if not (os.path.isabs(raw) or raw[:2] in ("\\\\", "//")
+            or re.match(r"^[A-Za-z]:[\\/]", raw)):
+        raw = os.path.join(STUDY_DIR, raw)
+    return raw if os.path.isfile(raw) else ""
+
+
+def _skipped_not_in_case():
+    """Ids the study SKIPPED because the fault bus is not in this case.
+
+       FINISHED, NOT GIVEN UP. The study's only SKIPPED reason ("fault bus N is
+       not in this case") is a fact about the topology, so re-running it only
+       starts PSS/E to skip it again. Accepted when judged after the case .sav
+       was last written, with no attempt since (a GAVE-UP row after it is the
+       queue refusing it at the attempt cap, not a run)."""
+    try:
+        t_sav = os.path.getmtime(_case_sav() or "")
+    except Exception:
+        return set()                       # case unknown: judge nothing
+    skip, other = {}, {}
+    for p in glob.glob(os.path.join(LOGS_DIR, "PROGRESS*.csv")):
+        try:
+            with open(p, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    sid = (r.get("scenario") or "").strip()
+                    tm = (r.get("time") or "").strip()
+                    st = (r.get("status") or "").strip()
+                    if not sid or not tm:
+                        continue
+                    if st == "SKIPPED" and "is not in this case" in (r.get("note") or ""):
+                        if tm > skip.get(sid, ""):
+                            skip[sid] = tm
+                    elif st != "GAVE-UP" and tm > other.get(sid, ""):
+                        other[sid] = tm
+        except Exception:
+            continue
+    out = set()
+    for sid, tm in skip.items():
+        if other.get(sid, "") > tm:
+            continue                       # run again since
+        try:
+            if time.mktime(time.strptime(tm, "%Y-%m-%d %H:%M:%S")) > t_sav:
+                out.add(sid)
+        except Exception:
+            pass
+    return out
 
 
 def _apply_skip_done(selected):
@@ -2509,7 +2693,8 @@ def _apply_skip_done(selected):
         if sigs:
             break
     todo, done, gave_up, stale, empty, partial, have_out = [], [], [], [], [], [], []
-    retimed = []
+    retimed, interrupted, not_here = [], [], []
+    _skipped = _skipped_not_in_case()
     for sid in ids:
         _op = os.path.join(OUT_DIR, "%s.out" % sid)
         # RUN WITH OTHER TIMES: set aside and run again, even under
@@ -2534,6 +2719,21 @@ def _apply_skip_done(selected):
                 _has_data = os.path.getsize(_op) >= OUT_MIN_BYTES
             except Exception:
                 _has_data = False
+            # EXCEPT A RUN THE STOPPED LAUNCH CUT OFF mid-simulation: that .out
+            # is a fragment of an attempt nothing judged -- set aside, run again.
+            if _has_data and _was_interrupted(sid, prog):
+                # ITS ATTEMPTS STAY COUNTED: set aside with the .out, a fault that
+                # errors every time was re-run on every launch, never reaching the cap.
+                _att = _read_attempts(sid)
+                _stale_aside(OUT_DIR, sid, "interrupted")
+                if _att:
+                    try:
+                        with open(os.path.join(OUT_DIR, "%s.attempts" % sid), "w") as _fh:
+                            _fh.write(str(int(_att)))
+                    except Exception:
+                        pass
+                interrupted.append(sid)
+                _has_data = False
             if _has_data:
                 have_out.append(sid)
                 done.append(sid)
@@ -2542,9 +2742,16 @@ def _apply_skip_done(selected):
                 and os.path.isfile(os.path.join(OUT_DIR, "%s.partial" % sid))
                 and os.path.isfile(_op)
                 and not os.path.isfile(os.path.join(OUT_DIR, "%s.done" % sid))):
-            partial.append(sid)
-            done.append(sid)
-            continue
+            # A PARTIAL RUN OF ANOTHER LIST'S ROW is set aside like a .done
+            # with the wrong fingerprint; one with no sig= is kept as before.
+            _psig = _done_sig(os.path.join(OUT_DIR, "%s.partial" % sid))
+            if _psig and sigs.get(sid) and _psig != sigs.get(sid):
+                _stale_aside(OUT_DIR, sid, "sig")
+                stale.append(sid)
+            else:
+                partial.append(sid)
+                done.append(sid)
+                continue
         if (os.path.isfile(os.path.join(OUT_DIR, "%s.done" % sid))
                 and os.path.isfile(_op)):
             # AN EMPTY .out IS NOT A RESULT. IronStar came back with 231 .out
@@ -2567,6 +2774,11 @@ def _apply_skip_done(selected):
             else:
                 done.append(sid)
                 continue
+        # SKIPPED BY THE STUDY, the fault bus is not in this case: finished.
+        if sid in _skipped:
+            not_here.append(sid)
+            done.append(sid)
+            continue
         todo.append(sid)
         st = (prog.get(sid) or ("",))[0]
         if st in ("GAVE-UP", "ERROR", "FAILED"):
@@ -2584,6 +2796,15 @@ def _apply_skip_done(selected):
         print("[parallel] RUN_ONLY_MISSING_OUT: %d scenario(s) already have an .out file"
               " -- not simulated again; the scoring pass judges what is there: %s%s"
               % (len(have_out), ", ".join(have_out[:8]), " ..." if len(have_out) > 8 else ""))
+    if interrupted:
+        print("[parallel] RUN_ONLY_MISSING_OUT: %d .out file(s) were cut off mid-run when an earlier"
+              " launch was stopped (still RUNNING, no .done/.partial) -- moved aside as .stale and"
+              " re-run: %s%s"
+              % (len(interrupted), ", ".join(interrupted[:8]), " ..." if len(interrupted) > 8 else ""))
+    if not_here:
+        print("[parallel] SKIP_DONE: %d scenario(s) were SKIPPED by the study -- the fault bus is not"
+              " in this case (00_FAULTS_NOT_IN_THIS_CASE.txt) -- counted finished, not run again: %s%s"
+              % (len(not_here), ", ".join(not_here[:8]), " ..." if len(not_here) > 8 else ""))
     if partial:
         print("[parallel] SKIP_DONE: %d scenario(s) hold a PARTIAL run that is scored and compared"
               " -- kept as they are, NOT re-run (KEEP_PARTIAL_RUNS): %s%s"
@@ -2595,6 +2816,10 @@ def _apply_skip_done(selected):
     if not done:
         print("[parallel] SKIP_DONE: nothing has finished yet -- running all %d"
               % len(todo))
+        # A SKIP-DONE SELECTION TOO: main() must clear only .done here, not
+        # the .attempts that keep the attempt cap across launches. (With no
+        # selection nothing is cleared, and the coverage line stays as it was.)
+        SKIP_DONE_SELECTED = bool(selected)
         return selected
     if not todo:
         # EVERY SELECTED SCENARIO IS FINISHED. Returning an empty list would mean
@@ -4315,7 +4540,22 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
     start_fail  = {i: 0 for i in range(n)}   # deaths at start with NO licence evidence
     pending     = {}                  # i -> time at which to relaunch it (licence backoff)
 
+    _released = set()
+
+    def _release_claims(i):
+        """The worker in slot i has exited: free the claims it left."""
+        p = procs.get(i)
+        if p is None or p.poll() is None or id(p) in _released:
+            return
+        _released.add(id(p))                 # once per process, at its exit
+        _freed = _drop_claims_of(p.pid, i)
+        if _freed:
+            print("[parallel] worker %d (pid %d) has exited -- its claim(s) on %s released "
+                  "back to the queue" % (i, p.pid, ", ".join(_freed)))
+
     def start(i, first=False):
+        # A SLOT KILLED AND PARKED never reaches the exit handling below
+        _release_claims(i)
         launches[i] += 1
         _LAST_ACTIVITY[i] = time.time()
         launched_at[i] = time.time()
@@ -4420,6 +4660,34 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
     # the panel also deletes both files when it starts a parallel sweep.
     _slots_file = (os.environ.get("SPP_SLOTS_FILE") or "").strip()
     _slots_next = [0.0]            # look at once: a handover written between two projects still counts
+    _ids_all = []                  # the fault list, read once, when there is no selection
+
+    def _free_work():
+        """How many of this run's scenarios no one has finished, holds or given
+           up on -- one directory read. None when the ids are not known."""
+        if selected:
+            ids = selected
+        else:
+            if not _ids_all:
+                _ids_all.extend(_fault_ids())
+            ids = _ids_all
+        try:
+            names = set(os.listdir(OUT_DIR))
+        except Exception:
+            return None
+        if not ids:
+            return None
+        free = 0
+        for sid in ids:
+            if ("%s.done" % sid) in names or (KEEP_PARTIAL_RUNS and ("%s.partial" % sid) in names):
+                continue
+            if (("%s.claim" % sid) in names
+                    and _claim_holder(os.path.join(OUT_DIR, "%s.claim" % sid)) != "dead"):
+                continue
+            if ("%s.attempts" % sid) in names and _read_attempts(sid) >= _max_attempts_now():
+                continue
+            free += 1
+        return free
 
     def _maybe_grow():
         nonlocal n
@@ -4450,6 +4718,15 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
             target = min(target, n + max(0, _cap - _alive_now))
         if target <= n:
             return
+        # NO MORE WORKERS THAN THERE IS FREE WORK FOR. A worker grown into a
+        # queue that is all claimed starts PSS/E, finds nothing and comes back
+        # QUEUE_MAX_RETURNS times -- a licence checkout each for no work.
+        _free = _free_work()
+        if _free is not None:
+            _pend = len([k for k in pending if k not in done])
+            target = min(target, n + max(0, _free - _pend))
+            if target <= n:
+                return
         _banner("HANDOVER: %s -- growing from %d to %d worker(s)" % (_why, n, target))
         # CAPPED, AND ONE AT A TIME.
         #
@@ -4578,6 +4855,9 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
             if threads.get(i):
                 threads[i].join(timeout=2)                 # drain the last of its output
             rc = p.poll()
+            # ITS CLAIMS GO WITH IT, on every exit path: the PID in them may be
+            # reused at once, and a claim read as "alive" is never taken.
+            _release_claims(i)
             if os.path.isfile(_sentinel("_w%d" % i)):
                 _banner("worker %d COMPLETE (sentinel present)" % i); done.add(i)
             elif (rc == EXIT_LICENCE_BUSY
@@ -4632,7 +4912,17 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
     # and the licence runtime is not busy), RETRY_ATTEMPTS attempts each.
     if _round < RETRY_GAVE_UP_ROUNDS:
         try:
-            _gu = _gave_up_ids(selected if selected and selected != ["__ALL_ALREADY_DONE__"] else None)
+            # EVERY SELECTED SCENARIO WAS ALREADY DONE: nothing to retry. Read
+            # as "no selection" it scanned the whole list, ONLY_FAULTS or not.
+            if selected == ["__ALL_ALREADY_DONE__"]:
+                _gu = []
+            else:
+                _gu = _gave_up_ids(selected or None)
+            # UNDER RUN_ONLY_MISSING_OUT AN .out WITH DATA IS A RESULT, kept by
+            # design -- but only one from an earlier launch: a selection was
+            # attempted in THIS launch, and retrying it is what was asked.
+            if ONLY_MISSING_OUT and not selected:
+                _gu = [s for s in _gu if not _out_has_data(s)]
         except Exception as e:
             print("[parallel] gave-up scan failed: %s" % e); _gu = []
         if _gu:
@@ -4669,6 +4959,11 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
         # scenario. With it, a file the other plotter holds is skipped.
         _pe["SPP_PLOT_CLAIMS"] = "1"
         _pe.pop("SPP_ONLY", None)
+        # NEW AND MISSING PDFs ONLY. FORCE_REPLOT's stamp sent this pass down
+        # the whole folder in a serial chain of plotters the kill cannot reach;
+        # the panel's capped plot fleet does the full redraw.
+        for _k in ("SPP_REPLOT_BEFORE", "SPP_REPLOT_CHAIN", "SPP_REPLOT_HANDLED"):
+            _pe.pop(_k, None)
         _pp = subprocess.Popen([PYTHON, "-u", STUDY_SCRIPT], cwd=STUDY_DIR, env=_pe,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                universal_newlines=True, bufsize=1)
@@ -5410,8 +5705,8 @@ def confirm_case():
         if FRESH_START and not REPORT_ONLY:
             print("#")
             print("#  *** FRESH_START = True: the %d .done marker(s) above will be" % len(_done))
-            print("#      CLEARED, so every scenario runs again from the start. The .out")
-            print("#      files stay, but they are overwritten as each one re-runs. Set")
+            print("#      CLEARED, so every scenario runs again from the start. The old")
+            print("#      .out files are moved aside as .stale_<time> (never deleted). Set")
             print("#      FRESH_START = False to continue this study instead. ***")
     else:
         print("#  already here: nothing -- this is a first run for this folder")
@@ -5808,7 +6103,14 @@ def _run_one_study():
                   _sentinels()):
             if _clear(p):
                 nrm += 1
-        print("[parallel] FRESH_START: cleared %d marker/sentinel file(s)" % nrm)
+        # THE OLD RESULTS GO ASIDE TOO. Left in place, an old .out with no
+        # marker was marked done again by the in-run plotter and never re-run,
+        # and every old .partial was kept and scored as this study's.
+        nas = _fresh_aside([os.path.basename(o)[:-4]
+                            for o in glob.glob(os.path.join(OUT_DIR, "*.out"))],
+                           glob.glob(os.path.join(OUT_DIR, "*.partial")))
+        print("[parallel] FRESH_START: cleared %d marker/sentinel file(s), moved %d old "
+              "result(s) aside as .stale" % (nrm, nas))
         # A .done that could not be deleted makes the study skip that scenario as
         # already finished, so a "fresh" run silently reruns nothing. Worth stopping
         # for rather than discovering three hours later.
@@ -5841,6 +6143,11 @@ def _run_one_study():
         for p in _sentinels():
             if _clear(p):
                 nrm += 1
+        # FRESH_START ON A SELECTION: those ids' old results go aside too --
+        # see the whole-folder branch above.
+        if FRESH_START:
+            nrm += _fresh_aside(selected, [os.path.join(OUT_DIR, "%s.partial" % s)
+                                           for s in selected])
         print("[parallel] selective run: cleared %d marker(s) for the selected id(s) only "
               "-- finished scenarios are untouched" % nrm)
         _report_locked("The selected scenarios keep their old .done markers, so they "
@@ -5974,7 +6281,10 @@ def _run_one_study():
             print("[parallel] REPORT_FAULTS resolves to no scenario in this study -- "
                   "scoring NOTHING rather than silently scoring everything.")
         else:
-            _run_report_sharded(REPORT_WORKERS, _rsel)
+            # NO MORE SHARDS THAN FILES TO SCORE, as in REPORT_ONLY: a shard
+            # with nothing to do still starts PSS/E and takes a licence.
+            _run_report_sharded(min(REPORT_WORKERS, max(1, len(_rsel) if _rsel else
+                                    len(glob.glob(os.path.join(OUT_DIR, "*.out"))))), _rsel)
     elif REPORT_IN_BACKGROUND:
         _start_report_bg(_CUR_PROJECT, _CUR_MODE, RESULTS)
         el = time.time() - t0

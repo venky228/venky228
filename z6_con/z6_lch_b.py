@@ -1987,7 +1987,7 @@ def _pid_holds_claim(pid):
     return False
 
 
-def _drop_claims_of(pid):
+def _drop_claims_of(pid, slot=None):
     """Remove the claims an EXITED worker left on scenarios with no .done.
        Returns the ids freed.
 
@@ -1996,7 +1996,10 @@ def _drop_claims_of(pid):
        unclaimable, and a lone worker then wrote its sentinel with it never run.
        Renamed, read back, then removed: a worker may re-take it in between."""
     try:
-        pat = re.compile(r"\bpid%d\b" % int(pid))
+        # SLOT AND PID TOGETHER: the PID alone matched a new worker that
+        # Windows had given the dead one's number.
+        pat = (re.compile(r"^\s*w%d pid%d\b" % (int(slot), int(pid))) if slot is not None
+               else re.compile(r"\bpid%d\b" % int(pid)))
     except Exception:
         return []
     freed = []
@@ -2527,14 +2530,16 @@ def _out_has_data(sid):
 
 
 def _was_interrupted(sid, prog):
-    """True when <sid>.out is a run cut off because the LAUNCH was stopped:
-       no .done or .partial, its latest progress row still RUNNING, attempts
-       under the cap, the .out written by that attempt, and no live holder."""
+    """True when <sid>.out is a run CUT OFF with attempts still left: no .done
+       or .partial (mark_partial_runs has already marked one that ran far
+       enough), its latest progress row RUNNING (the launch was stopped) or
+       INCOMPLETE / ERROR / FAILED, attempts under the cap, the .out written by
+       that attempt, and no live holder. Kept, it was never scored."""
     for ext in ("done", "partial"):
         if os.path.isfile(os.path.join(OUT_DIR, "%s.%s" % (sid, ext))):
             return False
     row = prog.get(sid) or ("", "", "", "", "")
-    if (row[0] or "").strip() != "RUNNING":
+    if (row[0] or "").strip() not in ("RUNNING", "INCOMPLETE", "ERROR", "FAILED"):
         return False
     if _read_attempts(sid) >= _max_attempts_now():
         return False
@@ -2717,7 +2722,16 @@ def _apply_skip_done(selected):
             # EXCEPT A RUN THE STOPPED LAUNCH CUT OFF mid-simulation: that .out
             # is a fragment of an attempt nothing judged -- set aside, run again.
             if _has_data and _was_interrupted(sid, prog):
+                # ITS ATTEMPTS STAY COUNTED: set aside with the .out, a fault that
+                # errors every time was re-run on every launch, never reaching the cap.
+                _att = _read_attempts(sid)
                 _stale_aside(OUT_DIR, sid, "interrupted")
+                if _att:
+                    try:
+                        with open(os.path.join(OUT_DIR, "%s.attempts" % sid), "w") as _fh:
+                            _fh.write(str(int(_att)))
+                    except Exception:
+                        pass
                 interrupted.append(sid)
                 _has_data = False
             if _has_data:
@@ -4526,12 +4540,15 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
     start_fail  = {i: 0 for i in range(n)}   # deaths at start with NO licence evidence
     pending     = {}                  # i -> time at which to relaunch it (licence backoff)
 
+    _released = set()
+
     def _release_claims(i):
         """The worker in slot i has exited: free the claims it left."""
         p = procs.get(i)
-        if p is None or p.poll() is None:
+        if p is None or p.poll() is None or id(p) in _released:
             return
-        _freed = _drop_claims_of(p.pid)
+        _released.add(id(p))                 # once per process, at its exit
+        _freed = _drop_claims_of(p.pid, i)
         if _freed:
             print("[parallel] worker %d (pid %d) has exited -- its claim(s) on %s released "
                   "back to the queue" % (i, p.pid, ", ".join(_freed)))
@@ -4902,8 +4919,9 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
             else:
                 _gu = _gave_up_ids(selected or None)
             # UNDER RUN_ONLY_MISSING_OUT AN .out WITH DATA IS A RESULT, kept by
-            # design -- the next launch would keep it too, so do not re-run it.
-            if ONLY_MISSING_OUT:
+            # design -- but only one from an earlier launch: a selection was
+            # attempted in THIS launch, and retrying it is what was asked.
+            if ONLY_MISSING_OUT and not selected:
                 _gu = [s for s in _gu if not _out_has_data(s)]
         except Exception as e:
             print("[parallel] gave-up scan failed: %s" % e); _gu = []

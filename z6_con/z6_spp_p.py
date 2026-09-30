@@ -27175,7 +27175,9 @@ def merge_report_parts():
         _gap, _repl = [], []
         _in_rows = set(r["Case"] for r in all_rows)
         for _c, (_rw, _v) in read_scenario_parts().items():
-            if not (_rw and _wanted(_c)
+            # THE FLAT RUN BELONGS TO EVERY SELECTION: it is the folder's
+            # initial-conditions check, not a fault, and ONLY_FAULTS dropped it.
+            if not (_rw and (_wanted(_c) or str(_c).upper().startswith("FLAT"))
                     and os.path.isfile(os.path.join(OUT_DIR, _c + ".out"))):
                 continue
             if _c in verdicts or _c in _in_rows:
@@ -30425,6 +30427,13 @@ def _reset_resume_state():
               + glob.glob(os.path.join(OUT_DIR, "*.claim"))
               + glob.glob(os.path.join(OUT_DIR, "*.claim.stale*"))
               + glob.glob(os.path.join(OUT_DIR, "*.returns"))):
+        # A LIVE CLAIM IS NOT OURS TO CLEAR. A lone worker relaunched after a
+        # crash may share the queue with workers a handover added since.
+        try:
+            if p.endswith(".claim") and _claim_holder(p) == "alive":
+                continue
+        except Exception:
+            pass
         try: os.remove(p)
         except Exception: pass
     try:
