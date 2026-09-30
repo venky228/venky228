@@ -2948,7 +2948,7 @@ def _violations_from_parts(rdir, out):
     return n
 
 
-def read_criteria(rdir, proj):
+def read_criteria(rdir, proj, parts=True):
     """{fault: {"verdict": .., "rows": [(criterion, result, detail), ..]}}
 
        CSV first -- it is the same data with no parsing risk. The .txt is parsed
@@ -2979,7 +2979,7 @@ def read_criteria(rdir, proj):
                                                       for x in out[case]["rows"])
                                         else "FAIL")
             if out:
-                _np = _criteria_from_parts(rdir, proj, out)
+                _np = _criteria_from_parts(rdir, proj, out) if parts else 0
                 return out, os.path.basename(csvp) + ((" + parts\\SCEN_*.csv (%d fault(s))" % _np) if _np else "")
         except Exception as e:
             print("[compare] could not read %s (%s) -- falling back to the .txt"
@@ -2989,7 +2989,7 @@ def read_criteria(rdir, proj):
     txtp = rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj)
     if not txtp:
         out = {}
-        _np = _criteria_from_parts(rdir, proj, out)
+        _np = _criteria_from_parts(rdir, proj, out) if parts else 0
         return (out, "parts\\SCEN_*.csv (%d fault(s))" % _np) if _np else ({}, "")
     cur = None
     for line in _read_text(txtp).splitlines():
@@ -3016,7 +3016,7 @@ def read_criteria(rdir, proj):
                                                   for r in out[case]["rows"])
                                     else "FAIL")
             out[case]["recovered"] = True
-    _np = _criteria_from_parts(rdir, proj, out)
+    _np = _criteria_from_parts(rdir, proj, out) if parts else 0
     return out, os.path.basename(txtp) + ((" + parts\\SCEN_*.csv (%d fault(s))" % _np) if _np else "")
 
 
@@ -18752,12 +18752,23 @@ def auto_remerge_stale_reports(quiet=False):
                         # reads 0 there, so it was never rebuilt.
                         todo.append((case, proj, rdir, "no merged report yet"))
                     else:
-                        # SCORED, BUT NOT IN THE REPORT -- whatever the dates.
+                        # SCORED, BUT NOT IN THE REPORT -- whatever the dates. The
+                        # merge rebuilds from a scoring pass's CRITERIA_w* parts;
+                        # with none (every scenario scored on its own while
+                        # simulating) it has nothing to build from, and the pass
+                        # that fixes that is ensure_reports' coverage test.
                         _miss = _report_misses_parts(rdir, proj)
-                        if _miss:
+                        if _miss and glob.glob(os.path.join(rdir, "parts", "CRITERIA_w*.csv")):
                             todo.append((case, proj, rdir, "report lacks %d scored scenario(s): %s%s"
                                          % (len(_miss), ", ".join(_miss[:6]),
                                             " ..." if len(_miss) > 6 else "")))
+                        elif _miss and not quiet:
+                            print("[auto-merge] %-6s %-16s %s: its report lacks %d scored "
+                                  "scenario(s) (%s) and no scoring pass left parts to rebuild "
+                                  "it from -- the comparison reads them from parts\\; "
+                                  "FORCE_RESCORE = True once rebuilds the report"
+                                  % (case["key"], proj, os.path.basename(rdir), len(_miss),
+                                     ", ".join(_miss[:6]) + (" ..." if len(_miss) > 6 else "")))
     if not todo:
         return 0
     print("")
@@ -19735,9 +19746,15 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             # So ask about COVERAGE too: a report describing far fewer scenarios
             # than there are .out files beside it has not finished, whatever its
             # date.
+            # THE MERGED REPORT ITSELF, parts=False. read_criteria fills a fault
+            # the report lacks from its parts\SCEN_<id>.csv -- right for the
+            # comparison, wrong here: counted that way, a report holding only the
+            # flat run read as complete, no scoring pass was started, and the
+            # folder's own criteria report, violations and compliance table
+            # stayed empty. (A stale cache of the parts used to hide this.)
             try:
                 _rd = results_dir(case, proj, md)
-                _scored = len([1 for _k, _v in (read_criteria(_rd, proj)[0] or {}).items()
+                _scored = len([1 for _k, _v in (read_criteria(_rd, proj, parts=False)[0] or {}).items()
                                if norm_verdict(_v.get("verdict"))])
             except Exception:
                 _scored = -1
