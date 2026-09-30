@@ -19948,6 +19948,17 @@ def load_out(p, cache=True):
                   % (os.path.basename(p), time.time() - _t0, len(out[1]),
                      len(out[0])))
             _note_read_path(p, "packed", time.time() - _t0)
+    # A SCORING SHARD DOES NOT HAND A FILE WHOSE LAYOUT IT KNOWS TO DYNTOOLS.
+    # The packed read failed on it outright (F159): dyntools then took the
+    # shard down (0xC0000005), the next shard took the file over and died the
+    # same way, and so on through the fleet. Set aside for this pass instead --
+    # the plot pass, one file per process, reads and scores it.
+    if (out is None and _fits and SPP_ROLE == "report"
+            and not _env_bool("SPP_NAN_DYNTOOLS", False)):
+        raise RuntimeError("%s fits a known layout but its packed read failed; a scoring "
+                           "shard does not use dyntools on it (it has crashed shards) -- "
+                           "the plot pass scores it (SPP_NAN_DYNTOOLS=1 overrides)"
+                           % os.path.basename(p))
     if out is None:
         try:
             sh, cid, cd = dyntools.CHNF(p).get_data()
