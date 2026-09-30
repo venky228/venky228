@@ -2850,10 +2850,19 @@ def _scen_parts_for(rdir):
     if not rdir:
         return {}
     k = _side_key(rdir)
-    if k in _SCEN_PART_CACHE:
-        return _SCEN_PART_CACHE[k]
-    out = {}
     pdir = os.path.join(rdir, "parts")
+    # KEPT ONLY WHILE parts\ IS UNCHANGED. A new part moves the folder's own
+    # date, so a scenario scored after the first look is seen by the next one.
+    # Cached for good, the first look -- often the live comparison's, before
+    # the scoring had written anything -- was served for the rest of the run.
+    try:
+        _pm = os.path.getmtime(pdir)
+    except Exception:
+        _pm = None
+    _hit = _SCEN_PART_CACHE.get(k)
+    if _hit is not None and _hit[0] == _pm:
+        return _hit[1]
+    out = {}
     odir = os.path.join(rdir, "outs")
     for p in glob.glob(os.path.join(pdir, "SCEN_*.csv")):
         nm = os.path.basename(p)
@@ -2898,7 +2907,7 @@ def _scen_parts_for(rdir):
         out[case or sid] = (rows, verdict, vio)
         if (case or sid) != sid:
             out[sid] = out[case or sid]
-    _SCEN_PART_CACHE[k] = out
+    _SCEN_PART_CACHE[k] = (_pm, out)
     return out
 
 
@@ -18684,6 +18693,42 @@ def _merge_one_folder(case, rdir):
     return rc == 0
 
 
+def _report_misses_parts(rdir, proj):
+    """Scenario ids scored in parts\\ (a part at least as new as its .out, and
+       the .out still there) that the merged criteria report does not list --
+       the selected faults only.
+
+       The date tests cannot see these: parts written within
+       STALE_REPORT_TOL_S of the report, or a merge that wrote a fresh report
+       over fewer scenarios than the parts hold. The comparison still filled
+       them from the parts, but the folder's own files -- criteria report,
+       violations, compliance table -- stayed short."""
+    if _sel_tag() and not ONLY_IDS:
+        return []              # events-only selection: the ids are not known here
+    csvp = rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj)
+    if not csvp:
+        return []
+    try:
+        parts = _scen_parts_for(rdir)
+    except Exception:
+        return []
+    if not parts:
+        return []
+    have = set()
+    try:
+        with csv_open(csvp) as fh:
+            for r in csv.DictReader(fh):
+                c = (r.get("Case") or "").strip()
+                if c:
+                    have.add(c)
+    except Exception:
+        return []
+    odir = os.path.join(rdir, "outs")
+    return sorted(k for k in parts
+                  if k not in have and (not _sel_tag() or _id_selected(k))
+                  and os.path.isfile(os.path.join(odir, k + ".out")))
+
+
 def auto_remerge_stale_reports(quiet=False):
     """Rebuild every folder whose reports are older than its parts\\.
 
@@ -18699,26 +18744,32 @@ def auto_remerge_stale_reports(quiet=False):
                 for rdir in _result_folders_for(case, proj, mode):
                     by = _report_behind_parts_by(rdir, proj)
                     if by > STALE_REPORT_TOL_S:
-                        todo.append((case, proj, rdir, by))
+                        todo.append((case, proj, rdir, "report is %s behind" % _fmt_hms(by)))
                     elif (not (rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj)
                                or rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj))
                           and glob.glob(os.path.join(rdir, "parts", "SCEN_*.csv"))):
                         # SCORED PARTS AND NO MERGED REPORT AT ALL -- "behind"
                         # reads 0 there, so it was never rebuilt.
-                        todo.append((case, proj, rdir, -1))
+                        todo.append((case, proj, rdir, "no merged report yet"))
+                    else:
+                        # SCORED, BUT NOT IN THE REPORT -- whatever the dates.
+                        _miss = _report_misses_parts(rdir, proj)
+                        if _miss:
+                            todo.append((case, proj, rdir, "report lacks %d scored scenario(s): %s%s"
+                                         % (len(_miss), ", ".join(_miss[:6]),
+                                            " ..." if len(_miss) > 6 else "")))
     if not todo:
         return 0
     print("")
-    print("[auto-merge] %d folder(s) hold parts NEWER than the reports built from"
+    print("[auto-merge] %d folder(s) have reports that describe less than their"
           % len(todo))
-    print("[auto-merge] them -- scenarios were scored after those reports were")
-    print("[auto-merge] written, so the reports describe less than the parts hold.")
+    print("[auto-merge] parts\\ hold -- scenarios scored after those reports were")
+    print("[auto-merge] written, or left out of them.")
     print("[auto-merge] Rebuilding them from parts\\ first (merge only -- no .out is read).")
     n = 0
     for case, proj, rdir, by in todo:
         print("[auto-merge] %-6s %-16s %-42s %s"
-              % (case["key"], proj, os.path.basename(rdir),
-                 "no merged report yet" if by < 0 else "report is %s behind" % _fmt_hms(by)))
+              % (case["key"], proj, os.path.basename(rdir), by))
         if _merge_one_folder(case, rdir):
             n += 1
     print("[auto-merge] %d of %d folder(s) rebuilt." % (n, len(todo)))
