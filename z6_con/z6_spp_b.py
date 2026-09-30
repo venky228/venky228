@@ -26420,11 +26420,11 @@ def _done_sig(path):
 
 
 def _stale_aside(out_dir, sid, why):
-    """Move <sid>.out / .done aside as *.stale_<stamp> -- never deleted."""
+    """Move <sid>.out / .done / .partial aside as *.stale_<stamp> -- never deleted."""
     import time as _t
     stamp = _t.strftime("%Y%m%d_%H%M%S")
     moved = 0
-    for ext in ("out", "done"):
+    for ext in ("out", "done", "partial"):
         p = os.path.join(out_dir, "%s.%s" % (sid, ext))
         if os.path.isfile(p):
             try:
@@ -26541,6 +26541,34 @@ def _partial_tend(scen_id):
     return None
 
 
+def _partial_stale(scen_id):
+    """Why <id>.partial belongs to another study, or "" when it may be kept.
+
+       sig= is the fault's fingerprint (_mark_partial); pre=/end= are the
+       PRE_FAULT_S / SIM_END_S it was judged under (z6_main's marker). A field
+       the marker does not carry is not held against it."""
+    try:
+        with open(_state_path(scen_id, "partial")) as fh:
+            txt = fh.read(4000)
+    except Exception:
+        return ""
+    kv = {}
+    for ln in txt.splitlines():
+        k, eq, v = ln.partition("=")
+        if eq:
+            kv[k.strip()] = v.strip()
+    want = _FAULT_SIG.get(scen_id)
+    if want and kv.get("sig") and kv["sig"] != want:
+        return "is a DIFFERENT fault (the list was renumbered)"
+    for k, now, name in (("pre", PRE_FAULT_S, "PRE_FAULT_S"), ("end", SIM_END_S, "SIM_END_S")):
+        try:
+            if kv.get(k) and abs(float(kv[k]) - float(now)) > 1e-3:
+                return "was run with %s=%s, this run has %.3f" % (name, kv[k], float(now))
+        except ValueError:
+            pass
+    return ""
+
+
 def _is_done(scen_id, out_path):
     """A scenario counts as done only if BOTH its .done marker and a real .out exist.
 
@@ -26560,6 +26588,15 @@ def _is_done(scen_id, out_path):
     if (KEEP_PARTIAL_RUNS and _is_partial(scen_id)
             and os.path.isfile(out_path)
             and not (ONLY_MODE_RERUNS_DONE and _only_mode() and _wanted(scen_id))):
+        # NOT IF IT IS ANOTHER STUDY'S. A renumbered list, or another fault
+        # instant or end time, makes it a different run: scored here it is
+        # measured from the wrong clearing time. Set aside, as a .done is below.
+        _why = _partial_stale(scen_id)
+        if _why:
+            print("  [resume] %s: the PARTIAL run on disk %s -- moved aside as .stale, "
+                  "running it again" % (scen_id, _why))
+            _stale_aside(OUT_DIR, scen_id, "partial")
+            return False
         print("  [resume] %s has a PARTIAL run on disk (%.2f s) -- kept and scored, "
               "NOT re-run (KEEP_PARTIAL_RUNS)"
               % (scen_id, _partial_tend(scen_id) or 0.0))
@@ -29523,6 +29560,11 @@ def _steal_claim(path):
             was = fh.read()
     except Exception:
         was = None
+    # JUDGE THE TEXT BEING TAKEN, NOT THE CALLER'S EARLIER READ. Another thief
+    # can re-create the claim in between, and the compare below only proves
+    # that NEW claim did not change. A live holder is never taken.
+    if was is None or _claim_text_holder(was[:200]) == "alive":
+        return False
     st = "%s.stale%d" % (path, os.getpid())
     try:
         os.rename(path, st)
@@ -29565,6 +29607,14 @@ def _claim_holder(path):
             txt = fh.read(200)
     except Exception:
         return "alive"                     # cannot read it -> do not take it
+    return _claim_text_holder(txt)
+
+
+def _claim_text_holder(txt):
+    """_claim_holder's verdict on claim text already read. _steal_claim uses
+       it on the exact text it is about to take."""
+    if not NEVER_STEAL_FROM_LIVE:
+        return "unknown"
     if not (txt or "").strip():
         return "unknown"                   # created, not yet written
     pid = host = None
@@ -33545,9 +33595,14 @@ def main():
     # supervisor to stop relaunching THIS worker, and its core is then out of
     # the study for good, even though work may come back. So the sentinel waits
     # until every scenario is genuinely finished or written off.
-    if retryable == 0 and DYNAMIC_WORK and SPP_ROLE == "work" and N_WORKERS > 1:
+    # A LONE WORKER COMES BACK TOO: it claims (see _claim_mine), and a handover
+    # can add workers beside it, so a scenario can be out with another process
+    # while N_WORKERS still reads 1. What this walk found done (a kept partial
+    # has no .done) is not out.
+    if retryable == 0 and eff_run_faults and DYNAMIC_WORK and SPP_ROLE == "work":
         _left = [str(f.get("id")) for f in faults
-                 if not os.path.isfile(_state_path(str(f.get("id")), "done"))
+                 if f.get("id") not in _seen_done
+                 and not os.path.isfile(_state_path(str(f.get("id")), "done"))
                  and _read_int(_state_path(str(f.get("id")), "attempts")) < MAX_SCENARIO_ATTEMPTS]
         # BOUNDED. Withholding the sentinel forever would relaunch this worker
         # every time it exits -- a full PSS/E startup each time -- for as long as
@@ -33689,6 +33744,11 @@ def _request_plotter(why=""):
             if _n > 1:
                 env["SPP_PLOT_FLEET"] = "1"   # per-file claims between the slots
             env.pop("SPP_ONLY", None)
+            # NEW OR MISSING PDFs ONLY. FORCE_REPLOT's full redraw belongs to the
+            # panel's capped fleet; inherited here it sent this child down the
+            # unsupervised successor chain, redrawing the folder one file a time.
+            for _k in ("SPP_REPLOT_BEFORE", "SPP_REPLOT_CHAIN", "SPP_REPLOT_HANDLED"):
+                env.pop(_k, None)
             try:
                 os.makedirs(LOG_DIR)
             except Exception:
