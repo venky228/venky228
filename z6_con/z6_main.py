@@ -8564,10 +8564,20 @@ def _why_side_missing(side_name, rdir, fid):
        which is SIMULATION, not scoring -- so 'DONE' there and 'no verdict'
        here can both be true of the same fault."""
     st, det = _side_state(rdir, fid)
+    # A FOLDER "compare" CANNOT SCORE (a POI or project-MW level: its settings
+    # are not in its name) is scored only by its own run -- say that, not
+    # PIPELINE = "compare", which does nothing for it.
+    _how = 'PIPELINE = "compare"'
+    try:
+        _sp, _sm, _st = _split_run_folder(rdir) if rdir else ("", "", "")
+        if _st and _tag_env_from_name(_sp, _st, rdir) is None:
+            _how = 'PIPELINE = "all" with that run switched on'
+    except Exception:
+        pass
     if st == "scored-less":
         return ("the %s case SIMULATED this fault (.out + .done on disk) but never "
-                "SCORED it -- score it (FORCE_RESCORE = True, PIPELINE = \"compare\"), "
-                "do not re-run it" % side_name)
+                "SCORED it -- score it (FORCE_RESCORE = True, %s), "
+                "do not re-run it" % (side_name, _how))
     if st == "crashed":
         return ("the %s case's run of this fault CRASHED -- .out on disk but no .done "
                 "(%s); the launcher gave up after MAX_SCENARIO_ATTEMPTS, so it is not "
@@ -8578,8 +8588,8 @@ def _why_side_missing(side_name, rdir, fid):
         # (.partial marker) and has no verdict yet -- score what exists, or
         # re-run it for the full length.
         return ("the %s case ran this fault PART-WAY (%s) and has no verdict for "
-                "it yet -- score the partial record (PIPELINE = \"compare\") or "
-                "re-run it (PIPELINE = \"missing\")" % (side_name, det or "stopped early"))
+                "it yet -- score the partial record (%s) or "
+                "re-run it (PIPELINE = \"missing\")" % (side_name, det or "stopped early", _how))
     return ("the %s case has no result for this fault -- it was not run there"
             % side_name)
 
@@ -15953,6 +15963,9 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False,
         time.sleep(2)
     if th is not None:
         th.join(timeout=5)
+    # A FORCED SCORING PASS THAT FINISHED is recorded here, the one place every
+    # scoring run passes through -- see _note_forced_pass().
+    _note_forced_pass(case, projects, modes, env, rc)
     if _lfh is not None:
         try:
             _lfh.close()
@@ -17359,8 +17372,11 @@ def _early_scorer_start(pjs, t_go):
             try:
                 print("[early-score] %s: drawing the PDFs still missing, %d plotter(s)"
                       % (proj, _np))
+                # STOPS WITH THE SIMULATIONS: once `stop` is set no new plotter
+                # starts, so phase 2's scoring does not run beside a redraw that
+                # takes hours (over CORES_MAX). The final catch-up pass draws the rest.
                 plot_missing_everywhere("all", after_runs=True,
-                                        only_projects=[proj], cap=_np)
+                                        only_projects=[proj], cap=_np, stop=stop)
             except Exception as e:
                 print("[early-score] %s: plotting now failed (%s) -- the final "
                       "catch-up pass will do it" % (proj, e))
@@ -17431,8 +17447,8 @@ def _early_scorer_start(pjs, t_go):
         if busy["score"]:
             print("[early-score] waiting for the project being scored to finish ...")
         # TIMED, so Ctrl+C still reaches this process on Windows. The PLOT
-        # thread is not waited for here -- the final scoring does not need the
-        # PDFs; _early_plots_wait() holds the final catch-up plot pass instead.
+        # thread is not waited for here: `stop` lets it start no new plotter,
+        # and _early_plots_wait() before phase 2 waits for the ones still drawing.
         while th.is_alive():
             th.join(1.0)
     return _stop
@@ -17441,14 +17457,25 @@ def _early_scorer_start(pjs, t_go):
 _EARLY_PLOT_THREADS = []
 
 
-def _early_plots_wait():
-    """Before the final catch-up plot pass: let the early plotter finish the
-       project it is drawing, so the two never draw the same folder."""
+def _early_plots_wait(max_s=None):
+    """Before phase 2's scoring and before the final catch-up plot pass: let
+       the early plotter finish, so its plotters never run beside the scoring
+       shards (over CORES_MAX) or the catch-up pass on the same folder. Once the
+       early scorer is stopped it starts no new plotter, so this is the files
+       already being drawn. max_s bounds the wait; True when it has finished."""
+    t0 = time.time()
     for t in _EARLY_PLOT_THREADS:
         if t.is_alive():
-            print("[early-score] waiting for the early plotter to finish its project ...")
+            print("[early-score] waiting for the early plotter to finish the file(s) "
+                  "it is drawing ...")
         while t.is_alive():
+            if max_s is not None and time.time() - t0 > max_s:
+                print("[early-score] the early plotter is still drawing after %s -- going "
+                      "on; its last plotter(s) finish beside the scoring"
+                      % _fmt_hms(time.time() - t0))
+                return False
             t.join(1.0)
+    return True
 
 
 def _case_thread_begin(case_key):
@@ -17857,7 +17884,8 @@ def _plot_cases(pipeline):
     return cases or [CASE_BASE, CASE_TEST]
 
 
-def plot_missing_everywhere(pipeline, after_runs=False, only_projects=None, cap=None):
+def plot_missing_everywhere(pipeline, after_runs=False, only_projects=None, cap=None,
+                            stop=None):
     """Draw every missing PDF, in ROUNDS, with fewer plotters each time.
 
        WHY ROUNDS. A plotter is a 32-bit process reading a ~113 MB .out into
@@ -17883,11 +17911,16 @@ def plot_missing_everywhere(pipeline, after_runs=False, only_projects=None, cap=
        and the reason is already recorded in NOT_PLOTTED.txt. A round that draws
        something has made progress and earns the next one.
 
-       PLOT_ROUNDS_MAX = 1 restores the single-pass behaviour."""
+       PLOT_ROUNDS_MAX = 1 restores the single-pass behaviour.
+
+       stop (a threading.Event, the early plotter's): once set, no new plotter
+       and no new round starts; the plotters already drawing finish their file."""
     rounds = max(1, int(PLOT_ROUNDS_MAX or 1))
     n = max(1, int(PLOT_WORKERS or 1))
     left = None
     for r in range(1, rounds + 1):
+        if stop is not None and stop.is_set():
+            return
         if r > 1:
             print("")
             print("[compare] " + "=" * 70)
@@ -17901,8 +17934,8 @@ def plot_missing_everywhere(pipeline, after_runs=False, only_projects=None, cap=
             print("[compare] " + "=" * 70)
         before = left
         left = _plot_missing_pass(pipeline, after_runs=after_runs, n_plot=n,
-                                  only_projects=only_projects, cap=cap)
-        if not left:
+                                  only_projects=only_projects, cap=cap, stop=stop)
+        if not left or (stop is not None and stop.is_set()):
             return
         if before is not None and left >= before:
             print("[compare] round %d drew nothing -- stopping. The %d remaining "
@@ -18012,7 +18045,8 @@ def clear_stale_plot_claims(jobs):
     return freed
 
 
-def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=None, cap=None):
+def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=None, cap=None,
+                       stop=None):
     """Draw the PDFs for .out files that have none, in every results folder this
        run covers -- BOTH cases, every project, every mode.
 
@@ -18028,9 +18062,14 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=No
 
        No PSS/E session, no queue, no case load: the study script is started with
        SPP_PLOT_MISSING=1, reads the files already on disk, writes the plots and
-       exits. Safe to run while a study is going in another window."""
+       exits. Safe to run while a study is going in another window.
+
+       stop: see plot_missing_everywhere(). Set, no plotter is started or
+       refilled; the pass ends when the ones drawing have exited."""
     if pipeline == "all" and not after_runs:
         return 0        # during a full run each scenario is plotted as it finishes
+    if stop is not None and stop.is_set():
+        return 0
     # FORCE_REPLOT ON ITS OWN IS ENOUGH: it asks for every PDF to be redrawn,
     # and this pass is the only one that can do it for finished runs.
     if not (PLOT_MISSING_OUTS or FORCE_REPLOT):
@@ -18218,6 +18257,8 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=No
 
     slots, _taken = [], {}
     for k in range(_cap):
+        if stop is not None and stop.is_set():
+            break
         _j = _busiest(_taken)
         if _j is None:
             break
@@ -18258,6 +18299,11 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=No
             rc = p.poll()
             if rc is None:
                 alive += 1
+                continue
+            # STOPPED (the early plotter, at the end of the simulations): the
+            # slot is not refilled -- the final catch-up pass draws the rest.
+            if stop is not None and stop.is_set():
+                sl["proc"] = None
                 continue
             # This one is gone. Was it done, or did it fall over?
             up = time.time() - sl["since"]
@@ -18529,7 +18575,10 @@ def _plot_missing_pass(pipeline, after_runs=False, n_plot=None, only_projects=No
         left += _count_unplotted(j[3])
     print("[compare] plotting finished: %d of %d drawn in %s"
           % (total_todo - left, total_todo, _fmt_hms(time.time() - t0)))
-    if left:
+    if left and stop is not None and stop.is_set():
+        print("[compare] stopped for the scoring pass -- the final catch-up plot pass "
+              "draws the %d left" % left)
+    elif left:
         # NAME THEM. "2 .out file(s) still have no PDF" is not something anyone
         # can act on; the scenario, the reason and the file to delete are.
         print("[compare] %d .out file(s) still have no PDF:" % left)
@@ -18963,6 +19012,104 @@ def _tag_env(proj, tag):
     return None
 
 
+def _tag_env_from_name(proj, tag, rdir=None):
+    """The scoring settings of a tagged folder read off its NAME, for folders
+       _tag_env() does not know: a .dyr sweep value (with its capacity level and
+       surplus scenario), a capacity level, the new plant, the project off, an
+       EGF variant no longer in the panel. None for a POI or project-MW level
+       (the value in the name is rounded, so that run's setting cannot be
+       rebuilt) and for any tag not recognised.
+
+       A scoring pass builds nothing, so the .dyr edits do not matter. What does:
+       the folder (SPP_CAP_TAG + SPP_RUN_TAG, as _start_plotter sends them), the
+       settings the report names the machines by (SPP_NEW_PLANT, SPP_PROJECT_OFF,
+       SPP_EGF_OFF), and the times the criteria windows start from -- a quick
+       sweep folder's QUICK_SIM_TIMES.txt."""
+    rest, env = str(tag or ""), {}
+    m = re.match(r"^cap(\d+)(?:_(.+))?$", rest)
+    if m:
+        env["SPP_CAP_TAG"] = m.group(1)
+        rest = m.group(2) or ""
+    qdir = os.path.normpath(str(rdir)) if rdir else None
+    _sc = [sc for sc in surplus_scenarios() if rest == sc["tag"]
+           or (rest.startswith("dyr_") and rest.endswith("_" + sc["tag"]))]
+    if _sc:
+        env.update(_surplus_env(_sc[0]))
+        if qdir and rest != _sc[0]["tag"]:
+            qdir = qdir[:-len("_" + _sc[0]["tag"])]    # QUICK_MARK is in the value's folder
+    elif rest == NEW_PLANT_TAG:
+        _np = dict(NEW_PLANT or {})
+        _np["enabled"] = True                          # as run_new_plant() sends it
+        env["SPP_NEW_PLANT"] = json.dumps(_np)
+    elif rest == PROJECT_OFF_TAG:
+        env["SPP_PROJECT_OFF"] = "1"
+    elif rest == EGF_OFF_TAG:
+        env["SPP_EGF_OFF"] = "1"
+    elif not (rest.startswith("dyr_") or rest == EGF_TAG or (m and not rest)):
+        return None
+    if rest:
+        env["SPP_RUN_TAG"] = rest
+    env["SPP_DEFER_REPORTS"] = "0"
+    try:
+        if qdir and _is_quick_folder(qdir):
+            with open(os.path.join(_quick_folder_of(qdir), QUICK_MARK)) as fh:
+                for ln in fh:
+                    k, _s, v = ln.strip().partition("=")
+                    if k in ("FLAT_RUN_S", "PRE_FAULT_S", "SIM_END_S") and v:
+                        env["SPP_" + k] = v
+    except Exception:
+        pass
+    return env
+
+
+def _tagged_scoring_env(proj, tag, rdir=None):
+    """_tag_env() for the folders the panel still runs, else the folder name."""
+    try:
+        env = _tag_env(proj, tag)
+    except Exception:
+        env = None
+    return env if env is not None else _tag_env_from_name(proj, tag, rdir)
+
+
+# FOLDERS A FORCED SCORING PASS FINISHED IN THIS LAUNCH (FORCE_RESCORE).
+# Filled by run_study() when a forced pass ends rc 0 -- the early scorer, the
+# phase-2 pass, a tagged pass, a run that scored its own report -- and never by
+# a merge. The report's date could not tell the two apart: the auto-merge
+# rewrote a tagged folder's report from OLD parts after the launch began, and
+# the forced pass then took it for "already rescored" and was skipped.
+_FORCE_SCORED = set()
+
+
+def _forced_key(rdir):
+    return os.path.normcase(os.path.abspath(str(rdir)))
+
+
+def _note_forced_pass(case, projects, modes, env, rc):
+    """Record the folders a FORCED scoring pass has just finished. Only a pass
+       over the whole folder (or the launch's own ONLY_FAULTS) counts: one
+       narrowed to a few ids scored those alone, and a simulation run whose
+       report was deferred to this panel scored nothing but its new runs."""
+    try:
+        env = env or {}
+        if rc != 0 or not projects or env.get("SPP_FORCE_RESCORE") != "1":
+            return
+        if env.get("SPP_MERGE_ONLY") == "1":
+            return
+        if env.get("SPP_REPORT_ONLY") != "1" and env.get("SPP_DEFER_REPORTS") != "0":
+            return
+        _rf = (env.get("SPP_REPORT_FAULTS") or "").strip()
+        if _rf and _rf != ",".join(ONLY_FAULTS or []):
+            return
+        _cap = (env.get("SPP_CAP_TAG") or "").strip()
+        _tag = (env.get("SPP_RUN_TAG") or "").strip()
+        for p in projects:
+            for m in (list(modes or MODES) or ["spp"]):
+                _FORCE_SCORED.add(_forced_key(_run_path(case, p, "%s_%s%s%s" % (
+                    p, m, _cap_suffix(_cap), ("_" + _tag) if _tag else ""))))
+    except Exception:
+        pass
+
+
 def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
     """Score the .out files of an EGF / surplus folder that have no verdict.
        Returns the ids still unscored afterwards, or None when nothing was run.
@@ -18972,14 +19119,18 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
     _p, _m, tag = _split_run_folder(rdir)
     if not tag:
         return None
-    env = _tag_env(proj, tag)
+    # SWEEP, CAPACITY, NEW-PLANT ... FOLDERS TOO, from the folder name, as their
+    # plotter is started -- _tag_env() alone knew only EGF and surplus tags.
+    env = _tagged_scoring_env(proj, tag, rdir)
     if env is None:
         return None
     od = os.path.join(rdir, "outs")
     todo = []
     for sid in missing:
         q = os.path.join(od, sid + ".out")
-        if sid.upper().startswith("FLAT") or not os.path.isfile(q):
+        # FLAT_RUN IS RESCORED TOO when forced: left out of SPP_REPORT_FAULTS,
+        # its old SCEN part was kept and merged back under the old rule.
+        if (sid.upper().startswith("FLAT") and not force) or not os.path.isfile(q):
             continue
         if not (os.path.isfile(os.path.join(od, sid + ".done"))
                 or os.path.isfile(os.path.join(od, sid + ".partial"))):
@@ -18991,8 +19142,13 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
         if force:
             omt = "%s force=%.0f" % (omt, _LAUNCH_T0)
         try:
-            if os.path.isfile(stamp) and open(stamp).read().strip() == omt:
-                continue                # asked once already for this .out
+            if os.path.isfile(stamp):
+                _was = open(stamp).read().strip()
+                # UNFORCED: THE .out's DATE ONLY. A forced pass stamps
+                # "<mtime> force=<T0>", which never equalled the bare mtime, so
+                # a run it could not score was asked for again at once.
+                if _was == omt or (not force and _was.split()[:1] == [omt]):
+                    continue            # asked once already for this .out
         except Exception:
             pass
         todo.append((sid, stamp, omt))
@@ -19031,6 +19187,10 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
                 os.remove(stamp)
             except Exception:
                 pass
+    elif force:
+        # EVERY FINISHED RUN OF THE FOLDER, so the folder counts as rescored
+        # (run_study() does not: SPP_REPORT_FAULTS names ids).
+        _FORCE_SCORED.add(_forced_key(rdir))
     # ITS REPORTS ARE THE _SELECTED ONES -- rebuild the full ones from every part.
     _merge_one_folder(case, rdir)
     _MEAS_CACHE.clear()
@@ -19063,6 +19223,7 @@ def verify_scoring_coverage(quiet=False):
     if not VERIFY_SCORING_COVERAGE:
         return 0
     still = []
+    unreached = []
     for mode in (list(MODES) or ["spp"]):
         for proj in (list(PROJECTS) or [""]):
             for case in (CASE_BASE, CASE_TEST):
@@ -19073,16 +19234,15 @@ def verify_scoring_coverage(quiet=False):
                     # FORCE_RESCORE REACHES THE TAGGED FOLDERS TOO. ensure_reports()
                     # rescores the plain <proj>_<mode> folders only; _egfoff and
                     # _s1_egfoff were rescored only by their own runs, which a
-                    # PIPELINE = "compare" launch does not start. Skipped when the
-                    # folder's report was already rewritten during this launch.
-                    if FORCE_RESCORE and _split_run_folder(rdir)[2]:
-                        _rp = (rfile(rdir, "SPP_CRITERIA_REPORT", "csv", proj)
-                               or rfile(rdir, "SPP_CRITERIA_REPORT", "txt", proj))
-                        try:
-                            _fresh = bool(_rp) and os.path.getmtime(_rp) >= _LAUNCH_T0
-                        except Exception:
-                            _fresh = False
-                        if not _fresh:
+                    # PIPELINE = "compare" launch does not start. Skipped when a
+                    # forced SCORING pass finished the folder in this launch --
+                    # not when its report is merely new: the auto-merge above
+                    # rewrites it from the old parts (see _FORCE_SCORED).
+                    _tg = _split_run_folder(rdir)[2]
+                    if FORCE_RESCORE and _tg and _forced_key(rdir) not in _FORCE_SCORED:
+                        if _tagged_scoring_env(proj, _tg, rdir) is None:
+                            unreached.append("%s %s" % (case["key"], os.path.basename(rdir)))
+                        else:
                             _after = _score_tagged_folder(
                                 case, proj, mode, rdir,
                                 sorted(outs, key=_fault_key), force=True)
@@ -19133,6 +19293,17 @@ def verify_scoring_coverage(quiet=False):
                             missing = _after
                     if missing:
                         still.append((case, proj, rdir, missing))
+    # SAID, NOT SKIPPED IN SILENCE: a folder whose run settings cannot be read
+    # off its name keeps the old rule's verdicts, and its comparison says nothing.
+    if unreached:
+        print("")
+        print("[coverage] FORCE_RESCORE did NOT rescore %d folder(s) -- their run settings "
+              "cannot be read off the folder name (a POI or project-MW level, or a tag "
+              "this panel does not know), so their verdicts are still the old rule's. "
+              "Their own runs rescore them: "
+              "PIPELINE = \"all\" with that run switched on." % len(unreached))
+        for _u in unreached:
+            print("[coverage]     %s" % _u)
     if not still:
         return 0
     print("")
@@ -19493,8 +19664,16 @@ def mark_partial_runs(quiet=False):
                   % _end)
         for sid, te in found:
             try:
+                # THE TIMES IT WAS JUDGED AGAINST, so the launcher and the engine
+                # can tell a marker written under another PRE_FAULT_S / SIM_END_S
+                # (line 1 is still not a clearing time: tend=).
                 with open(os.path.join(od, sid + ".partial"), "w") as fh:
-                    fh.write("tend=%.3f\nby=z6_main (time axis)\n" % te)
+                    if PRE_FAULT_S is None:     # the study script's own: not known here
+                        fh.write("tend=%.3f\nend=%.3f\nby=z6_main (time axis)\n"
+                                 % (te, float(SIM_END_S)))
+                    else:
+                        fh.write("tend=%.3f\npre=%.3f\nend=%.3f\nby=z6_main (time axis)\n"
+                                 % (te, float(PRE_FAULT_S), float(SIM_END_S)))
                 n_new += 1
                 if not quiet:
                     print("[compare]     %-10s reached %.2f s of %.2f s" % (sid, te, _end))
@@ -19794,6 +19973,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
     for case in (CASE_BASE, CASE_TEST):
         need, stale, thin, nomeas, gaps = [], [], [], [], []
         nopoi, nopoi_asked = [], []
+        forced, forced_done = [], []
         for nm, proj, md, rep, n_out, _when in inventory(case):
             if md not in mode_list or not n_out:
                 continue
@@ -19819,13 +19999,18 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             # setting rather than a guess. Turn it on for the run after you
             # change a criterion, and off again afterwards -- scoring is not
             # free.
+            # ONCE PER LAUNCH: a folder a forced pass already finished in this
+            # launch (the early scorer) is not scored a second time -- shards
+            # and merge over every part again -- only put to the tests below.
             if FORCE_RESCORE:
-                need.append(proj)
-                continue
+                if _forced_key(results_dir(case, proj, md)) in _FORCE_SCORED:
+                    forced_done.append(proj)
+                else:
+                    forced.append(proj)
+                    need.append(proj)
+                    continue
             if not rep:
                 need.append(proj)
-                continue
-            if not RESCORE_STALE_REPORTS:
                 continue
             # A REPORT OLDER THAN THE RESULTS IT DESCRIBES.
             #
@@ -19834,11 +20019,37 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             # routinely a few seconds younger than the report through no fault
             # of anyone. Anything past the tolerance is a re-run that was never
             # scored.
-            by = _report_stale_by(case, proj, md)
-            if by > STALE_REPORT_TOL_S:
-                stale.append((proj, by))
-                need.append(proj)
-                continue
+            # ONLY THIS TEST IS RESCORE_STALE_REPORTS'. It used to skip every
+            # test below as well, so coverage and unscored runs went unchecked.
+            if RESCORE_STALE_REPORTS:
+                by = _report_stale_by(case, proj, md)
+                if by > STALE_REPORT_TOL_S:
+                    stale.append((proj, by))
+                    need.append(proj)
+                    continue
+            # THE SCORABLE .out FILES: a .done or .partial, no .badout, not the
+            # flat run, in the selection. The coverage, measurement and POI
+            # tests count against these, as the gap test does: counted against
+            # every .out, gave-up and short runs a pass can never score kept a
+            # folder "thin" and re-scored it on every launch.
+            _rd2 = results_dir(case, proj, md)
+            _od = os.path.join(_rd2, "outs")
+            _scorable = []
+            try:
+                for _q in glob.glob(os.path.join(_od, "*.out")):
+                    _sid = os.path.splitext(os.path.basename(_q))[0]
+                    if _sid.upper().startswith("FLAT"):
+                        continue
+                    if _sel_tag() and not _id_selected(_sid):
+                        continue
+                    if not (os.path.isfile(os.path.join(_od, _sid + ".done"))
+                            or os.path.isfile(os.path.join(_od, _sid + ".partial"))):
+                        continue
+                    if os.path.isfile(_q + ".badout"):
+                        continue
+                    _scorable.append((_sid, _q))
+            except Exception:
+                _scorable = None
             # A REPORT THAT IS RECENT BUT COVERS ALMOST NOTHING.
             #
             # Staleness is a question about TIME, and it is the wrong question
@@ -19871,15 +20082,8 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             # the _SELECTED report and the next launch counts 100 .out again.
             # A full scoring pass per launch is exactly the "scoring takes too
             # long" symptom. Measure coverage against the .out files this
-            # comparison is actually about.
-            _n_den = n_out
-            if _sel_tag() and n_out:
-                try:
-                    _n_den = len([1 for _q in glob.glob(
-                        os.path.join(results_dir(case, proj, md), "outs", "*.out"))
-                        if _id_selected(os.path.splitext(os.path.basename(_q))[0])])
-                except Exception:
-                    _n_den = n_out
+            # comparison is actually about -- the scorable ones (above).
+            _n_den = len(_scorable) if _scorable is not None else n_out
             # ONLY_EVENTS WITHOUT IDS: _id_selected() accepts every id, so the
             # denominator stayed every .out and an events-only _SELECTED report
             # read as "thin" -- a full re-score on every launch. The event of
@@ -19953,8 +20157,6 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             # .out's mtime and not asked for again until the .out changes.
             try:
                 _gap = []
-                _rd2 = results_dir(case, proj, md)
-                _od = os.path.join(_rd2, "outs")
                 # THE FOLDER'S OWN REPORT (parts=False). A scenario a worker
                 # scored while simulating has its verdict in parts\SCEN_<id>.csv,
                 # which the comparison reads -- but when it finished after the
@@ -19963,17 +20165,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                 # measurement files) in the folder. Counted with the parts, that
                 # pass was never started. It re-reads no .out a worker scored.
                 _verd = read_criteria(_rd2, proj, parts=False)[0] or {}
-                for _q in glob.glob(os.path.join(_od, "*.out")):
-                    _sid = os.path.splitext(os.path.basename(_q))[0]
-                    if _sid.upper().startswith("FLAT"):
-                        continue
-                    if _sel_tag() and not _id_selected(_sid):
-                        continue
-                    if not (os.path.isfile(os.path.join(_od, _sid + ".done"))
-                            or os.path.isfile(os.path.join(_od, _sid + ".partial"))):
-                        continue
-                    if os.path.isfile(_q + ".badout"):
-                        continue
+                for _sid, _q in (_scorable or []):
                     if norm_verdict((_verd.get(_sid) or {}).get("verdict")):
                         continue
                     _stamp = os.path.join(_od, _sid + ".scoretry")
@@ -19996,10 +20188,15 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                     except Exception:
                         pass
                 need.append(proj)
-        if FORCE_RESCORE and need:
+        if forced_done:
+            print("")
+            print("[compare] FORCE_RESCORE: %s %s already rescored earlier in this launch "
+                  "-- not scored again; only the usual tests apply"
+                  % (case["key"], ", ".join(forced_done)))
+        if FORCE_RESCORE and forced:
             print("")
             print("[compare] FORCE_RESCORE: scoring all %d %s folder(s) again, however "
-                  "fresh their reports look." % (len(need), case["key"]))
+                  "fresh their reports look." % (len(forced), case["key"]))
             print("[compare]     Use this after changing a criterion -- nothing about "
                   "the .out")
             print("[compare]     files or the report's date can show that the RULE "
@@ -20020,7 +20217,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             print("[compare] *** %s: %d report(s) cover only a fraction of the .out "
                   "files beside them ***" % (case["key"], len(thin)))
             for proj, sc, no in thin:
-                print("[compare]     %-16s %d scenario(s) scored of %d .out file(s)"
+                print("[compare]     %-16s %d scenario(s) scored of %d finished run(s)"
                       % (proj, sc, no))
             print("[compare]     A report can be minutes old and still describe almost")
             print("[compare]     nothing -- that is what a scoring pass that died part")
@@ -20030,7 +20227,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
             print("[compare] *** %s: %d report(s) have verdicts for their .out files but "
                   "MEASUREMENTS for only a few of them ***" % (case["key"], len(nomeas)))
             for proj, nmf, no in nomeas:
-                print("[compare]     %-16s measurements cover %d fault(s) of %d .out file(s)"
+                print("[compare]     %-16s measurements cover %d fault(s) of %d finished run(s)"
                       % (proj, nmf, no))
             print("[compare]     That is what a forced rescore stopped part way leaves: the")
             print("[compare]     verdicts survive, the measurement files are rebuilt from the")
@@ -20083,9 +20280,12 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
         _pkey = lambda p: (_po.get(p, len(_po)), p)
         _full = sorted(set(p for p in need
                            if p not in _gap_ids or need.count(p) > 1), key=_pkey)
-        _runs = []
-        if _full:
-            _runs.append((_full, dict(env_extra_base)))
+        # ONE RUN PER PROJECT, each sized as it starts (run_study). One run for
+        # every project fixed the shard count at launch: when the other case
+        # finished, this one kept half the cores for all its later projects.
+        # The launcher scores and merges one project at a time either way, so
+        # the only extra cost is one launcher start per project.
+        _runs = [([_p], dict(env_extra_base)) for _p in _full]
         for proj in sorted(_gap_ids, key=_pkey):
             if proj in _full:
                 continue
@@ -24908,6 +25108,12 @@ def main():
     if pipeline == "compare":
         print("[compare] PIPELINE = \"compare\": this scores .out files that have no")
         print("[compare] report yet. It runs NO simulation.")
+    # THE EARLY PLOTTER FIRST. It was left drawing through phase 2 and 3: its
+    # plotters on top of the shards (over CORES_MAX), scoring the same tagged
+    # .out as the forced pass. Stopped with the simulations, it starts no new
+    # plotter; this waits for the files being drawn (bounded -- PLOT_STALL_MIN
+    # ends a stuck one anyway).
+    _early_plots_wait(max_s=(float(PLOT_STALL_MIN or 30) + 5.0) * 60.0)
     # BEFORE SCORING, NOT AFTER. A .done marker written for a run that stopped
     # early is the one thing the report phase cannot see past.
     try:
