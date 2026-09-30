@@ -25313,9 +25313,13 @@ def write_what_failed_report(cases, verdicts, rows, crit_rows=None):
         # find out which of the two this is.
         _near = _far = _unk = 0
         for d in recs:
-            if d["hops"] in ("", None):
+            # "no path" (an islanded element) is text, not a distance
+            try:
+                _h = int(float(d["hops"]))
+            except (TypeError, ValueError):
                 _unk += 1
-            elif int(float(d["hops"])) <= 1:
+                continue
+            if _h <= 1:
                 _near += 1
             else:
                 _far += 1
