@@ -574,6 +574,13 @@ OVERSHOOT_SPIKE_S = 2.0 / 60.0               # above the limit <= this = SPIKE, 
 V_SS_LOW = 0.90                              # post-fault steady-state band, low
 V_SS_HIGH = 1.10                             # and high
 SS_AS_VIOLATION = False                      # False = steady-state band NOTED in the results only (not in SPP Rev 3.0) | True = a FAIL
+# -- rotor angle (SPP Rev 3.0 damping) --
+ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
+SPPR_MIN_AFTER_FIRST_PEAK = False            # False = SPPR "Minimum Value" = lowest point of the trace (Rev 3.0) | True = lowest trough after the 1st peak
+SPPR_SETTLED_AS_NOTE = True                  # True = a machine >= 16 deg that fails SPPR but settles by the end of the run is NOTED, not a violation | False = a FAIL (Rev 3.0 as written)
+SPPR_FLOOR_REVIEW = False                    # True = a machine >= 16 deg failing SPPR only because it rings onto a floor (settles above its minimum) goes to INDIVIDUAL REVIEW | False = a FAIL (Rev 3.0 as written)
+REVIEW_ROWS_IN_COMPARISON = False            # False = machines below 16 deg set aside for individual evaluation stay in each case's violations report only | True = also as rows in the comparison sheets
+WORSE_DEG_DELTA = 2.0                        # PASS both sides but this many deg worse = WORSENED
 # records beside the criteria (INFO, no PASS/FAIL) -- changing one re-scores finished gen-test runs
 POI_P_RECOVERY_FRAC = 0.90                   # POI power back to this fraction of pre-fault (and held +/- 1-this)
 RIPPLE_WINDOW_S = 2.0                        # ripple: the last this many s of each fault run
@@ -582,16 +589,11 @@ RIPPLE_P_MW = 10.0                            # ... or POI power peak-to-peak ab
 SETTLE_V_PU = 0.01                           # settled: over the same last RIPPLE_WINDOW_S every V (POI, machines, buses) moves <= this pu p-p
 SETTLE_PQ_MW = 2.0                           # ... and every P / Q moves <= this many MW / MVAr p-p (GEN_TEST_ANSWER_<proj>.txt)
 TRIP_PGEN_DEAD_MW = 1.0                     # machine ending below this MW = tripped (and under 10 % of pre-fault)
-ANGLE_DEV_DEG = 16.0                         # rotor-angle deviation limit
-SPPR_MIN_AFTER_FIRST_PEAK = False            # False = SPPR "Minimum Value" = lowest point of the trace (Rev 3.0) | True = lowest trough after the 1st peak
-SPPR_SETTLED_AS_NOTE = True                  # True = a machine >= 16 deg that fails SPPR but settles by the end of the run is NOTED, not a violation | False = a FAIL (Rev 3.0 as written)
-REVIEW_ROWS_IN_COMPARISON = False            # False = machines below 16 deg set aside for individual evaluation stay in each case's violations report only | True = also as rows in the comparison sheets
 # FLAT_TOL_BY_KIND: flat-run tolerance per quantity
 FLAT_TOL_BY_KIND = {"VOLT": 0.005, "ETERM": 0.005, "ANGLE": 1.0,
                     "PELEC": 1.0, "QELEC": 2.0, "SPEED": 0.0002}
 FLAT_REL = 0.02                              # or this share of the initial value
 WORSE_PU_DELTA = 0.02                        # PASS both sides but this much worse = WORSENED
-WORSE_DEG_DELTA = 2.0                        # same, degrees
 POI_RADIUS_HOPS = None                       # buses from the POI monitored (None = study value)
 # STUDY_AREAS: areas monitored (None = engine list)
 STUDY_AREAS = [327, 330, 356, 515, 520, 523, 524, 525, 526, 531, 534, 536, 541, 542,
@@ -15438,6 +15440,7 @@ def _push_settings(env, case):
                         ("SPP_ANGLE_DEV_DEG", ANGLE_DEV_DEG),
                         ("SPP_SPPR_MIN_AFTER_PEAK", "1" if SPPR_MIN_AFTER_FIRST_PEAK else "0"),
                         ("SPP_SPPR_SETTLED_AS_NOTE", "1" if SPPR_SETTLED_AS_NOTE else "0"),
+                        ("SPP_SPPR_FLOOR_REVIEW", "1" if SPPR_FLOOR_REVIEW else "0"),
                         ("SPP_TRIP_PGEN_DEAD_MW", TRIP_PGEN_DEAD_MW),
                         ("SPP_MISMATCH_MVA", MISMATCH_MVA),
                         ("SPP_MISMATCH_PASSES", MISMATCH_PASSES),
