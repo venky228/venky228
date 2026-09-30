@@ -19924,7 +19924,16 @@ def _ensure_reports_run(jobs, _run_case):
                 finally:
                     _case_thread_end(c["key"])
             th = threading.Thread(target=_go)
-            th.start()
+            try:
+                th.start()
+            except RuntimeError as _e:
+                # NO ROOM FOR ANOTHER THREAD (a 32-bit Python near its 2 GB):
+                # score this case here instead of losing the whole pass.
+                print("[compare] could not start a scoring thread (%s) -- scoring "
+                      "%s in this thread instead" % (_e, case["key"]))
+                _release_compare_memory()
+                _go()
+                continue
             ths.append(th)
         for th in ths:
             th.join()
@@ -24565,6 +24574,15 @@ def main():
         except Exception as _e:
             print("[compare] completeness check failed (%s) -- continuing" % _e)
 
+    # STOP THE LIVE COMPARISON BEFORE SCORING. Left running, its refresh read
+    # every folder's measurements into this process while phase 2 started its
+    # scoring threads: in a 32-bit Python (2 GB) the reads failed with
+    # MemoryError and phase 2 died with "can't start new thread". Phase 3
+    # writes the final comparison anyway.
+    if _live_stop:
+        _live_stop()
+        _live_stop = None
+    _release_compare_memory()
     _banner("PHASE 2 of 3 -- SCORING ANY RESULTS THAT HAVE NO REPORT")
     if pipeline == "compare":
         print("[compare] PIPELINE = \"compare\": this scores .out files that have no")
