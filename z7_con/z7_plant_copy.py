@@ -20,14 +20,18 @@ WHAT IT DOES
   3. Checks before changing anything: every selected bus is new to TARGET, every
      branch / transformer it needs ends on a selected bus or on a bus TARGET
      already has, and every copied bus reaches the TARGET network through the
-     copied elements (no island). Anything it cannot copy faithfully (a
-     three-winding transformer, a switched shunt) stops the script with the
-     list, so a half-copied plant is never saved.
-  4. Records TARGET's generation in each area that receives a machine, adds the
-     buses, plants, machines, lines, two-winding transformers, loads and fixed
-     shunts with SOURCE's data, solves, and then scales the OTHER machines in
-     each such area (not the copied ones, not the swing, not HOLD_EXCLUDE) until
-     the area is back at its original MW (HOLD_TOL_MW), solving after each pass.
+     copied elements (no island). Three-winding transformers (a 3-winding
+     MPT) are copied: impedances on the system base and the three winding
+     ratios, built from psspy's own help text and read back. A switched shunt
+     on a plant stops that plant with the list, so a half-copied plant is never
+     saved.
+  4. ONE PLANT AT A TIME (ONE_AT_A_TIME): adds its buses, plant, machines,
+     lines, two-winding transformers, loads and fixed shunts with SOURCE's data
+     and solves; then scales the OTHER machines in that plant's area (not the
+     copied ones, not the swing, not HOLD_EXCLUDE) back to TARGET's original
+     area MW (HOLD_TOL_MW), solving after each pass. The step is kept only when
+     the case converged and the area balances; otherwise the case goes back to
+     the end of the last good step and that plant is reported as skipped.
   5. Saves OUT_SAV and writes <OUT>.txt (what was copied, area MW before/after,
      every change made) and <OUT>_compare.csv. With SOURCE_DYR set, the dynamic
      records of the copied machines go to OUT_DYR (appended to TARGET_DYR when
@@ -95,6 +99,11 @@ HOLD_AREAS   = []           # [] = every area a copied machine is in; or [534, 5
 HOLD_EXCLUDE = []           # buses whose machines are never rescaled (e.g. an EGF)
 HOLD_TOL_MW  = 0.5          # stop when every held area is within this
 HOLD_PASSES  = 6            # solve + rescale passes at most
+ONE_AT_A_TIME = True        # True = one plant per step: add it, solve, redispatch
+                            # its area, solve again, keep it only if the case
+                            # converged and the area balances; else go back
+REQUIRE_BALANCE = True      # True = a plant whose area cannot be brought back
+                            # within HOLD_TOL_MW is taken out again (skipped)
 RESPECT_LIMITS = True       # True = rescaled machines stay within PMIN..PMAX
 
 SOURCE_DYR = r""            # optional: dynamic data of SOURCE (.dyr)
@@ -305,7 +314,7 @@ def _expand(spec):
     return out
 
 
-def select(S, T, want=None, extra_mach=None):
+def select(S, T, want=None, extra_mach=None, added=()):
     new = set(S["bus"]) - set(T["bus"])
     if want is None:
         want = _expand(PLANT_BUSES) if PLANT_BUSES else set(new)
@@ -315,7 +324,7 @@ def select(S, T, want=None, extra_mach=None):
             errs.append("bus %d is not in SOURCE" % b)
         elif b in T["bus"]:
             errs.append("bus %d is already in TARGET -- not copied over it" % b)
-    have = set(T["bus"]) | want
+    have = set(T["bus"]) | want | set(added)
     lines = {k: v for k, v in S["line"].items() if (k[0] in want or k[1] in want)}
     xf2 = {k: v for k, v in S["xf2"].items() if (k[0] in want or k[1] in want)}
     for k in list(lines) + list(xf2):
@@ -325,9 +334,10 @@ def select(S, T, want=None, extra_mach=None):
                            k[1] if k[0] in have else k[0]))
     xf3 = [k for k in S["xf3"] if any(b in want for b in k[:3])]
     for k in xf3:
-        errs.append("3-winding transformer %d-%d-%d ck%s touches the plant: it is not copied "
-                    "by this script -- add it by hand (or a RAW append) and rerun with its "
-                    "buses excluded" % k)
+        for b in k[:3]:
+            if b not in have:
+                errs.append("3-winding transformer %d-%d-%d ck%s ends on bus %d, which is neither "
+                            "selected nor in TARGET" % (k + (b,)))
     for b in sorted(set(S["swsh"]) & want):
         errs.append("switched shunt at bus %d is not copied by this script -- add it by hand" % b)
     mach = {k: v for k, v in S["mach"].items() if k[0] in want}
@@ -341,7 +351,12 @@ def select(S, T, want=None, extra_mach=None):
     for k in list(lines) + list(xf2):
         adj.setdefault(k[0], set()).add(k[1])
         adj.setdefault(k[1], set()).add(k[0])
-    seen = set(b for b in adj if b in T["bus"])
+    for k in xf3:
+        for a in k[:3]:
+            for b in k[:3]:
+                if a != b:
+                    adj.setdefault(a, set()).add(b)
+    seen = set(b for b in adj if b in T["bus"] or b in added)
     stack = list(seen)
     while stack:
         b = stack.pop()
@@ -351,7 +366,7 @@ def select(S, T, want=None, extra_mach=None):
                 stack.append(c)
     for b in sorted(want - seen):
         errs.append("bus %d would be an island: nothing selected connects it to TARGET" % b)
-    return want, mach, lines, xf2, errs
+    return want, mach, dict(lines, **{}), dict(xf2, **{"_xf3": xf3}) if xf3 else xf2, errs
 
 
 # ---------------------------------------------------------------- distance / plants
@@ -458,10 +473,221 @@ def pick_plants(S, T):
         say("  %-14s %5s %-8s %-8d  %s   %s" % (name, mw, typ, poi, "  ".join(cells), note))
         if take:
             want |= pocket
-            chosen.append((name, poi, sorted(pocket)))
-    for name, poi, pocket in chosen:
+            pex = set(k for k in pm if k[0] == poi)
+            # TWO PLANTS ON ONE POI (Holcomb: GEN-2023-172 and -173) share what
+            # is behind it -- one step, both names.
+            same = [c for c in chosen if c[1] == poi]
+            if same:
+                c = same[0]
+                chosen[chosen.index(c)] = (c[0] + " + " + name, poi, sorted(set(c[2]) | pocket), c[3] | pex)
+            else:
+                chosen.append((name, poi, sorted(pocket), pex))
+    for name, poi, pocket, _x in chosen:
         say("  %s behind POI %d: %s" % (name, poi, ", ".join(str(b) for b in pocket) or "(machines at the POI bus only)"))
     return want, extra, chosen
+
+
+# ---------------------------------------------------------------- 3-winding
+# A THREE-WINDING TRANSFORMER IS BUILT FROM psspy's OWN HELP TEXT.
+# The array layouts of three_wnd_imped_data_* and three_wnd_winding_data_* moved
+# between PSS/E builds (STAT is INTGAR(9) in v34, not INTGAR(1)), and calling a
+# Fortran API with a guessed layout has crashed PSS/E before. So the help text
+# is read, every value is placed by its NAME (R1-2, X1-2, ..., STAT, CZ, CW,
+# WINDV, ANG, RATA ...), and the transformer is read back afterwards. A call
+# whose names are not all in the text is not made: the step fails, the plant is
+# skipped, and the help text goes to the log.
+def _doc_map(fn):
+    """{ARRAY: (length, {NAME: 0-based index})} from psspy.<fn>.__doc__."""
+    f = getattr(psspy, fn, None)
+    doc = (getattr(f, "__doc__", None) or "") if f else ""
+    out = {}
+    for arr in ("INTGAR", "REALARI", "REALAR", "RATINGS", "RATING"):
+        n = 0
+        m = re.search(arr + r"\s*=?\s*\(?\w*\)?\s*(?:is\s+)?(?:an\s+)?array\s+of\s+(\d+)", doc, re.I)
+        if m:
+            n = int(m.group(1))
+        names = {}
+        for m in re.finditer(arr + r"\s*\(\s*(\d+)\s*\)\s*[=:]?\s*([^\n]*)", doc, re.I):
+            idx = int(m.group(1))
+            n = max(n, idx)
+            tok = m.group(2).strip().split()
+            if tok:
+                names.setdefault(tok[0].upper().rstrip(",.;:"), idx - 1)
+        if names:
+            out[arr] = (n, names)
+    return out, doc
+
+
+def _pick(names, *keys):
+    for k in keys:
+        if k in names:
+            return names[k]
+    return None
+
+
+def _say_doc(fn, doc):
+    say("  ---- psspy.%s help text, as this PSS/E states it ----" % fn)
+    for ln in (doc or "(none)").splitlines()[:80]:
+        say("  | " + ln.rstrip()[:150])
+    say("  ---- end ----")
+
+
+def xf3_read(k):
+    """{st, rx: {12, 23, 31}, wind: {1: {ratio, ang, rate}, ...}} for one
+       3-winding transformer of the LOADED case, or (None, why)."""
+    w1, w2, w3, ck = k
+    d = {"rx": {}, "wind": {}}
+    try:
+        ie, st = psspy.tr3int(w1, w2, w3, ck, "STATUS")
+        d["st"] = int(st) if ie in (0, None) else 1
+    except Exception:
+        d["st"] = 1
+    for pair, names in (("12", ("RX1-2", "RX1-2NOM", "RX1-2ACT")),
+                        ("23", ("RX2-3", "RX2-3NOM", "RX2-3ACT")),
+                        ("31", ("RX3-1", "RX3-1NOM", "RX3-1ACT"))):
+        for s in names:
+            try:
+                ie, v = psspy.tr3dt2(w1, w2, w3, ck, s)
+            except Exception:
+                continue
+            if ie in (0, None) and v is not None:
+                d["rx"][pair] = complex(v)
+                break
+        if pair not in d["rx"]:
+            return None, "impedance %s not readable (tr3dt2)" % pair
+    for n, (a, b, c) in ((1, (w1, w2, w3)), (2, (w2, w3, w1)), (3, (w3, w1, w2))):
+        w = {}
+        for key, names in (("ratio", ("RATIO",)), ("ang", ("ANGLE", "ANG")),
+                           ("ra", ("RATEA", "RATE1")), ("rb", ("RATEB", "RATE2")), ("rc", ("RATEC", "RATE3"))):
+            for s in names:
+                try:
+                    ie, v = psspy.wnddat(a, b, c, ck, s)
+                except Exception:
+                    continue
+                if ie in (0, None) and v is not None:
+                    w[key] = float(v)
+                    break
+        if "ratio" not in w:
+            return None, "winding %d ratio not readable (wnddat)" % n
+        d["wind"][n] = w
+    return d, ""
+
+
+def add_xf3(k, d):
+    """Create one 3-winding transformer by name-placed arrays; '' on failure."""
+    w1, w2, w3, ck = k
+    made = ""
+    for fn in ("three_wnd_imped_data_4", "three_wnd_imped_data_3"):
+        if not hasattr(psspy, fn):
+            continue
+        dm, doc = _doc_map(fn)
+        ig = dm.get("INTGAR")
+        ra = dm.get("REALARI") or dm.get("REALAR")
+        pos = {}
+        if ra:
+            for key, names in (("r12", ("R1-2",)), ("x12", ("X1-2",)), ("r23", ("R2-3",)),
+                               ("x23", ("X2-3",)), ("r31", ("R3-1",)), ("x31", ("X3-1",))):
+                pos[key] = _pick(ra[1], *names)
+        ist = _pick(ig[1], "STAT", "STATUS") if ig else None
+        icz = _pick(ig[1], "CZ") if ig else None
+        icw = _pick(ig[1], "CW") if ig else None
+        if not ra or not ig or None in pos.values() or ist is None:
+            say("  *** %s: the help text does not name every value needed (STAT, R1-2 ... X3-1) "
+                "-- not called" % fn)
+            _say_doc(fn, doc)
+            continue
+        ia = [_i] * ig[0]
+        ia[ist] = d["st"]
+        if icz is not None:
+            ia[icz] = 1          # impedances on the SYSTEM base, as read
+        if icw is not None:
+            ia[icw] = 1          # winding ratios in pu of the bus base kV, as read
+        rr = [_f] * ra[0]
+        for key, z in (("12", d["rx"]["12"]), ("23", d["rx"]["23"]), ("31", d["rx"]["31"])):
+            rr[pos["r" + key]] = z.real
+            rr[pos["x" + key]] = z.imag
+        kw = {"intgar": ia, ("realari" if "REALARI" in dm else "realar"): rr}
+        try:
+            rc = getattr(psspy, fn)(w1, w2, w3, ck, **kw)
+        except Exception as e:
+            say("  *** %s raised: %s" % (fn, e))
+            _say_doc(fn, doc)
+            continue
+        if not ok(rc):
+            say("  *** %s answered ierr=%s" % (fn, rc))
+            continue
+        made = fn
+        break
+    if not made:
+        return ""
+    for n in (1, 2, 3):
+        w = d["wind"][n]
+        done = False
+        for fn in ("three_wnd_winding_data_5", "three_wnd_winding_data_4", "three_wnd_winding_data_3"):
+            if not hasattr(psspy, fn):
+                continue
+            dm, doc = _doc_map(fn)
+            ra = dm.get("REALARI") or dm.get("REALAR")
+            rt = dm.get("RATINGS") or dm.get("RATING")
+            iv = _pick(ra[1], "WINDV", "WINDV1") if ra else None
+            ian = _pick(ra[1], "ANG", "ANGLE") if ra else None
+            if iv is None:
+                say("  *** %s: the help text does not name WINDV -- not called" % fn)
+                _say_doc(fn, doc)
+                continue
+            rr = [_f] * ra[0]
+            rr[iv] = w["ratio"]
+            if ian is not None and "ang" in w:
+                rr[ian] = w["ang"]
+            kw = {("realari" if "REALARI" in dm else "realar"): rr}
+            rates = [w.get("ra"), w.get("rb"), w.get("rc")]
+            if rt:
+                rl = [_f] * rt[0]
+                for j, key in enumerate(("RATE1", "RATE2", "RATE3")):
+                    q = _pick(rt[1], key, ("RATA", "RATB", "RATC")[j])
+                    if q is not None and rates[j] is not None:
+                        rl[q] = rates[j]
+                kw["ratings" if "RATINGS" in dm else "rating"] = rl
+            else:
+                for j, key in enumerate(("RATA", "RATB", "RATC")):
+                    q = _pick(ra[1], key)
+                    if q is not None and rates[j] is not None:
+                        rr[q] = rates[j]
+            try:
+                rc = getattr(psspy, fn)(w1, w2, w3, ck, n, **kw)
+            except TypeError:
+                try:
+                    rc = getattr(psspy, fn)(w1, w2, w3, ck, warg=n, **kw)
+                except Exception as e:
+                    say("  *** %s raised: %s" % (fn, e))
+                    _say_doc(fn, doc)
+                    continue
+            except Exception as e:
+                say("  *** %s raised: %s" % (fn, e))
+                _say_doc(fn, doc)
+                continue
+            if ok(rc):
+                done = True
+                break
+        if not done:
+            say("  *** winding %d of %d-%d-%d ck%s: no winding call took" % (n, w1, w2, w3, ck))
+            return ""
+    # READ BACK: the copy must hold the impedances and ratios that were sent.
+    got, why = xf3_read(k)
+    if got is None:
+        say("  *** %d-%d-%d ck%s created but cannot be read back: %s" % (k + (why,)))
+        return ""
+    for pair in ("12", "23", "31"):
+        a, b = got["rx"][pair], d["rx"][pair]
+        if abs(a.imag - b.imag) > max(1e-5, 0.02 * abs(b.imag)) or abs(a.real - b.real) > max(1e-5, 0.02 * abs(b.real) + 1e-5):
+            say("  *** %d-%d-%d ck%s: X%s reads %.5f, sent %.5f -- NOT what was intended" % (w1, w2, w3, ck, pair, a.imag, b.imag))
+            return ""
+    for n in (1, 2, 3):
+        if abs(got["wind"][n]["ratio"] - d["wind"][n]["ratio"]) > 0.002:
+            say("  *** %d-%d-%d ck%s: winding %d ratio reads %.4f, sent %.4f" % (w1, w2, w3, ck, n,
+                got["wind"][n]["ratio"], d["wind"][n]["ratio"]))
+            return ""
+    return made
 
 
 # ---------------------------------------------------------------- adding
@@ -678,37 +904,162 @@ def main():
         pw, pextra, chosen = pick_plants(S, T)
         if not chosen:
             say("no plant within %d node(s) of a project POI needs copying" % MAX_NODES)
-        want, mach, lines, xf2, errs = select(S, T, pw, pextra)
     else:
-        chosen = []
-        want, mach, lines, xf2, errs = select(S, T)
+        w0 = _expand(PLANT_BUSES) if PLANT_BUSES else set(S["bus"]) - set(T["bus"])
+        chosen = [("selected buses", None, sorted(w0), set())]
+    if not ONE_AT_A_TIME and len(chosen) > 1:
+        chosen = [(" + ".join(c[0] for c in chosen), None,
+                   sorted(set(b for c in chosen for b in c[2])), set(k for c in chosen for k in c[3]))]
     stem = os.path.splitext(TARGET_SAV)[0]
-    out = OUT_SAV or "%s_plus_%dbus.sav" % (stem, len(want))
+    n_bus = len(set(b for c in chosen for b in c[2]))
+    out = OUT_SAV or "%s_plus_%dbus.sav" % (stem, n_bus)
     out_stem = os.path.splitext(out)[0]
     compare(S, T, out_stem + "_compare.csv")
-    say("")
-    say("SELECTED: %d bus(es), %d machine(s), %d line(s), %d two-winding transformer(s)"
-        % (len(want), len(mach), len(lines), len(xf2)))
-    if want:
-        say("  buses: %s" % ", ".join(str(b) for b in sorted(want)))
-    if errs:
+
+    # ALL CHECKS FIRST, every step against what the steps before it add.
+    steps, added, refused = [], set(), []
+    for name, poi, pocket, pex in chosen:
+        want, mach, lines, xf2, errs = select(S, T, set(pocket), pex, added)
+        if errs:
+            refused.append((name, errs))
+            continue
+        if not want and not mach:
+            continue
+        steps.append((name, poi, want, mach, lines, xf2))
+        added |= want
+    # THREE-WINDING TRANSFORMERS: their data read from SOURCE now
+    if any("_xf3" in s[5] for s in steps):
+        psspy.case(SOURCE_SAV)
+        keep = []
+        for st in steps:
+            keys = st[5].get("_xf3")
+            if keys:
+                det, bad = {}, []
+                for k in keys:
+                    d, why = xf3_read(k)
+                    if d is None:
+                        bad.append("3-winding transformer %d-%d-%d ck%s: %s" % (k + (why,)))
+                    else:
+                        det[k] = d
+                if bad:
+                    refused.append((st[0], bad))
+                    continue
+                st[5]["_xf3"] = det
+            keep.append(st)
+        steps = keep
+    for name, errs in refused:
         say("")
-        say("*** NOT COPIED -- fix these first (nothing was changed or saved):")
+        say("*** %s NOT COPIED -- fix these first:" % name)
         for e in errs:
             say("  - " + e)
+    if not steps:
+        say("")
+        say("nothing to copy" + (" (see above)" if refused else ": TARGET already has it all"))
+        _write_log(out_stem + ".txt")
+        raise SystemExit(1 if refused else 0)
+
+    # TARGET as it is: the area MW every step goes back to
+    psspy.case(TARGET_SAV)
+    if not solve():
+        say("*** TARGET itself does not solve -- nothing done ***")
         _write_log(out_stem + ".txt")
         raise SystemExit(1)
-    if not want and not mach:
-        say("nothing to copy: TARGET already has every bus and machine of SOURCE")
-        _write_log(out_stem + ".txt")
-        return
-    # TARGET as it is: its area MW is what the held areas go back to
-    psspy.case(TARGET_SAV)
-    areas = sorted(set(HOLD_AREAS) if HOLD_AREAS else
-                   set(S["bus"][b]["area"] for (b, _m) in mach if b in S["bus"]))
-    before = dict((a, area_gen(T, a)) for a in areas)
+    base_mw = {}
+    swing = set(b for b, d in T["bus"].items() if d["type"] == 3)
+    excl = _expand(HOLD_EXCLUDE) | swing
+    ckpt = out_stem + "_step.sav"
+    psspy.save(ckpt)
+    done, skipped, all_mach = [], [], {}
+    for k, (name, poi, want, mach, lines, xf2) in enumerate(steps, 1):
+        say("")
+        say("=" * 92)
+        say("STEP %d of %d: %s%s -- %d bus(es), %d machine(s), %.1f MW"
+            % (k, len(steps), name, (" at POI %d" % poi) if poi else "", len(want), len(mach),
+               sum(m["r"][0] for m in mach.values() if m["st"] == 1)))
+        say("=" * 92)
+        areas = sorted(set(HOLD_AREAS) if HOLD_AREAS else
+                       set(S["bus"][b]["area"] for (b, _m) in mach if b in S["bus"]))
+        for a in areas:
+            base_mw.setdefault(a, area_gen(T, a))     # TARGET's own MW, never a step's
+        n_bad = add_step(S, want, mach, lines, xf2)
+        why = ""
+        if n_bad:
+            why = "%d element(s) could not be added" % n_bad
+        elif not solve():
+            why = "the case does not converge with this plant added"
+        else:
+            say("  solved with the plant added")
+            if HOLD_AREA_MW and areas:
+                skip = excl | set(b for (b, _m) in list(all_mach) + list(mach))
+                held = hold_areas(dict((a, base_mw[a]) for a in areas), skip)
+                if not solve():
+                    why = "the case does not converge after the redispatch"
+                elif not held and REQUIRE_BALANCE:
+                    why = "the area could not be brought back within %.2f MW" % HOLD_TOL_MW
+            if not why:
+                for a in areas:
+                    now = sum(m[2] for m in live_area_machines(a, ()))
+                    say("  area %-5d TARGET %.1f MW -> now %.1f MW (%+.2f), converged"
+                        % (a, base_mw[a], now, now - base_mw[a]))
+        if why:
+            say("  *** %s -- %s is SKIPPED, the case goes back to the end of the last good step ***" % (why, name))
+            psspy.case(ckpt)
+            skipped.append((name, why))
+            continue
+        psspy.save(ckpt)
+        done.append((name, poi, sorted(want)))
+        all_mach.update(mach)
+    # the last good step is the answer
+    psspy.case(ckpt)
+    solve()
     say("")
-    say("ADDING to TARGET")
+    say("AREA GENERATION (MW)        TARGET before    OUT after    difference")
+    for a in sorted(base_mw):
+        now = sum(m[2] for m in live_area_machines(a, ()))
+        say("  area %-5d            %12.1f %12.1f %+12.1f" % (a, base_mw[a], now, now - base_mw[a]))
+    say("  copied: %s" % (", ".join(d[0] for d in done) or "nothing"))
+    for name, why in skipped:
+        say("  SKIPPED %s: %s" % (name, why))
+    for name, _e in refused:
+        say("  NOT COPIED %s (see the checks above)" % name)
+    if not done:
+        say("*** no plant could be added -- NOT saved ***")
+        _write_log(out_stem + ".txt")
+        raise SystemExit(1)
+    if not ok(psspy.save(out)):
+        say("*** could not save %s ***" % out)
+        raise SystemExit(1)
+    try:
+        os.remove(ckpt)
+    except Exception:
+        pass
+    say("")
+    say("SAVED %s" % out)
+    if any(d[1] for d in done):
+        # THE DISTANCES THE PLANTS WERE CHOSEN BY, read again on the saved case:
+        # a plant hangs radially off its own POI, so nothing should have moved.
+        O = read_case(out)
+        g0, g1 = graph(T), graph(O)
+        say("")
+        say("POI DISTANCE CHECK (nodes, TARGET -> OUT)")
+        for name, poi, _p in done:
+            if not poi:
+                continue
+            cells = []
+            for pj, ppoi in sorted(PROJECT_POIS.items()):
+                if ppoi not in T["bus"]:
+                    continue
+                h0 = distances(g0, int(ppoi))[0].get(poi)
+                h1 = distances(g1, int(ppoi))[0].get(poi)
+                cells.append("%s %s->%s%s" % (pj, h0, h1, "" if h0 == h1 else " *** CHANGED ***"))
+            say("  %-28s POI %-7d %s" % (name, poi, "   ".join(cells)))
+    if SOURCE_DYR:
+        copy_dyr(all_mach, OUT_DYR or out_stem + ".dyr")
+    _write_log(out_stem + ".txt")
+
+
+def add_step(S, want, mach, lines, xf2):
+    """Add one plant's elements; the number that failed."""
     n_bad = 0
     for b in sorted(want):
         fn = add_bus(b, S["bus"][b])
@@ -720,7 +1071,13 @@ def main():
         say("  line %d-%d ck%s R=%.5f X=%.5f B=%.5f %s" % (k[0], k[1], k[2], complex(v["rx"]).real,
                                                        complex(v["rx"]).imag, v["b"], fn or "*** FAILED ***"))
         n_bad += not fn
-    for k, v in sorted(xf2.items()):
+    for k, v in sorted(xf2.get("_xf3", {}).items()):
+        fn = add_xf3(k, v)
+        say("  3W   %d-%d-%d ck%s X12=%.5f X23=%.5f X31=%.5f ratios %.4f/%.4f/%.4f %s"
+            % (k + (v["rx"]["12"].imag, v["rx"]["23"].imag, v["rx"]["31"].imag,
+                    v["wind"][1]["ratio"], v["wind"][2]["ratio"], v["wind"][3]["ratio"], fn or "*** FAILED ***")))
+        n_bad += not fn
+    for k, v in sorted((kk, vv) for kk, vv in xf2.items() if kk != "_xf3"):
         fn = add_xf2(k, v)
         say("  xfmr %d-%d ck%s R=%.5f X=%.5f (system base) ratio %.4f/%.4f, fixed tap %s"
             % (k[0], k[1], k[2], complex(v["rx"] or 0).real, complex(v["rx"] or 0).imag,
@@ -743,54 +1100,7 @@ def main():
             say("  shunt %d '%s' %.1f + j%.1f MVA %s" % (k[0], k[1], complex(v["s"]).real, complex(v["s"]).imag,
                                                          "" if good else "*** FAILED ***"))
             n_bad += not good
-    if n_bad:
-        say("*** %d element(s) could not be added -- NOT saved ***" % n_bad)
-        _write_log(out_stem + ".txt")
-        raise SystemExit(1)
-    say("")
-    if not solve():
-        say("*** the case with the plant added does not solve -- NOT saved ***")
-        _write_log(out_stem + ".txt")
-        raise SystemExit(1)
-    held = True
-    if HOLD_AREA_MW and before:
-        skip = set(b for (b, _m) in mach) | _expand(HOLD_EXCLUDE) | \
-            set(b for b, d in T["bus"].items() if d["type"] == 3)
-        held = hold_areas(before, skip)
-    say("")
-    say("AREA GENERATION (MW)        TARGET before    OUT after    difference")
-    for a in areas:
-        now = sum(m[2] for m in live_area_machines(a, ()))
-        say("  area %-5d            %12.1f %12.1f %+12.1f" % (a, before[a], now, now - before[a]))
-    copied = sum(m["r"][0] for m in mach.values() if m["st"] == 1)
-    say("  copied machines carry %.1f MW; the other machines in the held area(s) were scaled down by that" % copied)
-    if not held:
-        say("  *** an area is still outside %.2f MW after %d passes -- see the [hold] lines ***"
-            % (HOLD_TOL_MW, HOLD_PASSES))
-    if not ok(psspy.save(out)):
-        say("*** could not save %s ***" % out)
-        raise SystemExit(1)
-    say("")
-    say("SAVED %s" % out)
-    if chosen:
-        # THE DISTANCES THE PLANTS WERE CHOSEN BY, read again on the saved case:
-        # a plant hangs radially off its own POI, so nothing should have moved.
-        O = read_case(out)
-        g0, g1 = graph(T), graph(O)
-        say("")
-        say("POI DISTANCE CHECK (nodes, TARGET -> OUT)")
-        for name, poi, _p in chosen:
-            cells = []
-            for pj, ppoi in sorted(PROJECT_POIS.items()):
-                if ppoi not in T["bus"]:
-                    continue
-                h0 = distances(g0, int(ppoi))[0].get(poi)
-                h1 = distances(g1, int(ppoi))[0].get(poi)
-                cells.append("%s %s->%s%s" % (pj, h0, h1, "" if h0 == h1 else " *** CHANGED ***"))
-            say("  %-14s POI %-7d %s" % (name, poi, "   ".join(cells)))
-    if SOURCE_DYR:
-        copy_dyr(mach, OUT_DYR or out_stem + ".dyr")
-    _write_log(out_stem + ".txt")
+    return n_bad
 
 
 def _write_log(path):
