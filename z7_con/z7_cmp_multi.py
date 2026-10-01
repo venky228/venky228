@@ -390,7 +390,9 @@ def _discover_scenarios(z4, ref):
     pat = "%s_%s*" % (proj, mode)
     roots = [os.path.join(z4.STUDY_ROOT, "Projects", "results_proj")]
     for d in sorted(glob.glob(os.path.join(z4.STUDY_ROOT, "Base", "results_base*"))):
-        if os.path.isdir(d):
+        # NOT THE _Q STUDY'S (results_base_q): the queue-project runs have their
+        # own panel and side-by-side, and are not scenarios of this study.
+        if os.path.isdir(d) and not os.path.basename(d).lower().endswith("_q"):
             roots.append(d)
     roots += [r for r in SCAN_ROOTS if r]
     found, seen = [], set([_norm(ref)])
