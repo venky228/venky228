@@ -28,7 +28,8 @@ WHAT IT DOES
   4. ONE PLANT AT A TIME (ONE_AT_A_TIME): adds its buses, plant, machines,
      lines, two-winding transformers, loads and fixed shunts with SOURCE's data
      and solves; then scales the OTHER machines in that plant's area (not the
-     copied ones, not the swing, not HOLD_EXCLUDE) back to TARGET's original
+     copied ones, not the swing, not HOLD_EXCLUDE, and never the four project
+     plants behind PROJECT_POIS -- PROTECT_PROJECTS) back to TARGET's original
      area MW (HOLD_TOL_MW), solving after each pass. The step is kept only when
      the case converged and the area balances; otherwise the case goes back to
      the end of the last good step and that plant is reported as skipped.
@@ -55,8 +56,8 @@ import time
 #  SETTINGS
 # ============================================================================
 # >>> THE TWO CASES <<<
-SOURCE_SAV = r"C:\KV\IA_BUILDS\SOURCE_WITH_PLANTS.sav"         # >>> the case that HAS the plants
-TARGET_SAV = r"C:\KV\Base\DIS2201-25SP-G03-CQ_Mitigated.sav"   # >>> the case to add them to
+SOURCE_SAV = r"C:\KV\ENGIE\CQ_Cases\DIS23.sav"         # >>> the case that HAS the plants
+TARGET_SAV = r"C:\KV\ENGIE\CQ_Cases\Base\DIS2201-25SP-G03-CQ_Mitigated.sav"   # >>> the case to add them to
 OUT_SAV    = r""            # "" = <TARGET>_plus_<n>bus.sav beside TARGET_SAV
 
 # >>> THE PROJECT POIs the distance is measured from (nodes, counted in TARGET)
@@ -97,6 +98,10 @@ COPY_MACHINES_ON_EXISTING_BUSES = False
 HOLD_AREA_MW = True         # True = the areas receiving machines keep their MW
 HOLD_AREAS   = []           # [] = every area a copied machine is in; or [534, 541]
 HOLD_EXCLUDE = []           # buses whose machines are never rescaled (e.g. an EGF)
+PROTECT_PROJECTS = True     # True = the redispatch never touches the PROJECT_POIS
+                            # plants: every machine radially behind each project
+                            # POI (EGF + SGF -- tie, MPT, collector, units) keeps
+                            # its MW; only the other machines of the area move
 HOLD_TOL_MW  = 0.5          # stop when every held area is within this
 HOLD_PASSES  = 6            # solve + rescale passes at most
 ONE_AT_A_TIME = True        # True = one plant per step: add it, solve, redispatch
@@ -810,6 +815,43 @@ def live_area_machines(area, skip):
     return out
 
 
+def project_machines(T):
+    """{project: [(bus, id, MW)]} -- the machines radially behind each project
+       POI in TARGET. Taking the POI out of the network, whatever is then cut
+       off from the grid hangs on it alone: that is the plant, whatever kV its
+       tie is at (Santa Fe's is 345 kV). A neighbour that still reaches the grid
+       (more than PLANT_MAX_BUSES buses) is grid, not plant."""
+    g = graph(T)
+    out = {}
+    for pj, poi in sorted(PROJECT_POIS.items()):
+        poi = int(poi)
+        if poi not in T["bus"]:
+            continue
+        plant = set([poi])
+        for nb in g.get(poi, {}):
+            if nb in plant:
+                continue
+            seen, stack, grid = set([nb]), [nb], False
+            while stack:
+                a = stack.pop()
+                for b in g.get(a, {}):
+                    if b == poi or b in seen:
+                        continue
+                    seen.add(b)
+                    stack.append(b)
+                if len(seen) > PLANT_MAX_BUSES:
+                    grid = True
+                    break
+            if not grid:
+                plant |= seen
+        out[pj] = sorted((b, mid, m["r"][0]) for (b, mid), m in T["mach"].items()
+                         if b in plant and m["st"] == 1)
+    return out
+
+
+PLANT_MAX_BUSES = 400       # a piece cut off behind a POI larger than this is grid
+
+
 def hold_areas(before, skip):
     for k in range(1, int(HOLD_PASSES) + 1):
         worst = 0.0
@@ -967,6 +1009,21 @@ def main():
     base_mw = {}
     swing = set(b for b, d in T["bus"].items() if d["type"] == 3)
     excl = _expand(HOLD_EXCLUDE) | swing
+    if PROTECT_PROJECTS and PROJECT_POIS:
+        pm = project_machines(T)
+        say("")
+        say("PROJECT PLANTS -- never redispatched (PROTECT_PROJECTS)")
+        for pj in sorted(pm):
+            ms = pm[pj]
+            say("  %-14s POI %-7d %3d machine(s) %8.1f MW: %s" % (
+                pj, PROJECT_POIS[pj], len(ms), sum(m[2] for m in ms),
+                ", ".join("%d '%s'" % (b, mid) for b, mid, _p in ms[:12]) + (" ..." if len(ms) > 12 else "")))
+            if not ms:
+                say("  *** %s: no machine found behind POI %d -- check PROJECT_POIS ***" % (pj, PROJECT_POIS[pj]))
+            excl |= set(b for b, _mid, _p in ms)
+        project_mw0 = dict((pj, sum(m[2] for m in ms)) for pj, ms in pm.items())
+    else:
+        pm, project_mw0 = {}, {}
     ckpt = out_stem + "_step.sav"
     psspy.save(ckpt)
     done, skipped, all_mach = [], [], {}
@@ -1017,6 +1074,15 @@ def main():
     for a in sorted(base_mw):
         now = sum(m[2] for m in live_area_machines(a, ()))
         say("  area %-5d            %12.1f %12.1f %+12.1f" % (a, base_mw[a], now, now - base_mw[a]))
+    if pm:
+        say("")
+        say("PROJECT PLANTS (MW)          TARGET before    OUT after")
+        live = dict(((b, mid), p) for a in sorted(set(T["bus"][b]["area"] for ms in pm.values() for b, _m, _p in ms))
+                    for b, mid, p, _x, _y, _z in live_area_machines(a, ()))
+        for pj in sorted(pm):
+            now = sum(live.get((b, mid), 0.0) for b, mid, _p in pm[pj])
+            say("  %-14s              %12.1f %12.1f%s" % (pj, project_mw0[pj], now,
+                "" if abs(now - project_mw0[pj]) < 0.5 else "   *** CHANGED ***"))
     say("  copied: %s" % (", ".join(d[0] for d in done) or "nothing"))
     for name, why in skipped:
         say("  SKIPPED %s: %s" % (name, why))
