@@ -110,6 +110,11 @@ ONE_AT_A_TIME = True        # True = one plant per step: add it, solve, redispat
 REQUIRE_BALANCE = True      # True = a plant whose area cannot be brought back
                             # within HOLD_TOL_MW is taken out again (skipped)
 RESPECT_LIMITS = True       # True = rescaled machines stay within PMIN..PMAX
+COPIED_AT_PMAX = True       # True = every copied (extra) machine goes in at its
+                            # PMAX, not at SOURCE's dispatch; the area is then
+                            # balanced by the OTHER machines as usual. A machine
+                            # whose PMAX is a placeholder (>= 9000 MW) or out of
+                            # service keeps SOURCE's PGEN, and the log says so.
 
 SOURCE_DYR = r""            # optional: dynamic data of SOURCE (.dyr)
 TARGET_DYR = r""            # optional: dynamic data of TARGET (.dyr); the copied
@@ -756,6 +761,14 @@ def add_bus(b, d):
     return ""
 
 
+def copied_mw(m):
+    """The MW a copied machine is put in at."""
+    pg, pmax = m["r"][0], m["r"][4]
+    if COPIED_AT_PMAX and m["st"] == 1 and 0.0 < pmax < 9000.0:
+        return pmax
+    return pg
+
+
 def add_machine(b, mid, m, plant):
     try:
         if b in plant:
@@ -765,7 +778,7 @@ def add_machine(b, mid, m, plant):
     except Exception:
         pass
     r = m["r"]   # PGEN QGEN QMAX QMIN PMAX PMIN MBASE RSOURCE XSOURCE RTRAN XTRAN GENTAP WPF
-    realar = [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11],
+    realar = [copied_mw(m), r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11],
               _f, _f, _f, _f, r[12]]
     intgar = [m["st"], _i, _i, _i, _i, m["wmod"]]
     try:
@@ -1079,7 +1092,7 @@ def main():
         say("=" * 92)
         say("STEP %d of %d: %s%s -- %d bus(es), %d machine(s), %.1f MW"
             % (k, len(steps), name, (" at POI %d" % poi) if poi else "", len(want), len(mach),
-               sum(m["r"][0] for m in mach.values() if m["st"] == 1)))
+               sum(copied_mw(m) for m in mach.values() if m["st"] == 1)))
         say("=" * 92)
         areas = sorted(set(HOLD_AREAS) if HOLD_AREAS else
                        set(S["bus"][b]["area"] for (b, _m) in mach if b in S["bus"]))
@@ -1198,8 +1211,14 @@ def add_step(S, want, mach, lines, xf2):
         n_bad += not fn
     for (b, mid), m in sorted(mach.items()):
         good = add_machine(b, mid, m, S["plant"])
-        say("  gen  %d '%s' P=%.1f Q=%.1f Pmax=%.1f MBASE=%.1f %s" % (b, mid, m["r"][0], m["r"][1], m["r"][4],
-                                                                   m["r"][6], "" if good else "*** FAILED ***"))
+        p_in = copied_mw(m)
+        note = ""
+        if COPIED_AT_PMAX and m["st"] == 1 and p_in == m["r"][0] and not (0.0 < m["r"][4] < 9000.0):
+            note = "  (PMAX %.0f is a placeholder -- kept SOURCE's PGEN)" % m["r"][4]
+        elif p_in != m["r"][0]:
+            note = "  (at PMAX; SOURCE had %.1f)" % m["r"][0]
+        say("  gen  %d '%s' P=%.1f Q=%.1f Pmax=%.1f MBASE=%.1f%s %s" % (b, mid, p_in, m["r"][1], m["r"][4],
+                                                                     m["r"][6], note, "" if good else "*** FAILED ***"))
         n_bad += not good
     for k, v in sorted(S["load"].items()):
         if k[0] in want:
