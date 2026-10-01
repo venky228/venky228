@@ -10,8 +10,13 @@ the other, holding each affected area's generation at its original MW.
 WHAT IT DOES
   1. Loads both cases and writes a COMPARISON: buses, machines, branches and
      transformers that are only in one of them, and generation per area.
-  2. Picks the plant: PLANT_BUSES (bus numbers / ranges), or [] = every bus that
-     is in SOURCE and not in TARGET.
+  2. Picks the plants. With PLANTS filled in (the POI DISTANCE list), each plant
+     whose POI bus is within MAX_NODES of a project POI (PROJECT_POIS), counted
+     in TARGET, is taken WHOLE: every bus SOURCE has behind that POI and TARGET
+     does not -- the tie, the main transformer, the collector, the GSUs and the
+     units -- found by walking SOURCE outward from the plant's POI bus. Without
+     PLANTS: PLANT_BUSES (bus numbers / ranges), or every bus that is in SOURCE
+     and not in TARGET.
   3. Checks before changing anything: every selected bus is new to TARGET, every
      branch / transformer it needs ends on a selected bus or on a bus TARGET
      already has, and every copied bus reaches the TARGET network through the
@@ -45,9 +50,39 @@ import time
 # ============================================================================
 #  SETTINGS
 # ============================================================================
-SOURCE_SAV = r"C:\KV\Projects\DIS2201-25SP-G03-CQ_PROJ.sav"   # has the plant(s)
-TARGET_SAV = r"C:\KV\Base\DIS2201-25SP-G03-CQ.sav"            # gets them added
+# >>> THE TWO CASES <<<
+SOURCE_SAV = r"C:\KV\IA_BUILDS\SOURCE_WITH_PLANTS.sav"         # >>> the case that HAS the plants
+TARGET_SAV = r"C:\KV\Base\DIS2201-25SP-G03-CQ_Mitigated.sav"   # >>> the case to add them to
 OUT_SAV    = r""            # "" = <TARGET>_plus_<n>bus.sav beside TARGET_SAV
+
+# >>> THE PROJECT POIs the distance is measured from (nodes, counted in TARGET)
+PROJECT_POIS = {
+    "EmpirePrairie": 761383,     # G17-183-TAP 345 kV
+    "IronStar":      560080,     # G16-046-TAP 345 kV
+    "EastFork":      531623,     # EASTFORK3 115 kV
+    "SantaFe":       765911,     # G21-068-TAP 345 kV
+}
+MAX_NODES = 5               # a plant is copied when its POI is within this many
+                            # nodes of ANY project POI (5 = NEAR in the list)
+MAX_Z_PU  = None            # optional second test: summed |R+jX| pu (100 MVA) to
+                            # the nearest project POI must be <= this; None = off
+
+# >>> THE PLANTS (from the POI DISTANCE list): name, MW, type, POI bus.
+# [] = do not select by plant; use PLANT_BUSES below instead.
+PLANTS = [
+    ("GEN-2023-099", 300, "Solar",   532766),   # Jeffery EC 345 kV
+    ("GEN-2023-171", 150, "Battery", 548814),   # Sub M 161 kV
+    ("GEN-2023-033", 200, "Battery", 541248),   # Liberty South 161 kV
+    ("GEN-2023-170", 150, "Battery", 543062),   # Salisbury 161 kV
+    ("GEN-2023-037", 200, "Battery", 546653),   # Nearman 161 kV
+    ("GEN-2023-173", 100, "Wind",    531449),   # Holcomb 345 kV
+    ("GEN-2023-172", 200, "Wind",    531449),   # Holcomb 345 kV
+    ("GEN-2023-107", 300, "Wind",    531465),   # Setab 345 kV
+    ("GEN-2023-034", 130, "Solar",   533073),   # Clear Water-Waco 138 kV
+    ("GEN-2023-061", 100, "Battery", 505488),   # Carthage 161 kV
+]
+ONLY_PLANTS = []            # [] = every plant within MAX_NODES; or ["GEN-2023-107"]
+                            # to copy just those (still reported with distances)
 
 PLANT_BUSES = []            # [] = every bus in SOURCE that TARGET does not have.
                             # Or a list of buses / ranges: [999001, "999950-999954"]
@@ -270,9 +305,10 @@ def _expand(spec):
     return out
 
 
-def select(S, T):
+def select(S, T, want=None, extra_mach=None):
     new = set(S["bus"]) - set(T["bus"])
-    want = _expand(PLANT_BUSES) if PLANT_BUSES else set(new)
+    if want is None:
+        want = _expand(PLANT_BUSES) if PLANT_BUSES else set(new)
     errs = []
     for b in sorted(want):
         if b not in S["bus"]:
@@ -298,6 +334,8 @@ def select(S, T):
     if COPY_MACHINES_ON_EXISTING_BUSES:
         mach.update({k: v for k, v in S["mach"].items()
                      if k[0] in T["bus"] and k not in T["mach"]})
+    for k in extra_mach or ():
+        mach[k] = S["mach"][k]
     # EVERY COPIED BUS MUST REACH TARGET'S NETWORK through the copied elements.
     adj = {}
     for k in list(lines) + list(xf2):
@@ -314,6 +352,116 @@ def select(S, T):
     for b in sorted(want - seen):
         errs.append("bus %d would be an island: nothing selected connects it to TARGET" % b)
     return want, mach, lines, xf2, errs
+
+
+# ---------------------------------------------------------------- distance / plants
+def graph(C):
+    """{bus: {neighbour: |R+jX|}} over in-service lines and transformers."""
+    g = {}
+
+    def edge(a, b, z):
+        if a == b:
+            return
+        g.setdefault(a, {})
+        g.setdefault(b, {})
+        if b not in g[a] or z < g[a][b]:
+            g[a][b] = g[b][a] = z
+    for k, v in list(C["line"].items()) + list(C["xf2"].items()):
+        if v["st"] == 1:
+            edge(k[0], k[1], abs(complex(v["rx"])) if v.get("rx") is not None else 0.0)
+    for w1, w2, w3, _ck in C["xf3"]:
+        edge(w1, w2, 0.0)
+        edge(w2, w3, 0.0)
+        edge(w1, w3, 0.0)
+    return g
+
+
+def distances(g, src):
+    """({bus: nodes}, {bus: summed |Z| along the fewest-nodes path})."""
+    hops, z = {src: 0}, {src: 0.0}
+    frontier = [src]
+    while frontier:
+        nxt = []
+        for a in frontier:
+            for b, zz in g.get(a, {}).items():
+                if b not in hops:
+                    hops[b] = hops[a] + 1
+                    z[b] = z[a] + zz
+                    nxt.append(b)
+                elif hops[b] == hops[a] + 1 and z[a] + zz < z[b]:
+                    z[b] = z[a] + zz
+        frontier = nxt
+    return hops, z
+
+
+def plant_pocket(S, T, poi):
+    """The buses SOURCE has behind `poi` that TARGET does not: walk SOURCE out
+       from the POI, stepping only onto buses TARGET lacks. That is the plant --
+       tie, main transformer, collector, GSUs, units -- and nothing of the grid."""
+    gs = graph(S)
+    seen, stack = set(), [poi]
+    while stack:
+        a = stack.pop()
+        for b in gs.get(a, {}):
+            if b not in seen and b not in T["bus"]:
+                seen.add(b)
+                stack.append(b)
+    # out-of-service elements still belong to the plant
+    for k in list(S["line"]) + list(S["xf2"]):
+        for a, b in ((k[0], k[1]), (k[1], k[0])):
+            if a in seen and b not in seen and b not in T["bus"]:
+                seen.add(b)
+    return seen
+
+
+def pick_plants(S, T):
+    """Plants within MAX_NODES (and MAX_Z_PU) of a project POI, in TARGET."""
+    gt = graph(T)
+    dist = {}
+    for pj, poi in sorted(PROJECT_POIS.items()):
+        if poi not in T["bus"]:
+            say("  *** project %s POI %d is not in TARGET -- left out of the distances ***" % (pj, poi))
+            continue
+        dist[pj] = distances(gt, int(poi))
+    say("")
+    say("PLANT DISTANCE FROM EACH PROJECT POI (nodes / |Z| pu), counted in TARGET")
+    say("  %-14s %5s %-8s %-8s  %s   %s" % ("plant", "MW", "type", "POI bus",
+        "  ".join("%-16s" % pj for pj in sorted(dist)), "copy?"))
+    want, extra, chosen = set(), set(), []
+    for name, mw, typ, poi in PLANTS:
+        poi = int(poi)
+        cells, near = [], []
+        for pj in sorted(dist):
+            h, z = dist[pj]
+            if poi in h:
+                cells.append("%3d / %-10.4f" % (h[poi], z[poi]))
+                if h[poi] <= MAX_NODES and (MAX_Z_PU is None or z[poi] <= MAX_Z_PU):
+                    near.append(pj)
+            else:
+                cells.append("%-16s" % ("POI not in case" if poi not in T["bus"] else "not connected"))
+        take = bool(near) and (not ONLY_PLANTS or name in ONLY_PLANTS)
+        note = ("YES (near %s)" % ", ".join(near)) if take else ("no" if not near else "near, not in ONLY_PLANTS")
+        if take and poi not in T["bus"]:
+            note = "*** POI %d not in TARGET -- cannot attach ***" % poi
+            take = False
+        pocket = set()
+        if take:
+            pocket = plant_pocket(S, T, poi)
+            pm = [k for k in S["mach"] if k[0] in pocket or (k[0] == poi and k not in T["mach"])]
+            if not pocket and not pm:
+                note = "already in TARGET (nothing behind POI %d to add)" % poi
+                take = False
+            else:
+                note += " -- %d bus(es), %d machine(s), %.1f MW in SOURCE" % (
+                    len(pocket), len(pm), sum(S["mach"][k]["r"][0] for k in pm if S["mach"][k]["st"] == 1))
+                extra |= set(k for k in pm if k[0] == poi)
+        say("  %-14s %5s %-8s %-8d  %s   %s" % (name, mw, typ, poi, "  ".join(cells), note))
+        if take:
+            want |= pocket
+            chosen.append((name, poi, sorted(pocket)))
+    for name, poi, pocket in chosen:
+        say("  %s behind POI %d: %s" % (name, poi, ", ".join(str(b) for b in pocket) or "(machines at the POI bus only)"))
+    return want, extra, chosen
 
 
 # ---------------------------------------------------------------- adding
@@ -526,7 +674,14 @@ def main():
     say("TARGET %s" % TARGET_SAV)
     S = read_case(SOURCE_SAV)
     T = read_case(TARGET_SAV)
-    want, mach, lines, xf2, errs = select(S, T)
+    if PLANTS:
+        pw, pextra, chosen = pick_plants(S, T)
+        if not chosen:
+            say("no plant within %d node(s) of a project POI needs copying" % MAX_NODES)
+        want, mach, lines, xf2, errs = select(S, T, pw, pextra)
+    else:
+        chosen = []
+        want, mach, lines, xf2, errs = select(S, T)
     stem = os.path.splitext(TARGET_SAV)[0]
     out = OUT_SAV or "%s_plus_%dbus.sav" % (stem, len(want))
     out_stem = os.path.splitext(out)[0]
@@ -617,6 +772,22 @@ def main():
         raise SystemExit(1)
     say("")
     say("SAVED %s" % out)
+    if chosen:
+        # THE DISTANCES THE PLANTS WERE CHOSEN BY, read again on the saved case:
+        # a plant hangs radially off its own POI, so nothing should have moved.
+        O = read_case(out)
+        g0, g1 = graph(T), graph(O)
+        say("")
+        say("POI DISTANCE CHECK (nodes, TARGET -> OUT)")
+        for name, poi, _p in chosen:
+            cells = []
+            for pj, ppoi in sorted(PROJECT_POIS.items()):
+                if ppoi not in T["bus"]:
+                    continue
+                h0 = distances(g0, int(ppoi))[0].get(poi)
+                h1 = distances(g1, int(ppoi))[0].get(poi)
+                cells.append("%s %s->%s%s" % (pj, h0, h1, "" if h0 == h1 else " *** CHANGED ***"))
+            say("  %-14s POI %-7d %s" % (name, poi, "   ".join(cells)))
     if SOURCE_DYR:
         copy_dyr(mach, OUT_DYR or out_stem + ".dyr")
     _write_log(out_stem + ".txt")
