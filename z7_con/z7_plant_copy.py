@@ -186,15 +186,51 @@ def ok(rc):
 
 
 # ---------------------------------------------------------------- case reading
+_BAD_STRINGS = set()
+
+
 def _col(fn, *args):
-    """One subsystem-array call -> list of columns, [] on any error."""
+    """One subsystem-array call -> list of columns.
+
+       ONE BAD STRING MUST NOT BLANK THE WHOLE TABLE. PSS/E answers ierr for the
+       whole call when any one of the strings asked for is not one this build
+       knows (v34 amachreal), and every column came back empty. So the call is
+       made once with all of them and, if that fails, once per string: a column
+       this build does not have is None, and is said once in the log."""
+    *head, strings = args
     try:
         ie, cols = fn(*args)
+        if ie in (0, None) and cols is not None:
+            return cols
     except Exception:
+        pass
+    if not isinstance(strings, (list, tuple)) or len(strings) < 2:
         return []
-    if ie not in (0, None) or cols is None:
-        return []
-    return cols
+    out, got = [], False
+    for s in strings:
+        try:
+            ie, c = fn(*(list(head) + [[s]]))
+        except Exception:
+            ie, c = 1, None
+        if ie in (0, None) and c:
+            out.append(c[0])
+            got = True
+        else:
+            out.append(None)
+            key = "%s %s" % (getattr(fn, "__name__", "?"), s)
+            if key not in _BAD_STRINGS:
+                _BAD_STRINGS.add(key)
+                say("  (this PSS/E does not answer %s('%s') -- a default is used)" % (getattr(fn, "__name__", "?"), s))
+    return out if got else []
+
+
+def _v(cols, n, k, default):
+    """cols[n][k], or default when that column was not available."""
+    try:
+        c = cols[n]
+        return default if c is None else c[k]
+    except Exception:
+        return default
 
 
 def _strip(s):
@@ -212,22 +248,30 @@ def read_case(path):
     names = _col(psspy.abuschar, -1, 2, ["NAME"])
     for k in range(len(ints[0]) if ints else 0):
         C["bus"][int(ints[0][k])] = {
-            "type": int(ints[1][k]), "area": int(ints[2][k]), "zone": int(ints[3][k]),
-            "owner": int(ints[4][k]), "kv": float(reals[0][k]), "vm": float(reals[1][k]),
-            "va": float(reals[2][k]), "lim": [float(reals[n][k]) for n in (3, 4, 5, 6)],
-            "name": _strip(names[0][k]) if names else ""}
+            "type": int(_v(ints, 1, k, 1)), "area": int(_v(ints, 2, k, 1)), "zone": int(_v(ints, 3, k, 1)),
+            "owner": int(_v(ints, 4, k, 1)), "kv": float(_v(reals, 0, k, 0.0)), "vm": float(_v(reals, 1, k, 1.0)),
+            "va": float(_v(reals, 2, k, 0.0)),
+            "lim": [float(_v(reals, n, k, d)) for n, d in ((3, 1.1), (4, 0.9), (5, 1.1), (6, 0.9))],
+            "name": _strip(_v(names, 0, k, ""))}
     mi = _col(psspy.amachint, -1, 4, ["NUMBER", "STATUS", "WMOD"])
     mr = _col(psspy.amachreal, -1, 4, ["PGEN", "QGEN", "QMAX", "QMIN", "PMAX", "PMIN", "MBASE",
                                        "RSOURCE", "XSOURCE", "RTRAN", "XTRAN", "GENTAP", "WPF"])
     mc = _col(psspy.amachchar, -1, 4, ["ID"])
+    mz = _col(psspy.amachcplx, -1, 4, ["ZSORCE", "XTRAN"])
     for k in range(len(mi[0]) if mi else 0):
         key = (int(mi[0][k]), _strip(mc[0][k]))
-        C["mach"][key] = {"st": int(mi[1][k]), "wmod": int(mi[2][k]),
-                          "r": [float(mr[n][k]) for n in range(len(mr))]}
+        zs = complex(_v(mz, 0, k, 1j))
+        zt = complex(_v(mz, 1, k, 0j))
+        r = [float(_v(mr, 0, k, 0.0)), float(_v(mr, 1, k, 0.0)), float(_v(mr, 2, k, 9999.0)),
+             float(_v(mr, 3, k, -9999.0)), float(_v(mr, 4, k, 9999.0)), float(_v(mr, 5, k, -9999.0)),
+             float(_v(mr, 6, k, 100.0)), float(_v(mr, 7, k, zs.real)), float(_v(mr, 8, k, zs.imag)),
+             float(_v(mr, 9, k, zt.real)), float(_v(mr, 10, k, zt.imag)), float(_v(mr, 11, k, 1.0)),
+             float(_v(mr, 12, k, 1.0))]
+        C["mach"][key] = {"st": int(_v(mi, 1, k, 1)), "wmod": int(_v(mi, 2, k, 0)), "r": r}
     gi = _col(psspy.agenbusint, -1, 4, ["NUMBER", "IREG"])
     gr = _col(psspy.agenbusreal, -1, 4, ["VSPU"])
     for k in range(len(gi[0]) if gi else 0):
-        C["plant"][int(gi[0][k])] = {"ireg": int(gi[1][k]), "vs": float(gr[0][k]) if gr else 1.0}
+        C["plant"][int(gi[0][k])] = {"ireg": int(_v(gi, 1, k, 0)), "vs": float(_v(gr, 0, k, 1.0))}
     # non-transformer branches (flag 2 = all, in or out of service)
     bi = _col(psspy.abrnint, -1, 1, 1, 2, 1, ["FROMNUMBER", "TONUMBER", "STATUS"])
     bc = _col(psspy.abrnchar, -1, 1, 1, 2, 1, ["ID"])
@@ -235,8 +279,8 @@ def read_case(path):
     br = _col(psspy.abrnreal, -1, 1, 1, 2, 1, ["CHARGING", "RATEA", "RATEB", "RATEC", "LENGTH"])
     for k in range(len(bi[0]) if bi else 0):
         key = (int(bi[0][k]), int(bi[1][k]), _strip(bc[0][k]))
-        C["line"][key] = {"st": int(bi[2][k]), "rx": bx[0][k], "b": float(br[0][k]),
-                          "rate": [float(br[n][k]) for n in (1, 2, 3)], "len": float(br[4][k])}
+        C["line"][key] = {"st": int(_v(bi, 2, k, 1)), "rx": _v(bx, 0, k, None), "b": float(_v(br, 0, k, 0.0)),
+                          "rate": [float(_v(br, n, k, 0.0)) for n in (1, 2, 3)], "len": float(_v(br, 4, k, 0.0))}
     # two-winding transformers (flag 2 = all)
     ti = _col(psspy.atrnint, -1, 1, 1, 2, 1, ["FROMNUMBER", "TONUMBER", "STATUS"])
     tc = _col(psspy.atrnchar, -1, 1, 1, 2, 1, ["ID"])
@@ -244,23 +288,24 @@ def read_case(path):
     tr = _col(psspy.atrnreal, -1, 1, 1, 2, 1, ["RATIO", "RATIO2", "ANGLE", "RATEA", "RATEB", "RATEC", "SBASE1"])
     for k in range(len(ti[0]) if ti else 0):
         key = (int(ti[0][k]), int(ti[1][k]), _strip(tc[0][k]))
-        C["xf2"][key] = {"st": int(ti[2][k]), "rx": tx[0][k] if tx else None,
-                         "ratio": float(tr[0][k]), "ratio2": float(tr[1][k]), "ang": float(tr[2][k]),
-                         "rate": [float(tr[n][k]) for n in (3, 4, 5)], "sbase": float(tr[6][k])}
+        C["xf2"][key] = {"st": int(_v(ti, 2, k, 1)), "rx": _v(tx, 0, k, None),
+                         "ratio": float(_v(tr, 0, k, 1.0)), "ratio2": float(_v(tr, 1, k, 1.0)),
+                         "ang": float(_v(tr, 2, k, 0.0)),
+                         "rate": [float(_v(tr, n, k, 0.0)) for n in (3, 4, 5)], "sbase": float(_v(tr, 6, k, 100.0))}
     t3 = _col(psspy.atr3int, -1, 1, 1, 2, 1, ["WIND1NUMBER", "WIND2NUMBER", "WIND3NUMBER"])
     t3c = _col(psspy.atr3char, -1, 1, 1, 2, 1, ["ID"])
     for k in range(len(t3[0]) if t3 else 0):
-        C["xf3"].append((int(t3[0][k]), int(t3[1][k]), int(t3[2][k]), _strip(t3c[0][k]) if t3c else "1"))
+        C["xf3"].append((int(t3[0][k]), int(t3[1][k]), int(t3[2][k]), _strip(_v(t3c, 0, k, "1"))))
     li = _col(psspy.aloadint, -1, 4, ["NUMBER", "STATUS"])
     lc = _col(psspy.aloadchar, -1, 4, ["ID"])
     lx = _col(psspy.aloadcplx, -1, 4, ["MVANOM"])
     for k in range(len(li[0]) if li else 0):
-        C["load"][(int(li[0][k]), _strip(lc[0][k]))] = {"st": int(li[1][k]), "s": lx[0][k] if lx else 0j}
+        C["load"][(int(li[0][k]), _strip(_v(lc, 0, k, "1")))] = {"st": int(_v(li, 1, k, 1)), "s": _v(lx, 0, k, 0j)}
     si = _col(psspy.afxshuntint, -1, 4, ["NUMBER", "STATUS"])
     sc = _col(psspy.afxshuntchar, -1, 4, ["ID"])
     sx = _col(psspy.afxshuntcplx, -1, 4, ["SHUNTNOM"])
     for k in range(len(si[0]) if si else 0):
-        C["fxsh"][(int(si[0][k]), _strip(sc[0][k]))] = {"st": int(si[1][k]), "s": sx[0][k] if sx else 0j}
+        C["fxsh"][(int(si[0][k]), _strip(_v(sc, 0, k, "1")))] = {"st": int(_v(si, 1, k, 1)), "s": _v(sx, 0, k, 0j)}
     ws = _col(psspy.aswshint, -1, 4, ["NUMBER"])
     C["swsh"] = [int(b) for b in (ws[0] if ws else [])]
     return C
@@ -730,6 +775,8 @@ def add_machine(b, mid, m, plant):
 
 
 def add_line(k, v):
+    if v["rx"] is None:
+        return ""
     rx = complex(v["rx"])
     ra = [rx.real, rx.imag, v["b"]] + [_f] * 9
     ra[7] = v["len"] if v["len"] > 0 else _f
@@ -1134,8 +1181,8 @@ def add_step(S, want, mach, lines, xf2):
         n_bad += not fn
     for k, v in sorted(lines.items()):
         fn = add_line(k, v)
-        say("  line %d-%d ck%s R=%.5f X=%.5f B=%.5f %s" % (k[0], k[1], k[2], complex(v["rx"]).real,
-                                                       complex(v["rx"]).imag, v["b"], fn or "*** FAILED ***"))
+        say("  line %d-%d ck%s R=%.5f X=%.5f B=%.5f %s" % (k[0], k[1], k[2], complex(v["rx"] or 0).real,
+                                                       complex(v["rx"] or 0).imag, v["b"], fn or "*** FAILED ***"))
         n_bad += not fn
     for k, v in sorted(xf2.get("_xf3", {}).items()):
         fn = add_xf3(k, v)
