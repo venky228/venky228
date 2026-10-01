@@ -19215,6 +19215,7 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
         env = {}
     od = os.path.join(rdir, "outs")
     todo = []
+    dyn_only = []                       # asked once already, never with the dyntools read
     for sid in missing:
         q = os.path.join(od, sid + ".out")
         # FLAT_RUN TOO. Forced, its old SCEN part was otherwise kept and merged
@@ -19231,19 +19232,35 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
         omt = "%.0f" % os.path.getmtime(q)
         if force:
             omt = "%s force=%.0f" % (omt, _LAUNCH_T0)
+        _asked = _dyn = False
         try:
             if os.path.isfile(stamp):
                 _was = open(stamp).read().strip()
+                _wt = _was.split()
+                _dyn = "dyn" in _wt
                 # UNFORCED: THE .out's DATE ONLY. A forced pass stamps
                 # "<mtime> force=<T0>", which never equalled the bare mtime, so
                 # a run it could not score was asked for again at once.
-                if _was == omt or (not force and _was.split()[:1] == [omt]):
-                    continue            # asked once already for this .out
+                _asked = (" ".join(t for t in _wt if t != "dyn") == omt
+                          or (not force and _wt[:1] == [omt]))
         except Exception:
             pass
+        if _asked and _dyn:
+            continue                    # asked, and read with dyntools too, for this .out
+        if _asked:
+            # ASKED ONCE -- BUT NEVER WITH THE DYNTOOLS READ. ensure_reports()
+            # stamps the same "<mtime>" before ITS pass, which runs with the
+            # dyntools read barred; this function then took the stamp for its
+            # own and skipped the file, so the one pass that can read it never
+            # ran (SantaFe project F97, F143, F151, F152; F167 on both sides,
+            # stamped 28 Sep and never asked again).
+            dyn_only.append((sid, stamp, omt))
+            continue
         todo.append((sid, stamp, omt))
-    if not todo:
+    if not todo and not dyn_only:
         return None
+    if not todo:
+        return _score_retry_dyntools(case, proj, mode, rdir, env, missing, dyn_only)
     ids = [s for s, _st, _o in todo]
     if force:
         print("[coverage] %-6s %-16s %-38s FORCE_RESCORE: scoring %d finished run(s) "
@@ -19290,42 +19307,70 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
     _OUT_SET_CACHE.clear()
     outs, scored = _out_and_scored_sets(rdir, proj)
     after = sorted(outs - scored, key=_fault_key)
-    # ONE MORE TRY FOR THE FILES THIS PASS ASKED FOR AND DID NOT SCORE. What a
-    # shard sets aside is mostly a file the packed reader cannot take (its
-    # grid does not verify, or the read fails outright): a scoring shard does
-    # not hand those to dyntools, because dyntools has crashed shards (F159),
-    # and the plot pass was left to score them -- hours later, after the
-    # comparison, or never when it skipped them too. They are few, so they are
-    # read here with dyntools allowed, on as few shards as there are files. A
-    # file that really kills the reader is struck and marked .badout by the
-    # shard's own guard after OUT_READ_STRIKES deaths, so this cannot loop.
-    _retry = [s for s in ids if s in after and os.path.isfile(os.path.join(od, s + ".out"))
-              and not os.path.isfile(os.path.join(od, s + ".out.badout"))]
+    # ONE MORE TRY FOR THE FILES THIS PASS ASKED FOR AND DID NOT SCORE, and
+    # for the ones an earlier pass (ensure_reports(), an earlier launch) asked
+    # for without the dyntools read -- see _score_retry_dyntools.
+    _retry = [x for x in todo if x[0] in after] + list(dyn_only)
     if _retry:
-        print("[coverage]     %d of them %s still unscored -- one more pass, the dyntools "
-              "read allowed: %s" % (len(_retry), "is" if len(_retry) == 1 else "are",
-                                    ", ".join(_retry[:12]) + (" ..." if len(_retry) > 12 else "")))
-        _clear_score_claims(rdir, _retry)
-        env2 = dict(env0)
-        env2.update({"SPP_REPORT_ONLY": "1", "SPP_REPORT_FAULTS": ",".join(_retry),
-                     "SPP_ONLY_FAULTS": "", "SPP_NAN_DYNTOOLS": "1"})
-        try:
-            env2["SPP_LAUNCH_REPORT_WORKERS"] = str(max(1, min(
-                len(_retry), int(_report_workers_for(case["key"], 1)))))
-        except Exception:
-            env2["SPP_LAUNCH_REPORT_WORKERS"] = "1"
-        try:
-            rc2 = run_study(case, projects=[proj], modes=[mode], extra_env=env2)
-            if rc2 not in (0, None):
-                print("[coverage]     the second pass ended rc=%s -- what it scored is kept" % rc2)
-        except Exception as e:
-            print("[coverage]     the second pass could not start (%s)" % e)
-        _merge_one_folder(case, rdir)
-        _MEAS_CACHE.clear()
-        _SCEN_PART_CACHE.clear()
-        _OUT_SET_CACHE.clear()
-        outs, scored = _out_and_scored_sets(rdir, proj)
-        after = sorted(outs - scored, key=_fault_key)
+        return _score_retry_dyntools(case, proj, mode, rdir, env0, missing, _retry)
+    print("[coverage]     %d of %d now scored" % (len(missing) - len(after), len(missing)))
+    return after
+
+
+def _score_retry_dyntools(case, proj, mode, rdir, env, missing, items):
+    """One scoring pass for `items` [(id, .scoretry path, stamp)] with the
+       dyntools read allowed. Returns the ids of `missing` still unscored.
+
+       What a shard sets aside is mostly a file the packed reader cannot take
+       (its grid does not verify, or the read fails outright): a scoring shard
+       does not hand those to dyntools, because dyntools has crashed shards
+       (F159), and the plot pass was left to score them -- hours later, after
+       the comparison, or never when it skipped them too. They are few, so they
+       are read here with dyntools allowed, on as few shards as there are
+       files. A file that really kills the reader is struck and marked .badout
+       by the shard's own guard after OUT_READ_STRIKES deaths, so this cannot
+       loop. Asked once per version of the .out: the stamp gains " dyn"."""
+    od = os.path.join(rdir, "outs")
+    items = [x for x in items if os.path.isfile(os.path.join(od, x[0] + ".out"))
+             and not os.path.isfile(os.path.join(od, x[0] + ".out.badout"))]
+    if not items:
+        return None
+    ids = [s for s, _st, _o in items]
+    print("[coverage] %-6s %-16s %-38s %d finished run(s) still unscored -- one pass "
+          "with the dyntools read allowed: %s"
+          % (case["key"], proj, os.path.basename(rdir), len(ids),
+             ", ".join(ids[:12]) + (" ..." if len(ids) > 12 else "")))
+    _clear_score_claims(rdir, ids)
+    env2 = dict(env or {})
+    env2.update({"SPP_REPORT_ONLY": "1", "SPP_REPORT_FAULTS": ",".join(ids),
+                 "SPP_ONLY_FAULTS": "", "SPP_NAN_DYNTOOLS": "1"})
+    try:
+        env2["SPP_LAUNCH_REPORT_WORKERS"] = str(max(1, min(
+            len(ids), int(_report_workers_for(case["key"], 1)))))
+    except Exception:
+        env2["SPP_LAUNCH_REPORT_WORKERS"] = "1"
+    rc2 = "exception"
+    try:
+        rc2 = run_study(case, projects=[proj], modes=[mode], extra_env=env2)
+        if rc2 not in (0, None):
+            print("[coverage]     the dyntools pass ended rc=%s -- what it scored is kept" % rc2)
+    except Exception as e:
+        print("[coverage]     the dyntools pass could not start (%s)" % e)
+    if rc2 in (0, None):
+        # ASKED WITH DYNTOOLS: not again until the .out changes. A pass that
+        # did not finish leaves the stamp as it was, so the next launch retries.
+        for _sid, stamp, omt in items:
+            try:
+                with open(stamp, "w") as fh:
+                    fh.write(omt + " dyn")
+            except Exception:
+                pass
+    _merge_one_folder(case, rdir)
+    _MEAS_CACHE.clear()
+    _SCEN_PART_CACHE.clear()
+    _OUT_SET_CACHE.clear()
+    outs, scored = _out_and_scored_sets(rdir, proj)
+    after = sorted((outs - scored) & set(missing), key=_fault_key)
     print("[coverage]     %d of %d now scored" % (len(missing) - len(after), len(missing)))
     return after
 
@@ -19571,9 +19616,13 @@ def scoring_audit(quiet=False):
                             try:
                                 _st = os.path.join(od, sid + ".scoretry")
                                 if os.path.isfile(_st):
-                                    why += (" -- a scoring pass asked for it and it could not be "
-                                            "scored; the reason is in that folder's "
-                                            "logs\\DYN_STUDY_report_w*.log (search %s)" % sid)
+                                    _dy = "dyn" in open(_st).read().split()
+                                    why += (" -- %s; the reason is in that folder's "
+                                            "logs\\DYN_STUDY_report_w*.log (search %s)"
+                                            % ("read with the dyntools read allowed too and "
+                                               "still not scored -- re-simulate it" if _dy else
+                                               "scored without the dyntools read only; the "
+                                               "next launch reads it with dyntools", sid))
                             except Exception:
                                 pass
                         fin_un.append((sid, why))
@@ -20452,7 +20501,10 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                     _stamp = os.path.join(_od, _sid + ".scoretry")
                     _omt = "%.0f" % os.path.getmtime(_q)
                     try:
-                        if os.path.isfile(_stamp) and open(_stamp).read().strip() == _omt:
+                        # FIRST WORD: the coverage check's dyntools pass stamps
+                        # "<mtime> dyn" -- asked too, for this .out.
+                        if (os.path.isfile(_stamp)
+                                and open(_stamp).read().split()[:1] == [_omt]):
                             continue          # asked once already for this .out
                     except Exception:
                         pass
