@@ -873,10 +873,10 @@ COMPARE_BY_PROJECT = True                    # comparison\<project>\
 KEEP_PREVIOUS_RUNS = True                    # rename the last run aside
 COMPARE_ALL_RUNS = True
 COMPARE_RUNS = None                          # run against run, e.g. ("__run1", "")
-SWEEP_PLAN_FILE = "SWEEP_PLAN.txt"           # "" = off
+SWEEP_PLAN_FILE = "SWEEP_PLAN_Q.txt"           # "" = off
 SWEEP_PLAN_EVERY = 60                        # s
 LIVE_COMPARE_EVERY = 300                     # s (0 = end only)
-LIVE_STATUS_ALL = "LIVE_STATUS.txt"          # "" = off
+LIVE_STATUS_ALL = "LIVE_STATUS_Q.txt"          # "" = off
 
 # ---- 20. WATCHDOG / LICENCE ----------------------------------------------------
 KILL_GRACE_MIN = 30                          # min of silence before a watchdog acts
@@ -17267,7 +17267,7 @@ def _live_case_count():
 
 
 def _slots_file_for(case_key):
-    return os.path.join(STUDY_ROOT, ".spp_slots_%s.txt" % str(case_key).upper())
+    return os.path.join(STUDY_ROOT, ".spp_slots_Q_%s.txt" % str(case_key).upper())
 
 
 def _clear_slots_files():
@@ -17301,11 +17301,11 @@ _EARLY_MIN_CORES = 4            # fewer idle cores than this: wait
 
 
 def _alive_file_for(case_key):
-    return os.path.join(STUDY_ROOT, ".spp_alive_%s.txt" % str(case_key).upper())
+    return os.path.join(STUDY_ROOT, ".spp_alive_Q_%s.txt" % str(case_key).upper())
 
 
 def _busy_file():
-    return os.path.join(STUDY_ROOT, ".spp_scoring_busy.txt")
+    return os.path.join(STUDY_ROOT, ".spp_scoring_busy_Q.txt")
 
 
 def _cores_ceiling():

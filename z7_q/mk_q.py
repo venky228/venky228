@@ -11,6 +11,7 @@ So a _Q run never touches a normal run, everything it writes is named apart:
     <case>_Q[...].cnl/.cnv/.snp/.sav        (normal: <case>[...])
     LOADED_*_Q_<project>.dyr                (normal: LOADED_*_<project>.dyr)
     comparison_q, comparison_scenarios_q, comparison_pairs_q
+    LIVE_STATUS_Q*, SWEEP_PLAN_Q*, .spp_slots_Q_*, .spp_alive_Q_*, .spp_scoring_busy_Q
 and each _Q script starts the other _Q scripts, never the normal ones.
 
 Run again whenever the z7 scripts change: python3 mk_q.py <z7 folder> <out folder>."""
@@ -105,6 +106,16 @@ def main_panel(txt, f):
     txt = sub(txt, '_case_dir(CMP_FOLDER, "comparison")', '_case_dir(CMP_FOLDER, "comparison_q")', 1, f)
     txt = sub(txt, '_case_dir(SCEN_CMP_FOLDER, "comparison_scenarios")',
               '_case_dir(SCEN_CMP_FOLDER, "comparison_scenarios_q")', 1, f)
+    # THE PANEL'S OWN STATUS AND CORE-SHARING FILES in the study root: each
+    # panel clears its slot files when it starts, so sharing them would let a
+    # _Q launch wipe a normal launch's worker counts (and the other way round).
+    txt = sub(txt, '".spp_slots_%s.txt"', '".spp_slots_Q_%s.txt"', 1, f)
+    txt = sub(txt, '".spp_alive_%s.txt"', '".spp_alive_Q_%s.txt"', 1, f)
+    txt = sub(txt, '".spp_scoring_busy.txt"', '".spp_scoring_busy_Q.txt"', 1, f)
+    txt = re.sub(r'^SWEEP_PLAN_FILE = "SWEEP_PLAN.txt"', 'SWEEP_PLAN_FILE = "SWEEP_PLAN_Q.txt"', txt, count=1, flags=re.M)
+    txt = re.sub(r'^LIVE_STATUS_ALL = "LIVE_STATUS.txt"', 'LIVE_STATUS_ALL = "LIVE_STATUS_Q.txt"', txt, count=1, flags=re.M)
+    if 'SWEEP_PLAN_FILE = "SWEEP_PLAN_Q.txt"' not in txt or 'LIVE_STATUS_ALL = "LIVE_STATUS_Q.txt"' not in txt:
+        raise SystemExit("%s: SWEEP_PLAN_FILE / LIVE_STATUS_ALL not found" % f)
     return txt
 
 
