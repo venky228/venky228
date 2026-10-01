@@ -1210,6 +1210,43 @@ def _compact_fallback(z4, ctx, t, k4):
         return None
 
 
+def _run_has_fault(ctx, t, fid):
+    """Run/pair t's summary row for this fault, or None when it never ran it."""
+    try:
+        return ((ctx or {}).get("summ") or {}).get(t, {}).get(str(fid).strip())
+    except Exception:
+        return None
+
+
+def _absent_cell(z4, ctx, lay, kind, t, fid, c):
+    """WHAT A COLUMN SAYS WHERE ITS RUN HAS NO ROW FOR THIS LINE.
+
+       'not in this run' was written whenever a run had no row of its own for a
+       line -- and a run has none for every fault it COMPARED (sheet 7 lists the
+       ones it did not) and for every element it did not list. So the EGF-off
+       base, which ran all 180 SantaFe faults on 28 Sep, read 'not in this run'
+       beside every fault the GIA pair could not compare. The run's own summary
+       says whether it ran the fault: if it did, its state is given (its
+       verdict) or the cell says the value was not recorded; 'not in this run'
+       is left for a run that truly does not have the fault."""
+    pairs = list(lay.get("of_ref", {}).get(t, [])) if kind == "ref" else [t]
+    SC = (ctx or {}).get("SC") or {}
+    for p in pairs:
+        s = _run_has_fault(ctx, p, fid)
+        if s is None:
+            continue
+        if c in ("base_state", "projects_state", "project_state") and SC:
+            col = "verdict_base" if kind == "ref" else "verdict_projects"
+            try:
+                v = str(s[SC[col]]).strip().upper()
+            except Exception:
+                v = ""
+            if v in ("PASS", "FAIL"):
+                return ("scored %s" % v) if kind == "ref" else ("compared in this run: %s" % v)
+        return "not recorded"
+    return "not in this run"
+
+
 def _notrun_fallback(z4, ctx, t, fid):
     """A fault run t DID compare: its not-compared cells say so, with the
        verdict, instead of 'not in this run'."""
@@ -1864,12 +1901,12 @@ def _wide_sheet(z4, group, tags, key, cols, rk, ctx=None, lay=None):
                 elif kind == "ref":
                     if (lay["multi"] and c not in mr[t]
                             and not any(p in per[k] for p in lay["of_ref"].get(t, []))):
-                        row.append("not in this run")
+                        row.append(_absent_cell(z4, ctx, lay, "ref", t, k[0], c))
                     else:
                         row.append(_merge_get(mr[t], c, z4))
                 elif kind == "pair":
                     v = _val(t, c)
-                    row.append("not in this run" if v is None else v)
+                    row.append(_absent_cell(z4, ctx, lay, "pair", t, k[0], c) if v is None else v)
                 else:
                     row.append(_per_test(z4, [(p, _val(p, c), own[p]) for p in lay["of_test"][t]]))
                 if _si in cyc_pos:

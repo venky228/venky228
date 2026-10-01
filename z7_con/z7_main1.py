@@ -17903,7 +17903,6 @@ def _unplotted_list(rdir):
     return rows
 
 
-@_timed("plotting")
 def _plot_cases(pipeline):
     """The cases the plot/score pass must visit.
 
@@ -17924,6 +17923,7 @@ def _plot_cases(pipeline):
     return cases or [CASE_BASE, CASE_TEST]
 
 
+@_timed("plotting")
 def plot_missing_everywhere(pipeline, after_runs=False, only_projects=None, cap=None,
                             stop=None):
     """Draw every missing PDF, in ROUNDS, with fewer plotters each time.
@@ -19155,27 +19155,72 @@ def _note_forced_pass(case, projects, modes, env, rc):
         pass
 
 
+def _clear_score_claims(rdir, ids):
+    """Drop the scoring claims an EARLIER pass left on these ids.
+
+       A shard claims each .out as it takes it (outs\\rclaim\\<id>.rclaim) and
+       marks one it set aside (<id>.rclaim.fin). The next pass's shard 0 clears
+       them as it starts -- but the other shards start at the same time, and a
+       shard that reaches an id before shard 0 has cleared it finds the old
+       .fin and skips it: one more pass that does not score the file. Called
+       between passes, when no shard of this folder is running; a claim whose
+       process is still alive is left alone."""
+    d = os.path.join(rdir, "outs", "rclaim")
+    n = 0
+    for sid in ids:
+        for p in ([os.path.join(d, sid + ".rclaim"), os.path.join(d, sid + ".rclaim.fin"),
+                   os.path.join(rdir, "outs", sid + ".rclaim")]
+                  + glob.glob(os.path.join(d, sid + ".rclaim.stale*"))):
+            if not os.path.isfile(p):
+                continue
+            if p.endswith(".rclaim"):
+                try:
+                    with open(p, "r") as fh:
+                        _txt = fh.read(200)
+                    _pid = [t[3:] for t in _txt.split() if t.startswith("pid")]
+                    if _pid and _pid_alive_here(_pid[0]):
+                        continue
+                except Exception:
+                    pass
+            try:
+                os.remove(p)
+                n += 1
+            except Exception:
+                pass
+    return n
+
+
 def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
-    """Score the .out files of an EGF / surplus folder that have no verdict.
+    """Score the .out files of a folder that have no verdict -- an EGF /
+       surplus / sweep folder, or the plain <proj>_<mode> folder.
        Returns the ids still unscored afterwards, or None when nothing was run.
 
        force=True (FORCE_RESCORE): every finished .out of the folder is scored
        again, once per launch, whatever the .scoretry stamps say."""
     _p, _m, tag = _split_run_folder(rdir)
-    if not tag:
-        return None
-    # SWEEP, CAPACITY, NEW-PLANT ... FOLDERS TOO, from the folder name, as their
-    # plotter is started -- _tag_env() alone knew only EGF and surplus tags.
-    env = _tagged_scoring_env(proj, tag, rdir)
-    if env is None:
-        return None
+    if tag:
+        # SWEEP, CAPACITY, NEW-PLANT ... FOLDERS TOO, from the folder name, as
+        # their plotter is started -- _tag_env() alone knew only EGF and surplus.
+        env = _tagged_scoring_env(proj, tag, rdir)
+        if env is None:
+            return None
+    else:
+        # THE PLAIN <proj>_<mode> FOLDER TOO. ensure_reports() scores it as a
+        # whole; a fault its pass did not reach -- a shard that gave up, a file
+        # it set aside -- was only LISTED below as "never scored" and then
+        # compared as missing (CQ_MIT, 30 Sep: 222 finished runs read
+        # "simulated, not scored" in the main comparison and were scored hours
+        # later by the plot pass). A complete .out is scored before the
+        # comparison is written, here, by a pass restricted to those ids.
+        env = {}
     od = os.path.join(rdir, "outs")
     todo = []
     for sid in missing:
         q = os.path.join(od, sid + ".out")
-        # FLAT_RUN IS RESCORED TOO when forced: left out of SPP_REPORT_FAULTS,
-        # its old SCEN part was kept and merged back under the old rule.
-        if (sid.upper().startswith("FLAT") and not force) or not os.path.isfile(q):
+        # FLAT_RUN TOO. Forced, its old SCEN part was otherwise kept and merged
+        # back under the old rule; unforced, a flat run with no verdict left
+        # "Flat (no-fault) run: -" in the comparison (IronStar, 30 Sep).
+        if not os.path.isfile(q):
             continue
         if not (os.path.isfile(os.path.join(od, sid + ".done"))
                 or os.path.isfile(os.path.join(od, sid + ".partial"))):
@@ -19204,13 +19249,15 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
         print("[coverage] %-6s %-16s %-38s FORCE_RESCORE: scoring %d finished run(s) "
               "again" % (case["key"], proj, os.path.basename(rdir), len(ids)))
     print("[coverage]     scoring %d of them now under the %s settings -- no simulation: %s"
-          % (len(ids), tag, ", ".join(ids[:12]) + (" ..." if len(ids) > 12 else "")))
+          % (len(ids), tag or "as-studied", ", ".join(ids[:12]) + (" ..." if len(ids) > 12 else "")))
     for _sid, stamp, omt in todo:
         try:
             with open(stamp, "w") as fh:
                 fh.write(omt)
         except Exception:
             pass
+    _clear_score_claims(rdir, ids)
+    env0 = dict(env)
     env.update({"SPP_REPORT_ONLY": "1", "SPP_REPORT_FAULTS": ",".join(ids),
                 "SPP_ONLY_FAULTS": ""})
     try:
@@ -19243,6 +19290,42 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
     _OUT_SET_CACHE.clear()
     outs, scored = _out_and_scored_sets(rdir, proj)
     after = sorted(outs - scored, key=_fault_key)
+    # ONE MORE TRY FOR THE FILES THIS PASS ASKED FOR AND DID NOT SCORE. What a
+    # shard sets aside is mostly a file the packed reader cannot take (its
+    # grid does not verify, or the read fails outright): a scoring shard does
+    # not hand those to dyntools, because dyntools has crashed shards (F159),
+    # and the plot pass was left to score them -- hours later, after the
+    # comparison, or never when it skipped them too. They are few, so they are
+    # read here with dyntools allowed, on as few shards as there are files. A
+    # file that really kills the reader is struck and marked .badout by the
+    # shard's own guard after OUT_READ_STRIKES deaths, so this cannot loop.
+    _retry = [s for s in ids if s in after and os.path.isfile(os.path.join(od, s + ".out"))
+              and not os.path.isfile(os.path.join(od, s + ".out.badout"))]
+    if _retry:
+        print("[coverage]     %d of them %s still unscored -- one more pass, the dyntools "
+              "read allowed: %s" % (len(_retry), "is" if len(_retry) == 1 else "are",
+                                    ", ".join(_retry[:12]) + (" ..." if len(_retry) > 12 else "")))
+        _clear_score_claims(rdir, _retry)
+        env2 = dict(env0)
+        env2.update({"SPP_REPORT_ONLY": "1", "SPP_REPORT_FAULTS": ",".join(_retry),
+                     "SPP_ONLY_FAULTS": "", "SPP_NAN_DYNTOOLS": "1"})
+        try:
+            env2["SPP_LAUNCH_REPORT_WORKERS"] = str(max(1, min(
+                len(_retry), int(_report_workers_for(case["key"], 1)))))
+        except Exception:
+            env2["SPP_LAUNCH_REPORT_WORKERS"] = "1"
+        try:
+            rc2 = run_study(case, projects=[proj], modes=[mode], extra_env=env2)
+            if rc2 not in (0, None):
+                print("[coverage]     the second pass ended rc=%s -- what it scored is kept" % rc2)
+        except Exception as e:
+            print("[coverage]     the second pass could not start (%s)" % e)
+        _merge_one_folder(case, rdir)
+        _MEAS_CACHE.clear()
+        _SCEN_PART_CACHE.clear()
+        _OUT_SET_CACHE.clear()
+        outs, scored = _out_and_scored_sets(rdir, proj)
+        after = sorted(outs - scored, key=_fault_key)
     print("[coverage]     %d of %d now scored" % (len(missing) - len(after), len(missing)))
     return after
 
@@ -19374,8 +19457,13 @@ def verify_scoring_coverage(quiet=False):
                     # unscored .out files for good (EmpirePrairie_spp_s1_egfoff:
                     # 198 of 285). One pass restricted to those ids, under the
                     # tag's own settings; asked once per version of each .out.
+                    # THE PLAIN FOLDER TOO (see _score_tagged_folder), and under
+                    # FORCE_RESCORE asked again whatever an earlier launch's
+                    # .scoretry says -- the rule changed since it was asked.
                     if missing:
-                        _after = _score_tagged_folder(case, proj, mode, rdir, missing)
+                        _after = _score_tagged_folder(
+                            case, proj, mode, rdir, missing,
+                            force=bool(FORCE_RESCORE and not _split_run_folder(rdir)[2]))
                         if _after is not None:
                             missing = _after
                     if missing:
@@ -19420,6 +19508,112 @@ def verify_scoring_coverage(quiet=False):
     print("=" * 92)
     print("")
     return sum(len(m) for _c, _p, _r, m in still)
+
+
+def _scores_added_since(t, results):
+    """(count, [(case, project, n)]) of per-scenario scores written after time t
+       in the plain folders a comparison covers -- scores the comparison written
+       at t could not contain."""
+    n, where = 0, []
+    for res in (results or []):
+        for case in (CASE_BASE, CASE_TEST):
+            try:
+                rdir = results_dir(case, res["project"], res["mode"])
+            except Exception:
+                continue
+            k = 0
+            for f in glob.glob(os.path.join(rdir, "parts", "SCEN_*.csv")):
+                if f.upper().endswith("_MEAS.CSV") or ".tmp" in os.path.basename(f):
+                    continue
+                try:
+                    if os.path.getmtime(f) > t:
+                        k += 1
+                except Exception:
+                    pass
+            if k:
+                where.append((case["key"], res["project"], k))
+                n += k
+    return n, where
+
+
+def scoring_audit(quiet=False):
+    """THE LAST CHECK: does every finished .out of every folder of this launch's
+       projects have a verdict? Counted from what the reports read -- the merged
+       report and the per-scenario parts -- and written to
+       comparison\\00_SCORING_AUDIT.txt with the reason for each one that does not.
+
+       A finished run is one with a .done or .partial marker. One without either
+       stopped before the end (crashed / incomplete) and is listed apart: it needs
+       a re-run, not a score. Returns the number of finished runs with no verdict."""
+    lines, n_fin_un, n_tot, n_inc = [], 0, 0, 0
+    for mode in (list(MODES) or ["spp"]):
+        for proj in (_panel_projects() or list(PROJECTS) or [""]):
+            for case in (CASE_BASE, CASE_TEST):
+                for rdir in _result_folders_for(case, proj, mode):
+                    _MEAS_CACHE.clear()
+                    _SCEN_PART_CACHE.clear()
+                    _OUT_SET_CACHE.clear()
+                    outs, scored = _out_and_scored_sets(rdir, proj)
+                    if not outs:
+                        continue
+                    od = os.path.join(rdir, "outs")
+                    fin_un, inc = [], []
+                    for sid in sorted(outs - scored, key=_fault_key):
+                        q = os.path.join(od, sid + ".out")
+                        if not (os.path.isfile(os.path.join(od, sid + ".done"))
+                                or os.path.isfile(os.path.join(od, sid + ".partial"))):
+                            inc.append(sid)
+                            continue
+                        if os.path.isfile(q + ".badout"):
+                            why = "marked .badout -- reading it killed the reader; re-simulate it"
+                        else:
+                            why = "finished, no verdict"
+                            try:
+                                _st = os.path.join(od, sid + ".scoretry")
+                                if os.path.isfile(_st):
+                                    why += (" -- a scoring pass asked for it and it could not be "
+                                            "scored; the reason is in that folder's "
+                                            "logs\\DYN_STUDY_report_w*.log (search %s)" % sid)
+                            except Exception:
+                                pass
+                        fin_un.append((sid, why))
+                    n_tot += len(outs)
+                    n_fin_un += len(fin_un)
+                    n_inc += len(inc)
+                    tag = "%-6s %s" % (case["key"], os.path.basename(rdir))
+                    if not fin_un and not inc:
+                        lines.append("  OK    %-52s %4d .out, every one scored" % (tag, len(outs)))
+                        continue
+                    lines.append("  ***   %-52s %4d .out, %d finished run(s) WITHOUT a verdict, "
+                                 "%d stopped early" % (tag, len(outs), len(fin_un), len(inc)))
+                    for sid, why in fin_un:
+                        lines.append("            %-8s %s" % (sid, why))
+                    if inc:
+                        lines.append("            stopped before the end (re-run, not a scoring "
+                                     "job): %s" % ", ".join(inc))
+    head = [
+        "=" * 92,
+        " SCORING AUDIT  %s -- every .out of every folder of this launch"
+        % time.strftime("%Y-%m-%d %H:%M"),
+        "=" * 92,
+        (" ALL %d .out file(s) that finished have a verdict%s."
+         % (n_tot - n_inc, (" (%d more stopped before the end -- see below)" % n_inc) if n_inc else ""))
+        if not n_fin_un else
+        (" *** %d finished run(s) have NO verdict -- the comparison cannot judge them ***"
+         % n_fin_un),
+        ""]
+    txt = "\n".join(head + lines) + "\n"
+    if not quiet or n_fin_un:
+        print("")
+        print(txt)
+    try:
+        if not os.path.isdir(COMPARE_DIR):
+            os.makedirs(COMPARE_DIR)
+        with open(os.path.join(COMPARE_DIR, "00_SCORING_AUDIT.txt"), "w") as fh:
+            fh.write(txt)
+    except Exception:
+        pass
+    return n_fin_un
 
 
 _PDF_PROJ_RE = re.compile(r"PROJ (\d{4,})")
@@ -25318,6 +25512,7 @@ def main():
         _fp = _fast_projects()
         if int(FAST_COMPARE_PARALLEL or 1) > 1 and len(_fp) > 1:
             return _fast_compare_parallel(_fp)
+    _cmp_written_t = time.time()      # scores after this are not in the comparison
     results, all_only_b, all_only_t = compare_now(quiet=False)
     _res_n = [r for r in results if r["project"] not in _egf_skip]     # EGF_ONLY projects: no other extra run
     all_only_b, all_only_t = set(all_only_b), set(all_only_t)
@@ -25585,6 +25780,39 @@ def main():
             plot_missing_everywhere(pipeline, after_runs=True, cap=_plot_idle_cap())
         except Exception as e:
             print("[compare] the catch-up plot pass for the extra runs failed (%s)" % e)
+    # ---- EVERY FINISHED .out SCORED -- THE SECOND CHECK ---------------------
+    # After the plot pass and the extra runs, before the side-by-side and the
+    # tables after it. The first check ran before the comparison; anything a run
+    # since then left unscored (a surplus or EGF run's report phase that died, a
+    # pass that stopped part way) is scored now. A file the first check already
+    # asked for in this launch is not asked again (outs\<id>.scoretry).
+    if not _fast:
+        try:
+            verify_scoring_coverage()
+        except Exception as _e:
+            print("[coverage] the second coverage check failed (%s)" % _e)
+        # THE MAIN COMPARISON AGAIN, WHEN SCORES LANDED AFTER IT WAS WRITTEN.
+        # CQ_MIT, 30 Sep: comparison\<project>\00_COMPARISON_REPORT was written
+        # at 10:47 with 222 finished runs "simulated, not scored"; the plot pass
+        # scored them by 15:05, and the workbook was never written again -- only
+        # the side-by-side in comparison_pairs\ had them.
+        try:
+            _late, _where = _scores_added_since(_cmp_written_t, results)
+            if _late:
+                print("")
+                print("[compare] %d fault score(s) were written AFTER the comparison (%s) -- "
+                      "rewriting it so it holds every scored fault"
+                      % (_late, ", ".join("%s %s %d" % w for w in _where[:8])))
+                try:
+                    auto_remerge_stale_reports()
+                except Exception as _e:
+                    print("[auto-merge] the staleness check failed (%s)" % _e)
+                _cmp_written_t = time.time()
+                results, all_only_b, all_only_t = compare_now(quiet=False)
+                all_only_b, all_only_t = set(all_only_b), set(all_only_t)
+        except Exception as _e:
+            print("[compare] could not rewrite the comparison with the later scores (%s)" % _e)
+
     # BASE | GIA | EACH SURPLUS SCENARIO | BASE EGF OFF, side by side, one
     # workbook per project -- AFTER the EGF runs, so the base with the existing
     # machines off is on disk when it is written.
@@ -25697,6 +25925,14 @@ def main():
         print("[compare] result folders. A results folder that has vanished was removed from")
         print("[compare] outside these scripts, or the case folder now points somewhere new.")
         return 1
+
+    # ---- THE LAST CHECK: EVERY FINISHED .out HAS A VERDICT -----------------
+    # Counted from what the reports read, per folder, written beside the
+    # comparison as 00_SCORING_AUDIT.txt with the reason for any that has none.
+    try:
+        scoring_audit(quiet=False)
+    except Exception as _e:
+        print("[audit] the scoring audit could not be written (%s)" % _e)
 
     p = cmp_path("COMPARISON_SUMMARY", "txt")
     print("")
