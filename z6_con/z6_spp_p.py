@@ -18568,17 +18568,119 @@ def _fast_bits(path):
         total = os.path.getsize(path) // 4
     except Exception:
         return None
+    if _arr.array("I").itemsize != 4:
+        return None
+    if _FAST_CHUNKED[0] or os.environ.get("SPP_FAST_CHUNKED", "") == "1":
+        return _fast_bits_chunked(path, total)
     raw = _arr.array("I")
     try:
         with open(path, "rb") as fh:
             raw.fromfile(fh, total)
     except EOFError:
         pass
-    except Exception:
-        return None
-    if raw.itemsize != 4:
+    except MemoryError:
+        # ONE CONTIGUOUS BLOCK OF THE WHOLE FILE IS NOT ALWAYS THERE TO HAVE.
+        # A 32-bit process has 2 GB of address space, and after a large read
+        # (the head calibration's dyntools pass, a big .out before this one)
+        # it is left in pieces: plenty free in total, no single 90 MB hole.
+        # This returned None silently, so every later file in the process
+        # "did not verify (no detail)" and was set aside unscored -- one
+        # shard failing every file while the shards beside it read the same
+        # files packed. Read in pieces instead, and stay that way for the
+        # rest of this process: the address space does not heal.
+        raw = None
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
+        _FAST_CHUNKED[0] = True
+        print("  [fast] %s: no single %.0f MB block of memory is free in this process -- "
+              "reading .out files in %d MB pieces from here on (same words, same result)"
+              % (os.path.basename(path), total * 4 / 1048576.0, _FAST_CHUNK_WORDS * 4 // 1048576))
+        return _fast_bits_chunked(path, total)
+    except Exception as e:
+        _FAST_TITLE_WHY[0] = "could not read the file (%s)" % e
         return None
     return raw
+
+
+_FAST_CHUNK_WORDS = 1048576     # 4 MB per piece when one block cannot be had
+_FAST_CHUNKED = [False]         # this process reads in pieces (see _fast_bits)
+
+
+class _FastWords(object):
+    """A whole .out as unsigned 32-bit words, held in pieces of
+       _FAST_CHUNK_WORDS. Indexing and stepped slicing behave as on the
+       array('I') _fast_bits otherwise returns -- a slice comes back as a
+       fresh array('I') -- so the reader cannot tell the two apart."""
+
+    def __init__(self, chunks):
+        self._c = chunks
+        self._n = sum(len(c) for c in chunks)
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, k):
+        import array as _arr
+        if isinstance(k, slice):
+            start, stop, step = k.indices(self._n)
+            out = _arr.array("I")
+            if step <= 0:
+                if step < 0:
+                    raise ValueError("negative step")
+                return out
+            c0 = 0
+            for c in self._c:
+                c1 = c0 + len(c)
+                if c1 > start and c0 < stop:
+                    i = max(start, c0)
+                    r = (i - start) % step
+                    if r:
+                        i += step - r
+                    hi = min(stop, c1)
+                    if i < hi:
+                        out.extend(c[i - c0: hi - c0: step])
+                c0 = c1
+                if c0 >= stop:
+                    break
+            return out
+        if k < 0:
+            k += self._n
+        if k < 0 or k >= self._n:
+            raise IndexError("word index out of range")
+        return self._c[k // _FAST_CHUNK_WORDS][k % _FAST_CHUNK_WORDS]
+
+
+def _fast_bits_chunked(path, total):
+    """_fast_bits in pieces -- no allocation larger than one piece."""
+    import array as _arr
+    chunks = []
+    try:
+        with open(path, "rb") as fh:
+            left = total
+            while left > 0:
+                a = _arr.array("I")
+                want = min(left, _FAST_CHUNK_WORDS)
+                try:
+                    a.fromfile(fh, want)
+                except EOFError:
+                    pass
+                if len(a):
+                    chunks.append(a)
+                if len(a) < want:
+                    break
+                left -= len(a)
+    except MemoryError:
+        chunks = None
+        _FAST_TITLE_WHY[0] = ("out of memory in this process even reading the file in "
+                              "%d MB pieces" % (_FAST_CHUNK_WORDS * 4 // 1048576))
+        return None
+    except Exception as e:
+        _FAST_TITLE_WHY[0] = "could not read the file (%s)" % e
+        return None
+    return _FastWords(chunks)
 
 
 _FAST_PREFIX = {}          # ("last": (path, samples read, samples available, last t))
