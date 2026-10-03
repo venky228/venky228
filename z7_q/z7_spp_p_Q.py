@@ -18105,7 +18105,7 @@ _OUT_CACHE = {"path": None, "data": None}
 _FAST_LAYOUT = {"tried": False, "layouts": [], "attempted": False, "no_more": False}
 _FAST_MAX_HEADER = 4000000        # a header bigger than this is not a header
 _FAST_TITLE_WHY = [""]            # why the last title search failed, for the log
-_FAST_READER_VERSION = 8          # bump when the packed reader changes: a failure noted by an
+_FAST_READER_VERSION = 9          # bump when the packed reader changes: a failure noted by an
                                   # older reader says nothing about this one and is dropped
 
 
@@ -19191,6 +19191,194 @@ def _fast_complete(path):
         return True
 
 
+
+# ---- CALIBRATION ON THE HEAD OF THE FILE ITSELF ------------------------------
+#
+# Calibrating the packed reader on the smallest .out in the folder assumed the
+# flat run is "~18 MB, a fifth of a fault run". It is not, always: with a 25 s
+# flat run FLAT_RUN.out is 91 MB beside 92 MB fault runs, so the calibration
+# read IS the big dyntools read -- ~460 MB of Python floats -- and every report
+# shard died on it (0xC0000005) before scoring a single file, relaunched, and
+# died on it again, 40 times each. The layout was never written, so no process
+# ever got past it. A flat run also has no FLT<bus> channels, so even when that
+# read survived, its layout fitted no fault file and the next read went to
+# dyntools in full anyway.
+#
+# The layout -- header, stride, the column of every channel -- is all in the
+# first part of the file. So the first SPP_FAST_HEAD share of the wanted .out is
+# copied to a temporary file and dyntools reads only that: same channel set,
+# same header, same stride, a quarter of the memory. Each channel is still
+# located by matching dyntools' own values bit for bit (_fast_calibrate), and
+# the trailer -- the only thing a head copy cannot show -- is measured on the
+# full file afterwards. If any of it fails, nothing changes: the old path runs.
+_FAST_HEAD_FRAC = 0.30                 # share of the .out copied for calibration
+_FAST_HEAD_MIN = 8 * 1048576           # ... at least this many bytes
+_FAST_HEAD_MAX = 40 * 1048576          # ... at most this many
+_FAST_HEAD_TRIED = set()               # files already tried in this process
+
+
+def _fast_read_time_words(path, t_off, stride):
+    """The time column of a whole .out at (t_off, stride), as floats with the
+       non-finite words as NaN. Seeks only -- no bulk read."""
+    out = []
+    try:
+        nw = os.path.getsize(path) // 4
+        n_max = (nw - 1 - t_off) // stride + 1
+        with open(path, "rb") as fh:
+            for i in range(max(0, n_max)):
+                fh.seek(4 * (t_off + i * stride))
+                b = fh.read(4)
+                if len(b) < 4:
+                    break
+                w = _struct_g.unpack("<I", b)[0]
+                if (w >> 23) & 0xFF == 0xFF:
+                    out.append(float("nan"))
+                else:
+                    out.append(_struct_g.unpack("<f", b)[0])
+        return out, nw
+    except Exception:
+        return None, 0
+
+
+def _fast_head_trailer(want, lay):
+    """The layout with its trailer measured on WHOLE files.
+
+       The head copy ends mid-record, so the trailer _fast_calibrate measured
+       on it is just a cut. The real one is what follows the last time sample
+       of a complete file: measured on the wanted file, or -- if its time
+       column breaks (reclose records off the grid) -- on the first complete
+       .out beside it that this layout fits and whose time column runs to the
+       end. Returns None if no file gives a clean answer: a layout with a
+       guessed trailer is not written."""
+    base, stride, offs, n_samples, meta = lay
+    t_off = offs.get("time")
+    if t_off is None or stride <= 0:
+        return None
+    cands = [want]
+    try:
+        d = os.path.dirname(os.path.abspath(want))
+        for f in sorted(os.listdir(d)):
+            q = os.path.join(d, f)
+            if f.lower().endswith(".out") and os.path.abspath(q) != os.path.abspath(want) \
+                    and _fast_complete(q):
+                cands.append(q)
+    except Exception:
+        pass
+    for q in cands[:12]:
+        if q != want and not _fast_time_probe(q, lay):
+            continue
+        tv, nw = _fast_read_time_words(q, t_off, stride)
+        if not tv:
+            continue
+        n_s = _fast_time_prefix(tv)
+        if n_s < 8:
+            continue
+        left = nw - (t_off + (n_s - 1) * stride + 1)
+        if 0 <= left <= 4 * stride:
+            meta = dict(meta)
+            meta["trailer"] = left
+            try:
+                p = _fast_layout_path_for(len(offs))
+                txt = open(p, "r").read()
+                txt = re.sub(r"(?m)^trailer\s*=\s*\d+", "trailer = %d" % left, txt)
+                txt = re.sub(r"(?m)^samples\s*=\s*\d+", "samples = %d" % n_s, txt)
+                tmp = p + ".%d" % os.getpid()
+                with open(tmp, "w") as fh:
+                    fh.write(txt)
+                os.replace(tmp, p)
+            except Exception:
+                return None
+            print("  [fast] trailer measured on %s: %d word(s) after its last of %d "
+                  "time samples" % (os.path.basename(q), left, n_s))
+            return (base, stride, offs, n_s, meta)
+    print("  [fast] no complete .out here has a time column that runs to its end at "
+          "this layout -- the trailer cannot be measured, so the head calibration "
+          "is not used")
+    try:
+        os.remove(_fast_layout_path_for(len(offs)))
+    except Exception:
+        pass
+    return None
+
+
+def _fast_calibrate_head(want):
+    """Calibrate the packed reader on the first part of `want` itself (see the
+       note above). The layout, or None -- once per file per process."""
+    key = os.path.abspath(want)
+    if key in _FAST_HEAD_TRIED:
+        return None
+    _FAST_HEAD_TRIED.add(key)
+    try:
+        sz = os.path.getsize(want)
+    except Exception:
+        return None
+    try:
+        _mb = float(os.environ.get("SPP_FAST_HEAD_MB", "") or 0)
+    except Exception:
+        _mb = 0.0
+    if _mb > 0:
+        head = int(_mb * 1048576)
+    else:
+        head = max(_FAST_HEAD_MIN, min(_FAST_HEAD_MAX, int(_FAST_HEAD_FRAC * sz)))
+    head -= head % 4
+    if head <= 0 or head >= sz:
+        return None              # small enough that the ordinary read is the cheap one
+    import tempfile as _tf, shutil as _sh_
+    tmpd = None
+    lay = None
+    try:
+        tmpd = _tf.mkdtemp(prefix="spp_calib_")
+        small = os.path.join(tmpd, os.path.basename(want))
+        with open(want, "rb") as src, open(small, "wb") as dst:
+            left = head
+            while left > 0:
+                b = src.read(min(left, 4194304))
+                if not b:
+                    break
+                dst.write(b)
+                left -= len(b)
+        print("  [fast] calibrating the packed reader on the first %.1f MB of %s "
+              "(%.1f MB) -- same channels and header, a fraction of the memory"
+              % (head / 1048576.0, os.path.basename(want), sz / 1048576.0))
+        _FAST_LAYOUT["attempted"] = True
+        _cid = _cd = None
+        try:
+            _shd, _cid, _cd = dyntools.CHNF(small).get_data()
+            lay = _fast_calibrate(small, _cid, _cd)
+        except Exception as e:
+            print("  [fast] dyntools could not read the head copy of %s (%s)"
+                  % (os.path.basename(want), e))
+            lay = None
+        _cid = _cd = None
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
+        if lay:
+            lay = _fast_head_trailer(want, lay)
+    except Exception as e:
+        print("  [fast] head calibration of %s failed (%s)" % (os.path.basename(want), e))
+        lay = None
+    finally:
+        if tmpd:
+            _sh_.rmtree(tmpd, ignore_errors=True)
+    return lay
+
+
+def _fast_head_fit(p):
+    """Head-calibrate `p` when no known layout fits it, and add the result."""
+    try:
+        _ls = _FAST_LAYOUT["layouts"]
+        if _ls and _fast_pick(p, _ls)[0]:
+            return
+        _hl = _fast_calibrate_head(p)
+        if _hl:
+            _FAST_LAYOUT["layouts"].append(_hl)
+    except Exception:
+        pass
+
+
 def _fast_calibrate_on_smallest(want):
     """Calibrate against the SMALLEST plausible .out in this folder, not the one
        asked for.
@@ -19217,6 +19405,10 @@ def _fast_calibrate_on_smallest(want):
        Sets _FAST_LAYOUT["attempted"] when a calibration was actually run, so
        the caller records a failure only for a real one."""
     _FAST_LAYOUT["attempted"] = False
+    # THE HEAD OF THE WANTED FILE FIRST -- see _fast_calibrate_head.
+    _hl = _fast_calibrate_head(want)
+    if _hl:
+        return _hl
     try:
         try:
             want_sz = os.path.getsize(want)
@@ -19758,7 +19950,9 @@ def _chnf_ids(path):
     # (_fast_titles) -- verified, and without opening dyntools, which on this
     # build parses every sample just to be constructed.
     try:
-        if _fast_ensure(path):
+        _fast_ensure(path)
+        _fast_head_fit(path)
+        if _FAST_LAYOUT["layouts"]:
             _lay, _ft = _fast_pick(path, _FAST_LAYOUT["layouts"])
             if isinstance(_ft, dict) and _ft:
                 return _ft
@@ -19899,6 +20093,9 @@ def load_out(p, cache=True):
     out = None
     _t0 = time.time()
     _fast_ensure(p)
+    # A FILE NO KNOWN LAYOUT FITS (a new channel set) is calibrated on its
+    # own head before anything hands it to dyntools whole.
+    _fast_head_fit(p)
     _lays = _FAST_LAYOUT["layouts"]
     _fits = False
     if _lays:
@@ -38263,7 +38460,9 @@ def plot_missing_outs():
                 # skipped, so this can never turn a failed run into a PASS.
                 _nonfinite = ""
                 if _skipped and PLOT_NONFINITE and "non-finite" in _skipped:
-                    if _fast_pick(p, _fast_ensure(p))[0]:
+                    _fast_ensure(p)
+                    _fast_head_fit(p)
+                    if _fast_pick(p, _FAST_LAYOUT["layouts"])[0]:
                         _nonfinite = _skipped
                         _skipped = ""
                         print("               holds non-finite values -- reading it "
