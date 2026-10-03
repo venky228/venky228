@@ -18968,7 +18968,8 @@ def _fast_find_time_column(bts, tvals):
     return None
 
 
-def _locate_channel(bts, nw, pk, n_s, base, stride, first_words, used=None):
+def _locate_channel(bts, nw, pk, n_s, base, stride, first_words, used=None,
+                    lo=None, hi=None):
     """The word offset of one channel at the discovered stride, or None.
 
        The candidates come from first_words -- every position within four
@@ -18997,6 +18998,8 @@ def _locate_channel(bts, nw, pk, n_s, base, stride, first_words, used=None):
     for cand in sorted(set(cands)):
         if used is not None and cand in used:
             continue                  # ONE COLUMN PER CHANNEL -- see _fast_calibrate
+        if (lo is not None and cand <= lo) or (hi is not None and cand >= hi):
+            continue                  # outside the window the caller allows (ordered placement)
         if cand + (n_s - 1) * stride >= nw:
             continue
         if not _col_bits_match(bts, cand, stride, pk, quick):
@@ -19006,7 +19009,7 @@ def _locate_channel(bts, nw, pk, n_s, base, stride, first_words, used=None):
     return None
 
 
-def _fast_calibrate(path, cid, cd):
+def _fast_calibrate(path, cid, cd, ordered=False):
     """Work the layout out from dyntools' own values, then verify every channel.
 
        Finds the stride from the TIME column (see _fast_find_time_column for
@@ -19014,7 +19017,16 @@ def _fast_calibrate(path, cid, cd):
        at that stride, as bits, and every channel TITLE in the header (see
        _fast_find_titles). A channel that cannot be located, or whose samples
        do not match all the way through, abandons the calibration -- the packed
-       reader is never enabled on a partial match."""
+       reader is never enabled on a partial match.
+
+       ordered=True (the head calibration): every channel must sit in channel
+       INDEX order inside ONE record beside the time column -- after it, or
+       failing that before it. A head copy is mostly the pre-fault hold, where
+       many channels are constant at the same value, and an unconstrained
+       search placed some of them on another channel's column (the emulator
+       caught it: right values on the head, the wrong channel after the
+       fault). Index order inside the record is what PSS/E writes, and it
+       leaves a constant channel exactly one candidate -- its own column."""
     try:
         with open(path, "rb") as fh:
             bts = fh.read()
@@ -19050,7 +19062,31 @@ def _fast_calibrate(path, cid, cd):
             return (0, int(x))
         except Exception:
             return (1, str(x))
-    for k in sorted((x for x in cid if x != "time"), key=_ck):
+    _keys = sorted((x for x in cid if x != "time"), key=_ck)
+
+    def _place(after):
+        o, used = {"time": base}, set([base])
+        prev = base if after else base - stride
+        top = base + stride if after else base
+        for k in _keys:
+            v = cd[k]
+            f = _locate_channel(bts, nw, _pack_f32(v), len(v), base, stride,
+                                first_words, used, lo=prev, hi=top)
+            if f is None:
+                return None
+            o[k] = f
+            used.add(f)
+            prev = f
+        return o
+    if ordered:
+        offs = _place(True) or _place(False)
+        if not offs:
+            print("  [fast] %s: the channels are not in index order within one record "
+                  "of the time column -- this calibration is not used"
+                  % os.path.basename(path))
+            return None
+        _keys = []
+    for k in _keys:
         v = cd[k]
         pk = _pack_f32(v)
         found = _locate_channel(bts, nw, pk, len(v), base, stride, first_words, _used)
@@ -19344,7 +19380,7 @@ def _fast_calibrate_head(want):
         _cid = _cd = None
         try:
             _shd, _cid, _cd = dyntools.CHNF(small).get_data()
-            lay = _fast_calibrate(small, _cid, _cd)
+            lay = _fast_calibrate(small, _cid, _cd, ordered=True)
         except Exception as e:
             print("  [fast] dyntools could not read the head copy of %s (%s)"
                   % (os.path.basename(want), e))
@@ -19427,6 +19463,11 @@ def _fast_calibrate_on_smallest(want):
             except Exception:
                 continue
             if sz < floor or (want_sz and sz >= want_sz):
+                continue
+            # NOR A FILE TOO BIG TO SURVIVE. A full dyntools read of a file past
+            # _FAST_HEAD_MAX is the read that kills a 32-bit shard; dying on it
+            # writes nothing, so every relaunch would die on it again.
+            if sz > _FAST_HEAD_MAX:
                 continue
             cands.append((sz, q))
         if not cands:

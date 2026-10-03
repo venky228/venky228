@@ -4589,6 +4589,14 @@ def _criterion_family(criterion):
     if c.startswith(("transient voltage:", "rotor angle:", "generator tripping:", "***",
                      "back at the pre-fault level", "note:")):
         return ""
+    # NOR ARE THE POI RECORD ROWS. "POI active power recovery to 90% of
+    # pre-fault" and "POI ripple after recovery" carry the word "recovery" and
+    # were filed as the VOLTAGE recovery family; whichever row came first won
+    # the column, so the SPP table printed "Transient Voltage Response > 0.7 =
+    # No (worst 0.000 pu)" for faults whose voltage recovery PASSED. They are
+    # INFO records, read by their own names where they are used (_gt_* parsers).
+    if c.startswith(("poi active power recovery", "poi ripple", "settled at the end")):
+        return ""
     # BEFORE the "swing" test below: "Rotor angles measured relative to the
     # system swing machine" is a yes/no statement, and matched "swing" first --
     # an overshoot family for a row with no voltage in it.
@@ -5841,9 +5849,20 @@ def _fam_of_row(res_row):
         f = _criterion_family(c["criterion"])
         if f == "busangle":
             f = ""                      # recorded, not scored -- no column
-        if f and f not in out:
+        if f and (f not in out or (_scored_row(c) and not _scored_row(out[f]))):
             out[f] = c
     return out
+
+
+def _scored_row(c):
+    """True when either side of this criterion row is a PASS or FAIL verdict --
+       a scored criterion, not an INFO record that shares its words. A family
+       column takes a scored row over an INFO one, whatever order they come in."""
+    for k in ("base", "test"):
+        v = (c.get(k) or "").strip().upper()
+        if v in ("PASS", "FAIL"):
+            return True
+    return False
 
 
 def _num(v, unit):
@@ -6129,7 +6148,7 @@ def _spp_cells(res, r, side):
     fam = {}
     for c in r["crits"]:
         f = _criterion_family(c["criterion"])
-        if f and f not in fam:
+        if f and (f not in fam or (_scored_row(c) and not _scored_row(fam[f]))):
             fam[f] = c
     def ok(key):
         c = fam.get(key)
@@ -7540,16 +7559,28 @@ def _fault_num_key(f):
 
 def _by_poi_distance(rows):
     """Rows sorted fault, criterion, then NODES FROM THE POI (1 on top), then
-       the worst first -- each violation read outward from the plant."""
+       the worst first -- each violation read outward from the plant.
+
+       TIES ARE BROKEN BY BUS NUMBER, THEN ELEMENT. Two buses at the same
+       distance and the same margin (1.023 pu each) kept whatever order they
+       arrived in, which is not the same from one run to the next -- so a
+       rescore of unchanged results reordered rows, and two studies of the same
+       faults did not line up row for row."""
     fi, ci, hpi, pli = (_COL["fault"], _COL["criterion"], _COL["hops_from_poi"],
                         _COL["past_limit"])
+    bi, ei = _COL["bus_number"], _COL["element"]
 
     def _k(r):
         try:
             past = -float(r[pli])
         except (TypeError, ValueError):
             past = 0.0
-        return (_fault_num_key(r[fi]), str(r[ci]), _poi_nodes_num(r[hpi]), past)
+        try:
+            bus = (0, int(float(str(r[bi]).strip())), "")
+        except (TypeError, ValueError):
+            bus = (1, 0, str(r[bi]))
+        return (_fault_num_key(r[fi]), str(r[ci]), _poi_nodes_num(r[hpi]), past,
+                bus, str(r[ei]))
     return sorted(rows, key=_k)
 
 
