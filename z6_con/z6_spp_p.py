@@ -535,6 +535,12 @@ POI_P_EXISTING_OFF = False
 POI_P_MEASURE       = "metered"
 POI_P_METER_ITERS   = 8
 POI_P_METER_TOL_MW  = 0.5
+# THE POI TARGET IS A CEILING (the GIA / interconnection capacity). The meter
+# aims POI_P_METER_TOL_MW / 2 below it, so it settles inside
+# [target - POI_P_METER_TOL_MW, target], and the check after the solve FAILS a
+# case that delivers more than target + POI_P_CEIL_TOL_MW (rounding only).
+POI_P_NOT_ABOVE     = True
+POI_P_CEIL_TOL_MW   = 0.05
 
 POI_HOLD_AREA_TOL_MW = 0.5
 POI_HOLD_AREA_PASSES = 4
@@ -13428,6 +13434,84 @@ def _egf_off_target(project, target_mw):
     return r
 
 
+def _np_mpt_intake():
+    """(MW, n) entering the existing MPTs at their low-side buses (connect =
+       "egf_mpt") -- the EGF and the SGF together, before the MPT and tie
+       losses. Read on every transformer from an attach bus to a higher
+       voltage; three-winding units through _flow_leaving()."""
+    P = 0.0; n = 0
+    _att = sorted(set(int(m) for _g, m in (_NP_ATTACH or [])))
+    if not _att:
+        return 0.0, 0
+    try:
+        _tx = list(sf_all_transformers())
+    except Exception:
+        return 0.0, 0
+    _done = set()
+    for x, y, ck in _tx:
+        x, y = int(x), int(y)
+        for a, b in ((x, y), (y, x)):
+            if a not in _att or (a, b, str(ck)) in _done:
+                continue
+            ka, kb = sf_kv(a), sf_kv(b)
+            if not (ka > 0 and kb >= 1.8 * ka):
+                continue
+            _done.add((a, b, str(ck)))
+            try:
+                ierr, cx = _flow_leaving(a, b, ck)
+            except Exception:
+                continue
+            if ierr == 0 and cx is not None:
+                try:
+                    P += float(cx.real)
+                except Exception:
+                    P += float(cx[0])
+                n += 1
+    return P, n
+
+
+def _np_bess_at_poi(bess_attach_mw, tie_mw):
+    """The SGF's share of what reaches the POI (connect = "egf_mpt").
+
+       Beyond the MPT low side the SGF and the EGF share the MPTs and the tie,
+       so no cut separates them there. The losses of that shared path
+       (intake at the MPT low sides minus the tie sum at the POI) are shared
+       pro rata to what each plant puts into the MPTs: SGF at the POI = SGF
+       into the MPTs x tie sum / MPT intake. Falls back to the MPT-bus figure
+       when the intake cannot be read."""
+    try:
+        _in, _n = _np_mpt_intake()
+    except Exception:
+        _in, _n = 0.0, 0
+    if not _n or _in <= 1.0 or tie_mw is None or tie_mw <= 0:
+        return float(bess_attach_mw)
+    _f = float(tie_mw) / float(_in)
+    if not (0.8 <= _f <= 1.0 + 1e-6):
+        return float(bess_attach_mw)       # implausible -- something else is tapped there
+    return float(bess_attach_mw) * _f
+
+
+def _poi_meter_read(project):
+    """What the POI meter reads now: the tie sum when there is one, else the
+       plant/system split -- the same number _poi_target_verify() checks."""
+    poi = int(project.get("poi") or POI_BUS)
+    try:
+        tmw, nt, _r = _poi_plant_tie_mw(poi)
+        if nt:
+            return tmw
+    except Exception:
+        pass
+    plant = sorted(_pocket_buses_behind_poi(poi)
+                   | set(int(b) for b in (project.get("feeders") or []))
+                   | set(int(b) for b in (project.get("feeders_original") or []))
+                   | set(int(b) for b, _m in (PROJECT_GENS or [])))
+    dmw, nd = _poi_delivered_mw(poi, plant)
+    if nd:
+        return dmw
+    xmw, nx = _poi_export_mw(poi, plant)
+    return xmw if nx else None
+
+
 def _poi_target_verify(project, target_mw):
     """The last word on the POI total: what the plant DELIVERS into the POI on
        the solved case, against what was asked for. Prints it always; stops the
@@ -13485,10 +13569,22 @@ def _poi_target_verify(project, target_mw):
             print("  [poi-p]   tie %8d -> POI %d ck %-2s %9.1f MW" % (_b, poi, _ck, _p))
     tol = max(float(POI_P_STRICT_TOL_MW), 0.01 * abs(float(target_mw)))
     ok = abs(got - float(target_mw)) <= tol
+    _over = bool(POI_P_NOT_ABOVE) and got > float(target_mw) + float(POI_P_CEIL_TOL_MW)
+    if _over:
+        ok = False
     print("  [poi-p] VERIFY %s: %.1f MW delivered into POI %d against %.1f MW asked for "
           "(%+.1f MW; net export %.1f MW) -- %s"
           % (project.get("name"), got, poi, float(target_mw), got - float(target_mw), xmw,
-             "OK" if ok else "*** NOT MET ***"))
+             "OK" if ok else ("*** ABOVE THE POI CAPACITY ***" if _over else "*** NOT MET ***")))
+    if _NP_ATTACH:
+        try:
+            _ba, _bq, _bn = _np_attach_delivered()
+            _bp = _np_bess_at_poi(_ba, got)
+            print("  [poi-p] VERIFY %s: SGF %.1f MW into the MPT buses, %.1f MW of it reaching "
+                  "the POI (MPT and tie losses shared pro rata); EGF %.1f MW at the POI"
+                  % (project.get("name"), _ba, _bp, got - _bp))
+        except Exception:
+            pass
     if not ok:
         # SAY WHAT WAS FOUND, machine by machine, so the reason is on the screen.
         for b, m in _plant_machines(plant):
@@ -13777,12 +13873,17 @@ def apply_poi_p_metered(project, target_mw):
                   "target cannot be measured, leaving the dispatch as it is ***")
             return
         if _NP_ATTACH:
-            # connect = "egf_mpt": the BESS shares the existing MPTs and tie, so
-            # its share is what it delivers INTO those MPT buses.
+            # connect = "egf_mpt": the BESS shares the existing MPTs and tie.
+            # Its share AT THE POI is what it puts into the MPT buses less its
+            # pro-rata part of the shared MPT and tie losses.
             bess_mw, _q, _n = _np_attach_delivered()
+            bess_mw = _np_bess_at_poi(bess_mw, exp_mw)
         else:
             bess_mw, _q, _n = _delivered_to_poi(_bess_cut, poi)
-        err = float(target_mw) - exp_mw
+        # THE TARGET IS A CEILING: aim half a meter tolerance below it, so the
+        # band the loop stops in is [target - tol, target] and never above.
+        _aim = float(target_mw) - (0.5 * float(POI_P_METER_TOL_MW) if POI_P_NOT_ABOVE else 0.0)
+        err = _aim - exp_mw
         # THE MACHINES' OWN TOTAL, printed beside the meter.
         #
         # These two numbers differ by the losses, and ONLY by the losses. When
@@ -13802,7 +13903,7 @@ def apply_poi_p_metered(project, target_mw):
               "BESS share %.1f) -- %+.1f MW to find"
               % (it, exp_mw, "delivered into the POI" if exp_mw != net_mw or POI_P_METER == "delivered" else "net export",
                  net_mw, gen_mw, bess_mw, err))
-        if abs(err) <= float(POI_P_METER_TOL_MW):
+        if abs(err) <= (0.5 if POI_P_NOT_ABOVE else 1.0) * float(POI_P_METER_TOL_MW):
             print("  [poi-p]   converged: %.1f MW delivered into POI %d, %.1f MW net export to the "
                   "system, machines %.1f MW gross, BESS delivering %.1f MW  (meter - machines = %+.1f "
                   "MW of losses%s)"
@@ -13843,7 +13944,7 @@ def apply_poi_p_metered(project, target_mw):
                       % (float(_rate), float(target_mw), float(target_mw)))
                 print("  [poi-p]     This study is of the CURTAILED plant. Raise "
                       "POI_P_TARGET_MW to study it at full output.")
-            _rate = float(target_mw)
+            _rate = _aim
         if _rate is not None and _sgf_only_mode(target_mw, _poi_rate) == "split":
             _rate = float(target_mw) / 2.0      # SGF delivers half, the EGF the rest
         # EGF OFF: NOBODY ELSE TO TAKE THE ERROR. Whatever the switched-off
@@ -13883,7 +13984,7 @@ def apply_poi_p_metered(project, target_mw):
             _rate = None
         if _rate is not None and proj_pairs:
             dB = _rate - bess_mw
-            if abs(dB) > float(POI_P_METER_TOL_MW):
+            if abs(dB) > (0.5 if POI_P_NOT_ABOVE else 1.0) * float(POI_P_METER_TOL_MW):
                 _moved = 0
                 for b, m in proj_pairs:
                     # NOT A SILENT except. A machine that will not move is the
@@ -17087,6 +17188,34 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
                     except Exception as _qe:
                         print("  [poi-q] *** %s: reactive zeroing failed (%s) -- machines left as metered ***"
                               % (_mr.get("name"), _qe))
+        # THE CEILING, AFTER EVERYTHING THAT MOVES THE FLOWS. The area hold and
+        # the reactive zeroing both re-solve, and each nudges the POI flow by a
+        # few tenths of a MW. If that has carried a plant above its POI
+        # capacity, it is metered again (and the area held again) -- up to
+        # three rounds -- so what is verified and saved is never above it.
+        if (POI_P_NOT_ABOVE and POI_P_TARGET_MW is not None
+                and (POI_P_MEASURE or "metered").strip().lower() == "metered"):
+            for _trim in range(3):
+                _hi = []
+                for _mr, _mmw in _mm:
+                    with _member_scope(_mr, _mmw):
+                        _t = _egf_off_target(_mr, POI_P_TARGET_MW)
+                        if _t is None:
+                            continue
+                        _now = _poi_meter_read(_mr)
+                        if _now is not None and _now > float(_t) + float(POI_P_CEIL_TOL_MW):
+                            _hi.append((_mr, _mmw, _t, _now))
+                if not _hi:
+                    break
+                for _mr, _mmw, _t, _now in _hi:
+                    print("  [poi-p] %s: %.2f MW at the POI after the area hold / Q zeroing, above "
+                          "the %.1f MW capacity -- metered again (round %d)"
+                          % (_mr.get("name"), _now, float(_t), _trim + 1))
+                    with _member_scope(_mr, _mmw):
+                        apply_poi_p_metered(_mr, _t)
+                if _any_poi_target() and POI_HOLD_AREA_MW:
+                    for _hr in _hold_rows():
+                        _poi_hold_area_after_solve(_hr)
         # THE LAST WORD ON THE POI TOTAL, per plant, on the solved case.
         for _mr, _mmw in _mm:
             with _member_scope(_mr, _mmw):
