@@ -4857,6 +4857,12 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
             rc = p.poll()
             # ITS CLAIMS GO WITH IT, on every exit path: the PID in them may be
             # reused at once, and a claim read as "alive" is never taken.
+            # WHETHER IT HELD A SCENARIO IS READ BEFORE THE CLAIMS ARE RELEASED.
+            # Read after, it was always "no", so a worker that crashed INSIDE a
+            # fault in its first 10 minutes (a model's stack overflow on F01)
+            # was filed as a start failure: no attempt charged, a 4-minute
+            # licence backoff, and after START_FAIL_MAX of them the slot given up.
+            _held_claim = _holds(i)
             _release_claims(i)
             if os.path.isfile(_sentinel("_w%d" % i)):
                 _banner("worker %d COMPLETE (sentinel present)" % i); done.add(i)
@@ -4865,7 +4871,7 @@ def _run_workers(n, selected=None, _round=0, _attempts=None):
                       and _licence_hit("w%d" % i, launched_at.get(i, 0)))):
                 _worker_exit_note(i, _exit_reason(EXIT_LICENCE_BUSY))
                 _schedule(i, _exit_reason(rc))
-            elif (now - launched_at.get(i, now)) < STARTUP_DEAD_S and not _holds(i) and rc != 0:
+            elif (now - launched_at.get(i, now)) < STARTUP_DEAD_S and not _held_claim and rc != 0:
                 # DIED AT START, BEFORE TAKING ANYTHING. Whatever the code says,
                 # this is a start failure -- it goes through the backoff so a
                 # busy licence runtime is not asked again 3 s later.
