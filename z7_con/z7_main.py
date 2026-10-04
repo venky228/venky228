@@ -25806,15 +25806,30 @@ def main():
     # deliberately its own step: these are not a sweep of one study, they are
     # the two systems BP-7250 7.6 defines, and each is compared against the
     # base on its own terms.
-    if _res_n and SURPLUS_SCENARIOS and pipeline != "compare":
-        for res in _res_n:
+    # EVERY PANEL PROJECT, not only the ones compared above. A project whose
+    # GIA study failed (or never started) has no comparison, and its SGF / EGF-
+    # off runs were then skipped too -- EastFork had neither. They are their own
+    # studies against the base, so they run whatever happened to the GIA one.
+    _sur_runs = list(_res_n)
+    if SURPLUS_SCENARIOS:
+        for _sp in (list(_panel_projects() or []) or []):
+            if _sp in _egf_skip:
+                continue
+            for _sm in (list(MODES) or ["spp"]):
+                if not any(r["project"] == _sp and r["mode"] == _sm for r in _sur_runs):
+                    print("[surplus] %s (%s) has no GIA comparison -- its surplus "
+                          "scenario(s) %s anyway" % (_sp, _sm, "are compared" if pipeline
+                                                     == "compare" else "run and are compared"))
+                    _sur_runs.append({"project": _sp, "mode": _sm})
+    if _sur_runs and SURPLUS_SCENARIOS and pipeline != "compare":
+        for res in _sur_runs:
             try:
                 run_surplus_scenarios(res["project"], res["mode"])
             except Exception as e:
                 print("[surplus] the scenario runs failed (%s) -- the comparison "
                       "above is unaffected" % e)
-    if results and SURPLUS_SCENARIOS:
-        for res in results:
+    if _sur_runs and SURPLUS_SCENARIOS:
+        for res in _sur_runs:
             try:
                 compare_surplus_scenarios(res["project"], res["mode"])
             except Exception as e:

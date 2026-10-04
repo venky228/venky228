@@ -58,6 +58,9 @@ def connect_mpt(txt, f):
 
 
 def launcher(txt, f):
+    # EVERY PROJECT RUNS: one that fails is reported and the queue goes on
+    # (the _Q run stopped at EmpirePrairie and never started EastFork).
+    txt = sub(txt, "\nSTOP_ON_FAILED_PROJECT = True", "\nSTOP_ON_FAILED_PROJECT = False", 1, f)
     txt = sub(txt, '_plain = os.path.join(STUDY_DIR, "results")', '_plain = os.path.join(STUDY_DIR, "results_f")', 1, f)
     txt = sub(txt, '"results_%s" % _RES_KIND', '"results_%s_f" % _RES_KIND', 1, f)
     return txt
