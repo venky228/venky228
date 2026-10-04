@@ -780,6 +780,7 @@ NEW_PLANT = {
     "collector": {"r": 0.000351, "x": 0.000545, "b": 0.0016},
     "mpt":       {"r": 0.002499, "x": 0.099969, "sbase": None},   # Z = 10.0 %, X/R = 40
     "tie":       {"r": 0.0000, "x": 0.0005, "b": 0.0},
+    "connect":   "poi",                     # "poi" own MPT + tie | "egf_mpt" one feeder per existing feeder, on its MPT
 }
 
 # ---- 15. EXTRA STUDIES ---------------------------------------------------------

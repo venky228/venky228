@@ -392,7 +392,7 @@ def _discover_scenarios(z4, ref):
     for d in sorted(glob.glob(os.path.join(z4.STUDY_ROOT, "Base", "results_base*"))):
         # NOT THE _Q STUDY'S (results_base_q): the queue-project runs have their
         # own panel and side-by-side, and are not scenarios of this study.
-        if os.path.isdir(d) and not os.path.basename(d).lower().endswith("_q"):
+        if os.path.isdir(d) and not os.path.basename(d).lower().endswith(("_q", "_f")):
             roots.append(d)
     roots += [r for r in SCAN_ROOTS if r]
     found, seen = [], set([_norm(ref)])

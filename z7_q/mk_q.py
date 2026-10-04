@@ -131,7 +131,7 @@ def cmp_multi(txt, f):
               'os.path.join(z4.STUDY_ROOT, "Base", "results_base_q*")', 1, f)
     # the normal tool leaves the _q folders out of its scenario search; this one
     # searches ONLY them, so that filter goes
-    txt = sub(txt, ' and not os.path.basename(d).lower().endswith("_q")', '', 1, f)
+    txt = sub(txt, ' and not os.path.basename(d).lower().endswith(("_q", "_f"))', '', 1, f)
     txt = sub(txt, "        # NOT THE _Q STUDY'S (results_base_q): the queue-project runs have their\n"
                    "        # own panel and side-by-side, and are not scenarios of this study.\n",
               "        # _Q: ONLY the queue study's own base runs (results_base_q*).\n", 1, f)

@@ -820,6 +820,13 @@ NEW_PLANT = {
     "mpt":       {"r": 0.002499, "x": 0.099969, "sbase": None},
     # HV bus -> POI. Near zero unless there is a real line in between.
     "tie":       {"r": 0.0000, "x": 0.0005, "b": 0.0000},
+    # WHERE THE PLANT CONNECTS:
+    #   "poi"      its own collector bus, its own MPT and a tie to the POI
+    #   "egf_mpt"  NO new MPT: one new feeder per EXISTING feeder of the plant,
+    #              each landing on the low (collector) side of the MPT that
+    #              existing feeder already uses -- unit -> GSU -> collector ->
+    #              the existing MPT bus. The "mpt" and "tie" rows are not used.
+    "connect":   "poi",
 }
 
 # ---- WHICH psspy CALL CREATES A TRANSFORMER AND A BRANCH --------------------
@@ -8964,6 +8971,12 @@ def zero_bess_poi_q(project, mw_level):
     except Exception:
         _hv = []
     cut = _hv or [b for b, _m in gens]
+
+    def _meas_q():
+        # Q AT THE POI. connect = "egf_mpt" has no tie of its own, so the cut is
+        # the plant's POI tie(s) -- the BESS machines are moved until the POI
+        # reads 0 MVAr, within their own 0.95-pf range, as before.
+        return _delivered_to_poi(cut, poi)
     n = len(gens)
     # what the machines have now: Q, and the limits they must stay inside
     cur, lim, pinned = {}, {}, {}
@@ -9003,7 +9016,7 @@ def zero_bess_poi_q(project, mw_level):
                 qmx, qmn = _cap, -_cap
         lim[(b, m)] = (qmn, qmx)
         pinned[(b, m)] = (qmn, qmx)          # the range left on the machine afterwards
-    P0, Q0, nb = _delivered_to_poi(cut, poi)
+    P0, Q0, nb = _meas_q()
     if nb == 0:
         print("  [poi-q] %s: no tie branch between the plant and POI %d could be read -- "
               "the reactive exchange cannot be measured, machines left as they are"
@@ -9043,7 +9056,7 @@ def zero_bess_poi_q(project, mw_level):
         except Exception as e:
             print("  [poi-q]   the re-solve failed (%s) -- stopping" % e)
             break
-        P, Q, nb = _delivered_to_poi(cut, poi)
+        P, Q, nb = _meas_q()
         print("  [poi-q]   iter %d: machines Q %+.1f MVAr total -> POI P=%.1f MW, Q=%+.1f MVAr%s"
               % (it, sum(cur.values()), P, Q, ("   [%s]" % "; ".join(at_limit)) if at_limit else ""))
         if abs(Q) <= float(POI_Q_TOL_MVAR):
@@ -9095,7 +9108,7 @@ def zero_bess_poi_q(project, mw_level):
     # CHECKED, not assumed: one regulating solve with the limits back
     try:
         solve_powerflow("FDNS POI-Q check")
-        P2, Q2, _n2 = _delivered_to_poi(cut, poi)
+        P2, Q2, _n2 = _meas_q()
         qs = []
         for b, m in gens:
             try:
@@ -13706,7 +13719,12 @@ def apply_poi_p_metered(project, target_mw):
             print("  [poi-p] *** no branch out of the POI could be read -- the metered "
                   "target cannot be measured, leaving the dispatch as it is ***")
             return
-        bess_mw, _q, _n = _delivered_to_poi(_bess_cut, poi)
+        if _NP_ATTACH:
+            # connect = "egf_mpt": the BESS shares the existing MPTs and tie, so
+            # its share is what it delivers INTO those MPT buses.
+            bess_mw, _q, _n = _np_attach_delivered()
+        else:
+            bess_mw, _q, _n = _delivered_to_poi(_bess_cut, poi)
         err = float(target_mw) - exp_mw
         # THE MACHINES' OWN TOTAL, printed beside the meter.
         #
@@ -13797,7 +13815,8 @@ def apply_poi_p_metered(project, target_mw):
         _cut_foreign = [(b, m) for (b, m) in _plant_machines([int(x) for x in _bess_cut])
                         if (int(b), str(m).strip()) not in
                         set((int(x), str(y).strip()) for x, y in proj_pairs)]
-        if _rate is not None and proj_pairs and _cut_foreign and not _hv:
+        if _rate is not None and proj_pairs and _cut_foreign and not _hv \
+                and not _NP_ATTACH:
             print("  [poi-p]     BESS gross-up REFUSED: the cut it would be measured "
                   "across (%s) also carries %s, so \"the BESS share\" cannot be told "
                   "from the plant's total. The existing machines take the whole "
@@ -15219,7 +15238,23 @@ def _collector_stamp():
     # REECAU1 constant is as wrong to reuse as one built with a different
     # collector, and for the same reason: the change happens during the build.
     return (coll + " | " + _dyr_stamp() + " | " + _poi_stamp()
-            + " | " + _monitor_stamp() + " | " + _poi_q_stamp())
+            + " | " + _monitor_stamp() + " | " + _poi_q_stamp() + _np_stamp())
+
+
+def _np_stamp():
+    """Where the new plant connects, when it is NOT the POI. The plant is built
+       during the build, so a snapshot built with its own MPT at the POI must
+       not be reused for one on the existing MPTs: the stamp differs, the
+       snapshot is rebuilt and the finished scenarios are run again. Empty for
+       connect = "poi" and for no new plant, so those stamps are unchanged."""
+    try:
+        c = _np_cfg()
+    except Exception:
+        return ""
+    if not c:
+        return ""
+    m = str(c.get("connect") or "poi").strip().lower()
+    return "" if m == "poi" else " | newplant: connect=%s" % m
 
 
 def _poi_q_stamp():
@@ -15846,6 +15881,18 @@ def _np_units_for(cfg, warn=True):
        feeders nobody asked for."""
     total = float(ACTIVE_MW or 0.0)
     n = cfg.get("units")
+    if cfg.get("_attach"):
+        # ONE NEW FEEDER PER EXISTING FEEDER (connect = "egf_mpt"): the count
+        # is the plant's own, not derived from the cap -- and still held to it.
+        n = len(cfg["_attach"])
+        per = (total / n) if total > 0 else float(cfg.get("mw_per_unit") or 0.0)
+        if total > 0 and per > FEEDER_MAX_MW + 1e-6:
+            raise RuntimeError(
+                "NEW_PLANT (connect = egf_mpt): the plant has %d existing feeder(s), so "
+                "%.1f MW is %.1f MW per new feeder, over the %.0f MW cap. Raise "
+                "FEEDER_MAX_MW if the equipment really is that big, or use "
+                "connect = \"poi\"." % (n, total, per, FEEDER_MAX_MW))
+        return n, per, "one per existing feeder, on its MPT"
     if n in (None, 0, "", "auto"):
         if total <= 0.0:
             raise RuntimeError("NEW_PLANT: units is 'auto' but the project MW is "
@@ -15897,7 +15944,10 @@ def _np_layout(cfg, poi):
     gsuhv = [(b0 + 100 + i, ckv, "%s G%d" % (nm, i + 1)) for i in range(n)]
     coll = (b0 + 200, ckv, "%s COLL" % nm)
     hv = (b0 + 201, hkv, "%s HV" % nm)
-    return {"units": units, "gsuhv": gsuhv, "coll": coll, "hv": hv,
+    att = list(cfg.get("_attach") or [])
+    if att:
+        coll = hv = None             # the existing MPTs take their place
+    return {"units": units, "gsuhv": gsuhv, "coll": coll, "hv": hv, "attach": att,
             "n": n, "unit_kv": ukv, "coll_kv": ckv, "hv_kv": hkv, "name": nm}
 
 
@@ -16123,8 +16173,73 @@ def _np_roles(lay):
        and those buses are new, so nothing else in the study knows they exist."""
     out = [("MACH", int(b)) for b, _kv, _nm in lay["units"]]
     out += [("GSUHV", int(b)) for b, _kv, _nm in lay["gsuhv"]]
-    out.append(("COLL", int(lay["coll"][0])))
-    out.append(("HV", int(lay["hv"][0])))
+    if lay.get("coll"):
+        out.append(("COLL", int(lay["coll"][0])))
+    if lay.get("hv"):
+        out.append(("HV", int(lay["hv"][0])))
+    return out
+
+
+# connect = "egf_mpt": [(new GSU high side, existing MPT low-side bus)] of the
+# plant this process built -- what the BESS share at the POI is metered across
+# (see apply_poi_p_target). Empty for a plant built at the POI.
+_NP_ATTACH = []
+
+
+def _np_attach_points(feeders, poi, ckv):
+    """[(existing feeder, its MPT low-side bus)] -- where each new feeder lands.
+
+       From each EXISTING feeder bus, walk the plant side of the POI (never
+       through the POI) and take the NEAREST bus at collector voltage that is
+       the low side of a transformer to a higher voltage: the bus the existing
+       feeder's power enters its MPT at. Two- and three-winding MPTs alike --
+       a three-winding transformer is held as its two highest windings, so
+       East Fork's 115 / 34.5 / 13.8 kV units give the 34.5 kV bus and the
+       tertiary is never a candidate."""
+    poi = int(poi)
+    adj, up = {}, {}
+    for x, y, ck in list(sf_all_branches()):
+        x, y = int(x), int(y)
+        if x != y:
+            adj.setdefault(x, set()).add(y); adj.setdefault(y, set()).add(x)
+    for x, y, ck in list(sf_all_transformers()):
+        x, y = int(x), int(y)
+        if x == y:
+            continue
+        adj.setdefault(x, set()).add(y); adj.setdefault(y, set()).add(x)
+        kx, ky = sf_kv(x), sf_kv(y)
+        if kx > 0 and ky >= 1.8 * kx:
+            up.setdefault(x, set()).add(y)
+        elif ky > 0 and kx >= 1.8 * ky:
+            up.setdefault(y, set()).add(x)
+    lo_kv, hi_kv = 0.6 * float(ckv), 1.6 * float(ckv)
+    out = []
+    for f in feeders:
+        f = int(f)
+        seen, frontier, hit = {f}, [f], None
+        while frontier and hit is None:
+            frontier.sort()
+            for u in frontier:
+                if u != poi and lo_kv <= sf_kv(u) <= hi_kv and up.get(u):
+                    hit = u
+                    break
+            if hit is not None:
+                break
+            nxt = []
+            for u in frontier:
+                for v in adj.get(u, ()):
+                    if v != poi and v not in seen:
+                        seen.add(v); nxt.append(v)
+            frontier = nxt
+            if len(seen) > 2000:
+                break
+        if hit is None:
+            raise RuntimeError(
+                "NEW_PLANT (connect = egf_mpt): from existing feeder %d no bus at "
+                "collector voltage (%.1f-%.1f kV) on a transformer to a higher voltage "
+                "was found before the POI %d. Check the feeder list of this project, "
+                "or use connect = \"poi\"." % (f, lo_kv, hi_kv, poi))
+        out.append((f, hit))
     return out
 
 
@@ -16178,12 +16293,81 @@ def _topology_cache_reset(why=""):
           % (" -- %s" % why if why else ""))
 
 
+def _np_chain(lay, poi):
+    """[(i, j, label)] -- every element from the units to the POI (or to the
+       existing MPT buses, connect = "egf_mpt")."""
+    chain = []
+    for idx in range(len(lay["units"])):
+        ub = lay["units"][idx][0]; gb = lay["gsuhv"][idx][0]
+        chain.append((ub, gb, "GSU %d" % (idx + 1)))
+        if lay.get("attach"):
+            chain.append((gb, int(lay["attach"][idx]), "collector %d" % (idx + 1)))
+        else:
+            chain.append((gb, lay["coll"][0], "collector %d" % (idx + 1)))
+    if not lay.get("attach"):
+        chain.append((lay["coll"][0], lay["hv"][0], "MPT"))
+        chain.append((lay["hv"][0], int(poi), "POI tie"))
+    return chain
+
+
+def _bus_name_safe(b):
+    try:
+        ie, nm = psspy.notona(int(b))
+        return str(nm).strip() if ie in (0, None) else ""
+    except Exception:
+        return ""
+
+
+def _np_attach_delivered():
+    """(MW, MVAr, n) the new plant delivers into the existing MPT buses --
+       its share, metered where it joins the existing plant (connect =
+       "egf_mpt"). Beyond that point it shares the MPTs and the tie with the
+       existing units, so no cut further out separates the two."""
+    P = Q = 0.0; n = 0
+    for g, m in _NP_ATTACH:
+        try:
+            ierr, cx = _flow_leaving(int(g), int(m), "1")
+        except Exception:
+            continue
+        if ierr == 0 and cx is not None:
+            try:
+                P += float(cx.real); Q += float(cx.imag)
+            except Exception:
+                P += float(cx[0]); Q += float(cx[1])
+            n += 1
+    return P, Q, n
+
+
 def build_new_plant(cfg, poi):
     """Create the whole facility and return the list of NEW machine buses.
 
        Raises rather than returning a half-built plant. A study of a facility
        missing its main transformer is not a conservative study, it is a study
-       of something else."""
+       of something else.
+
+       connect = "egf_mpt": no collector bus, MPT or tie of its own -- each new
+       feeder (unit -> GSU -> collector equivalent) lands on the MPT low side
+       of one existing feeder, so the plant has as many feeders as the
+       existing one and shares its MPTs (see _np_attach_points)."""
+    global _NP_ATTACH
+    _NP_ATTACH = []
+    cfg = dict(cfg)
+    _mode = str(cfg.get("connect") or "poi").strip().lower()
+    if _mode not in ("poi", "egf_mpt"):
+        raise RuntimeError("NEW_PLANT['connect'] = %r -- use \"poi\" or \"egf_mpt\""
+                           % cfg.get("connect"))
+    if _mode == "egf_mpt":
+        _egf = [int(b) for b in (cfg.get("_egf_feeders") or [])]
+        if not _egf:
+            raise RuntimeError("NEW_PLANT (connect = egf_mpt): the project row has no "
+                               "existing feeders to follow to their MPTs")
+        _pts = _np_attach_points(_egf, poi, float(cfg.get("collector_kv") or 34.5))
+        cfg["_attach"] = [m for _f, m in _pts]
+        print("  [newplant] connect = egf_mpt: one new feeder per existing feeder, on "
+              "its MPT low side")
+        for _f, _m in _pts:
+            print("  [newplant]   existing feeder %-7d -> MPT bus %-7d %s (%.1f kV)"
+                  % (_f, _m, _bus_name_safe(_m), sf_kv(_m)))
     lay = _np_layout(cfg, poi)
     n, mw_u, why = _np_units_for(cfg)
     # THE MACHINES GO ON bus_start .. bus_start+8 (999001..999009) AND NOWHERE
@@ -16206,21 +16390,34 @@ def build_new_plant(cfg, poi):
     print("  [newplant] new machine bus(es): %s  (allowed %d..%d)"
           % (", ".join(str(b) for b in _ub), _b0, _b0 + 8))
     print("")
-    print("  [newplant] === BUILDING A NEW FACILITY AT POI %s ===" % poi)
+    if lay["attach"]:
+        print("  [newplant] === BUILDING A NEW FACILITY ON THE EXISTING MPTs BEHIND POI %s ==="
+              % poi)
+    else:
+        print("  [newplant] === BUILDING A NEW FACILITY AT POI %s ===" % poi)
     print("  [newplant] %s: %d feeder(s) x %.1f MW = %.1f MW   (%s)"
           % (lay["name"], n, mw_u, n * mw_u, why))
-    print("  [newplant] %.3f kV -> %.1f kV -> %.1f kV"
-          % (lay["unit_kv"], lay["coll_kv"], lay["hv_kv"]))
+    if lay["attach"]:
+        print("  [newplant] %.3f kV -> %.1f kV -> existing MPT bus(es) %s"
+              % (lay["unit_kv"], lay["coll_kv"], ", ".join(str(m) for m in lay["attach"])))
+    else:
+        print("  [newplant] %.3f kV -> %.1f kV -> %.1f kV"
+              % (lay["unit_kv"], lay["coll_kv"], lay["hv_kv"]))
     if not _bus_exists(int(poi)):
         raise RuntimeError("NEW_PLANT: POI bus %s is not in the case -- nothing to "
                            "connect to" % poi)
     # ---- EVERY NUMBER FREE, CHECKED BEFORE ANYTHING IS CREATED -------------
     want = [b for b, _kv, _nm in lay["units"]] + [b for b, _kv, _nm in lay["gsuhv"]] \
-        + [lay["coll"][0], lay["hv"][0]]
+        + ([lay["coll"][0], lay["hv"][0]] if not lay["attach"] else [])
+    for _m in lay["attach"]:
+        if not _bus_exists(int(_m)):
+            raise RuntimeError("NEW_PLANT: existing MPT bus %s is not in the case" % _m)
     # THE TRANSFORMER MVA BASES, worked out before the bus check so BOTH paths
     # can record them -- the adopt path below writes NEW_PLANT.txt too.
     gsu_mva = float((cfg.get("gsu") or {}).get("sbase") or (mw_u * 1.2))
     mpt_mva = float((cfg.get("mpt") or {}).get("sbase") or (n * mw_u * 1.2))
+    if lay["attach"]:
+        mpt_mva = 0.0                # no MPT of its own
     taken = [b for b in want if _bus_exists(b)]
     if taken and len(taken) == len(want):
         # THE PLANT IS ALREADY IN THIS CASE.
@@ -16239,13 +16436,7 @@ def build_new_plant(cfg, poi):
               "(%d..%d)." % (min(want), max(want)))
         print("  [newplant] that is what a case saved by a previous build looks "
               "like -- checking it is intact rather than rebuilding it.")
-        _chain = []
-        for _idx in range(n):
-            _ub = lay["units"][_idx][0]; _gb = lay["gsuhv"][_idx][0]
-            _chain.append((_ub, _gb, "GSU %d" % (_idx + 1)))
-            _chain.append((_gb, lay["coll"][0], "collector %d" % (_idx + 1)))
-        _chain.append((lay["coll"][0], lay["hv"][0], "MPT"))
-        _chain.append((lay["hv"][0], int(poi), "POI tie"))
+        _chain = _np_chain(lay, poi)
         _gone = [nm for i2, j2, nm in _chain if _brn_rxb(i2, j2, "1") is None]
         if _gone:
             raise RuntimeError(
@@ -16255,8 +16446,11 @@ def build_new_plant(cfg, poi):
                 "built over. Point PROJ_SAV at the ORIGINAL deck to build it fresh, "
                 "or move NEW_PLANT['bus_start'] to a free block."
                 % (min(want), max(want), ", ".join(_gone)))
-        print("  [newplant] chain verified: unit -> GSU -> collector -> MPT -> POI "
-              "%s  (ADOPTED, not rebuilt)" % poi)
+        print("  [newplant] chain verified: unit -> GSU -> collector -> %s  (ADOPTED, "
+              "not rebuilt)" % (("existing MPT bus(es) %s" % ", ".join(
+                  str(m) for m in lay["attach"])) if lay["attach"] else "MPT -> POI %s" % poi))
+        _NP_ATTACH = [(int(lay["gsuhv"][_k][0]), int(lay["attach"][_k]))
+                      for _k in range(len(lay["attach"]))]
         print("  [newplant] the impedances are whatever that case holds -- NOT the "
               "NEW_PLANT settings in this run. To build it from the panel's values,")
         print("  [newplant] point PROJ_SAV at the original deck instead of a case a "
@@ -16303,7 +16497,7 @@ def build_new_plant(cfg, poi):
                                "%.3f kV). No bus_data_* form this PSS/E exposes "
                                "accepted it." % (b, nm, kv))
         made.append(b)
-    for b, kv, nm in lay["gsuhv"] + [lay["coll"], lay["hv"]]:
+    for b, kv, nm in lay["gsuhv"] + ([lay["coll"], lay["hv"]] if not lay["attach"] else []):
         if not _np_add_bus(b, kv, nm, a, z, o, ide=1):
             raise RuntimeError("NEW_PLANT: could not create bus %d (%s, %.3f kV). "
                                "No bus_data_* form this PSS/E exposes accepted it."
@@ -16333,34 +16527,38 @@ def build_new_plant(cfg, poi):
         if not _np_add_xfmr(ub, gb, "1", gsu.get("r", 0.007662), gsu.get("x", 0.076618),
                             gsu_mva, lay["unit_kv"], lay["coll_kv"], "GSU"):
             raise RuntimeError("NEW_PLANT: GSU %d-%d could not be created" % (ub, gb))
-        if not _np_add_line(gb, lay["coll"][0], "1", col.get("r", 0.02),
+        # THE COLLECTOR EQUIVALENT ENDS AT THE PLANT'S OWN COLLECTOR BUS, or --
+        # connect = "egf_mpt" -- at the existing MPT bus this feeder shares.
+        _cto = int(lay["attach"][idx]) if lay["attach"] else lay["coll"][0]
+        if not _np_add_line(gb, _cto, "1", col.get("r", 0.02),
                             col.get("x", 0.04), col.get("b", 0.0), "collector"):
             raise RuntimeError("NEW_PLANT: collector %d-%d could not be created"
-                               % (gb, lay["coll"][0]))
-    if not _np_add_xfmr(lay["coll"][0], lay["hv"][0], "1", mpt.get("r", 0.002499),
-                        mpt.get("x", 0.099969), mpt_mva, lay["coll_kv"], lay["hv_kv"],
-                        "MPT"):
-        raise RuntimeError("NEW_PLANT: the main power transformer could not be created")
-    if not _np_add_line(lay["hv"][0], int(poi), "1", tie.get("r", 0.0),
-                        tie.get("x", 0.0005), tie.get("b", 0.0), "POI tie"):
-        raise RuntimeError("NEW_PLANT: the tie from %d to the POI %s could not be "
-                           "created" % (lay["hv"][0], poi))
+                               % (gb, _cto))
+    if not lay["attach"]:
+        if not _np_add_xfmr(lay["coll"][0], lay["hv"][0], "1", mpt.get("r", 0.002499),
+                            mpt.get("x", 0.099969), mpt_mva, lay["coll_kv"], lay["hv_kv"],
+                            "MPT"):
+            raise RuntimeError("NEW_PLANT: the main power transformer could not be created")
+        if not _np_add_line(lay["hv"][0], int(poi), "1", tie.get("r", 0.0),
+                            tie.get("x", 0.0005), tie.get("b", 0.0), "POI tie"):
+            raise RuntimeError("NEW_PLANT: the tie from %d to the POI %s could not be "
+                               "created" % (lay["hv"][0], poi))
 
     # ---- IS IT ACTUALLY CONNECTED TO THE POI? ------------------------------
     # Every element above was read back individually, which proves each exists
     # and proves nothing about the chain. This walks it.
-    chain = []
-    for idx in range(n):
-        ub = lay["units"][idx][0]; gb = lay["gsuhv"][idx][0]
-        chain.append((ub, gb, "GSU %d" % (idx + 1)))
-        chain.append((gb, lay["coll"][0], "collector %d" % (idx + 1)))
-    chain.append((lay["coll"][0], lay["hv"][0], "MPT"))
-    chain.append((lay["hv"][0], int(poi), "POI tie"))
+    chain = _np_chain(lay, poi)
     broken = [nm for i2, j2, nm in chain if _brn_rxb(i2, j2, "1") is None]
     if broken:
         raise RuntimeError("NEW_PLANT: the plant is not continuous to the POI -- "
                            "missing: %s" % ", ".join(broken))
-    print("  [newplant] chain verified: unit -> GSU -> collector -> MPT -> POI %s" % poi)
+    if lay["attach"]:
+        _NP_ATTACH = [(int(lay["gsuhv"][_k][0]), int(lay["attach"][_k]))
+                      for _k in range(len(lay["attach"]))]
+        print("  [newplant] chain verified: unit -> GSU -> collector -> existing MPT "
+              "bus(es) %s -> POI %s" % (", ".join(str(m) for m in lay["attach"]), poi))
+    else:
+        print("  [newplant] chain verified: unit -> GSU -> collector -> MPT -> POI %s" % poi)
     _np_record(cfg, lay, poi, mw_u, gsu_mva, mpt_mva)
     # THE CASE HAS JUST CHANGED. Everything cached from it is now wrong -- see
     # _topology_cache_reset(); without this the POI dispatch and its check both
@@ -16397,12 +16595,21 @@ def _np_record(cfg, lay, poi, mw_u, gsu_mva, mpt_mva):
         gsu = dict(cfg.get("gsu") or {}); col = dict(cfg.get("collector") or {})
         mpt = dict(cfg.get("mpt") or {}); tie = dict(cfg.get("tie") or {})
         with open(os.path.join(d, "NEW_PLANT.txt"), "w") as fh:
-            fh.write("NEW PLANT BUILT AT POI %s\n" % poi)
+            if lay.get("attach"):
+                fh.write("NEW PLANT BUILT ON THE EXISTING MPTs BEHIND POI %s "
+                         "(connect = egf_mpt)\n" % poi)
+            else:
+                fh.write("NEW PLANT BUILT AT POI %s\n" % poi)
             fh.write("written %s\n\n" % _ts())
             fh.write("%s: %d unit(s) x %.1f MW = %.1f MW\n"
                      % (lay["name"], lay["n"], mw_u, lay["n"] * mw_u))
-            fh.write("%.3f kV -> %.1f kV -> %.1f kV\n\n"
-                     % (lay["unit_kv"], lay["coll_kv"], lay["hv_kv"]))
+            if lay.get("attach"):
+                fh.write("%.3f kV -> %.1f kV -> existing MPT bus(es) %s\n\n"
+                         % (lay["unit_kv"], lay["coll_kv"],
+                            ", ".join(str(m) for m in lay["attach"])))
+            else:
+                fh.write("%.3f kV -> %.1f kV -> %.1f kV\n\n"
+                         % (lay["unit_kv"], lay["coll_kv"], lay["hv_kv"]))
             # Z AND X/R AS WELL AS R AND X. A transformer is specified as an
             # impedance and a ratio and stored as R and X, and reading the
             # stored pair back to check it against a nameplate is arithmetic
@@ -16411,19 +16618,28 @@ def _np_record(cfg, lay, poi, mw_u, gsu_mva, mpt_mva):
             fh.write("GSU        R=%s X=%s on %.0f MVA (one per unit)   %s\n"
                      % (gsu.get("r"), gsu.get("x"), gsu_mva,
                         _np_z_xr(gsu.get("r"), gsu.get("x"))))
-            fh.write("collector  R=%s X=%s B=%s (one per unit, to the collector bus)\n"
-                     % (col.get("r"), col.get("x"), col.get("b")))
-            fh.write("MPT        R=%s X=%s on %.0f MVA   %s\n"
-                     % (mpt.get("r"), mpt.get("x"), mpt_mva,
-                        _np_z_xr(mpt.get("r"), mpt.get("x"))))
-            fh.write("POI tie    R=%s X=%s B=%s\n\n"
-                     % (tie.get("r"), tie.get("x"), tie.get("b")))
+            if lay.get("attach"):
+                fh.write("collector  R=%s X=%s B=%s (one per unit, to its existing MPT bus)\n"
+                         % (col.get("r"), col.get("x"), col.get("b")))
+                fh.write("MPT / tie  the EXISTING plant's -- none built\n\n")
+                for _k, _m in enumerate(lay["attach"]):
+                    fh.write("  feeder %d: %d -> existing MPT bus %d %s\n"
+                             % (_k + 1, lay["gsuhv"][_k][0], _m, _bus_name_safe(_m)))
+                fh.write("\n")
+            else:
+                fh.write("collector  R=%s X=%s B=%s (one per unit, to the collector bus)\n"
+                         % (col.get("r"), col.get("x"), col.get("b")))
+                fh.write("MPT        R=%s X=%s on %.0f MVA   %s\n"
+                         % (mpt.get("r"), mpt.get("x"), mpt_mva,
+                            _np_z_xr(mpt.get("r"), mpt.get("x"))))
+                fh.write("POI tie    R=%s X=%s B=%s\n\n"
+                         % (tie.get("r"), tie.get("x"), tie.get("b")))
             fh.write("buses created\n")
             for b, kv, nm in lay["units"]:
                 fh.write("  %-8d %-14s %8.3f kV   MACHINE\n" % (b, nm, kv))
             for b, kv, nm in lay["gsuhv"]:
                 fh.write("  %-8d %-14s %8.3f kV   GSU high side\n" % (b, nm, kv))
-            for b, kv, nm in (lay["coll"], lay["hv"]):
+            for b, kv, nm in [x for x in (lay["coll"], lay["hv"]) if x]:
                 fh.write("  %-8d %-14s %8.3f kV\n" % (b, nm, kv))
     except Exception as e:
         print("  [newplant] could not write NEW_PLANT.txt (%s)" % e)
@@ -16572,7 +16788,12 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         def _np_build_member(_mr):
             """The new facility of ONE member: buses, GSUs, collector, MPT, tie.
                Must run inside that member's _member_scope."""
-            _npc = _np_member_cfg(_np, _mr)
+            _npc = dict(_np_member_cfg(_np, _mr) or {})
+            # THE EXISTING FEEDERS, for connect = "egf_mpt": each new feeder lands
+            # on the MPT one of them uses. The original list -- "feeders" is
+            # replaced by the new units just below.
+            _npc["_egf_feeders"] = [int(x) for x in (_mr.get("feeders_original")
+                                                      or _mr.get("feeders") or [])]
             _np_plant = build_new_plant(_npc, _mr["poi"])
             _np_buses = [b for role, b in _np_plant if role == "MACH"]
             _mr.setdefault("feeders_original",
