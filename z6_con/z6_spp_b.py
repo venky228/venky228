@@ -25065,6 +25065,59 @@ def write_run_times(all_rows=None):
     return path
 
 
+def _measure_fill_from_parts():
+    """Fill SPP_MEASURE from parts\\SCEN_<id>_MEAS.csv for every scenario it
+       does not hold yet.
+
+       A case with ONE report shard writes its reports straight from that
+       shard's memory, with no merge pass -- and a scenario the WORKER scored
+       while it ran is taken "from the worker's score" without re-reading the
+       .out, so its measurements exist only in its SCEN_<id>_MEAS.csv part.
+       The merged SPP_MEASURE_*.csv files and the measurements workbook were
+       then simply not written for that case. With several shards the merge
+       pass read the parts and nothing was missing, which is why it showed only
+       with few report cores. A part older than its .out is left out, as in the
+       merge."""
+    import glob as _g
+    try:
+        files = [f for f in sorted(_g.glob(os.path.join(PARTS_DIR, "SCEN_*_MEAS.csv")))
+                 if not _scen_stale(f)]
+    except Exception:
+        return 0
+    have = set(SPP_MEASURE.keys())
+    n = 0
+    for f in files:
+        try:
+            with open(f) as fh:
+                rows = list(csv.DictReader(fh))
+        except Exception:
+            continue
+        cases = set(r.get("Case", "") for r in rows)
+        if not cases or cases & have:
+            continue
+        for r in rows:
+            case, tbl = r.get("Case", ""), r.get("table", "")
+            if not case or tbl not in ("angles", "volts", "machines", "poi"):
+                continue
+            vals = []
+            for i in range(1, 17):
+                v = (r.get("c%d" % i) or "").strip()
+                if i <= 2 or v == "":
+                    vals.append(v)
+                    continue
+                try:
+                    vals.append(float(v))
+                except ValueError:
+                    vals.append(v)
+            while vals and vals[-1] == "":
+                vals.pop()
+            SPP_MEASURE.setdefault(case, {}).setdefault(tbl, []).append(vals)
+            n += 1
+    if n:
+        print("[merge] %d measurement row(s) read from the per-scenario parts" % n)
+    return n
+
+
 def write_measurements_workbook(cases, verdicts):
     """03_MEASUREMENTS_<KIND>_<project>.xlsx -- what every monitored quantity DID.
 
@@ -25096,6 +25149,7 @@ def write_measurements_workbook(cases, verdicts):
        from the minimum -- so SPPR1 is Rev 3.0's SPPR1 and SPPR5 its SPPR5, and
        2, 3 and 4 are the same quantity at the peaks in between. Only 1 and 5
        carry a limit; the others say how the decay actually progressed."""
+    _measure_fill_from_parts()
     if not SPP_MEASURE:
         return ""
     A_HDR = ["Scenario", "Signal", "Bus", "Machine type", "Deviation (deg)",

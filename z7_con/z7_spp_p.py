@@ -13755,6 +13755,23 @@ def apply_poi_p_metered(project, target_mw):
             elif it == 1:
                 print("  [poi-p]   plant side of the POI could not be separated -- metering the "
                       "net export instead")
+            # THE SAME METER THE VERIFY USES. _poi_target_verify() takes the sum
+            # of the plant's own ties into the POI as the authority; metering
+            # the plant/system walk here instead let the two disagree wherever
+            # something else is tapped at the POI. EmpirePrairie: the loop
+            # settled at 769.0 on the walk, the tie 761376 -> 761383 carried
+            # 779.3, and POI_P_STRICT stopped every build of that project.
+            try:
+                _tmw, _nt, _trows = _poi_plant_tie_mw(poi)
+            except Exception:
+                _tmw, _nt = 0.0, 0
+            if _nt:
+                if it == 1 and abs(_tmw - exp_mw) > max(float(POI_P_STRICT_TOL_MW),
+                                                        0.01 * abs(float(target_mw))):
+                    print("  [poi-p]   the plant's tie(s) into POI %d carry %.1f MW and the plant/"
+                          "system split reads %.1f -- metering the TIE SUM, as the check after "
+                          "the solve does" % (poi, _tmw, exp_mw))
+                exp_mw = _tmw
         if nbr == 0:
             print("  [poi-p] *** no branch out of the POI could be read -- the metered "
                   "target cannot be measured, leaving the dispatch as it is ***")
@@ -23405,6 +23422,24 @@ def _existing_plant_buses():
     return out
 
 
+def _new_machine_series(ch, want):
+    """[(bus, series)] of the NEW plant's machines (NPGEN<bus>_PELEC / _QELEC),
+       one per machine -- the SGF's output at its terminals."""
+    cat = "PELEC" if want == "POWR" else "QELEC"
+    out, seen = [], set()
+    for k, (t, v) in ch.items():
+        core = chan_core(t).upper()
+        if not core.startswith("NPGEN") or categorize(t) != cat:
+            continue
+        m = re.match(r"NPGEN(\d+)", core)
+        b = int(m.group(1)) if m else None
+        if b is None or b in seen:
+            continue
+        seen.add(b)
+        out.append((b, v))
+    return sorted(out, key=lambda x: x[0])
+
+
 def _existing_machine_series(ch, want):
     """[(bus, series)] of the PROJECT_GENS machines' PELEC ("POWR") or QELEC
        ("VARS") channels in this .out -- the EXISTING units of the plant, named
@@ -26119,13 +26154,34 @@ def evaluate_case(path, kind, tclear, kb):
                         _qsrc.append((_poi, _tl[0][1]))
                 _new = [v for (f, v) in _tl if _isnew(f) or (not f and len(_tl) == 1)]
                 _old = [v for (f, v) in _tl if f and not _isnew(f)]
+                # THE NEW PLANT ON THE EXISTING MPTs (connect = "egf_mpt") has no
+                # tie of its own: every tie into the POI carries the EGF and the
+                # SGF together. Calling them "existing plant tie(s)" read as EGF
+                # only -- and in the EGF-off scenario the EGF delivers nothing.
+                # So the ties are named as shared, and the two plants' own
+                # outputs are given beside them, at their terminals.
+                _npm = _new_machine_series(_pu, _q)
+                _shared = bool(_npm) and bool(_tl) and not any(_isnew(f) for (f, v) in _tl)
+                if _shared:
+                    _new = []
                 if _new:
                     poi_rows.append([_poi, _unit, "new plant tie(s)"] + _pstat(_psum(_new))
                                     + ["%d tie(s) from the %s* block" % (len(_new), _npre)])
                 if _old:
-                    poi_rows.append([_poi, _unit, "existing plant tie(s)"] + _pstat(_psum(_old))
+                    poi_rows.append([_poi, _unit, ("plant tie(s), shared by the EGF and the SGF"
+                                                   if _shared else "existing plant tie(s)")]
+                                    + _pstat(_psum(_old))
                                     + ["%d tie(s): far bus %s" % (len(_old), ", ".join(f for (f, v) in _tl if f and not _isnew(f)))])
-                if len(_tl) < 2:
+                if _shared:
+                    poi_rows.append([_poi, _unit, "SGF machines (terminals)"]
+                                    + _pstat(_psum([v for (b, v) in _npm]))
+                                    + ["%d machine(s): %s" % (len(_npm), ", ".join(str(b) for (b, v) in _npm))])
+                    _exs = _existing_machine_series(_pu, _q)
+                    if _exs:
+                        poi_rows.append([_poi, _unit, "EGF machines (terminals)"]
+                                        + _pstat(_psum([v for (b, v) in _exs]))
+                                        + ["%d machine(s): %s" % (len(_exs), ", ".join(str(b) for (b, v) in _exs))])
+                if len(_tl) < 2 and not _shared:
                     _ex = _existing_machine_series(_pu, _q)
                     if _ex:
                         poi_rows.append([_poi, _unit, "existing machines (terminals)"]
@@ -28932,6 +28988,59 @@ def write_run_times(all_rows=None):
     return path
 
 
+def _measure_fill_from_parts():
+    """Fill SPP_MEASURE from parts\\SCEN_<id>_MEAS.csv for every scenario it
+       does not hold yet.
+
+       A case with ONE report shard writes its reports straight from that
+       shard's memory, with no merge pass -- and a scenario the WORKER scored
+       while it ran is taken "from the worker's score" without re-reading the
+       .out, so its measurements exist only in its SCEN_<id>_MEAS.csv part.
+       The merged SPP_MEASURE_*.csv files and the measurements workbook were
+       then simply not written for that case. With several shards the merge
+       pass read the parts and nothing was missing, which is why it showed only
+       with few report cores. A part older than its .out is left out, as in the
+       merge."""
+    import glob as _g
+    try:
+        files = [f for f in sorted(_g.glob(os.path.join(PARTS_DIR, "SCEN_*_MEAS.csv")))
+                 if not _scen_stale(f)]
+    except Exception:
+        return 0
+    have = set(SPP_MEASURE.keys())
+    n = 0
+    for f in files:
+        try:
+            with open(f) as fh:
+                rows = list(csv.DictReader(fh))
+        except Exception:
+            continue
+        cases = set(r.get("Case", "") for r in rows)
+        if not cases or cases & have:
+            continue
+        for r in rows:
+            case, tbl = r.get("Case", ""), r.get("table", "")
+            if not case or tbl not in ("angles", "volts", "machines", "poi"):
+                continue
+            vals = []
+            for i in range(1, 17):
+                v = (r.get("c%d" % i) or "").strip()
+                if i <= 2 or v == "":
+                    vals.append(v)
+                    continue
+                try:
+                    vals.append(float(v))
+                except ValueError:
+                    vals.append(v)
+            while vals and vals[-1] == "":
+                vals.pop()
+            SPP_MEASURE.setdefault(case, {}).setdefault(tbl, []).append(vals)
+            n += 1
+    if n:
+        print("[merge] %d measurement row(s) read from the per-scenario parts" % n)
+    return n
+
+
 def write_measurements_workbook(cases, verdicts):
     """03_MEASUREMENTS_<KIND>_<project>.xlsx -- what every monitored quantity DID.
 
@@ -28963,6 +29072,7 @@ def write_measurements_workbook(cases, verdicts):
        from the minimum -- so SPPR1 is Rev 3.0's SPPR1 and SPPR5 its SPPR5, and
        2, 3 and 4 are the same quantity at the peaks in between. Only 1 and 5
        carry a limit; the others say how the decay actually progressed."""
+    _measure_fill_from_parts()
     if not SPP_MEASURE:
         return ""
     A_HDR = ["Scenario", "Signal", "Bus", "Machine type", "Deviation (deg)",

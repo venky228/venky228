@@ -8071,8 +8071,11 @@ def _poi_power_rows(results):
                 continue
             seen.add((proj, fid))
             bt, tt = _pick(mb, fid, "TOTAL delivered into the POI"), _pick(mt, fid, "TOTAL delivered into the POI")
-            tn = _pick(mt, fid, "new plant tie(s)")
-            te = _pick(mt, fid, "existing plant tie(s)") or _pick(mt, fid, "existing machines (terminals)")
+            # connect = "egf_mpt": the ties are shared, so the SGF and EGF split
+            # is taken at the machines' terminals instead of from the ties.
+            tn = _pick(mt, fid, "new plant tie(s)") or _pick(mt, fid, "SGF machines (terminals)")
+            te = (_pick(mt, fid, "existing plant tie(s)") or _pick(mt, fid, "EGF machines (terminals)")
+                  or _pick(mt, fid, "existing machines (terminals)"))
             bq, tq = (_pick(mb, fid, "TOTAL delivered into the POI", "MVAr"),
                       _pick(mt, fid, "TOTAL delivered into the POI", "MVAr"))
             poi = (tt or bt or tn or {}).get("poi", "")
