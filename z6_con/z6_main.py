@@ -8104,7 +8104,11 @@ def _poi_power_rows(results):
             if tt and not tn:
                 _row[7] = _row[8] = "no new plant in this run"
             if tt and not te:
-                _row[9] = _row[10] = "no existing plant tie"
+                # egf_mpt with the EGF switched off: the ties are shared, the
+                # SGF row is there and the EGF has no machine in service
+                _shared_t = bool(_pick(mt, fid, "SGF machines (terminals)")) and not _pick(mt, fid, "new plant tie(s)")
+                _row[9] = _row[10] = ("EGF off -- no existing machine in service" if _shared_t
+                                      else "no existing plant tie")
             rows.append([(EMPTY_CELL if v in ("", None) else v) for v in _row])
     return rows
 
