@@ -544,6 +544,11 @@ POI_P_CEIL_TOL_MW   = 0.05
 
 POI_HOLD_AREA_TOL_MW = 0.5
 POI_HOLD_AREA_PASSES = 4
+# MACHINES THE AREA HOLD NEVER MOVES. The area hold scales the other machines
+# of the project's area to keep the area total at its pre-project value; a
+# machine listed here keeps its case dispatch (the same MW as the base case).
+# [bus, ...] for every project, or {"SantaFe": [584713], "all": [...]}.
+POI_HOLD_EXCLUDE_BUSES = []
 # A machine is never pushed past its PMAX or below its PMIN. If the remainder
 # cannot be placed inside those limits the shortfall is reported rather than
 # quietly absorbed -- a plant that cannot reach the target is a finding about
@@ -3210,6 +3215,16 @@ POI_P_METER_ITERS  = int(_env_num("SPP_POI_METER_ITERS", POI_P_METER_ITERS))
 POI_P_METER_TOL_MW = _env_num("SPP_POI_METER_TOL", POI_P_METER_TOL_MW)
 POI_HOLD_AREA_TOL_MW = _env_num("SPP_POI_HOLD_TOL", POI_HOLD_AREA_TOL_MW)
 POI_HOLD_AREA_PASSES = int(_env_num("SPP_POI_HOLD_PASSES", POI_HOLD_AREA_PASSES))
+_phx = (os.environ.get("SPP_POI_HOLD_EXCLUDE") or "").strip()
+if _phx:
+    try:
+        if _phx.startswith("{"):
+            import json as _json_phx
+            POI_HOLD_EXCLUDE_BUSES = _json_phx.loads(_phx)
+        else:
+            POI_HOLD_EXCLUDE_BUSES = [int(float(x)) for x in _phx.split(",") if x.strip()]
+    except Exception:
+        print("[poi-p] SPP_POI_HOLD_EXCLUDE is %r -- ignored" % _phx)
 _peb = (os.environ.get("SPP_POI_P_EXIST_BUSES") or "").strip()
 if _peb:
     # "765910,765920" for every project, or {"SantaFe": [765910, 765920]} per
@@ -13073,7 +13088,47 @@ def _area_gen_mw(area):
     return tot
 
 
-def _area_machines(area, exclude_buses, skip_slack=True):
+def _hold_exclude_buses():
+    """The buses of POI_HOLD_EXCLUDE_BUSES that apply to this run: the list
+       itself, or from a {project: [...]} table the active project's entry
+       plus "all" (every entry when no project name is known)."""
+    raw = globals().get("POI_HOLD_EXCLUDE_BUSES") or []
+    out = set()
+    try:
+        if isinstance(raw, dict):
+            names = set(str(x).strip().lower() for x in
+                        (globals().get("ACTIVE_PROJECT"), globals().get("RUN_PROJECT")) if x)
+            try:
+                for _mr, _mmw in _bess_members():
+                    if _mr.get("name"):
+                        names.add(str(_mr.get("name")).strip().lower())
+            except Exception:
+                pass
+            for k, v in raw.items():
+                kk = str(k).strip().lower()
+                if kk in ("all", "*") or not names or kk in names:
+                    out |= set(int(float(b)) for b in (v or []))
+        else:
+            out = set(int(float(b)) for b in raw)
+    except Exception as e:
+        print("  [poi-p] POI_HOLD_EXCLUDE_BUSES = %r could not be read (%s) -- ignored" % (raw, e))
+        return set()
+    return out
+
+
+def _hold_excluded_mw(area):
+    """(MW, [(bus, id, MW)]) of the POI_HOLD_EXCLUDE_BUSES machines in `area`."""
+    ex = _hold_exclude_buses()
+    if not ex:
+        return 0.0, []
+    rows = []
+    for b, mid, p, _pmax, _pmin in _area_machines(area, (), skip_slack=True, _no_hold_exclude=True):
+        if int(b) in ex:
+            rows.append((int(b), mid, float(p)))
+    return sum(r[2] for r in rows), rows
+
+
+def _area_machines(area, exclude_buses, skip_slack=True, _no_hold_exclude=False):
     """[(bus, id, P, PMAX, PMIN)] for the machines this rebalance may move.
 
        THE SLACK IS NOT ONE OF THEM. Its output is whatever balances the system,
@@ -13089,6 +13144,8 @@ def _area_machines(area, exclude_buses, skip_slack=True):
        grinding."""
     out = []
     skip = set(int(b) for b in (exclude_buses or []))
+    if not _no_hold_exclude:
+        skip |= _hold_exclude_buses()      # POI_HOLD_EXCLUDE_BUSES keep their dispatch
     if skip_slack:
         try:
             skip |= set(int(b) for b in (SLACK_GENS or []))
@@ -14511,13 +14568,20 @@ def apply_poi_p_target(project, target_mw):
     others = _area_machines(area, poi_buses)
     now_others = sum(r[2] for r in others)
     plant_now = proj_mw + placed
-    want_others = before - plant_now
+    # The machines held at their dispatch (POI_HOLD_EXCLUDE_BUSES) are part of
+    # the area total and do not move, so the others make up the rest without them.
+    _hx_mw, _hx_rows = _hold_excluded_mw(area)
+    if _hx_rows:
+        print("  [poi-p] held at their dispatch (POI_HOLD_EXCLUDE_BUSES): %s -- %.1f MW"
+              % (", ".join("%d '%s' %.1f MW" % r for r in _hx_rows), _hx_mw))
+    want_others = before - plant_now - _hx_mw
     print("  [poi-p] area %s: was %.1f MW, plant is now %.1f MW -> the rest of the "
           "area must come to %.1f MW (it is %.1f)"
           % (area, before, plant_now, want_others, now_others))
     if want_others < 0:
-        print("  [poi-p] *** the plant alone exceeds the area's original total. The "
-              "area cannot be held at %.1f MW; it is left unscaled. ***" % before)
+        print("  [poi-p] *** the plant%s exceeds the area's original total. The "
+              "area cannot be held at %.1f MW; it is left unscaled. ***"
+              % (" plus the held machines (POI_HOLD_EXCLUDE_BUSES)" if _hx_rows else " alone", before))
         return
     if now_others <= 0:
         print("  [poi-p] *** the rest of the area generates nothing -- there is "
@@ -15361,6 +15425,16 @@ def _poi_stamp():
         _tg = " together=" + ",".join("%s:%g@%s" % (_r.get("name"), float(_r.get("mw_together") or 0),
                                                     _member_target(_r))
                                       for _r in _t["member_rows"])
+    # A case built before the POI target became a ceiling, or with another
+    # set of held machines, carries a different dispatch -- rebuilt.
+    if POI_P_NOT_ABOVE:
+        _tg += " ceil=1"
+    try:
+        _hx = sorted(_hold_exclude_buses())
+    except Exception:
+        _hx = []
+    if _hx:
+        _tg += " holdx=" + ",".join(str(b) for b in _hx)
     return ("poi: target=%s measure=%s share=%s at=%s projmw=%s area=%s hold=%s "
             "newblock=%s existing=[%s] off=%s%s"
             % (POI_P_TARGET_MW, POI_P_MEASURE, POI_P_SHARE, POI_P_PROJECT_AT,

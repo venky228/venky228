@@ -528,6 +528,7 @@ POI_P_AREA = None                            # None = the project's own area
 POI_HOLD_AREA_MW = True                      # True = area total put back to its pre-project MW
 POI_HOLD_AREA_TOL_MW = None                  # default 0.5 MW
 POI_HOLD_AREA_PASSES = None                  # default 4
+POI_HOLD_EXCLUDE_BUSES = []                  # buses the area hold never scales (keep base MW): [584713] or {"SantaFe": [584713]}
 POI_P_LEVELS = []                            # [] = off | [MW, ...] one study per level
 POI_P_LEVELS_PCT = []                        # [] = off | [100, 80, ...] % of POI_P_TARGET_MW
 POI_P_COMPARE = True                         # full comparison per level
@@ -15508,6 +15509,11 @@ def _push_settings(env, case):
                         ("SPP_POI_METER_TOL", POI_P_METER_TOL_MW),
                         ("SPP_POI_HOLD_TOL", POI_HOLD_AREA_TOL_MW),
                         ("SPP_POI_HOLD_PASSES", POI_HOLD_AREA_PASSES),
+                        ("SPP_POI_HOLD_EXCLUDE",
+                         (json.dumps(POI_HOLD_EXCLUDE_BUSES)
+                          if isinstance(POI_HOLD_EXCLUDE_BUSES, dict)
+                          else (",".join(str(int(x)) for x in (POI_HOLD_EXCLUDE_BUSES or []))
+                                or None))),
                         ("SPP_POI_P_EXIST_BUSES",
                          (json.dumps(POI_P_EXISTING_BUSES)
                           if isinstance(POI_P_EXISTING_BUSES, dict)
