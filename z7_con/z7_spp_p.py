@@ -23425,14 +23425,32 @@ def _existing_plant_buses():
 def _new_machine_series(ch, want):
     """[(bus, series)] of the NEW plant's machines (NPGEN<bus>_PELEC / _QELEC),
        one per machine -- the SGF's output at its terminals."""
+    # When the new units are PROJECT_GENS (the usual NEW_PLANT run) they are
+    # channelled as PROJ<n>_* and NOT as NPGEN<bus>_* -- _new_plant_gens() skips
+    # a machine that is already a project machine. So both families are read;
+    # a PROJ<n> counts only when its bus is in the new-plant block.
     cat = "PELEC" if want == "POWR" else "QELEC"
     out, seen = [], set()
     for k, (t, v) in ch.items():
         core = chan_core(t).upper()
-        if not core.startswith("NPGEN") or categorize(t) != cat:
+        if categorize(t) != cat:
             continue
-        m = re.match(r"NPGEN(\d+)", core)
-        b = int(m.group(1)) if m else None
+        b = None
+        if core.startswith("NPGEN"):
+            m = re.match(r"NPGEN(\d+)", core)
+            b = int(m.group(1)) if m else None
+        else:
+            m = re.match(r"PROJ(\d+)", core)
+            if not m:
+                continue
+            try:
+                n = int(m.group(1))
+                _mb = re.search(r"\b(\d{3,})\b", _proj_bus_text(n))
+                b = int(_mb.group(1)) if _mb else int(PROJECT_GENS[n - 1][0])
+            except Exception:
+                continue
+            if not _is_new_plant_bus(b):
+                continue
         if b is None or b in seen:
             continue
         seen.add(b)
