@@ -781,6 +781,7 @@ NEW_PLANT = {
     "mpt":       {"r": 0.002499, "x": 0.099969, "sbase": None},   # Z = 10.0 %, X/R = 40
     "tie":       {"r": 0.0000, "x": 0.0005, "b": 0.0},
     "connect":   "poi",                     # "poi" own MPT + tie | "egf_mpt" one feeder per existing feeder, on its MPT
+    "q_zero_at": "own",                     # egf_mpt only: "own" 0 MVAr into the MPT buses (own GSU + collector losses) | "poi" 0 MVAr at the POI
 }
 
 # ---- 15. EXTRA STUDIES ---------------------------------------------------------

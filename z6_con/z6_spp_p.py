@@ -827,6 +827,11 @@ NEW_PLANT = {
     #              existing feeder already uses -- unit -> GSU -> collector ->
     #              the existing MPT bus. The "mpt" and "tie" rows are not used.
     "connect":   "poi",
+    # connect = "egf_mpt" only -- WHERE THE BESS HOLDS 0 MVAr:
+    #   "own"  into the existing MPT buses: it supplies the losses of its own
+    #          GSUs and collector and nothing else (the POI is not held)
+    #   "poi"  at the POI: it also covers the existing MPTs' and feeders' losses
+    "q_zero_at": "own",
 }
 
 # ---- WHICH psspy CALL CREATES A TRANSFORMER AND A BRANCH --------------------
@@ -8972,10 +8977,21 @@ def zero_bess_poi_q(project, mw_level):
         _hv = []
     cut = _hv or [b for b, _m in gens]
 
+    # WHERE THE REACTIVE EXCHANGE IS HELD AT 0. For a plant built at the POI
+    # (or none built) it is the POI. connect = "egf_mpt" with q_zero_at = "own"
+    # holds it at the EXISTING MPT buses the new feeders land on: the BESS then
+    # supplies the losses of its own GSUs and collector and nothing more, and
+    # the POI carries whatever the existing plant and its MPTs do. Holding the
+    # POI at 0 instead made the BESS cover the existing MPTs' and feeders'
+    # reactive losses too -- SantaFe's units sat at QMAX with 1.05 pu at their
+    # terminals.
+    _own = bool(_NP_ATTACH) and _np_q_zero_at() == "own"
+    _at = (("the existing MPT bus(es) %s" % ", ".join(str(m) for _g, m in _NP_ATTACH))
+           if _own else "the POI %d" % poi)
+
     def _meas_q():
-        # Q AT THE POI. connect = "egf_mpt" has no tie of its own, so the cut is
-        # the plant's POI tie(s) -- the BESS machines are moved until the POI
-        # reads 0 MVAr, within their own 0.95-pf range, as before.
+        if _own:
+            return _np_attach_delivered()
         return _delivered_to_poi(cut, poi)
     n = len(gens)
     # what the machines have now: Q, and the limits they must stay inside
@@ -9022,9 +9038,9 @@ def zero_bess_poi_q(project, mw_level):
               "the reactive exchange cannot be measured, machines left as they are"
               % (project.get("name"), poi))
         return
-    print("  [poi-q] === %s: driving the reactive exchange at POI %d to 0 MVAr (now P=%.1f MW, Q=%+.1f MVAr "
-          "delivered into the POI; machines Q %s) ==="
-          % (project.get("name"), poi, P0, Q0,
+    print("  [poi-q] === %s: driving the reactive exchange at %s to 0 MVAr (now P=%.1f MW, Q=%+.1f MVAr "
+          "delivered there; machines Q %s) ==="
+          % (project.get("name"), _at, P0, Q0,
              ", ".join("%s '%s' %+.1f" % (b, m, cur[(b, m)]) for b, m in gens)))
     if abs(Q0) <= float(POI_Q_TOL_MVAR):
         print("  [poi-q]   already within %.1f MVAr -- nothing moved" % float(POI_Q_TOL_MVAR))
@@ -9057,15 +9073,15 @@ def zero_bess_poi_q(project, mw_level):
             print("  [poi-q]   the re-solve failed (%s) -- stopping" % e)
             break
         P, Q, nb = _meas_q()
-        print("  [poi-q]   iter %d: machines Q %+.1f MVAr total -> POI P=%.1f MW, Q=%+.1f MVAr%s"
+        print("  [poi-q]   iter %d: machines Q %+.1f MVAr total -> P=%.1f MW, Q=%+.1f MVAr delivered%s"
               % (it, sum(cur.values()), P, Q, ("   [%s]" % "; ".join(at_limit)) if at_limit else ""))
         if abs(Q) <= float(POI_Q_TOL_MVAR):
-            print("  [poi-q]   converged: %+.2f MVAr at the POI after %d pass(es)" % (Q, it))
+            print("  [poi-q]   converged: %+.2f MVAr at %s after %d pass(es)" % (Q, _at, it))
             break
         limited = bool(at_limit)
         if at_limit and len(at_limit) >= n:
-            print("  [poi-q]   *** every machine is at a reactive limit -- %+.1f MVAr at the POI "
-                  "cannot be removed within QMAX/QMIN (limits NOT changed) ***" % Q)
+            print("  [poi-q]   *** every machine is at a reactive limit -- %+.1f MVAr at %s "
+                  "cannot be removed within QMAX/QMIN (limits NOT changed) ***" % (Q, _at))
             break
     # THE SCHEDULED VOLTAGE = THE VOLTAGE REACHED, so the regulating solve that
     # follows (limits restored) reproduces this Q instead of pulling back to the
@@ -9116,9 +9132,18 @@ def zero_bess_poi_q(project, mw_level):
                 qs.append("%s '%s' %+.1f" % (b, m, float(q)))
             except Exception:
                 pass
-        print("  [poi-q] RESULT %s: POI %d  P=%.1f MW  Q=%+.2f MVAr with the machines regulating their "
-              "scheduled voltage (%d plant(s) set); machines Q %s%s"
-              % (project.get("name"), poi, P2, Q2, n_vs, ", ".join(qs),
+        _pq = ""
+        if _own:
+            try:
+                _pp, _qp, _np_ = _delivered_to_poi(cut, poi)
+                if _np_:
+                    _pq = "; at the POI %d: P=%.1f MW Q=%+.2f MVAr (existing plant + MPTs, not held)" % (
+                        poi, _pp, _qp)
+            except Exception:
+                pass
+        print("  [poi-q] RESULT %s: %s  P=%.1f MW  Q=%+.2f MVAr with the machines regulating their "
+              "scheduled voltage (%d plant(s) set); machines Q %s%s%s"
+              % (project.get("name"), _at, P2, Q2, n_vs, ", ".join(qs), _pq,
                  "" if abs(Q2) <= 2.0 * float(POI_Q_TOL_MVAR) else
                  ("   *** held back by the machines' QMAX/QMIN (not changed) ***" if limited else
                   "   *** drifted past the tolerance on the regulating solve -- read the iterations above ***")))
@@ -15254,7 +15279,7 @@ def _np_stamp():
     if not c:
         return ""
     m = str(c.get("connect") or "poi").strip().lower()
-    return "" if m == "poi" else " | newplant: connect=%s" % m
+    return "" if m == "poi" else " | newplant: connect=%s q0=%s" % (m, _np_q_zero_at())
 
 
 def _poi_q_stamp():
@@ -16316,6 +16341,18 @@ def _bus_name_safe(b):
         return str(nm).strip() if ie in (0, None) else ""
     except Exception:
         return ""
+
+
+def _np_q_zero_at():
+    """NEW_PLANT["q_zero_at"]: "own" (connect = egf_mpt: 0 MVAr into the
+       existing MPT buses -- the BESS covers its own GSU and collector losses
+       only) or "poi" (0 MVAr at the POI). Default "own"."""
+    try:
+        c = _np_cfg() or {}
+    except Exception:
+        c = {}
+    v = str(c.get("q_zero_at") or "own").strip().lower()
+    return "poi" if v == "poi" else "own"
 
 
 def _np_attach_delivered():
