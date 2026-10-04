@@ -13439,23 +13439,19 @@ def _poi_plant_tie_mw(poi):
         pass
     tot, rows = 0.0, []
     for other, ck in ties:
-        # A THREE-WINDING TIE IS READ AT THE POI WINDING. Read at `other` it
-        # counts that one winding only, and a machine on the third winding
-        # (EastFork's 531624 behind 531622/531623) is left out of the total.
+        # EVERY TIE IS READ AT THE POI END: what ARRIVES at the POI. Read at
+        # `other` a line tie counts its own losses as delivered -- EmpirePrairie's
+        # 761376 -> 761383 gen-tie sends 603.9 MW and lands 597.9 MW at the POI,
+        # and the meter held the 603.9. A three-winding tie read at `other`
+        # would also count one winding only (EastFork's 531624 behind
+        # 531622/531623). The plot channels are metered at the POI the same way.
         try:
-            _w3 = _three_wind_of(other, poi, ck)
-        except Exception:
-            _w3 = None
-        try:
-            if _w3:
-                ierr, cx = _flow_leaving(poi, int(other), str(ck))
-            else:
-                ierr, cx = _flow_leaving(int(other), poi, str(ck))
+            ierr, cx = _flow_leaving(poi, int(other), str(ck))
         except Exception:
             continue
         if ierr not in (0, None) or cx is None:
             continue
-        p = -float(cx.real) if _w3 else float(cx.real)   # MW from the plant into the POI
+        p = -float(cx.real)                                # MW from the plant into the POI
         tot += p
         rows.append((other, ck, p))
     rows.sort(key=lambda r: -abs(r[2]))
