@@ -344,7 +344,7 @@ POI_PF         = 0.95           # power-factor capability at the POI (Q = +/- ta
 BESS_ID        = "B"            # machine id for the added BESS (distinct from the existing '1')
 DISABLE_EXISTING_MODE = "oos"   # "oos" = existing gens out of service | "remove" = purge them
 import math as _math
-_Q_PER_P       = (_math.tan(_math.acos(POI_PF)) )* 1.32   # 0.95 -> 0.3287 x 1.32 = 0.434 at the terminals (covers the collector/GSU vars)
+_Q_PER_P       = (_math.tan(_math.acos(POI_PF)) )* 1.35   # 0.95 -> 0.3287 x 1.35 = 0.444 at the terminals (covers the collector/GSU vars)
 # A BESS charges as well as discharges: Pmin = -Pmax. False = Pmin 0 (solar/wind).
 BESS_PMIN_SYMMETRIC = True
 # >>> MBASE AS A WHOLE NUMBER OF INVERTERS. The power triangle gives a machine
@@ -832,6 +832,21 @@ NEW_PLANT = {
     #          GSUs and collector and nothing else (the POI is not held)
     #   "poi"  at the POI: it also covers the existing MPTs' and feeders' losses
     "q_zero_at": "own",
+    # COLLECTOR SIZED FROM EACH FEEDER'S CAPACITY: set "collector": "auto" and
+    # the equivalent R, X, B of every new feeder is worked out from its MW and
+    # this cable data, by the standard equivalencing method (NREL / WECC
+    # power-flow modelling guides: Z_eq = sum(I^2 Z) / I_total^2, B_eq = sum B):
+    #   n circuits   = ceil(feeder current / ampacity), current at pf
+    #   skids        = feeder MVA / skid_mva, spread evenly over the n circuits
+    #   one circuit  = string_km of cable with its skids equally spaced, so the
+    #                  segment k skids from the far end carries k skids' current
+    #   Z_eq = z * string_km * sum(k^2)/m^3 / n  +  z * homerun_km / n
+    #   B_eq = (all cable) n * (string_km + homerun_km) * b
+    # 34.5 kV, 1000 kcmil Al XLPE, direct buried: about 0.070 + j0.110 ohm/km,
+    # 0.42 uF/km, 550 A. Put in the project's own cable and layout when known.
+    "collector_cable": {"ampacity_a": 550.0, "r_ohm_km": 0.070, "x_ohm_km": 0.110,
+                        "c_uf_km": 0.42, "string_km": 1.0, "homerun_km": 0.3,
+                        "skid_mva": 8.8, "pf": 0.95, "hz": 60.0},
 }
 
 # ---- WHICH psspy CALL CREATES A TRANSFORMER AND A BRANCH --------------------
@@ -15279,7 +15294,14 @@ def _np_stamp():
     if not c:
         return ""
     m = str(c.get("connect") or "poi").strip().lower()
-    return "" if m == "poi" else " | newplant: connect=%s q0=%s" % (m, _np_q_zero_at())
+    if m == "poi":
+        return ""
+    try:
+        import json as _j
+        _col = _j.dumps([c.get("collector"), c.get("collector_cable"), c.get("gsu")], sort_keys=True)
+    except Exception:
+        _col = "?"
+    return " | newplant: connect=%s q0=%s col=%s" % (m, _np_q_zero_at(), _col)
 
 
 def _poi_q_stamp():
@@ -16318,6 +16340,41 @@ def _topology_cache_reset(why=""):
           % (" -- %s" % why if why else ""))
 
 
+def _np_collector_auto(cfg, mw_u):
+    """({"r","x","b"} in pu on the system base at the collector kV, text) --
+       the collector equivalent of ONE new feeder of mw_u MW, sized from its
+       capacity (see "collector_cable" in NEW_PLANT)."""
+    import math as _m
+    cc = dict((NEW_PLANT or {}).get("collector_cable") or {})
+    cc.update(dict(cfg.get("collector_cable") or {}))
+    kv = float(cfg.get("collector_kv") or 34.5)
+    amp = float(cc.get("ampacity_a") or 550.0)
+    rk, xk = float(cc.get("r_ohm_km", 0.070)), float(cc.get("x_ohm_km", 0.110))
+    ck = float(cc.get("c_uf_km", 0.42))
+    L, Lh = float(cc.get("string_km", 1.0)), float(cc.get("homerun_km", 0.3))
+    skid = float(cc.get("skid_mva") or 8.8)
+    pf = float(cc.get("pf") or 0.95)
+    hz = float(cc.get("hz") or 60.0)
+    sbase = _np_sysbase() or 100.0
+    mva = abs(float(mw_u)) / pf
+    i_a = mva * 1e3 / (_m.sqrt(3.0) * kv)
+    n = max(1, int(_m.ceil(i_a / amp - 1e-9)))
+    skids = max(1, int(_m.ceil(mva / skid - 1e-9)))
+    m = max(1, int(_m.ceil(skids / float(n) - 1e-9)))
+    s_m = sum(k * k for k in range(1, m + 1)) / float(m ** 3)
+    r_ohm = rk * L * s_m / n + rk * Lh / n
+    x_ohm = xk * L * s_m / n + xk * Lh / n
+    b_s = n * (L + Lh) * 2.0 * _m.pi * hz * ck * 1e-6
+    zb = kv * kv / sbase
+    out = {"r": round(r_ohm / zb, 6), "x": round(x_ohm / zb, 6), "b": round(b_s * zb, 6)}
+    txt = ("%.1f MW -> %.1f MVA at pf %.2f = %.0f A at %.1f kV -> %d circuit(s) of %.0f A; "
+           "%d skid(s) of %.1f MVA, %d per circuit; %.2f km strings + %.2f km home run; "
+           "Z_eq = %.4f + j%.4f ohm, B_eq = %.3e S -> R=%.6f X=%.6f B=%.6f pu on %.0f MVA"
+           % (mw_u, mva, pf, i_a, kv, n, amp, skids, skid, m, L, Lh, r_ohm, x_ohm, b_s,
+              out["r"], out["x"], out["b"], sbase))
+    return out, txt
+
+
 def _np_chain(lay, poi):
     """[(i, j, label)] -- every element from the units to the POI (or to the
        existing MPT buses, connect = "egf_mpt")."""
@@ -16407,6 +16464,10 @@ def build_new_plant(cfg, poi):
                   % (_f, _m, _bus_name_safe(_m), sf_kv(_m)))
     lay = _np_layout(cfg, poi)
     n, mw_u, why = _np_units_for(cfg)
+    if isinstance(cfg.get("collector"), str) and cfg["collector"].strip().lower() == "auto":
+        cfg["collector"], _ctxt = _np_collector_auto(cfg, mw_u)
+        cfg["_collector_auto"] = _ctxt
+        print("  [newplant] collector sized from the feeder capacity: %s" % _ctxt)
     # THE MACHINES GO ON bus_start .. bus_start+8 (999001..999009) AND NOWHERE
     # ELSE. A tenth unit would land on bus_start+9 and the next plant's block,
     # and a unit outside NEW_GEN_BUS_PREFIX's block would be an anonymous area
@@ -16655,6 +16716,8 @@ def _np_record(cfg, lay, poi, mw_u, gsu_mva, mpt_mva):
             fh.write("GSU        R=%s X=%s on %.0f MVA (one per unit)   %s\n"
                      % (gsu.get("r"), gsu.get("x"), gsu_mva,
                         _np_z_xr(gsu.get("r"), gsu.get("x"))))
+            if cfg.get("_collector_auto"):
+                fh.write("collector  sized from the feeder capacity: %s\n" % cfg["_collector_auto"])
             if lay.get("attach"):
                 fh.write("collector  R=%s X=%s B=%s (one per unit, to its existing MPT bus)\n"
                          % (col.get("r"), col.get("x"), col.get("b")))
