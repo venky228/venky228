@@ -1090,7 +1090,7 @@ BESS_MODEL_TEMPLATE = r"""999000 'USRMDL' 1 'REGCAU1' 101 1 1 14 3 4
 @!/ Tg           Rrpwr        Brkpt        Zerox     Lvpl1
     0.0200      5.0000       0.9000       0.5000    1.0000
 @!/ Volim        Lvpnt1       Lvpnt0       Iolim     Tfltr
-    1.2000       0.0100       0.0000      -1.0000    0.0200
+    1.2000       0.8000       0.0500      -1.0000    0.0200
 @!/ Khv          Iqrmax       Iqrmin       Accel
     0.0000       20.000      -20.000       0.7000/
 /
@@ -2412,6 +2412,28 @@ PROGRESS_STEP_S   = 0.5     # seconds of SIMULATED time between progress prints
 FAULT_WALL_MAX_S  = 900.0
 try:
     FAULT_WALL_MAX_S = float(os.environ.get("SPP_FAULT_WALL_MAX_S") or FAULT_WALL_MAX_S)
+except Exception:
+    pass
+
+# ---- A RUN STILL BLOWN UP WELL AFTER CLEARING IS STOPPED --------------------
+# PSS/E may not converge for a while after a fault and can show NaN during the
+# fault or just after it clears -- that is allowed and nothing here looks at it.
+# What is stopped is a run whose solution is STILL NaN, infinite or above
+# DIVERGE_STOP_PU at the POI, the faulted bus or a project machine
+# DIVERGE_STOP_AFTER_S after the FINAL clearing (the start of the post-fault
+# segment). Such a run never recovers; left alone it crawls to the end of the
+# simulation on NaN or crashes PSS/E, and the fault is relaunched and given up.
+# Stopped, it ends like a slow-stop: the .out ends there, the scenario is
+# finished (not retried), <FID>.slowstop and <FID>.diverged say why, and the
+# scorer records the divergence as a System-stability FAIL and the windows
+# after it as NOT JUDGED. The fault, clearing, trips and reclose are untouched.
+# 0 = off.
+DIVERGE_STOP_AFTER_S = 1.0
+DIVERGE_STOP_PU      = 5.0
+DIVERGE_PROBE_MAX    = 12      # buses probed: faulted bus + POI + project machines
+try:
+    DIVERGE_STOP_AFTER_S = float(os.environ.get("SPP_DIVERGE_STOP_AFTER_S") or DIVERGE_STOP_AFTER_S)
+    DIVERGE_STOP_PU = float(os.environ.get("SPP_DIVERGE_STOP_PU") or DIVERGE_STOP_PU)
 except Exception:
     pass
 
@@ -15503,7 +15525,20 @@ def _collector_stamp():
     # REECAU1 constant is as wrong to reuse as one built with a different
     # collector, and for the same reason: the change happens during the build.
     return (coll + " | " + _dyr_stamp() + " | " + _poi_stamp()
-            + " | " + _monitor_stamp() + " | " + _poi_q_stamp() + _np_stamp())
+            + " | " + _monitor_stamp() + " | " + _poi_q_stamp() + _np_stamp() + _tmpl_stamp())
+
+
+def _tmpl_stamp():
+    """The storage model the build clones (BESS_MODEL_TEMPLATE). Its records go
+       into the deck at build time, so a snapshot built from one template must
+       not be reused after the template changes (Lvpnt1/Lvpnt0 0.01/0.0 ->
+       0.8/0.05): the stamp differs, the snapshot is rebuilt and the finished
+       scenarios are run again on the new model."""
+    try:
+        import hashlib as _hl
+        return " | bess-model: %s" % _hl.md5(str(BESS_MODEL_TEMPLATE).encode("utf-8")).hexdigest()[:12]
+    except Exception:
+        return ""
 
 
 def _np_stamp():
@@ -17816,6 +17851,65 @@ def _fault_wall_check(label):
     return True
 
 
+
+def _diverge_probe_buses():
+    out = []
+    for b in [_FAULT_WALL.get("fbus"), globals().get("POI_BUS")] + list(globals().get("PROJECT_GEN_BUSES") or []):
+        try:
+            b = int(b)
+        except (TypeError, ValueError):
+            continue
+        if b and b not in out:
+            out.append(b)
+    return out[:max(1, int(DIVERGE_PROBE_MAX))]
+
+
+def _diverge_check(label):
+    """True when, DIVERGE_STOP_AFTER_S or more after the final clearing, the
+       solution is still NaN, infinite or above DIVERGE_STOP_PU at a probed bus.
+       Never looks at the fault-on time or the grace period after clearing."""
+    if _FAULT_WALL.get("diverged"):
+        return True
+    try:
+        after = float(DIVERGE_STOP_AFTER_S or 0)
+    except Exception:
+        after = 0.0
+    p0 = _FAULT_WALL.get("post0")
+    if (after <= 0 or _FAULT_WALL.get("fid") is None or p0 is None
+            or "post-flt" not in str(label) or _SIM_T - p0 < after - 1e-9):
+        return False
+    bad = None
+    for b in _diverge_probe_buses():
+        try:
+            ierr, v = psspy.busdat(b, "PU")
+            v = float(v)
+        except Exception:
+            continue
+        if ierr not in (0, None):
+            continue
+        if v != v or v in (float("inf"), float("-inf")) or abs(v) > float(DIVERGE_STOP_PU):
+            bad = (b, v)
+            break
+    if bad is None:
+        return False
+    fid = _FAULT_WALL.get("fid") or "?"
+    el = time.time() - (_FAULT_WALL.get("t0") or time.time())
+    _FAULT_WALL["diverged"] = (bad[0], bad[1], _SIM_T)
+    _FAULT_WALL["stopped"] = (el, _SIM_T)
+    msg = ("solution still DIVERGED %.2f s after the final clearing (sim t = %.3f s): bus %d = %s pu "
+           "(limit %.1f pu; NaN / infinity also count) -- stopped here, the record ends at %.3f s"
+           % (_SIM_T - p0, _SIM_T, bad[0], bad[1], float(DIVERGE_STOP_PU), _SIM_T))
+    print("  [diverge-stop] %s: %s" % (fid, msg))
+    sys.stdout.flush()
+    for ext in ("slowstop", "diverged"):
+        try:
+            with open(os.path.join(OUT_DIR, "%s.%s" % (fid, ext)), "w") as fh:
+                fh.write(msg + "\n")
+        except Exception:
+            pass
+    return True
+
+
 def _run_to(t_end, total_end, label):
     """Advance the dynamic sim to t_end. With SHOW_SIM_PROGRESS, step in PROGRESS_STEP_S
        chunks and print 'label sim t = X / total' after each -- so you can watch the
@@ -17823,6 +17917,8 @@ def _run_to(t_end, total_end, label):
        scenario's final time (for the X/total display). Returns the last run's ierr."""
     global _SIM_T
     nprt = RUN_NPRT_DIAG if DIAG_SUPPORT_LOG else RUN_NPRT   # DIAG: emit per-step PSS/E progress
+    if "post-flt" in str(label) and _FAULT_WALL.get("fid") and _FAULT_WALL.get("post0") is None:
+        _FAULT_WALL["post0"] = _SIM_T          # the final clearing: the grace period starts here
     if not SHOW_SIM_PROGRESS or PROGRESS_STEP_S <= 0 or t_end <= _SIM_T + 1e-9:
         rc = psspy.run(0, t_end, nprt, RUN_NPLT, 0)
         if (rc[0] if isinstance(rc, (list, tuple)) else rc) in (0, None):
@@ -17849,6 +17945,8 @@ def _run_to(t_end, total_end, label):
         print("  [%s] %-16s sim t = %6.2f / %.2f s   (%s)"
               % (_ts(), label, _SIM_T, total_end, _fmt_el(time.time() - _t0)))
         sys.stdout.flush()
+        if _diverge_check(label):
+            break
     return rc
 
 # ---- HOW LONG EACH RUN TOOK ------------------------------------------------
@@ -18279,9 +18377,14 @@ def _apply_slg_fault_2(fbus, r_pu=0.0, x_pu=0.0):
 def fault_run(fault, idx=None, total=None):
     fid = fault["id"]
     _t_fault = time.time()
-    _FAULT_WALL.update({"t0": _t_fault, "fid": fault["id"], "stopped": None})
+    _FAULT_WALL.update({"t0": _t_fault, "fid": fault["id"], "stopped": None,
+                        "diverged": None, "fbus": None, "post0": None})
     try:
         os.remove(os.path.join(OUT_DIR, "%s.slowstop" % fault["id"]))
+    except Exception:
+        pass
+    try:
+        os.remove(os.path.join(OUT_DIR, "%s.diverged" % fault["id"]))
     except Exception:
         pass
     _unswitched_start(fid)
@@ -18490,6 +18593,7 @@ def fault_run(fault, idx=None, total=None):
               % (_ts(), t_now, fault_cyc)); sys.stdout.flush()
         tclear = t_now + fault_cyc * CYC
         _set_sim_clock(t_now)     # autotune may have advanced the real clock -- resync
+        _FAULT_WALL["fbus"] = fbus
         _set_out(out); chk(_run_to(tclear, SIM_END_S, "%s to-clear" % fid), "run to clear")
         vf = _read_vpu(fbus)                            # confirm the fault held the bus down (but > 0)
         print("  [%s] faulted-bus voltage during fault = %s pu (depressed but > 0 -> no Inf overflow)"
@@ -18650,9 +18754,11 @@ def fault_run(fault, idx=None, total=None):
     _el = time.time() - _t_fault
     _write_secs(fid, _el)
     print("  [%s] %s took %s%s" % (_ts(), fid, _fmt_el(_el),
-                                   ("  (SLOW-STOPPED at sim t = %.2f s)" % _FAULT_WALL["stopped"][1])
+                                   (("  (DIVERGED -- stopped at sim t = %.2f s)" if _FAULT_WALL.get("diverged")
+                                     else "  (SLOW-STOPPED at sim t = %.2f s)") % _FAULT_WALL["stopped"][1])
                                    if _FAULT_WALL.get("stopped") else ""))
-    _FAULT_WALL.update({"t0": None, "fid": None, "stopped": None})
+    _FAULT_WALL.update({"t0": None, "fid": None, "stopped": None, "diverged": None,
+                        "fbus": None, "post0": None})
     sys.stdout.flush()
     return out, tclear
 
@@ -27260,6 +27366,17 @@ def evaluate_case(path, kind, tclear, kb):
             _unstable.append("%s angle spans %.0f deg -- lost synchronism, or no "
                              "solution at that bus"
                              % (chan_label(_ti), max(_fin) - min(_fin)))
+    # STOPPED BY DIVERGE_STOP_AFTER_S: the solution was still NaN / off-scale
+    # that long after the final clearing. The note beside the .out says where;
+    # it is a System-stability FAIL whatever the recorded channels show (the bus
+    # that gave out need not be one of them).
+    try:
+        with open(os.path.splitext(path)[0] + ".diverged") as _dfh:
+            _dnote = (_dfh.read() or "").strip()
+        if _dnote:
+            _unstable.insert(0, _dnote)
+    except Exception:
+        pass
     add("System stability", not _unstable,
         ("the solution survived the disturbance -- finite through to t=%.3f s"
          % (t[-1] if len(t) else float("nan")))
@@ -37807,7 +37924,8 @@ def main():
             # Reusing it would run the whole study on the old network and report
             # it under the new settings -- the one failure mode of this feature
             # that nothing downstream could detect.
-            print("[resume] the collector impedance has changed since this snapshot was")
+            print("[resume] the collector impedance, the .dyr edits or the storage model (BESS_MODEL_TEMPLATE)")
+            print("[resume] have changed since this snapshot was")
             print("[resume] built -> rebuilding it, so the study runs on the network asked for")
             _reset_resume_state(); build_snapshot(); _did_build = True
         else:

@@ -502,6 +502,8 @@ SOLVER_RETRY_MAX_NONCONV = 6                 # non-converged steps allowed befor
 SOLVER_RETRY_RECIPES = [("iterations 200, accel 0.50", 200, 0.50), ("iterations 400, accel 0.30", 400, 0.30), ("iterations 600, accel 0.10", 600, 0.10)]  # [("label", MAXITER, ACCEL), ...]
 PSSE_FAULT_LOG = True                        # True = keep PSS/E messages per fault (logs\psse)
 FAULT_WALL_MAX_S = 900                       # s of wall clock per fault; a fault still running after it (post-fault) is stopped where it is, marked done, rest NOT JUDGED (0 = off)
+DIVERGE_STOP_AFTER_S = 1.0                   # s after the FINAL clearing: a run still NaN / above DIVERGE_STOP_PU then is stopped, marked done (diverged), rest NOT JUDGED -- NaN during the fault and before this is allowed (0 = off)
+DIVERGE_STOP_PU = 5.0                        # pu: a probed voltage above this (or NaN) counts as diverged
 
 # ---- 5. POI POWER --------------------------------------------------------------
 # POI_P_TARGET_MW: MW at the POI per project (BESS + existing together)
@@ -15511,6 +15513,8 @@ def _push_settings(env, case):
                         ("SPP_POI_HOLD_TOL", POI_HOLD_AREA_TOL_MW),
                         ("SPP_POI_HOLD_PASSES", POI_HOLD_AREA_PASSES),
                         ("SPP_FAULT_WALL_MAX_S", FAULT_WALL_MAX_S),
+                        ("SPP_DIVERGE_STOP_AFTER_S", DIVERGE_STOP_AFTER_S),
+                        ("SPP_DIVERGE_STOP_PU", DIVERGE_STOP_PU),
                         ("SPP_POI_HOLD_EXCLUDE",
                          (json.dumps(POI_HOLD_EXCLUDE_BUSES)
                           if isinstance(POI_HOLD_EXCLUDE_BUSES, dict)
