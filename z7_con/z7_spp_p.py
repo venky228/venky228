@@ -2401,6 +2401,20 @@ RUN_NPRT_DIAG    = 100     # with DIAG_SUPPORT_LOG: emit a PSS/E progress report
 # blocking run. PROGRESS_STEP_S = how often (in SIMULATED seconds) to print a line.
 SHOW_SIM_PROGRESS = True    # print the simulation clock as the run advances
 PROGRESS_STEP_S   = 0.5     # seconds of SIMULATED time between progress prints
+# ---- A FAULT THAT CRAWLS IS STOPPED, NOT WAITED FOR -------------------------
+# A run that does not converge keeps printing (so no hang watchdog fires) and
+# crawls -- 0.5 s of simulated time every 25 s -- while every other core sits
+# idle waiting for it. After FAULT_WALL_MAX_S of wall clock on one fault, once
+# the fault is cleared (the post-fault segment), the run is stopped where it is:
+# the .out ends at the time reached, the scenario is finished (not retried), and
+# a <FID>.slowstop note says so. The windows the record does not reach are
+# reported as NOT JUDGED, never as a pass. 0 = off.
+FAULT_WALL_MAX_S  = 900.0
+try:
+    FAULT_WALL_MAX_S = float(os.environ.get("SPP_FAULT_WALL_MAX_S") or FAULT_WALL_MAX_S)
+except Exception:
+    pass
+
 
 # A chunk of simulated time can take MINUTES of wall clock on a case this size --
 # one scenario ran 85 minutes for 10 simulated seconds. Between chunks nothing is
@@ -17737,6 +17751,39 @@ def _run_heartbeat_stop(hb):
         pass
 
 
+_FAULT_WALL = {"t0": None, "fid": None, "stopped": None}
+
+
+def _fault_wall_check(label):
+    """True when the fault running now has used up FAULT_WALL_MAX_S and is in
+       its post-fault segment -- the run is then stopped where it is."""
+    if _FAULT_WALL.get("stopped"):
+        return True
+    try:
+        lim = float(FAULT_WALL_MAX_S or 0)
+    except Exception:
+        lim = 0.0
+    t0 = _FAULT_WALL.get("t0")
+    if lim <= 0 or t0 is None or "post-flt" not in str(label):
+        return False
+    el = time.time() - t0
+    if el < lim:
+        return False
+    fid = _FAULT_WALL.get("fid") or "?"
+    _FAULT_WALL["stopped"] = (el, _SIM_T)
+    print("  [slow-stop] %s: %s of wall clock at sim t = %.2f s (FAULT_WALL_MAX_S = %.0f s) "
+          "-- stopped here; the record ends at %.2f s and the windows after it are NOT JUDGED"
+          % (fid, _fmt_el(el), _SIM_T, lim, _SIM_T))
+    sys.stdout.flush()
+    try:
+        with open(os.path.join(OUT_DIR, "%s.slowstop" % fid), "w") as fh:
+            fh.write("stopped at sim t = %.3f s after %.0f s of wall clock (FAULT_WALL_MAX_S = %.0f s)\n"
+                     % (_SIM_T, el, lim))
+    except Exception:
+        pass
+    return True
+
+
 def _run_to(t_end, total_end, label):
     """Advance the dynamic sim to t_end. With SHOW_SIM_PROGRESS, step in PROGRESS_STEP_S
        chunks and print 'label sim t = X / total' after each -- so you can watch the
@@ -17751,6 +17798,8 @@ def _run_to(t_end, total_end, label):
         return rc
     rc = 0
     while _SIM_T < t_end - 1e-6:
+        if _fault_wall_check(label):
+            break
         nxt = min(_SIM_T + PROGRESS_STEP_S, t_end)
         _t0 = time.time()
         _hb = _run_heartbeat_start(label, _SIM_T, nxt, total_end)
@@ -18198,6 +18247,11 @@ def _apply_slg_fault_2(fbus, r_pu=0.0, x_pu=0.0):
 def fault_run(fault, idx=None, total=None):
     fid = fault["id"]
     _t_fault = time.time()
+    _FAULT_WALL.update({"t0": _t_fault, "fid": fault["id"], "stopped": None})
+    try:
+        os.remove(os.path.join(OUT_DIR, "%s.slowstop" % fault["id"]))
+    except Exception:
+        pass
     _unswitched_start(fid)
     tag = ("%d/%d " % (idx, total)) if (idx and total) else ""
     status(">>> FAULT %s%s : %s  (%s)" %
@@ -18563,7 +18617,10 @@ def fault_run(fault, idx=None, total=None):
     _unswitched_finish(fid, fault)
     _el = time.time() - _t_fault
     _write_secs(fid, _el)
-    print("  [%s] %s took %s" % (_ts(), fid, _fmt_el(_el)))
+    print("  [%s] %s took %s%s" % (_ts(), fid, _fmt_el(_el),
+                                   ("  (SLOW-STOPPED at sim t = %.2f s)" % _FAULT_WALL["stopped"][1])
+                                   if _FAULT_WALL.get("stopped") else ""))
+    _FAULT_WALL.update({"t0": None, "fid": None, "stopped": None})
     sys.stdout.flush()
     return out, tclear
 
@@ -38057,6 +38114,15 @@ def main():
             # final value. The clock says how far it actually got; the plot
             # role has always used this same rule.
             _reached = (kind == "flat") or (float(_SIM_T) >= float(SIM_END_S) - 0.11)
+            # SLOW-STOPPED (FAULT_WALL_MAX_S) IS FINISHED ON PURPOSE: re-running
+            # it would crawl for the same quarter of an hour again. It is marked
+            # done with the time it reached; its .slowstop note says why.
+            if (not _reached and out and os.path.isfile(out)
+                    and os.path.isfile(os.path.join(OUT_DIR, "%s.slowstop" % scen_id))):
+                print("  [%s] %s SLOW-STOPPED at t=%.2f s of %.2f s -- marked done with the "
+                      "record it has (delete %s.slowstop to have it run again)"
+                      % (_ts(), scen_id, _SIM_T, SIM_END_S, scen_id))
+                _reached = True
             if out and os.path.isfile(out) and not _reached:
                 print("  [%s] %s stopped at t=%.2f s of %.2f s -- NOT marked done; it is "
                       "a partial run and will be run again" % (_ts(), scen_id, _SIM_T, SIM_END_S))

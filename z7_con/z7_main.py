@@ -501,6 +501,7 @@ SOLVER_RETRY_ON_NONCONV = False              # True = re-run a non-converged fau
 SOLVER_RETRY_MAX_NONCONV = 6                 # non-converged steps allowed before a retry
 SOLVER_RETRY_RECIPES = [("iterations 200, accel 0.50", 200, 0.50), ("iterations 400, accel 0.30", 400, 0.30), ("iterations 600, accel 0.10", 600, 0.10)]  # [("label", MAXITER, ACCEL), ...]
 PSSE_FAULT_LOG = True                        # True = keep PSS/E messages per fault (logs\psse)
+FAULT_WALL_MAX_S = 900                       # s of wall clock per fault; a fault still running after it (post-fault) is stopped where it is, marked done, rest NOT JUDGED (0 = off)
 
 # ---- 5. POI POWER --------------------------------------------------------------
 # POI_P_TARGET_MW: MW at the POI per project (BESS + existing together)
@@ -15509,6 +15510,7 @@ def _push_settings(env, case):
                         ("SPP_POI_METER_TOL", POI_P_METER_TOL_MW),
                         ("SPP_POI_HOLD_TOL", POI_HOLD_AREA_TOL_MW),
                         ("SPP_POI_HOLD_PASSES", POI_HOLD_AREA_PASSES),
+                        ("SPP_FAULT_WALL_MAX_S", FAULT_WALL_MAX_S),
                         ("SPP_POI_HOLD_EXCLUDE",
                          (json.dumps(POI_HOLD_EXCLUDE_BUSES)
                           if isinstance(POI_HOLD_EXCLUDE_BUSES, dict)
@@ -20174,6 +20176,11 @@ def retire_truncated_done(quiet=False):
             if z is not None and z < OUT_EMPTY_BYTES:
                 return False, "no data in the .out (%d KB)" % (z // 1024)
             te = _marker_tend(marker)
+            # SLOW-STOPPED ON PURPOSE (FAULT_WALL_MAX_S): finished with the
+            # record it has; the report says which windows it does not reach.
+            if os.path.isfile(os.path.join(od, sid + ".slowstop")):
+                return True, ("slow-stopped at tend=%.2f s (FAULT_WALL_MAX_S)" % te
+                              if te is not None else "slow-stopped (FAULT_WALL_MAX_S)")
             if te is not None and _t_full is not None:
                 return te >= _t_full, "tend=%.2f s" % te
             if te is not None:

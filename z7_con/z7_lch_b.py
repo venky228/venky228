@@ -2473,7 +2473,8 @@ def _timing_changed(out_dir, sid):
                         % (m_pre, pre))
             if end is not None and m_end is not None and abs(m_end - end) > 1e-3:
                 return "run for SIM_END_S %.2f s -- SIM_END_S is now %.2f s" % (m_end, end)
-        if ext == "done" and end is not None and tend is not None and abs(tend - end) > 0.11:
+        if (ext == "done" and end is not None and tend is not None and abs(tend - end) > 0.11
+                and not os.path.isfile(os.path.join(out_dir, "%s.slowstop" % sid))):
             return "ran to %.2f s -- SIM_END_S is now %.2f s" % (tend, end)
     return ""
 
