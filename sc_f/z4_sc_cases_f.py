@@ -1,5 +1,17 @@
 # -*- coding: utf-8 -*-
-"""
+"""z4_sc_cases_f.py -- WRITES THE SHORT-CIRCUIT CASES, ONE SET PER PROJECT.
+
+   For every project it opens the as-built GIA case (the _f study's ..._f_NEWPLANT.sav),
+   writes the SGF short-circuit model X'' = 0.8 pu (R = 0, on the machine MVA base) on the
+   machine record AND the sequence record, and saves the three SPP cases, solved:
+       shortcircuit\cases\<project>_SC1_NOGEN_SGF_EGF_OUT.sav   SGF + EGF out of service
+       shortcircuit\cases\<project>_SC2_EGF_ONLY.sav            SGF out, EGF to the GIA at the POI
+       shortcircuit\cases\<project>_SC3_SGF_EGF_100PCT.sav      SGF + EGF in service, as built
+   plus CASES_<project>.txt: which units are ON / OFF, their MW, and the POI MW, per case.
+   No fault sweep is run (CASES_ONLY = True); set it False to run the full study as well.
+   Every other setting is the SC study's own (z4_sc_study_sep23rd_f.py).
+
+
 =============================================================================
  z4_sc_study.py -- SPP SHORT-CIRCUIT study, PSS/E 34 (Python 3.4, 32-bit)
  -----------------------------------------------------------------------------
@@ -124,7 +136,7 @@ DEFAULT_SC_PARAMS = {"mbase": None, "r": 0.0, "xpp": 0.8}
 #       GEN-2025-SR16        : 0.8
 # Whatever goes here, check it landed on the "SC model parameters" sheet:
 # X'' written and X'' used by the fault calc must agree.
-SC_XPP_BY_PROJECT = {}
+SC_XPP_BY_PROJECT = {}                     # empty: X'' = 0.8 pu on MBASE for EVERY project (DEFAULT_SC_PARAMS)
 
 # ---- SAVE THE CASES THEMSELVES ---------------------------------------------
 # True = each case is saved as a .sav the moment it is set up and solved, with
@@ -136,8 +148,8 @@ SC_XPP_BY_PROJECT = {}
 #     <CASES_DIR>\<project>_SC3_SGF_EGF_<pct>PCT.sav      SGF + EGF in service, as built
 # CASES_ONLY = True stops there: no fault sweep, no SC report -- just the cases
 # and a CASES_<project>.txt saying what is on, what is off and at what MW.
-SAVE_CASES = False
-CASES_ONLY = False
+SAVE_CASES = True
+CASES_ONLY = True
 CASES_DIR  = None                  # None = <RESULTS_DIR>\cases
 NEW_GEN_BUS_PREFIX = "999"      # the bus block the new plants are built into ("NEW" above)
 NEW_GEN_BUS_DIGITS = 6          # ...and how many digits those bus numbers have (999001, not 99905)
