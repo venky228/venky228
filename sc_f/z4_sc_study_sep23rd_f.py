@@ -2636,11 +2636,19 @@ def _onoff_by_case(snaps):
     for lbl, rows_m in (snaps or []):
         d = {("project (new)", "IN"): [], ("project (new)", "OUT"): [],
              ("existing", "IN"): [], ("existing", "OUT"): []}
+        tot = {"project (new)": 0.0, "existing": 0.0}
         for m in rows_m:
             st = "IN" if m.get("status") == "IN" else "OUT"
-            d.setdefault((m["group"], st), []).append("%d '%s'" % (m["bus"], m["id"]))
+            if st == "IN":
+                pg = m.get("pgen") or 0.0
+                tot[m["group"]] = tot.get(m["group"], 0.0) + pg
+                txt = "%d '%s' %.1f MW" % (m["bus"], m["id"], pg)
+            else:
+                txt = "%d '%s'" % (m["bus"], m["id"])
+            d.setdefault((m["group"], st), []).append(txt)
         out.append((lbl, d[("project (new)", "IN")], d[("project (new)", "OUT")],
-                    d[("existing", "IN")], d[("existing", "OUT")]))
+                    d[("existing", "IN")], d[("existing", "OUT")],
+                    tot.get("project (new)", 0.0), tot.get("existing", 0.0)))
     return out
 
 
@@ -2716,8 +2724,8 @@ def _summary_text(p, sav, gens, rows, poi_row, hops, cap_notes=(), params=(), po
     _oo = _onoff_by_case(snaps)
     if _oo:
         L.append("GENERATORS IN EACH CASE (SGF = new plant, EGF = existing units):")
-        for lbl, sgf_on, sgf_off, egf_on, egf_off in _oo:
-            L.append("  %s" % lbl)
+        for lbl, sgf_on, sgf_off, egf_on, egf_off, sgf_mw, egf_mw in _oo:
+            L.append("  %s   (PGEN: SGF %.1f MW, EGF %.1f MW, total %.1f MW)" % (lbl, sgf_mw, egf_mw, sgf_mw + egf_mw))
             L.append("    SGF ON : %s" % (", ".join(sgf_on) or "none"))
             L.append("    SGF OFF: %s" % (", ".join(sgf_off) or "none"))
             L.append("    EGF ON : %s" % (", ".join(egf_on) or "none"))
@@ -3098,12 +3106,13 @@ def write_report_all(results):
                                   round(m["xpp_seq"], 4) if m.get("xpp_seq") is not None else "n/a"])
     onoff_rows = []
     for R_ in results:
-        for lbl, sgf_on, sgf_off, egf_on, egf_off in _onoff_by_case(R_.get("snaps")):
+        for lbl, sgf_on, sgf_off, egf_on, egf_off, sgf_mw, egf_mw in _onoff_by_case(R_.get("snaps")):
             onoff_rows.append([R_["project"], lbl,
-                               "%d of %d" % (len(sgf_on), len(sgf_on) + len(sgf_off)),
+                               "%d of %d" % (len(sgf_on), len(sgf_on) + len(sgf_off)), round(sgf_mw, 2),
                                ", ".join(sgf_on) or "none", ", ".join(sgf_off) or "none",
-                               "%d of %d" % (len(egf_on), len(egf_on) + len(egf_off)),
-                               ", ".join(egf_on) or "none", ", ".join(egf_off) or "none"])
+                               "%d of %d" % (len(egf_on), len(egf_on) + len(egf_off)), round(egf_mw, 2),
+                               ", ".join(egf_on) or "none", ", ".join(egf_off) or "none",
+                               round(sgf_mw + egf_mw, 2)])
     prm_rows = []
     for R_ in results:
         for g, rec in zip(R_["gens"], R_.get("params") or []):
@@ -3308,9 +3317,11 @@ def write_report_all(results):
     write_xlsx(xp, [("SPP tables", ["", "", "", "", ""], spp_rows, [22, 22, 22, 16, 14])]
                    + _apx_sheet + _three_sheet + [
                     ("Summary", s_hdr, s_rows, [14, 9, 14, 7, 9, 18, 14, 12, 12, 14, 9, 14, 9, 8, 12, 12, 12, 12]),
-                    ("Gens on-off by case", ["Project", "Case", "SGF in service", "SGF ON", "SGF OFF",
-                                             "EGF in service", "EGF ON", "EGF OFF"], onoff_rows,
-                     [14, 20, 10, 40, 40, 10, 40, 40]),
+                    ("Gens on-off by case", ["Project", "Case", "SGF in service", "SGF PGEN (MW)",
+                                             "SGF ON (PGEN MW)", "SGF OFF",
+                                             "EGF in service", "EGF PGEN (MW)", "EGF ON (PGEN MW)", "EGF OFF",
+                                             "Total PGEN (MW)"], onoff_rows,
+                     [14, 20, 10, 12, 52, 36, 10, 12, 52, 36, 12]),
                     ("Machines", ["Project", "Case", "Group", "Bus", "Id", "Bus name", "Base kV (kV)", "Status",
                                   "MVA base (MVA)", "PGEN (MW)", "QGEN (MVAr)",
                                   "PMAX (MW)", "Loading (% of PMAX)", "X'' ZSORCE (pu on MBASE)",
