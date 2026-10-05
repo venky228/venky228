@@ -40,7 +40,7 @@ PROJECTS = [
     {"name": "SantaFe",       "poi": 765911, "egf": [765912, 765922, 765932, 765935]},
     {"name": "IronStar",      "poi": 560080, "egf": [587313, 587317]},
     {"name": "EmpirePrairie", "poi": 761383, "egf": [761379, 761382, 761400, 761403]},
-    {"name": "EastFork",      "poi": 531623, "egf": [531620, 531607]},
+    {"name": "EastFork",      "poi": 531429, "egf": [531620, 531607]},
 ]
 NEW_GEN_BUS_PREFIX = "999"           # the SGF's bus block
 INVERTER_MVA       = 4.4             # MVA per inverter, for the inverter count
@@ -292,18 +292,14 @@ def sbase():
 
 
 def _pct_on_winding(zr, zx, cz, sb_wind, sb_sys):
-    """(R %, X %) on the winding MVA base, whatever CZ the case uses."""
+    """(R %, X %) on the winding MVA base.  RXACT / RXNOM (and the 3-winding
+    RXn-nACT / NOM) come back in pu on the SYSTEM base whatever CZ the case
+    uses, so always convert system base -> winding base.  With no winding base
+    (None / 0) the value is returned on the system base."""
     if zr is None or zx is None:
         return None, None
-    try:
-        cz = int(cz) if cz is not None else 1
-    except Exception:
-        cz = 1
-    if cz == 2:                                   # pu on winding base
-        return 100.0 * zr, 100.0 * zx
-    if cz == 1 and sb_wind:                       # pu on system base
-        return 100.0 * zr * sb_wind / sb_sys, 100.0 * zx * sb_wind / sb_sys
-    return None, None                             # CZ 3 (load loss W, |Z| pu) -- reported raw
+    k = (float(sb_wind) / float(sb_sys)) if (sb_wind and sb_sys) else 1.0
+    return 100.0 * zr * k, 100.0 * zx * k
 
 
 def _flow(a, b, ck, third=None):
