@@ -12701,6 +12701,29 @@ if _envcap:
         print("[cap] SPP_CAP_SCALE=%r is not a number -- ignored" % _envcap)
 CAP_TAG = (os.environ.get("SPP_CAP_TAG") or "").strip()
 
+# A CAPACITY LEVEL IS A LEVEL OF THE WHOLE GIA OUTPUT, NOT OF THE STORAGE ALONE.
+# With a POI total in force (POI_P_TARGET_MW) the EGF makes up whatever the SGF
+# does not deliver, so scaling only the SGF left the POI at its full total --
+# a 50 % run was 984 MW at the POI, the EGF carrying the difference. The total
+# is scaled here, and the SGF rating is scaled where it is dispatched
+# (apply_poi_p_metered / _sgf_only_mode / _egf_off_target), so both plants come
+# down by the same factor: SGF x level + EGF x level = POI total x level.
+if CAP_SCALE is not None:
+    def _cap_scaled(v):
+        try:
+            return float(v) * float(CAP_SCALE)
+        except (TypeError, ValueError):
+            return v
+    if isinstance(_POI_P_TARGET_RAW, dict):
+        _POI_P_TARGET_RAW = dict((k, _cap_scaled(v)) for k, v in _POI_P_TARGET_RAW.items())
+    elif _POI_P_TARGET_RAW is not None:
+        _POI_P_TARGET_RAW = _cap_scaled(_POI_P_TARGET_RAW)
+    if POI_P_TARGET_MW is not None and not isinstance(POI_P_TARGET_MW, dict):
+        print("[cap] capacity level %.0f %%: POI total %.1f MW -> %.1f MW (SGF and EGF "
+              "both at %.0f %%)" % (100.0 * CAP_SCALE, float(POI_P_TARGET_MW),
+                                    _cap_scaled(POI_P_TARGET_MW), 100.0 * CAP_SCALE))
+        POI_P_TARGET_MW = _cap_scaled(POI_P_TARGET_MW)
+
 
 # ---- RUN THE PROJECT CASE WITH THE PROJECT SWITCHED OFF --------------------
 # The base case answers "what does the system do without this project". This
@@ -17025,7 +17048,16 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # changed after the solution would appear in no result.
         for _mr, _mmw in _bess_members() or [(None, None)]:
             with _member_scope(_mr, _mmw):
-                if CAP_SCALE is not None:
+                # NOT WHEN THIS BUILD ADDS THE MACHINES (ENABLE_BESS / NEW_PLANT). They do
+                # not exist yet, so there is nothing to scale and the call raised "no
+                # project machine could be scaled" -- every _capNN build died in 20 s.
+                # The level is applied where those machines are dispatched instead:
+                # apply_poi_p_metered / _sgf_only_mode / _egf_off_target scale the
+                # rating by CAP_SCALE before the solve.
+                if CAP_SCALE is not None and _adding_machines:
+                    print("  [cap] project output %.0f %%: applied when the new machines are "
+                          "dispatched (they are added by this build)" % (100.0 * CAP_SCALE))
+                elif CAP_SCALE is not None:
                     _scale_project_output(CAP_SCALE)
                 _apply_collector_impedance()
         # 1a-) A BRAND-NEW FACILITY, when NEW_PLANT is on: buses, GSUs, collector,

@@ -13110,7 +13110,16 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         # less project injection, so the reduced dispatch has to be what the
         # power flow converges to -- scaled afterwards, the snapshot would still
         # hold full output and the sweep would measure nothing.
-        if CAP_SCALE is not None:
+        # NOT WHEN THIS BUILD ADDS THE MACHINES (ENABLE_BESS / NEW_PLANT). They do
+        # not exist yet, so there is nothing to scale and the call raised "no
+        # project machine could be scaled" -- every _capNN build died in 20 s.
+        # The level is applied where those machines are dispatched instead:
+        # apply_poi_p_metered / _sgf_only_mode / _egf_off_target scale the
+        # rating by CAP_SCALE before the solve.
+        if CAP_SCALE is not None and _adding_machines:
+            print("  [cap] project output %.0f %%: applied when the new machines are "
+                  "dispatched (they are added by this build)" % (100.0 * CAP_SCALE))
+        elif CAP_SCALE is not None:
             _scale_project_output(CAP_SCALE)
         # BEFORE THE SOLVE, for the same reason: the collector impedance sets
         # the voltage rise between the machines and the POI, and a network
