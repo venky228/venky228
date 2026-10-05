@@ -1536,6 +1536,8 @@ def poi_power(poi, gens, existing):
             if ie == 0 and s is not None:
                 out[grp + "_mw"] -= float(s.real)          # into the POI = minus what leaves it
                 out[grp + "_mvar"] -= float(s.imag)
+                out.setdefault("ties", []).append((int(other), str(ck), -float(s.real), -float(s.imag),
+                                                   third is not None))
         except Exception:
             pass
     for key, lst in (("pgen_proj", gens), ("pgen_exist", existing)):
@@ -1551,12 +1553,91 @@ def poi_power(poi, gens, existing):
     # SGF ON THE EXISTING MPTs: the ties carry the EGF and the SGF together, so
     # the walk files them all under the project. The POI total is exact; the
     # split between the two is given in proportion to the machines' own PGEN.
-    if poi in _SHARED_PLANT and (out["pgen_proj"] + out["pgen_exist"]) > 0.01:
-        _f = out["pgen_proj"] / (out["pgen_proj"] + out["pgen_exist"])
-        out["proj_mw"], out["exist_mw"] = out["total_mw"] * _f, out["total_mw"] * (1.0 - _f)
-        out["proj_mvar"], out["exist_mvar"] = out["total_mvar"] * _f, out["total_mvar"] * (1.0 - _f)
+    out["split_how"] = "each plant on its own ties (measured)"
+    if poi in _SHARED_PLANT:
         out["shared_ties"] = True
+        _pp, _pe = out["pgen_proj"], out["pgen_exist"]
+        if _pp + _pe <= 0.01:
+            # nothing generating: what the ties carry is line / cable charging
+            out["proj_mw"] = out["proj_mvar"] = 0.0
+            out["exist_mw"] = out["exist_mvar"] = 0.0
+            out["split_how"] = ("no generation in service -- the shared ties carry only the "
+                                "plant's charging / losses (TOTAL column)")
+        elif _pp <= 0.01:
+            out["proj_mw"] = out["proj_mvar"] = 0.0
+            out["exist_mw"], out["exist_mvar"] = out["total_mw"], out["total_mvar"]
+            out["split_how"] = "SGF out of service -- everything on the shared ties is the EGF's"
+        elif _pe <= 0.01:
+            out["exist_mw"] = out["exist_mvar"] = 0.0
+            out["proj_mw"], out["proj_mvar"] = out["total_mw"], out["total_mvar"]
+            out["split_how"] = "EGF out of service -- everything on the shared ties is the SGF's"
+        else:
+            # THE SAME RULE AS THE DYNAMIC STUDY: the SGF's share at the POI is what
+            # it puts into the existing MPT low-side buses, less its pro-rata part
+            # of the shared MPT + tie losses (SGF into MPTs x total / MPT intake).
+            sgf_in, mpt_in = _sgf_mpt_flows(gens, poi)
+            if sgf_in and mpt_in and mpt_in > 1.0 and 0.8 <= out["total_mw"] / mpt_in <= 1.0 + 1e-6:
+                _f = max(0.0, min(1.0, sgf_in / mpt_in))
+                out["sgf_mpt_mw"], out["mpt_in_mw"] = sgf_in, mpt_in
+                out["split_how"] = ("shared ties (SGF on the EGF's MPTs): SGF %.1f MW into the MPT low-side "
+                                    "buses of %.1f MW total intake; MPT + tie losses shared pro rata"
+                                    % (sgf_in, mpt_in))
+            else:
+                _f = _pp / (_pp + _pe)
+                out["split_how"] = ("shared ties (SGF on the EGF's MPTs): split pro rata to PGEN "
+                                    "(MPT intake could not be read)")
+            out["proj_mw"], out["exist_mw"] = out["total_mw"] * _f, out["total_mw"] * (1.0 - _f)
+            out["proj_mvar"], out["exist_mvar"] = out["total_mvar"] * _f, out["total_mvar"] * (1.0 - _f)
+    out["losses_mw"] = (out["pgen_proj"] + out["pgen_exist"]) - out["total_mw"]
     return out
+
+
+def _sgf_mpt_flows(gens, poi):
+    """(SGF MW into the existing MPT low-side buses, total MW into those MPTs).
+       The SGF's edge into the existing plant is a branch from a new-plant-block
+       bus to a non-block bus in the plant pocket; the MPT intake is every
+       transformer from those buses up to a higher voltage (>= 1.8 x kV)."""
+    pk = set()
+    for g in gens or []:
+        s_ = _pocket(g["num"], poi)
+        if s_:
+            pk |= s_
+    attach, sgf_in = set(), 0.0
+    for u in pk:
+        if not _is_block_bus(u):
+            continue
+        for w in _ADJ.get(u, ()):
+            if w in pk and not _is_block_bus(w):
+                try:
+                    ie, f = psspy.brnflo(int(u), int(w), "1")
+                    if ie == 0 and f is not None:
+                        sgf_in += float(f.real)
+                        attach.add(int(w))
+                except Exception:
+                    pass
+    if not attach:
+        return None, None
+    mpt_in = 0.0
+    for x, y, ck, third in [(a, b, k, None) for a, b, k in _all_branches_ck()] + list(_three_wind_ties()):
+        for a, b in ((x, y), (y, x)):
+            if a not in attach:
+                continue
+            try:
+                ka, kb = basekv(a) or 0.0, basekv(b) or 0.0
+            except Exception:
+                continue
+            if not (ka > 0 and kb >= 1.8 * ka):
+                continue
+            try:
+                if third is None:
+                    ie, f = psspy.brnflo(int(a), int(b), str(ck))
+                else:
+                    ie, f = psspy.wnddt2(int(a), int(b), int(third), str(ck), "FLOW")
+                if ie == 0 and f is not None:
+                    mpt_in += float(f.real)
+            except Exception:
+                pass
+    return sgf_in, mpt_in
 
 
 def _three_wind_ties():
@@ -2563,8 +2644,15 @@ def _onoff_by_case(snaps):
     return out
 
 
+def _ties_text(d):
+    return "; ".join("%d%s -> POI %.1f MW / %.1f MVAr" % (o, " (3-wdg)" if w3 else "", mw, mv)
+                     for o, ck, mw, mv, w3 in (d.get("ties") or [])) or "none read"
+
+
 def _say_power(pw):
     lbl, d = pw
+    print("  [%s] POI ties %-18s %s" % (_ts(), lbl, _ties_text(d)))
+    print("  [%s]          %-18s %s" % (_ts(), "", d.get("split_how", "")))
     print("  [%s] POI power %-18s project ties %.1f MW / %.1f MVAr, existing ties %.1f MW / %.1f MVAr, "
           "TOTAL into POI %.1f MW / %.1f MVAr  (PGEN project %.1f MW, existing %.1f MW)"
           % (_ts(), lbl, d["proj_mw"], d["proj_mvar"], d["exist_mw"], d["exist_mvar"], d["total_mw"], d["total_mvar"],
@@ -2608,9 +2696,13 @@ def _summary_text(p, sav, gens, rows, poi_row, hops, cap_notes=(), params=(), po
     _cv = dict((l, (c, n)) for l, c, n in (conv or []))
     for lbl, d in (powers or []):
         _c = _cv.get(lbl, (None, ""))[0]
-        L.append("POI power %-18s project %.1f MW, existing %.1f MW, total into POI %.1f MW / %.1f MVAr (PGEN project %.1f MW, existing %.1f MW)%s"
-                 % (lbl, d["proj_mw"], d["exist_mw"], d["total_mw"], d["total_mvar"], d["pgen_proj"], d["pgen_exist"],
+        L.append("POI power %-18s TOTAL into POI %.1f MW / %.1f MVAr -- SGF %.1f MW, EGF %.1f MW at the POI "
+                 "(PGEN SGF %.1f MW, EGF %.1f MW; losses machines -> POI %.1f MW)%s"
+                 % (lbl, d["total_mw"], d["total_mvar"], d["proj_mw"], d["exist_mw"], d["pgen_proj"], d["pgen_exist"],
+                    d.get("losses_mw", 0.0),
                     "" if _c in (0, None) else "   *** POWER FLOW NOT CONVERGED -- these MW are off an unsolved case ***"))
+        L.append("          ties: %s" % _ties_text(d))
+        L.append("          %s" % d.get("split_how", ""))
     for _ln in (gia_lines or []):
         L.append("POI vs GIA  %s" % _ln)
     if conv:
@@ -2805,7 +2897,7 @@ def write_report_all(results):
     # Summary: one row per project x capacity
     s_hdr = ["Project", "POI bus", "POI name", "POI kV (kV)", "Buses faulted (count)", "Case", "POI fault current (kA)",
              "POI change (kA)", "POI change (%)", "Highest fault current (kA)", "at bus", "Largest change (kA)", "at bus", "Largest change (%)",
-             "POI project (MW)", "POI existing (MW)", "POI total (MW)", "POI total (MVAr)"]
+             "POI SGF (MW)", "POI EGF (MW)", "POI total (MW)", "POI total (MVAr)"]
     s_rows, poi_rows, kv_rows, pw_rows = [], [], [], []
     sheets = []
     for R in results:
@@ -2818,8 +2910,10 @@ def write_report_all(results):
         for lbl, d in (R.get("powers") or []):
             _c, _cn = _cv.get(lbl, (None, "not recorded"))
             _okt = "CONVERGED" if _c in (0, None) else "NOT CONVERGED"
-            pw_rows.append([R["project"], R["poi"], lbl, round(d["proj_mw"], 2), round(d["proj_mvar"], 2), round(d["exist_mw"], 2),
-                            round(d["exist_mvar"], 2), round(d["total_mw"], 2), round(d["total_mvar"], 2), round(d["pgen_proj"], 2), round(d["pgen_exist"], 2),
+            pw_rows.append([R["project"], R["poi"], lbl, round(d["total_mw"], 2), round(d["total_mvar"], 2),
+                            round(d["proj_mw"], 2), round(d["proj_mvar"], 2), round(d["exist_mw"], 2), round(d["exist_mvar"], 2),
+                            round(d["pgen_proj"], 2), round(d["pgen_exist"], 2), round(d.get("losses_mw", 0.0), 2),
+                            _ties_text(d), d.get("split_how", ""),
                             (_okt, S_GREEN if _c in (0, None) else S_RED), _cn])
         # pr["off"] IS case 2 (the WITHOUT / EGF-only sweep), so it is labelled
         # as such -- powers[0] is the NO-GEN case when that runs, and using its
@@ -3222,12 +3316,15 @@ def write_report_all(results):
                                   "PMAX (MW)", "Loading (% of PMAX)", "X'' ZSORCE (pu on MBASE)",
                                   "X'' sequence record (pu on MBASE)"], mach_rows,
                      [14, 18, 14, 9, 5, 14, 7, 8, 10, 10, 11, 10, 14, 16, 18]),
-                    ("POI power", ["Project", "POI bus", "Case", "Project ties (MW)", "Project ties (MVAr)",
-                                   "Existing ties (MW)", "Existing ties (MVAr)",
+                    ("POI power", ["Project", "POI bus", "Case",
                                    "TOTAL into POI (MW)", "TOTAL into POI (MVAr)",
-                                   "PGEN project (MW)", "PGEN existing (MW)",
+                                   "SGF at POI (MW)", "SGF at POI (MVAr)",
+                                   "EGF at POI (MW)", "EGF at POI (MVAr)",
+                                   "PGEN SGF (MW)", "PGEN EGF (MW)", "Losses machines to POI (MW)",
+                                   "Each tie into the POI (MW / MVAr, read at the POI)",
+                                   "How SGF / EGF are separated",
                                    "Power flow", "Solver"], pw_rows,
-                     [14, 9, 18, 14, 14, 14, 14, 16, 16, 14, 14, 16, 30]),
+                     [14, 9, 18, 14, 14, 12, 12, 12, 12, 12, 12, 14, 60, 60, 14, 30]),
                     ("POI", poi_hdr, poi_rows, [14, 9, 14, 7, 12] + [12, 11, 10] * len(CAPACITY_PCT)),
                     ("Max by kV", kv_hdr, kv_rows, [14, 10, 7, 14] + [14, 14, 12] * len(CAPACITY_PCT)),
                     ("Gen contribution", ["Project", "Fault bus", "Fault bus name", "Fault kV (kV)", "Unit bus", "Id",
