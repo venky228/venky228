@@ -6809,6 +6809,7 @@ def _poi_power_channels():
               "(a base case without any plant on the POI has none)")
         return
     n_by, n_ok = {}, 0
+    _unmetered = []                   # 3-winding ties this psspy cannot channel
     for (a, b, ck) in ties:
         try:
             a, b = int(a), int(b)
@@ -6855,6 +6856,7 @@ def _poi_power_channels():
                           "three_wnd_winding_p_channel -- no POI power channel for it"
                           % (_ts(), b, a, ck))
                     rc = 1
+                    _unmetered.append((a, b, ck))
             else:
                 print("[%s] ERR POI P/Q %d->%d ck %s: 3-winding transformer %s does not have "
                       "%d as a winding bus (others: %s) -- no POI power channel for it"
@@ -6877,6 +6879,48 @@ def _poi_power_channels():
           % (n_ok, len(ties), " -- the plot adds their TOTAL as the first panel" if n_ok > 1 else ""))
     for (a, b, ck) in ties[:12]:
         print("  monitor [poi-pow ]   %s -> %s ck %s   (%s)" % (b, a, ck, _how.get((a, b, ck), "")))
+    # THE GRID SIDE OF THE POI, WHEN A PLANT TIE CANNOT BE METERED.
+    #
+    # East Fork's plant reaches POI 531623 through two THREE-WINDING
+    # transformers (531622 / 531624 and 531606 / 531610), and PSS/E 34 has no
+    # channel call for a three-winding winding -- so "0 of 2 tie(s)
+    # channelled", and no East Fork run ever recorded its POI power. The POI
+    # bus's other side is ordinary branches (531623-531429, the line to MINGO).
+    # What leaves the POI into the grid on those branches IS what the plant
+    # delivers into the POI, when nothing else sits on the POI bus. So every
+    # in-service grid-side branch is channelled, flow LEAVING the POI toward the
+    # grid (already "delivered" -- no sign turn), titled "... GRID <bus>", and
+    # _with_poi_totals() sums them into the POI TOTAL.
+    #
+    # ONLY HERE. A POI whose ties all channelled (every other project, every
+    # two-winding tie) never reaches this block, and its channels and totals
+    # are exactly what they were.
+    if _unmetered:
+        _tieset = set((frozenset((int(x), int(y))), str(c).strip() or "1") for (x, y, c) in ties)
+        for _pb in sorted(set(int(x) for (x, _y, _c) in _unmetered)):
+            _grid, _why = _poi_grid_branches(_pb, _tieset)
+            if not _grid:
+                print("  monitor [poi-grid] POI %d: the grid side cannot be metered exactly (%s) "
+                      "-- no POI power channel" % (_pb, _why))
+                continue
+            _ng, _seen = 0, set()
+            for (_j, _c) in _grid:
+                # PSS/E keeps 32 characters of a channel name: "POI VARS 531623
+                # MVAR GRID 531429" is exactly that, so a second circuit to the
+                # same bus is told apart as GRD<ckt> rather than by a suffix.
+                _tok = "GRID" if _j not in _seen else "GRD%s" % (_c[:1] or "2")
+                _seen.add(_j)
+                rc = chk(psspy.branch_p_and_q_channel([-1, -1, -1, _pb, _j], _c,
+                                                      ["POI POWR %d MW %s %d" % (_pb, _tok, _j),
+                                                       "POI VARS %d MVAR %s %d" % (_pb, _tok, _j)]),
+                         "POI P/Q at %d, grid side (to %d) ck %s" % (_pb, _j, _c))
+                if (rc[0] if isinstance(rc, (list, tuple)) else rc) in (0, None):
+                    _ng += 1
+            print("  monitor [poi-grid] POI %d: %d of %d grid-side branch(es) channelled -- the plant "
+                  "ties are 3-winding, so the POI power is metered as the flow leaving the POI into "
+                  "the grid%s" % (_pb, _ng, len(_grid), (" (%s)" % _why) if _why else ""))
+            for (_j, _c) in _grid:
+                print("  monitor [poi-grid]   %d -> %d ck %s" % (_pb, _j, _c))
 
 
 def _group3_named(areas):
@@ -19789,6 +19833,64 @@ def _behind_tie(bus, poi, tie_froms, max_hops=12):
         return None
 
 
+def _poi_grid_branches(pb, tieset):
+    """([(to_bus, ckt), ...], note) -- every in-service line or two-winding
+       transformer at POI bus pb that is not a plant tie. ([], why) when the
+       grid side cannot be metered exactly: a grid-side THREE-WINDING
+       transformer (it cannot be channelled either), or no grid branch at all.
+       A load, shunt or machine on the POI bus itself is reported in the note:
+       the grid-side flow is then the plant's delivery less what that device
+       takes, and the note says so."""
+    pb = int(pb)
+    out = []
+    try:
+        ie = psspy.inibrn(pb)
+        if (ie[0] if isinstance(ie, (list, tuple)) else ie) not in (0, None):
+            return [], "the POI bus's branches could not be read"
+        for _ in range(100000):
+            r = psspy.nxtbrn(pb)
+            if not isinstance(r, (list, tuple)) or len(r) < 3:
+                break
+            ierr, j, ck = r[0], r[1], r[2]
+            if ierr != 0 or not j:
+                break
+            ck = str(ck).strip() or "1"
+            if (frozenset((pb, int(j))), ck) in tieset:
+                continue
+            try:
+                se, st = psspy.brnint(pb, int(j), ck, "STATUS")
+                if se in (0, None) and int(st) == 0:
+                    continue
+            except Exception:
+                pass
+            out.append((int(j), ck))
+    except Exception as e:
+        return [], "the POI bus's branches could not be read (%s)" % e
+    # a three-winding transformer at the POI that is NOT one of the plant ties
+    try:
+        _tie_pairs = set(p for (p, _c) in tieset)
+        for _w in _three_wind_legs():
+            if pb in _w and not any(frozenset((pb, int(o))) in _tie_pairs for o in _w if int(o) != pb):
+                return [], "a grid-side three-winding transformer %s" % "/".join(str(x) for x in _w)
+    except Exception:
+        pass
+    if not out:
+        return [], "no grid-side branch at the POI bus"
+    dev = []
+    for _ini, _nxt, _what in (("inilod", "nxtlod", "load"), ("inimac", "nxtmac", "machine"),
+                              ("inifxs", "nxtfxs", "fixed shunt")):
+        try:
+            _i, _n = getattr(psspy, _ini), getattr(psspy, _nxt)
+            _i(pb)
+            r = _n(pb)
+            if isinstance(r, (list, tuple)) and r and r[0] == 0:
+                dev.append(_what)
+        except Exception:
+            pass
+    return out, ("the POI bus also carries a %s -- the grid-side flow is the plant's delivery "
+                 "less what it takes" % " / ".join(dev)) if dev else ""
+
+
 def _with_poi_totals(ch):
     """Add a synthetic 'POI POWR <poi> MW TOTAL' (and MVAR) series -- the number
        the POI meter reads: EVERY plant tie into the POI, new plant and existing
@@ -19804,9 +19906,13 @@ def _with_poi_totals(ch):
            765932/765935 -- so the meter reading is rebuilt from those. The
            GSU/collector losses between the terminals and the POI (about one
            percent) are not in it, and the label says so."""
-    groups, froms = {}, {}
+    groups, froms, grid = {}, {}, {}
     for k, (t, v) in ch.items():
         m = re.search(r"POI (POWR|VARS) (\d+) (MW|MVAR)(?: F(\d+))?", str(t).upper())
+        mg = re.search(r"POI (POWR|VARS) (\d+) (MW|MVAR) GR(?:ID|D\w) (\d+)", str(t).upper())
+        if mg and "TOTAL" not in str(t).upper():
+            grid.setdefault((mg.group(1), mg.group(2), mg.group(3)), []).append(v)
+            continue
         if m and "TOTAL" not in str(t).upper():
             groups.setdefault((m.group(1), m.group(2), m.group(3)), []).append(v)
             froms.setdefault((m.group(1), m.group(2), m.group(3)), []).append(m.group(4))
@@ -19816,10 +19922,21 @@ def _with_poi_totals(ch):
     except Exception:
         _poi = None
     for q, u in (("POWR", "MW"), ("VARS", "MVAR")):
-        pois = set(p for (qq, p, uu) in groups if qq == q)
+        pois = set(p for (qq, p, uu) in groups if qq == q) | set(p for (qq, p, uu) in grid if qq == q)
         if _poi is not None:
             pois.add(str(_poi))
         for poi in pois:
+            # METERED ON THE GRID SIDE (the plant ties are three-winding): the
+            # sum of the grid-side branches IS the POI reading -- nothing to
+            # add, and no machine to count beside it.
+            if (q, poi, u) in grid:
+                gv = grid[(q, poi, u)]
+                n = min(len(x) for x in gv)
+                tot = [sum(float(x[i]) for x in gv) for i in range(n)]
+                out["POITOT_%s_%s" % (q, poi)] = (
+                    "POI %s %s %s TOTAL (grid side) [grid side: %d branch(es) leaving the POI -- "
+                    "the plant ties are 3-winding]" % (q, poi, u, len(gv)), tot)
+                continue
             ties = list(groups.get((q, poi, u), []))
             vs = list(ties)
             note = None
@@ -22396,6 +22513,8 @@ def evaluate_case(path, kind, tclear, kb):
                 if "TOTAL" in _T:
                     _mh = re.search(r"\[([^\]]+)\]", str(_ti))
                     _tot[_poi] = (_v, _mh.group(1) if _mh else "sum of every plant tie channel")
+                elif re.search(r" GR(?:ID|D\w) \d", _T):
+                    continue             # grid-side meter: inside the TOTAL, not a tie
                 else:
                     _mf = re.search(r" F(\d+)", _T)
                     _ties.setdefault(_poi, []).append((_mf.group(1) if _mf else "", _v))
