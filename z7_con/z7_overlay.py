@@ -51,8 +51,8 @@ CASES = [
 ]
 
 OUT_DIR = r"overlay_plots"               # under ROOT unless absolute
-ALIGN_TO_FAULT = True                    # True = time axis from the fault (0 s = fault)
-T_MIN, T_MAX = -1.0, None                # seconds on that axis; None = the whole record
+ALIGN_TO_FAULT = False                   # False = simulation time, as the study plots | True = time from the fault (0 s = fault)
+T_MIN, T_MAX = 0.0, 20.0                 # seconds shown; None = the whole record
 PANELS_PER_PAGE = 4
 MAX_POINTS = 4000                        # points per trace (thinned evenly above this)
 INCLUDE_SGF_UNITS = True                 # per-unit SGF P / Q / ETERM
@@ -331,6 +331,19 @@ def _where(name, fbus, bmap, dist):
     return "more than 40 nodes from fault bus %d%s" % (fbus, ar)
 
 
+def _ylabel(name):
+    """'Voltage (pu)', 'P (MW)', 'Q (MVAr)' -- from the unit the panel name ends with."""
+    m = re.search(r"\(([^()]*)\)\s*$", name)
+    u = (m.group(1) if m else "").strip()
+    if u == "pu":
+        return "Voltage (pu)"
+    if u == "MW":
+        return "P (MW)"
+    if u.upper() == "MVAR":
+        return "Q (MVAr)"
+    return u or ""
+
+
 def _order(name):
     """Faulted bus, POI V, POI P, POI Q, then the SGF units, then the EGF units."""
     if name.startswith("POI"):
@@ -389,20 +402,27 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                         continue
                     lab, col, ls, lw = CASES[ci][0], CASES[ci][3], CASES[ci][4], CASES[ci][5]
                     tt, vv = _thin(t, v)
+                    # "end" = the last value shown (at T_MAX), not the end of the file
+                    _ve = v[-1]
+                    if T_MAX is not None:
+                        for _k in range(min(len(t), len(v)) - 1, -1, -1):
+                            if t[_k] <= T_MAX:
+                                _ve = v[_k]
+                                break
                     ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw,
-                            label="%s  (end %.3g)" % (lab, v[-1]))
+                            label="%s  (end %.3g)" % (lab, _ve))
                 _w = _where(name, fbus, bmap, dist) if SHOW_NODES else ""
                 ax.set_title(name + (("   --  " + _w) if _w else ""), fontsize=9, loc="left")
                 ax.grid(True, color="#d9d9d9", linewidth=0.6)
                 ax.tick_params(labelsize=8)
+                ax.set_ylabel(_ylabel(name), fontsize=8)
+                ax.set_xlabel("Time from fault (s)" if ALIGN_TO_FAULT else "Time (s)", fontsize=8)
                 if T_MIN is not None or T_MAX is not None:
                     ax.set_xlim(left=T_MIN, right=T_MAX)
                 if ALIGN_TO_FAULT:
                     ax.axvline(0.0, color="#999999", linewidth=0.8, linestyle=":")
                 ax.legend(fontsize=7, loc="best", frameon=False)
-            axes[-1, 0].set_xlabel("time from fault (s)" if ALIGN_TO_FAULT else "time (s)",
-                                   fontsize=8)
-            fig.subplots_adjust(left=0.07, right=0.98, top=0.92, bottom=0.07, hspace=0.45)
+            fig.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.07, hspace=0.75)
             pdf.savefig(fig)
             plt.close(fig)
     return pdf_path
@@ -468,6 +488,9 @@ def main():
         print("[overlay] %s" % proj)
         for c, d in zip(CASES, dirs):
             print("    %-30s %s" % (c[0], d or "*** folder not found ***"))
+        if not any(dirs):
+            print("    no results folder for %s in any case -- skipped" % proj)
+            continue
         faults = _faults(dirs)
         print("    %d fault(s)" % len(faults))
         jobs.extend((proj, f, dirs) for f in faults)
