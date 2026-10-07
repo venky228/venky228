@@ -639,8 +639,11 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
             fig.text(0.06, 0.965, "%s  |  %s" % (proj, fault), fontsize=14, fontweight="bold",
                      color="#1A1A1A", ha="left", va="center")
             fig.text(0.94, 0.965, PAGE_SUBTITLE, fontsize=9, color="#555555", ha="right", va="center")
-            fig.add_artist(plt.Line2D([0.06, 0.94], [0.945, 0.945], transform=fig.transFigure,
-                                      color="#1F5AA6", linewidth=1.2))
+            # the rule under the title -- fig.lines works on every matplotlib
+            # (fig.add_artist only exists from 3.0; Python 3.4 has older ones)
+            from matplotlib.lines import Line2D as _L2D
+            fig.lines.append(_L2D([0.06, 0.94], [0.945, 0.945], transform=fig.transFigure,
+                                  figure=fig, color="#1F5AA6", linewidth=1.2))
             legend = {}
             for ax, name in zip(axes[:, 0], page):
                 ends = []
@@ -664,8 +667,12 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                     ends.append((col, "%s: %s" % (_cap(_short(lab)), _fmt_end(_ve))))
                 # ---- panel title: quantity in bold, where it is in grey ----
                 _w = _where(name, fbus, bmap, dist) if SHOW_NODES else ""
-                ax.set_title(_cap(name), fontsize=9.5, fontweight="bold", loc="left",
-                             color="#1A1A1A", pad=14)
+                try:
+                    ax.set_title(_cap(name), fontsize=9.5, fontweight="bold", loc="left",
+                                 color="#1A1A1A", pad=14)
+                except (TypeError, AttributeError):      # matplotlib before 2.0: no pad
+                    ax.set_title(_cap(name) + "\n", fontsize=9.5, fontweight="bold",
+                                 loc="left", color="#1A1A1A")
                 if _w:
                     ax.text(0.0, 1.015, _cap(_w), transform=ax.transAxes, fontsize=7.5,
                             color="#666666", ha="left", va="bottom")
@@ -698,19 +705,25 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
             # ---- one legend for the page ----
             if legend:
                 order = sorted(legend)
-                lg = fig.legend([legend[c] for c in order], [_cap(CASES[c][0]) for c in order],
-                                loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=len(order),
-                                fontsize=9, frameon=True, fancybox=False, edgecolor="#CCCCCC",
-                                handlelength=4.0, columnspacing=2.5, borderpad=0.6)
-                lg.get_frame().set_linewidth(0.8)
+                _lk = dict(loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=len(order),
+                           fontsize=9, frameon=True, fancybox=False,
+                           handlelength=4.0, columnspacing=2.5, borderpad=0.6)
+                lg = fig.legend([legend[c] for c in order], [_cap(CASES[c][0]) for c in order], **_lk)
+                try:                                  # set on the frame: works on old matplotlib too
+                    lg.get_frame().set_edgecolor("#CCCCCC")
+                    lg.get_frame().set_linewidth(0.8)
+                except Exception:
+                    pass
             # ---- footer ----
             fig.text(0.06, 0.015, "%s  |  %s  |  %s" % (FOOTER_TEXT, proj, fault),
                      fontsize=7, color="#888888", ha="left", va="bottom")
             fig.text(0.94, 0.015, "Page %d of %d   |   %s" % (pg, n_pages, stamp),
                      fontsize=7, color="#888888", ha="right", va="bottom")
             fig.subplots_adjust(left=0.08, right=0.97, top=0.865, bottom=0.075, hspace=0.95)
-            pdf.savefig(fig)
-            plt.close(fig)
+            try:
+                pdf.savefig(fig)
+            finally:
+                plt.close(fig)
     return pdf_path
 
 
@@ -738,7 +751,11 @@ def _job(args):
         note = "fast %d / dyntools %d" % (_STATS["fast"] - f0, _STATS["dyntools"] - d0)
         return proj, fault, p, time.time() - t0, note
     except Exception as e:
-        return proj, fault, None, time.time() - t0, str(e)
+        if not _W.get("tb_shown"):                # the first failure in full, once
+            _W["tb_shown"] = True
+            import traceback
+            traceback.print_exc()
+        return proj, fault, None, time.time() - t0, "%s: %s" % (type(e).__name__, e)
 
 
 def _hms(sec):
@@ -809,7 +826,7 @@ def main():
             bar = "#" * int(30 * done / max(1, total))
             line = ("[overlay] [%-30s] %d/%d  %s %-8s %s  (%s%s)  elapsed %s  ETA %s"
                     % (bar, done, total, proj, fault, "OK" if pdf else "FAILED",
-                       _hms(sec), (", " + err) if (pdf and err) else "", _hms(el), _hms(eta)))
+                       _hms(sec), (", " + err) if err else "", _hms(el), _hms(eta)))
             print(line)
             sys.stdout.flush()
             rows.append("%-14s %-8s %-7s %8s  %-28s %s" % (proj, fault, "OK" if pdf else "FAILED",
