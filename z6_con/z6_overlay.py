@@ -59,7 +59,8 @@ INCLUDE_SGF_UNITS = True                 # per-unit SGF P / Q / ETERM
 INCLUDE_EGF_UNITS = True                 # per-unit EGF P / Q / ETERM
 EXTRA_TITLE_REGEX = []                   # more channels by .out title, e.g. [r"^GEN584713_PELEC$"]
 SBASE_MVA = 100.0                        # machine PELEC / QELEC are pu on the system base
-WORKERS = 4                              # faults drawn at once, each in its own process (1 = one at a time)
+FAST_READ = True                         # True = the study's fast packed reader where its verified layout fits (seconds, not minutes)
+WORKERS = 1                              # faults drawn at once, each in its own process (1 = one at a time)
 USE_CACHE = True                         # keep each .out's traces in <OUT_DIR>\cache: a re-run only reads new / changed .out files
 STATUS_FILE = "OVERLAY_STATUS.txt"       # live progress, in OUT_DIR ("" = off)
 SHOW_NODES = True                        # "N nodes from fault bus, area" on each panel (from flags\BUS_MAP.csv)
@@ -89,8 +90,10 @@ def _import_dyntools():
         import dyntools
         return dyntools
     except Exception as e:
-        raise SystemExit("dyntools could not be imported (%s). Run this with the PSS/E "
-                         "Python, or add its PSSPY34 folder to PSSE_DIRS." % e)
+        print("[overlay] dyntools could not be imported (%s) -- only files the fast reader "
+              "can read will be drawn. Run this with the PSS/E Python, or add its PSSPY34 "
+              "folder to PSSE_DIRS." % e)
+        return None
 
 
 def _abs(p):
@@ -139,12 +142,169 @@ _RX_EGF = re.compile(r"^XGEN(\d+)(?:_(\w{1,2}))?_(PELEC|QELEC|ETERM)$")
 _QTY = {"PELEC": ("P", "MW"), "QELEC": ("Q", "MVAr"), "ETERM": ("terminal V", "pu")}
 
 
+# ---- the fast .out reader ---------------------------------------------------------
+# The study's own packed reader, cut down to what this script needs. A .out is
+# read as raw 32-bit words using a layout the STUDY has already verified against
+# dyntools and saved beside the files (outs\OUT_LAYOUT_<channels>.txt). A file is
+# read this way only when (1) its header titles match a saved layout's to 90 %,
+# (2) its time column starts near 0 and rises at a constant step, and (3) the
+# regular time grid runs to the end of the file. Anything else -> dyntools.
+_STATS = {"fast": 0, "dyntools": 0}
+_LAYOUTS = {}
+
+
+def _load_layouts(folder):
+    if folder in _LAYOUTS:
+        return _LAYOUTS[folder]
+    lays = []
+    for d in (os.path.join(folder, "outs"), folder):
+        for p in sorted(glob.glob(os.path.join(d, "OUT_LAYOUT*.txt"))):
+            try:
+                txt = open(p, "r").read()
+            except Exception:
+                continue
+            if not re.search(r"^verified\s*=\s*yes", txt, re.M):
+                continue
+            m = re.search(r"^stride\s*=\s*(\d+)", txt, re.M)
+            b = re.search(r"^base\s*=\s*(\d+)", txt, re.M)
+            tw = re.search(r"^twidth\s*=\s*(\d+)", txt, re.M)
+            tr = re.search(r"^trailer\s*=\s*(\d+)", txt, re.M)
+            if not (m and b and tw):
+                continue
+            offs, tits = {}, {}
+            for line in txt.splitlines():
+                mm = re.match(r"^off\s+(\S+)\s*=\s*(\d+)$", line.strip())
+                if mm:
+                    k = mm.group(1)
+                    offs["time" if k == "time" else (int(k) if k.isdigit() else k)] = int(mm.group(2))
+                    continue
+                mt = re.match(r"^tit\s+(\S+)\s+(\d+)\s(.*)$", line.rstrip("\r\n"))
+                if mt:
+                    k = mt.group(1)
+                    tits[int(k) if k.isdigit() else k] = (int(mt.group(2)), " ".join(mt.group(3).split()))
+            if offs.get("time") is not None and tits:
+                lays.append((int(b.group(1)), int(m.group(1)), offs, int(tw.group(1)),
+                             int(tr.group(1)) if tr else (1 << 16), tits))
+    _LAYOUTS[folder] = lays
+    return lays
+
+
+def _fast_read(path):
+    """(t, {key: title}, {key: values}) for the wanted channels, or None."""
+    import array
+    import struct
+    lays = _load_layouts(os.path.dirname(os.path.dirname(path)))
+    if not lays:
+        return None
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        return None
+    for base, stride, offs, width, trailer, tits in lays:
+        need = max(p for p, _t in tits.values()) + width
+        if need > base * 4 or stride <= 0:
+            continue
+        try:
+            with open(path, "rb") as fh:
+                hdr = fh.read(need)
+        except Exception:
+            return None
+        cid, same, ok = {}, 0, True
+        for k, (p, ref) in tits.items():
+            try:
+                tx = " ".join(hdr[p:p + width].rstrip(b" \0").decode("ascii").split())
+            except Exception:
+                ok = False
+                break
+            if not tx or not all(32 <= ord(c) < 127 for c in tx):
+                ok = False
+                break
+            cid[k] = tx
+            same += (tx == ref)
+        if not ok or same < 0.9 * len(tits):
+            continue
+        n = size // 4
+        raw = array.array("I")
+        try:
+            with open(path, "rb") as fh:
+                raw.fromfile(fh, n)
+        except EOFError:
+            pass
+        except Exception:
+            return None
+        n = len(raw)
+
+        def col(o, cnt):
+            u = raw[o: o + (cnt - 1) * stride + 1: stride]
+            f = array.array("f")
+            f.frombytes(u.tobytes())
+            return [x if x == x and abs(x) < 3e38 else float("nan") for x in f]
+        t_off = offs["time"]
+        n_max = (n - 1 - t_off) // stride + 1
+        if n_max < 8:
+            continue
+        tall = col(t_off, n_max)
+        a, b2 = tall[0], tall[1]
+        step = b2 - a
+        if not (-1.0 <= a <= 1.0 and 1e-6 < step < 10.0):
+            continue
+        ns, jump = 1, max(10.0 * step, 1.0)
+        while ns < n_max:
+            d = tall[ns] - tall[ns - 1]
+            if d != d or d < 0 or d > jump:
+                break
+            ns += 1
+        if ns < 8:
+            continue
+        leftover = n - (t_off + (ns - 1) * stride + 1)
+        if leftover < 0 or leftover > trailer + stride:
+            return None               # the grid breaks before the end: dyntools reads it properly
+        t = tall[:ns]
+        ids, data = {}, {}
+        for k, title in cid.items():
+            if k == "time" or not _wanted(title):
+                continue
+            o = offs.get(k)
+            if o is None or o + (ns - 1) * stride >= n:
+                return None
+            ids[k] = title
+            data[k] = col(o, ns)
+        return t, ids, data
+    return None
+
+
+def _wanted(title):
+    """True for a channel title this script draws."""
+    ttl = str(title).strip()
+    if (_RX_FLT.match(ttl) or _RX_POIV.match(ttl) or _RX_POIP.match(ttl)
+            or _RX_POIQ.match(ttl)):
+        return True
+    if INCLUDE_SGF_UNITS and _RX_SGF.match(ttl):
+        return True
+    if INCLUDE_EGF_UNITS and _RX_EGF.match(ttl):
+        return True
+    return any(re.search(x, ttl) for x in EXTRA_TITLE_REGEX)
+
+
 def _read(dyntools, path):
-    """{title: (t list, value list)} for the channels this script draws, plus
-       the summed POI P / Q, read once from one .out."""
-    chnf = dyntools.CHNF(path)
-    _sh, ids, data = chnf.get_data()
-    t = list(data["time"])
+    """(t, {panel: values}) for one .out: the fast packed read when this
+       folder's verified layout fits the file, else dyntools."""
+    got = _fast_read(path) if FAST_READ else None
+    if got is not None:
+        t, ids, data = got
+        _STATS["fast"] += 1
+    else:
+        if dyntools is None:
+            raise RuntimeError("no verified fast layout fits %s and dyntools is not available"
+                               % os.path.basename(path))
+        chnf = dyntools.CHNF(path)
+        _sh, ids, data = chnf.get_data()
+        t = list(data["time"])
+        _STATS["dyntools"] += 1
+    return _extract(t, ids, data)
+
+
+def _extract(t, ids, data):
     out, poip, poiq = {}, [], []
     extra = [re.compile(x) for x in EXTRA_TITLE_REGEX]
     for k, title in ids.items():
@@ -447,8 +607,10 @@ def _job(args):
     try:
         if not _W:
             _worker_init()
+        f0, d0 = _STATS["fast"], _STATS["dyntools"]
         p = draw_fault(proj, fault, dirs, _W["dyntools"], _W["plt"], _W["PdfPages"])
-        return proj, fault, p, time.time() - t0, ""
+        note = "fast %d / dyntools %d" % (_STATS["fast"] - f0, _STATS["dyntools"] - d0)
+        return proj, fault, p, time.time() - t0, note
     except Exception as e:
         return proj, fault, None, time.time() - t0, str(e)
 
@@ -519,13 +681,13 @@ def main():
             el = time.time() - t0
             eta = el / done * (total - done)
             bar = "#" * int(30 * done / max(1, total))
-            line = ("[overlay] [%-30s] %d/%d  %s %-8s %s  (%s)  elapsed %s  ETA %s"
+            line = ("[overlay] [%-30s] %d/%d  %s %-8s %s  (%s%s)  elapsed %s  ETA %s"
                     % (bar, done, total, proj, fault, "OK" if pdf else "FAILED",
-                       _hms(sec), _hms(el), _hms(eta)))
+                       _hms(sec), (", " + err) if (pdf and err) else "", _hms(el), _hms(eta)))
             print(line)
             sys.stdout.flush()
-            rows.append("%-14s %-8s %-7s %8s  %s" % (proj, fault, "OK" if pdf else "FAILED",
-                                                    _hms(sec), pdf or err or ""))
+            rows.append("%-14s %-8s %-7s %8s  %-28s %s" % (proj, fault, "OK" if pdf else "FAILED",
+                                                          _hms(sec), err if pdf else "", pdf or err or ""))
             _status(["OVERLAY PLOTS -- %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
                      "progress  %d / %d done (%d OK, %d failed), %d worker(s)"
                      % (done, total, ok, len(fails), nw),
