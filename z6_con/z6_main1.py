@@ -813,6 +813,18 @@ PROJECT_OFF_COMPARE = False
 # flow | "switched" = IN after the final clearing once V < v_on for delay_s, OUT once
 # V > v_off for delay_s.
 CAP_BANK_RUN = False                         # True = run the cap-bank study for the projects below
+# DIAG_RUN: a DIAGNOSTIC CAMPAIGN instead of the study -- see DIAG_RUNS (z7_main_tst.py)
+DIAG_RUN = False                             # True = run ONLY the DIAG_RUNS rows below, then stop
+DIAG_PROJECT = "SantaFe"
+DIAG_FAULTS = ["F134"]
+DIAG_PARALLEL = 2                            # studies at once (each one PSS/E session)
+DIAG_SIM_END_S = None                        # s per fault for these runs (None = SIM_END_S)
+DIAG_SKIP_DONE = True                        # True = a row already finished is read, not re-run
+DIAG_BUILD_WAIT_S = 1800                     # wait at most this long for one build before starting the next
+DIAG_RUNS = []                               # [{"tag": "d01_asis", "label": "...", "capacity": 0.95, "connect": "poi",
+                                             #   "ppc": "egf", "sgf_off": True, "egf_off": True, "poi_mw": 900,
+                                             #   "sgf_dyr": [("REECCU1", {"PQflag": 1})], "egf_dyr": [("REPCTA1", {"icon7": 0})],
+                                             #   "cap_banks": [{"bus": "poi", "mvar": 200, "mode": "switched"}]}, ...]
 CAP_BANK_COMPARE = True                      # full comparison of it against the base
 CAP_BANKS = {
     # "SantaFe": [{"bus": "poi", "mvar": 100.0, "mode": "switched",
@@ -13168,6 +13180,217 @@ def run_project_off(proj, mode):
     return rows
 
 
+# ============================================================================
+# DIAGNOSTIC CAMPAIGN -- many variants of a few faults, several at a time
+# ============================================================================
+# DIAG_RUN = True runs ONLY DIAG_RUNS (nothing else in the panel): each row is
+# one project-case study of DIAG_FAULTS in its own folder <proj>_<mode>_<tag>
+# (or ..._cap<NN>_<tag>), DIAG_PARALLEL at a time. The next study starts only
+# once the previous one has finished its build, so no two builds share the deck
+# files. At the end DIAG_SUMMARY_<proj>.txt / .csv / .xlsx ranks every row by
+# how close the POI comes back to its pre-fault power.
+def _diag_job_env(proj, row):
+    """The environment one DIAG_RUNS row is run under."""
+    tag = str(row["tag"]).strip()
+    env = {"SPP_RUN_TAG": tag, "SPP_DEFER_REPORTS": "0",
+           "SPP_ONLY_FAULTS": ",".join(DIAG_FAULTS or []),
+           "SPP_REPORT_FAULTS": "",
+           "SPP_SKIP_DONE": "1" if DIAG_SKIP_DONE else "0",
+           "SPP_FRESH_START": "0"}
+    # SGF .dyr edits: the row's own, never the panel's
+    env["SPP_DYR_EDITS_BY_PROJECT"] = json.dumps(
+        {proj: [[m, dict((str(c), v) for c, v in d.items())] for m, d in (row.get("sgf_dyr") or [])]})
+    if row.get("egf_dyr"):
+        env["SPP_EGF_DYR_EDITS"] = json.dumps(
+            [[m, dict((str(c), v) for c, v in d.items())] for m, d in row["egf_dyr"]])
+    # the new plant: connect / shared control as the row says
+    _np = dict(NEW_PLANT or {})
+    if row.get("connect"):
+        _np["connect"] = row["connect"]
+    _np["ppc_branch"] = row.get("ppc") or None
+    env["SPP_NEW_PLANT"] = json.dumps(_np)
+    env["SPP_PPC_BRANCH"] = row.get("ppc") or "none"
+    if row.get("cap_banks"):
+        env["SPP_CAP_BANKS"] = json.dumps(list(row["cap_banks"]))
+    if row.get("sgf_off"):
+        env["SPP_SGF_OFF"] = "1"
+    if row.get("egf_off"):
+        env["SPP_EGF_OFF"] = "1"
+    if row.get("poi_mw") is not None:
+        env["SPP_POI_P_TARGET"] = repr(float(row["poi_mw"]))
+    cap = row.get("capacity")
+    if cap is not None and abs(float(cap) - 1.0) > 1e-9:
+        env.update(_cap_env("%d" % int(round(100.0 * float(cap))), float(cap)))
+    if DIAG_SIM_END_S:
+        env["SPP_SIM_END_S"] = repr(float(DIAG_SIM_END_S))
+    env["SPP_N_WORKERS"] = "1"
+    env["SPP_REPORT_WORKERS"] = "1"
+    return env
+
+
+def _diag_dir(proj, mode, row):
+    cap = row.get("capacity")
+    c = ("_cap%d" % int(round(100.0 * float(cap)))) if (cap is not None and abs(float(cap) - 1.0) > 1e-9) else ""
+    return _run_path(CASE_TEST, proj, "%s_%s%s_%s" % (proj, mode, c, str(row["tag"]).strip()))
+
+
+def _diag_text(row):
+    bits = []
+    if row.get("connect"):
+        bits.append("connect=%s" % row["connect"])
+    if row.get("capacity") is not None:
+        bits.append("output %.0f %%" % (100.0 * float(row["capacity"])))
+    if row.get("ppc"):
+        bits.append("ppc=%s" % row["ppc"])
+    if row.get("sgf_off"):
+        bits.append("SGF off")
+    if row.get("egf_off"):
+        bits.append("EGF off")
+    for m, d in (row.get("sgf_dyr") or []):
+        bits.append("SGF %s %s" % (m, ", ".join("%s=%s" % kv for kv in sorted(d.items(), key=lambda x: str(x[0])))))
+    for m, d in (row.get("egf_dyr") or []):
+        bits.append("EGF %s %s" % (m, ", ".join("%s=%s" % kv for kv in sorted(d.items(), key=lambda x: str(x[0])))))
+    for c in (row.get("cap_banks") or []):
+        bits.append("cap %s %s MVAr %s" % (c.get("bus", "poi"), c.get("mvar"), c.get("mode", "fixed")))
+    return "; ".join(bits) or "as studied"
+
+
+def _diag_poi_info(rows):
+    """The POI rows of one fault's criteria, shortened."""
+    out = []
+    for crit, res, det in rows or []:
+        if "POI" in crit.upper() or "POI" in det[:12].upper():
+            out.append("%s %s: %s" % (crit, res, det[:140]))
+    return " | ".join(out)
+
+
+def run_diag():
+    proj = DIAG_PROJECT
+    mode = (list(MODES) or ["spp"])[0]
+    rows = [r for r in (DIAG_RUNS or []) if isinstance(r, dict) and str(r.get("tag") or "").strip()]
+    tags = [str(r["tag"]).strip() for r in rows]
+    if len(set(tags)) != len(tags):
+        print("[diag] *** two DIAG_RUNS rows share a tag -- every tag must be unique ***")
+        return 2
+    if not rows or not DIAG_FAULTS:
+        print("[diag] nothing to run: DIAG_RUNS or DIAG_FAULTS is empty")
+        return 2
+    nw = max(1, int(DIAG_PARALLEL or 1))
+    _banner("DIAGNOSTIC CAMPAIGN -- %s %s, %d run(s) x %s, %d at a time"
+            % (proj, mode, len(rows), ", ".join(DIAG_FAULTS), nw))
+    for r in rows:
+        print("[diag]   %-24s %s" % (r["tag"], _diag_text(r)))
+    logdir = os.path.join(cmp_detail(), "diag_logs")
+    try:
+        os.makedirs(logdir)
+    except Exception:
+        pass
+    res = {}
+    lock = threading.Lock()
+    slots = threading.Semaphore(nw)
+    t0 = time.time()
+
+    def _one(r, started):
+        tag = str(r["tag"]).strip()
+        try:
+            rc = run_study(CASE_TEST, projects=[proj], modes=[mode],
+                           extra_env=_diag_job_env(proj, r),
+                           log_path=os.path.join(logdir, "%s.log" % tag))
+        except Exception as e:
+            rc = "error: %s" % e
+        with lock:
+            res[tag] = {"rc": rc, "min": (time.time() - started) / 60.0}
+        slots.release()
+
+    def _status(note=""):
+        done = len(res)
+        el = time.time() - t0
+        eta = (el / done * (len(rows) - done)) if done else 0
+        print("[diag] %d/%d finished, elapsed %dm, ETA %s%s"
+              % (done, len(rows), el / 60, ("%dm" % (eta / 60)) if done else "?",
+                 ("  -- " + note) if note else ""))
+        sys.stdout.flush()
+
+    threads = []
+    for i, r in enumerate(rows):
+        slots.acquire()
+        tag = str(r["tag"]).strip()
+        rdir = _diag_dir(proj, mode, r)
+        started = time.time()
+        th = threading.Thread(target=_one, args=(r, started))
+        th.daemon = True
+        th.start()
+        threads.append(th)
+        _status("started %s (%d of %d)" % (tag, i + 1, len(rows)))
+        # ONE BUILD AT A TIME: wait for this study's flat run (the end of its
+        # build) before starting the next, so two builds never write the same
+        # deck helper files at once.
+        flat = os.path.join(rdir, "outs", "FLAT_RUN.out")
+        while th.is_alive() and time.time() - started < DIAG_BUILD_WAIT_S:
+            try:
+                if os.path.getmtime(flat) >= started:
+                    break
+            except Exception:
+                pass
+            time.sleep(10)
+    for th in threads:
+        while th.is_alive():
+            th.join(60)
+            _status()
+    _status("all finished")
+    return write_diag_summary(proj, mode, rows, res)
+
+
+def write_diag_summary(proj, mode, rows, res):
+    out = []
+    for r in rows:
+        tag = str(r["tag"]).strip()
+        rdir = _diag_dir(proj, mode, r)
+        ct, _src = read_criteria(rdir, proj) if os.path.isdir(rdir) else ({}, "")
+        for f in DIAG_FAULTS:
+            e = ct.get(f) or {}
+            v = (e.get("verdict") or "?").upper()
+            fails = sorted(set(c for c, rs, _d in (e.get("rows") or []) if rs == "FAIL"))
+            out.append([tag, f, v, "; ".join(fails), _diag_text(r),
+                        "%.0f" % (res.get(tag, {}).get("min") or 0),
+                        _diag_poi_info(e.get("rows")), r.get("label") or "", rdir])
+    path = os.path.join(cmp_detail(), "DIAG_SUMMARY_%s_%s.txt" % (proj, mode))
+    hdr = ["tag", "fault", "verdict", "failing criteria", "what was changed", "min",
+           "POI rows", "label", "folder"]
+    with open(path, "w") as fh:
+        fh.write("DIAGNOSTIC CAMPAIGN -- %s (%s), faults %s\n" % (proj, mode, ", ".join(DIAG_FAULTS)))
+        fh.write("written %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("=" * 130 + "\n")
+        for o in out:
+            fh.write("%-24s %-6s %-5s %-60s\n      %s\n      %s\n"
+                     % (o[0], o[1], o[2], o[3][:60], o[4], o[6][:300]))
+        fh.write("=" * 130 + "\n")
+        npass = sum(1 for o in out if o[2] == "PASS")
+        fh.write("%d PASS of %d\n" % (npass, len(out)))
+    print("[diag] -> %s" % path)
+    try:
+        with csv_open(path[:-4] + ".csv", "w") as fh:
+            w = csv.writer(fh)
+            w.writerow(hdr)
+            for o in out:
+                w.writerow(o)
+    except Exception as e:
+        print("[diag] could not write the .csv (%s)" % e)
+    if WRITE_XLSX:
+        try:
+            write_xlsx_multi(path[:-4] + ".xlsx",
+                             [("Diagnostic", hdr, out, [24, 8, 8, 40, 60, 6, 80, 30, 50],
+                               lambda row: 5 if row[2] == "PASS" else (2 if row[2] == "FAIL" else 3))],
+                             legend=[(5, "GREEN", "PASS"), (2, "RED", "FAIL"), (3, "AMBER", "no verdict")],
+                             title_rows=["DIAGNOSTIC CAMPAIGN -- %s (%s)" % (proj, mode),
+                                         "faults %s" % ", ".join(DIAG_FAULTS)])
+        except Exception as e:
+            print("[diag] could not write the .xlsx (%s)" % e)
+    for o in out:
+        print("[diag] %-24s %-6s %-5s %s" % (o[0], o[1], o[2], o[3][:70]))
+    return 0
+
+
 CAP_BANK_TAG = "cbank"
 
 
@@ -24863,6 +25086,8 @@ def main():
     if FIXED_SOLVER:
         if not _fixed_solver_apply():
             return 2
+    elif DIAG_RUN:
+        return run_diag()
     elif GEN_TEST:
         return run_gen_tests()
 

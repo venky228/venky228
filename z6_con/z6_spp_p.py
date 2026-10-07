@@ -12448,14 +12448,48 @@ def _ppc_share_egf(add, members, deck_text):
     return add
 
 
+def _dyre_lock(wait_s=900, stale_s=900):
+    """A lock file beside the deck while dyre_new runs. Returns its path or ""."""
+    lp = os.path.join(STUDY_DIR, ".dyre_new.lock")
+    t0 = time.time()
+    while True:
+        try:
+            fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, ("%d %s" % (os.getpid(), time.time())).encode())
+            os.close(fd)
+            return lp
+        except OSError:
+            try:
+                if time.time() - os.path.getmtime(lp) > stale_s:
+                    os.remove(lp)            # left by a process that died
+                    continue
+            except Exception:
+                pass
+            if time.time() - t0 > wait_s:
+                print("  [dyre] lock %s held for %ds -- going ahead" % (lp, wait_s))
+                return ""
+            time.sleep(2)
+
+
+def _dyre_unlock(lp):
+    if lp:
+        try:
+            os.remove(lp)
+        except Exception:
+            pass
+
+
 def bess_combined_dyr(project, base_dyr):
     """Write <base>_with_BESS_<proj>.dyr = the ORIGINAL base .dyr (read only), optionally
        with the disabled gens' records stripped, plus this project's REGCAU1/REECAU1/REPCAU1
        records -- for EVERY member when the project is a together run. The original
        base_dyr is NEVER modified."""
-    dst = os.path.join(STUDY_DIR, "%s_with_BESS_%s.dyr"
+    # ONE FILE PER RUN: two studies building at once (a diagnostic campaign)
+    # must not write the same combined deck. Plain runs keep the old name.
+    _sfx = (("_cap" + _CAP_TAG_DIR) if _CAP_TAG_DIR else "") + (("_" + _RUN_TAG_DIR) if _RUN_TAG_DIR else "")
+    dst = os.path.join(STUDY_DIR, "%s_with_BESS_%s%s.dyr"
                        % (os.path.splitext(os.path.basename(base_dyr))[0],
-                          project.get("cluster") or project["name"]))
+                          project.get("cluster") or project["name"], _sfx))
     with open(base_dyr, "r", errors="ignore") as fh:
         base = fh.read()
     members = project.get("member_rows") or [project]
@@ -17773,9 +17807,15 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
         _dyr_used = dyr_drop_models(_dyr_used)
         _dyr_used = dyr_with_edits(_dyr_used)
         _dyr_used = egf_dyr_with_edits(_dyr_used)
-        chk(psspy.dyre_new([101, 101, 101, 101], _dyr_used,
-                           _abspath(CONEC_FLX), _abspath(CONET_FLX), _abspath(COMPILE_BAT)),
-            "dyre_new (%s)" % os.path.basename(_dyr_used))
+        # ONE dyre_new AT A TIME in this folder: it rewrites conec.flx /
+        # conet.flx, which every study here shares.
+        _dl = _dyre_lock()
+        try:
+            chk(psspy.dyre_new([101, 101, 101, 101], _dyr_used,
+                               _abspath(CONEC_FLX), _abspath(CONET_FLX), _abspath(COMPILE_BAT)),
+                "dyre_new (%s)" % os.path.basename(_dyr_used))
+        finally:
+            _dyre_unlock(_dl)
         # 7a) RECOMPILE THE USER MODELS. dyre_new has just rewritten conec.flx
         #     and conet.flx for this model set; they are Fortran until these run.
         #     Before the snapshot, because everything after inherits it.
