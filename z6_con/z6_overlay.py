@@ -50,6 +50,7 @@ CASES = [
     ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#D55E00", "-.", 1.4),
 ]
 
+PDF_NAME = "{project}_{fault}.pdf"        # file name per fault, e.g. SantaFe_F01.pdf ({project}, {fault}, {mode})
 OUT_DIR = r"overlay_plots"               # under ROOT unless absolute
 ALIGN_TO_FAULT = False                   # False = simulation time, as the study plots | True = time from the fault (0 s = fault)
 T_MIN, T_MAX = 0.0, 20.0                 # seconds shown; None = the whole record
@@ -589,7 +590,7 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     out_dir = _abs(OUT_DIR)
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
-    pdf_path = os.path.join(out_dir, "%s_%s_%s_overlay.pdf" % (proj, MODE, fault))
+    pdf_path = os.path.join(out_dir, PDF_NAME.format(project=proj, fault=fault, mode=MODE))
     have = ", ".join(CASES[c][0].split(":")[0] for c, _t, _s in traces)
     with PdfPages(pdf_path) as pdf:
         for p0 in range(0, len(panels), PANELS_PER_PAGE):
