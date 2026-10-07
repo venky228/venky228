@@ -133,12 +133,15 @@ def _faults(dirs):
 
 
 # ---- what is drawn ---------------------------------------------------------
-_RX_FLT = re.compile(r"^FLT(\d+) V$")
-_RX_POIV = re.compile(r"^POI ?(\d+) V$")
-_RX_POIP = re.compile(r"^POI POWR (\d+) MW p(\d+)")
-_RX_POIQ = re.compile(r"^POI VARS (\d+) MVAR p(\d+)")
-_RX_SGF = re.compile(r"^PROJ(\d+)_(PELEC|QELEC|ETERM)$")
-_RX_EGF = re.compile(r"^XGEN(\d+)(?:_(\w{1,2}))?_(PELEC|QELEC|ETERM)$")
+# PSS/E stores channel titles in UPPER case, so every pattern ignores case.
+# A POI tie channel ends in P<plant bus> (metered at the POI: the flow LEAVING
+# the POI, turned round here) or F<plant bus> (older runs: flow INTO the POI).
+_RX_FLT = re.compile(r"^FLT(\d+) V$", re.I)
+_RX_POIV = re.compile(r"^POI ?(\d+) V$", re.I)
+_RX_POIP = re.compile(r"^POI POWR (\d+) MW ([PF])(\d+)", re.I)
+_RX_POIQ = re.compile(r"^POI VARS (\d+) MVAR ([PF])(\d+)", re.I)
+_RX_SGF = re.compile(r"^PROJ(\d+)_(PELEC|QELEC|ETERM)$", re.I)
+_RX_EGF = re.compile(r"^XGEN(\d+)(?:_(\w{1,2}))?_(PELEC|QELEC|ETERM)$", re.I)
 _QTY = {"PELEC": ("P", "MW"), "QELEC": ("Q", "MVAr"), "ETERM": ("terminal V", "pu")}
 
 
@@ -323,38 +326,39 @@ def _extract(t, ids, data):
             out["POI %s voltage (pu)" % m.group(1)] = list(v)
             continue
         m = _RX_POIP.match(ttl)
-        if m and "GRID" not in ttl and "GRD" not in ttl:
-            poip.append((m.group(1), v))
+        if m and "GRID" not in ttl.upper() and "GRD" not in ttl.upper():
+            poip.append((m.group(1), m.group(2).upper(), v))
             continue
         m = _RX_POIQ.match(ttl)
-        if m and "GRID" not in ttl and "GRD" not in ttl:
-            poiq.append((m.group(1), v))
+        if m and "GRID" not in ttl.upper() and "GRD" not in ttl.upper():
+            poiq.append((m.group(1), m.group(2).upper(), v))
             continue
         m = _RX_SGF.match(ttl)
         if m and INCLUDE_SGF_UNITS:
-            q, u = _QTY[m.group(2)]
+            q, u = _QTY[m.group(2).upper()]
             sc = SBASE_MVA if u != "pu" else 1.0
             out["SGF unit %s %s (%s)" % (m.group(1), q, u)] = [x * sc for x in v]
             continue
         m = _RX_EGF.match(ttl)
         if m and INCLUDE_EGF_UNITS:
-            q, u = _QTY[m.group(3)]
+            q, u = _QTY[m.group(3).upper()]
             sc = SBASE_MVA if u != "pu" else 1.0
             unit = m.group(1) + (" '%s'" % m.group(2) if m.group(2) else "")
             out["EGF %s %s (%s)" % (unit, q, u)] = [x * sc for x in v]
             continue
         if any(rx.search(ttl) for rx in extra):
             out[ttl] = list(v)
-    # The tie channels record the flow LEAVING the POI towards the plant, so the
-    # power the plant delivers is minus their sum.
+    # Delivered INTO the POI: a 'P' tie (metered leaving the POI) is turned
+    # round, an 'F' tie (metered into the POI) is taken as it is.
     for lst, nm, u in ((poip, "P", "MW"), (poiq, "Q", "MVAr")):
         if lst:
             poi = lst[0][0]
             n = len(t)
             tot = [0.0] * n
-            for _b, v in lst:
+            for _b, d, v in lst:
+                sg = -1.0 if d == "P" else 1.0
                 for i in range(min(n, len(v))):
-                    tot[i] -= v[i]
+                    tot[i] += sg * v[i]
             out["POI %s %s delivered, sum of %d tie(s) (%s)" % (poi, nm, len(lst), u)] = tot
     return t, out
 
@@ -366,7 +370,7 @@ def _read_cached(dyntools, path, ci):
         return _read(dyntools, path)
     import pickle
     st = os.stat(path)
-    key = "%s|%d|%d|%s|%s|%s" % (os.path.abspath(path), st.st_size, int(st.st_mtime),
+    key = "v2|%s|%d|%d|%s|%s|%s" % (os.path.abspath(path), st.st_size, int(st.st_mtime),
                                  INCLUDE_SGF_UNITS, INCLUDE_EGF_UNITS, "|".join(EXTRA_TITLE_REGEX))
     cdir = os.path.join(_abs(OUT_DIR), "cache")
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.relpath(os.path.abspath(path), ROOT)) + ".pkl"
@@ -536,6 +540,25 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     if not traces:
         print("    %s: no case has an .out -- skipped" % fault)
         return None
+    # THE BASE CASE HAS NO SGF. Its "project machines" (PROJ1, PROJ2, ...) are
+    # the EXISTING units at the plant's feeders, in feeder order -- so they are
+    # drawn on the EGF panels (by the EGF buses the other cases name, ascending),
+    # never on the SGF ones.
+    egf_buses = sorted(set(int(m.group(1)) for _c, _t, sg in traces for k in sg
+                           for m in [re.match(r"^EGF (\d+)", k)] if m))
+    for j, (ci, t, sg) in enumerate(traces):
+        if "base" not in str(CASES[ci][1]).lower():
+            continue
+        new = {}
+        for k, v in sg.items():
+            m = re.match(r"^SGF unit (\d+) (.*)$", k)
+            if not m:
+                new[k] = v
+                continue
+            n = int(m.group(1))
+            if INCLUDE_EGF_UNITS and 1 <= n <= len(egf_buses):
+                new["EGF %d %s" % (egf_buses[n - 1], m.group(2))] = v
+        traces[j] = (ci, t, new)
     panels = sorted(set(k for _c, _t, s in traces for k in s), key=_order)
     bmap, fbus, dist = (_bus_map(dirs) if SHOW_NODES else None), None, {}
     for k in panels:
