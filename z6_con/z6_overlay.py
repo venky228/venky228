@@ -65,8 +65,10 @@ ALIGN_TO_FAULT = False                   # False = simulation time, as the study
 T_MIN, T_MAX = 0.0, 20.0                 # seconds shown; None = the whole record
 PANELS_PER_PAGE = 4
 MAX_POINTS = 4000                        # points per trace (thinned evenly above this)
-PLOT_QUANTITIES = ["V", "P", "Q"]        # which quantities: "V" voltage (pu), "P" (MW), "Q" (MVAr) -- e.g. ["V"] or ["P", "Q"]
-PLOT_GROUPS = ["FAULT", "POI", "SGF", "EGF"]   # which panels: faulted bus, POI, SGF units, EGF units -- e.g. ["POI"]
+CHANNEL_KEYWORDS = ["PROJ", "POI", "FLT", "GEN"]   # every channel whose title holds one of these is drawn --
+                                         #   the study PDFs' own set (INDIVIDUAL_KEYWORDS); [] = only the panels below
+PLOT_QUANTITIES = ["V", "P", "Q", "A", "S"]   # "V" voltage (pu), "P" (MW), "Q" (MVAr), "A" angle (deg), "S" speed (pu)
+PLOT_GROUPS = ["FAULT", "POI", "SGF", "EGF", "GEN"]   # faulted bus, POI, SGF units, EGF units, other machines
 INCLUDE_SGF_UNITS = True                 # per-unit SGF P / Q / ETERM
 INCLUDE_EGF_UNITS = True                 # per-unit EGF P / Q / ETERM
 EXTRA_TITLE_REGEX = []                   # more channels by .out title, e.g. [r"^GEN584713_PELEC$"]
@@ -152,9 +154,13 @@ _RX_FLT = re.compile(r"^FLT(\d+) V$", re.I)
 _RX_POIV = re.compile(r"^POI ?(\d+) V$", re.I)
 _RX_POIP = re.compile(r"^POI POWR (\d+) MW ([PF])(\d+)", re.I)
 _RX_POIQ = re.compile(r"^POI VARS (\d+) MVAR ([PF])(\d+)", re.I)
-_RX_SGF = re.compile(r"^PROJ(\d+)_(PELEC|QELEC|ETERM)$", re.I)
-_RX_EGF = re.compile(r"^XGEN(\d+)(?:_(\w{1,2}))?_(PELEC|QELEC|ETERM)$", re.I)
-_QTY = {"PELEC": ("P", "MW"), "QELEC": ("Q", "MVAr"), "ETERM": ("terminal V", "pu")}
+_RX_SGF = re.compile(r"^PROJ(\d+)_(PELEC|QELEC|ETERM|SPD|SPEED|ANGL)$", re.I)
+_RX_EGF = re.compile(r"^XGEN(\d+)(?:_(\w{1,2}))?_(PELEC|QELEC|ETERM|SPD|SPEED|ANGL)$", re.I)
+# the panels the study PDFs draw ALWAYS (its _plot_always), whatever the keywords say
+_RX_ALWAYS = re.compile(r"^(PROJ\d|POI(?![A-Z])|NPGEN|PBUS|XGEN|FLT|SWING)", re.I)
+_QTY = {"PELEC": ("P", "MW"), "QELEC": ("Q", "MVAr"), "ETERM": ("terminal V", "pu"),
+        "SPD": ("speed deviation", "pu speed"), "SPEED": ("speed deviation", "pu speed"),
+        "ANGL": ("angle", "deg")}
 
 
 # ---- the fast .out reader ---------------------------------------------------------
@@ -288,6 +294,41 @@ def _fast_read(path):
     return None
 
 
+_RX_GEN = re.compile(r"^(?:NP)?GEN(\d+)(?:_(\w{1,2}))?_(ANGL|PELEC|QELEC|ETERM|SPD|SPEED)$", re.I)
+_RX_BUSQ = re.compile(r"^(PBUS|POI|FLT) ?(\d+) (V|ANG)$", re.I)
+_GEN_QTY = {"ANGL": ("angle", "deg", 1.0), "PELEC": ("P", "MW", None), "QELEC": ("Q", "MVAr", None),
+            "ETERM": ("terminal V", "pu", 1.0), "SPD": ("speed deviation", "pu speed", 1.0),
+            "SPEED": ("speed deviation", "pu speed", 1.0)}
+
+
+def _generic(ttl, v):
+    """(panel name, values) for a channel CHANNEL_KEYWORDS takes in that the
+       named panels above do not -- other machines, bus angles, extra buses."""
+    m = _RX_GEN.match(ttl)
+    if m:
+        q, u, sc = _GEN_QTY[m.group(3).upper()]
+        sc = SBASE_MVA if sc is None else sc
+        unit = m.group(1) + (" '%s'" % m.group(2) if m.group(2) else "")
+        return "Gen %s %s (%s)" % (unit, q, u), [x * sc for x in v]
+    m = re.match(r"^SWING ?(\d+)_ANGL", ttl, re.I)
+    if m:
+        return "Swing %s rotor angle (deg)" % m.group(1), list(v)
+    m = _RX_BUSQ.match(ttl)
+    if m:
+        kind = {"PBUS": "Bus", "POI": "POI", "FLT": "Faulted bus"}[m.group(1).upper()]
+        if m.group(3).upper() == "ANG":
+            return "%s %s angle (deg)" % (kind, m.group(2)), list(v)
+        return "%s %s voltage (pu)" % (kind, m.group(2)), list(v)
+    return ttl, list(v)
+
+
+def _kw_hit(ttl):
+    up = str(ttl).upper().strip()
+    if CHANNEL_KEYWORDS and _RX_ALWAYS.match(up):
+        return True
+    return any(str(k).upper() in up for k in (CHANNEL_KEYWORDS or []))
+
+
 def _wanted(title):
     """True for a channel title this script draws."""
     ttl = str(title).strip()
@@ -298,7 +339,9 @@ def _wanted(title):
         return True
     if INCLUDE_EGF_UNITS and _RX_EGF.match(ttl):
         return True
-    return any(re.search(x, ttl) for x in EXTRA_TITLE_REGEX)
+    if any(re.search(x, ttl) for x in EXTRA_TITLE_REGEX):
+        return True
+    return _kw_hit(ttl)
 
 
 def _read(dyntools, path):
@@ -339,27 +382,31 @@ def _extract(t, ids, data):
             continue
         m = _RX_POIP.match(ttl)
         if m and "GRID" not in ttl.upper() and "GRD" not in ttl.upper():
-            poip.append((m.group(1), m.group(2).upper(), v))
+            poip.append((m.group(1), m.group(2).upper(), m.group(3), v))
             continue
         m = _RX_POIQ.match(ttl)
         if m and "GRID" not in ttl.upper() and "GRD" not in ttl.upper():
-            poiq.append((m.group(1), m.group(2).upper(), v))
+            poiq.append((m.group(1), m.group(2).upper(), m.group(3), v))
             continue
         m = _RX_SGF.match(ttl)
         if m and INCLUDE_SGF_UNITS:
             q, u = _QTY[m.group(2).upper()]
-            sc = SBASE_MVA if u != "pu" else 1.0
+            sc = SBASE_MVA if u in ("MW", "MVAr") else 1.0
             out["SGF unit %s %s (%s)" % (m.group(1), q, u)] = [x * sc for x in v]
             continue
         m = _RX_EGF.match(ttl)
         if m and INCLUDE_EGF_UNITS:
             q, u = _QTY[m.group(3).upper()]
-            sc = SBASE_MVA if u != "pu" else 1.0
+            sc = SBASE_MVA if u in ("MW", "MVAr") else 1.0
             unit = m.group(1) + (" '%s'" % m.group(2) if m.group(2) else "")
             out["EGF %s %s (%s)" % (unit, q, u)] = [x * sc for x in v]
             continue
-        if any(rx.search(ttl) for rx in extra):
-            out[ttl] = list(v)
+        if any(rx.search(ttl) for rx in extra) or _kw_hit(ttl):
+            if "POWR" in ttl.upper() or "VARS" in ttl.upper():
+                continue          # single tie / grid-side flows: the POI total covers them
+            nm, vals = _generic(ttl, v)
+            if nm not in out:
+                out[nm] = vals
     # Delivered INTO the POI: a 'P' tie (metered leaving the POI) is turned
     # round, an 'F' tie (metered into the POI) is taken as it is.
     for lst, nm, u in ((poip, "P", "MW"), (poiq, "Q", "MVAr")):
@@ -367,11 +414,16 @@ def _extract(t, ids, data):
             poi = lst[0][0]
             n = len(t)
             tot = [0.0] * n
-            for _b, d, v in lst:
+            for _b, d, _pl, v in lst:
                 sg = -1.0 if d == "P" else 1.0
                 for i in range(min(n, len(v))):
                     tot[i] += sg * v[i]
             out["POI %s %s (%s)" % (poi, "active power" if nm == "P" else "reactive power", u)] = tot
+            if len(lst) > 1:
+                for _b, d, _pl, v in lst:
+                    sg = -1.0 if d == "P" else 1.0
+                    out["POI %s tie from %s %s (%s)" % (poi, _pl, "active power" if nm == "P" else "reactive power", u)] = \
+                        [sg * x for x in v[:n]]
     return t, out
 
 
@@ -382,7 +434,8 @@ def _read_cached(dyntools, path, ci):
         return _read(dyntools, path)
     import pickle
     st = os.stat(path)
-    key = "v4|%s|%d|%d|%s|%s|%s" % (os.path.abspath(path), st.st_size, int(st.st_mtime),
+    key = "v5|%s|%s|%d|%d|%s|%s|%s" % (",".join(CHANNEL_KEYWORDS or []),
+                                       os.path.abspath(path), st.st_size, int(st.st_mtime),
                                  INCLUDE_SGF_UNITS, INCLUDE_EGF_UNITS, "|".join(EXTRA_TITLE_REGEX))
     cdir = os.path.join(_abs(OUT_DIR), "cache")
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.relpath(os.path.abspath(path), ROOT)) + ".pkl"
@@ -538,11 +591,14 @@ def _panel_on(name):
     """PLOT_QUANTITIES / PLOT_GROUPS: is this panel wanted? The faulted-bus
        voltage is still READ (it finds the fault time) even when not drawn."""
     u = _ylabel(name)
-    qty = "V" if u.startswith("Voltage") else ("P" if u.startswith("P ") else ("Q" if u.startswith("Q ") else "OTHER"))
+    qty = ("V" if u.startswith("Voltage") else "P" if u.startswith("P ") else "Q" if u.startswith("Q ")
+           else "A" if u.startswith("Angle") else "S" if u.startswith("Speed") else "OTHER")
     if qty != "OTHER" and qty not in [str(x).upper() for x in (PLOT_QUANTITIES or [])]:
         return False
     grp = ("FAULT" if name.startswith("Faulted bus") else "POI" if name.startswith("POI")
-           else "SGF" if name.startswith("SGF") else "EGF" if name.startswith("EGF") else "OTHER")
+           else "SGF" if name.startswith("SGF") else "EGF" if name.startswith("EGF")
+           else "GEN" if (name.startswith("Gen ") or name.startswith("Swing"))
+           else "POI" if name.startswith("Bus ") else "OTHER")
     return grp == "OTHER" or grp in [str(x).upper() for x in (PLOT_GROUPS or [])]
 
 
@@ -550,6 +606,10 @@ def _ylabel(name):
     """'Voltage (pu)', 'P (MW)', 'Q (MVAr)' -- from the unit the panel name ends with."""
     m = re.search(r"\(([^()]*)\)\s*$", name)
     u = (m.group(1) if m else "").strip()
+    if u == "deg":
+        return "Angle (deg)"
+    if u == "pu speed":
+        return "Speed (pu)"
     if u == "pu":
         return "Voltage (pu)"
     if u == "MW":
@@ -560,13 +620,24 @@ def _ylabel(name):
 
 
 def _order(name):
-    """Faulted bus, POI V, POI P, POI Q, then the SGF units, then the EGF units."""
+    """Faulted bus, POI (V, P, Q, angle), SGF units, EGF units, other machines
+       (by bus, then angle / P / Q / terminal V / speed), then anything else."""
     if name.startswith("POI"):
-        return (1, 0 if "voltage" in name else (2 if "reactive" in name else 1), name)
-    for i, p in enumerate(("Faulted bus", "", "SGF", "EGF")):
-        if p and name.startswith(p):
-            return (i, 0, name)
-    return (9, 0, name)
+        _k = (0 if "voltage" in name else 3 if "angle" in name else (2 if "reactive" in name else 1))
+        return (1, _k + (10 if " tie " in name else 0), 0, name)
+    if name.startswith("Faulted bus"):
+        return (0, 1 if "angle" in name else 0, 0, name)
+    for i, p in ((2, "SGF"), (3, "EGF")):
+        if name.startswith(p):
+            return (i, 0, 0, name)
+    m = re.match(r"^Gen (\d+)", name)
+    if m:
+        k = next((j for j, w in enumerate(("angle", " P ", " Q ", "terminal", "speed")) if w in name), 9)
+        return (4, int(m.group(1)), k, name)
+    m = re.match(r"^Bus (\d+)", name)
+    if m:
+        return (5, int(m.group(1)), 1 if "angle" in name else 0, name)
+    return (9, 0, 0, name)
 
 
 def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
