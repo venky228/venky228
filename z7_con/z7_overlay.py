@@ -55,6 +55,8 @@ ALIGN_TO_FAULT = False                   # False = simulation time, as the study
 T_MIN, T_MAX = 0.0, 20.0                 # seconds shown; None = the whole record
 PANELS_PER_PAGE = 4
 MAX_POINTS = 4000                        # points per trace (thinned evenly above this)
+PLOT_QUANTITIES = ["V", "P", "Q"]        # which quantities: "V" voltage (pu), "P" (MW), "Q" (MVAr) -- e.g. ["V"] or ["P", "Q"]
+PLOT_GROUPS = ["FAULT", "POI", "SGF", "EGF"]   # which panels: faulted bus, POI, SGF units, EGF units -- e.g. ["POI"]
 INCLUDE_SGF_UNITS = True                 # per-unit SGF P / Q / ETERM
 INCLUDE_EGF_UNITS = True                 # per-unit EGF P / Q / ETERM
 EXTRA_TITLE_REGEX = []                   # more channels by .out title, e.g. [r"^GEN584713_PELEC$"]
@@ -495,6 +497,18 @@ def _where(name, fbus, bmap, dist):
     return "more than 40 nodes from fault bus %d%s" % (fbus, ar)
 
 
+def _panel_on(name):
+    """PLOT_QUANTITIES / PLOT_GROUPS: is this panel wanted? The faulted-bus
+       voltage is still READ (it finds the fault time) even when not drawn."""
+    u = _ylabel(name)
+    qty = "V" if u.startswith("Voltage") else ("P" if u.startswith("P ") else ("Q" if u.startswith("Q ") else "OTHER"))
+    if qty != "OTHER" and qty not in [str(x).upper() for x in (PLOT_QUANTITIES or [])]:
+        return False
+    grp = ("FAULT" if name.startswith("Faulted bus") else "POI" if name.startswith("POI")
+           else "SGF" if name.startswith("SGF") else "EGF" if name.startswith("EGF") else "OTHER")
+    return grp == "OTHER" or grp in [str(x).upper() for x in (PLOT_GROUPS or [])]
+
+
 def _ylabel(name):
     """'Voltage (pu)', 'P (MW)', 'Q (MVAr)' -- from the unit the panel name ends with."""
     m = re.search(r"\(([^()]*)\)\s*$", name)
@@ -560,8 +574,13 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                 new["EGF %d %s" % (egf_buses[n - 1], m.group(2))] = v
         traces[j] = (ci, t, new)
     panels = sorted(set(k for _c, _t, s in traces for k in s), key=_order)
+    panels = [k for k in panels if _panel_on(k)]
+    if not panels:
+        print("    %s: nothing left to draw with PLOT_QUANTITIES = %s, PLOT_GROUPS = %s"
+              % (fault, PLOT_QUANTITIES, PLOT_GROUPS))
+        return None
     bmap, fbus, dist = (_bus_map(dirs) if SHOW_NODES else None), None, {}
-    for k in panels:
+    for k in set(k for _c, _t, sg in traces for k in sg):      # before PLOT_GROUPS filtered it out
         m = re.match(r"^Faulted bus (\d+)", k)
         if m:
             fbus = int(m.group(1))
