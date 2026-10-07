@@ -843,6 +843,15 @@ NEW_PLANT = {
     #          GSUs and collector and nothing else (the POI is not held)
     #   "poi"  at the POI: it also covers the existing MPTs' and feeders' losses
     "q_zero_at": "own",
+    # connect = "egf_mpt" only -- ONE PLANT CONTROL FOR THE SGF AND THE EGF:
+    #   None   the SGF plant controller (REPCAU1) regulates as BESS_MODEL_TEMPLATE
+    #          has it (its own output, no branch monitored)
+    #   "egf"  each SGF unit's REPCAU1 takes the regulated bus and the monitored
+    #          branch of the EGF plant controller (REPCTA1 / REPCA1 / REPCAU1) on
+    #          the existing feeder it shares the MPT with, so both regulate the
+    #          SAME tie flow back to its pre-fault value. EGF .dyr untouched.
+    #   SPP_PPC_BRANCH in the environment (a SURPLUS_SCENARIOS "ppc_branch") wins.
+    "ppc_branch": None,
     # COLLECTOR SIZED FROM EACH FEEDER'S CAPACITY: set "collector": "auto" and
     # the equivalent R, X, B of every new feeder is worked out from its MW and
     # this cable data, by the standard equivalencing method (NREL / WECC
@@ -12360,6 +12369,85 @@ def _dyr_stamp():
                                  for e in rows) + _dyr_disable_stamp() + _egf_stamp())
 
 
+def _ppc_mode():
+    """"egf" when the SGF plant controller takes the EGF's control point
+       (NEW_PLANT["ppc_branch"], or SPP_PPC_BRANCH); "" otherwise. Only with
+       connect = "egf_mpt" -- on its own MPT and tie the SGF has no shared tie."""
+    try:
+        c = _np_cfg()
+    except Exception:
+        c = None
+    if not c or str(c.get("connect") or "poi").strip().lower() != "egf_mpt":
+        return ""
+    v = os.environ.get("SPP_PPC_BRANCH")
+    if v is None or not str(v).strip():
+        v = c.get("ppc_branch")
+    v = str(v or "").strip().lower()
+    return "egf" if v == "egf" else ""
+
+
+_PPC_MODELS = ("REPCTA1", "REPCA1", "REPCAU1", "REPCBU1")
+
+
+def _egf_ppc_points(deck_text, buses):
+    """{EGF machine bus: (reg bus, from, to, ckt)} -- the first four ICONs of
+       the plant controller record on each bus, read from the deck."""
+    want = set(int(b) for b in buses)
+    out = {}
+    recs, _labs = _dyr_records(deck_text)
+    for rec in recs:
+        m = _DYR_HEAD.match(_dyr_data_text(rec).strip())
+        if not m:
+            continue
+        try:
+            bus = int(str(m.group(1)).strip())
+        except ValueError:
+            continue
+        if bus not in want or bus in out:
+            continue
+        model, toks, n_icon = _dyr_split(m.group(2).strip(), m.group(4))
+        if model.upper().strip("'") not in _PPC_MODELS or len(toks) < 4:
+            continue
+        out[bus] = (model.upper(), toks[0], toks[1], toks[2], toks[3])
+    return out
+
+
+def _ppc_share_egf(add, members, deck_text):
+    """Point each SGF unit's REPCAU1 at its paired EGF controller's regulated bus
+       and monitored branch (ICONs 1-4). The pairing is by position: the build
+       lands SGF unit k on the MPT of existing feeder k."""
+    for _m in members:
+        sgf = [int(b) for b in (_m.get("feeders") or [])]
+        egf = [int(b) for b in (_m.get("feeders_original") or [])]
+        if not sgf or len(sgf) != len(egf):
+            raise RuntimeError("ppc_branch = \"egf\": %s has %d SGF unit(s) and %d existing "
+                               "feeder(s) -- they must pair one to one"
+                               % (_m.get("name"), len(sgf), len(egf)))
+        pts = _egf_ppc_points(deck_text, egf)
+        for s_bus, e_bus in zip(sgf, egf):
+            pt = pts.get(e_bus)
+            if not pt:
+                raise RuntimeError("ppc_branch = \"egf\": no plant controller (%s) on existing "
+                                   "machine bus %d in the deck, so SGF unit %d has nothing to "
+                                   "share" % ("/".join(_PPC_MODELS), e_bus, s_bus))
+            model, reg, frm, to, ck = pt
+            ckq = ck if ck.startswith("'") else "'%s'" % ck
+            rx = re.compile(r"(^[ \t]*%d\s+'USRMDL'\s+\S+\s+'REPCAU1'[^\n]*\n"
+                            r"(?:[ \t]*@![^\n]*\n)*)"
+                            r"([ \t]*)(\S+)(\s+)(\S+)(\s+)(\S+)(\s+)('[^']*'|\S+)" % s_bus, re.M)
+
+            def _sub(mm):
+                return (mm.group(1) + mm.group(2) + reg + mm.group(4) + frm + mm.group(6)
+                        + to + mm.group(8) + ckq)
+            add, n = rx.subn(_sub, add, count=1)
+            if not n:
+                raise RuntimeError("ppc_branch = \"egf\": the REPCAU1 record of SGF unit %d "
+                                   "was not found in the generated models" % s_bus)
+            print("  [ppc] SGF %d REPCAU1 <- EGF %d %s: regulated bus %s, monitored branch "
+                  "%s-%s %s" % (s_bus, e_bus, model, reg, frm, to, ckq))
+    return add
+
+
 def bess_combined_dyr(project, base_dyr):
     """Write <base>_with_BESS_<proj>.dyr = the ORIGINAL base .dyr (read only), optionally
        with the disabled gens' records stripped, plus this project's REGCAU1/REECAU1/REPCAU1
@@ -12388,6 +12476,8 @@ def bess_combined_dyr(project, base_dyr):
     for _m in members:
         add += _bess_dyr_text(_m)
         n_feed += len(_m["feeders"])
+    if _ppc_mode() == "egf":
+        add = _ppc_share_egf(add, members, base)
     with open(dst, "w") as fh:
         fh.write(base + add)
     n_per = add.count("'USRMDL'") + add.count("'REPCAU1'")
@@ -15807,7 +15897,8 @@ def _np_stamp():
         _col = _j.dumps([c.get("collector"), c.get("collector_cable"), c.get("gsu")], sort_keys=True)
     except Exception:
         _col = "?"
-    return " | newplant: connect=%s q0=%s col=%s" % (m, _np_q_zero_at(), _col)
+    return (" | newplant: connect=%s q0=%s col=%s" % (m, _np_q_zero_at(), _col)
+            + (" ppc=egf" if _ppc_mode() == "egf" else ""))
 
 
 def _poi_q_stamp():

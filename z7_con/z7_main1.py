@@ -795,6 +795,8 @@ SURPLUS_SCENARIOS = [
       "egf_off": True,  "poi_mw": None},
     # {"tag": "s3_sgfoff", "label": "EGF 100 % (Pmax), SGF off",
     #  "sgf_off": True, "poi_mw": None},
+    # {"tag": "s4_ppc", "label": "SGF + EGF, one plant control (shared tie)",
+    #  "ppc_branch": "egf", "poi_mw": None},
     # {"tag": "s2_poi_is", "label": "SGF 100 %, EGF set so POI = IS (600 MW)",
     #  "egf_off": False, "poi_mw": 600.0},
 ]
@@ -9850,6 +9852,7 @@ def surplus_scenarios():
                     "label": str(sc.get("label") or tag),
                     "egf_off": bool(sc.get("egf_off")),
                     "sgf_off": bool(sc.get("sgf_off")),
+                    "ppc_branch": (str(sc.get("ppc_branch") or "").strip().lower() or None),
                     "poi_mw": sc.get("poi_mw")})
     return out
 
@@ -9864,6 +9867,8 @@ def _surplus_env(sc):
            "SPP_DEFER_REPORTS": "0"}
     if sc.get("poi_mw") is not None:
         env["SPP_POI_P_TARGET"] = repr(float(sc["poi_mw"]))
+    if sc.get("ppc_branch"):
+        env["SPP_PPC_BRANCH"] = sc["ppc_branch"]      # SGF REPCAU1 on the EGF's control point
     return env
 
 
@@ -16175,6 +16180,7 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False,
     env.pop("SPP_EGF_DYR_EDITS", None)
     env.pop("SPP_EGF_OFF", None)
     env.pop("SPP_SGF_OFF", None)       # SGF-off / cap-bank runs only via extra_env
+    env.pop("SPP_PPC_BRANCH", None)
     env.pop("SPP_CAP_BANKS", None)
     if extra_env:
         env.update(extra_env)
@@ -16506,6 +16512,7 @@ def build_all_savs():
         env.pop("SPP_EGF_OFF", None)
         env.pop("SPP_SGF_OFF", None)
         env.pop("SPP_CAP_BANKS", None)
+        env.pop("SPP_PPC_BRANCH", None)
         env.pop("SPP_RUN_TAG", None)
         env.update(extra)
         env["SPP_STUDY_DIR"] = case["dir"]
