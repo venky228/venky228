@@ -50,6 +50,7 @@ CASES = [
     ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#D55E00", "-.", 1.4),
 ]
 
+SHOW_END_VALUES = True                   # each panel's value at T_MAX per case, small, top right of the panel
 PDF_NAME = "{project}_{fault}.pdf"        # file name per fault, e.g. SantaFe_F01.pdf ({project}, {fault}, {mode})
 OUT_DIR = r"overlay_plots"               # under ROOT unless absolute
 ALIGN_TO_FAULT = False                   # False = simulation time, as the study plots | True = time from the fault (0 s = fault)
@@ -498,6 +499,22 @@ def _where(name, fbus, bmap, dist):
     return "more than 40 nodes from fault bus %d%s" % (fbus, ar)
 
 
+def _cap(text):
+    """First letter of every word in capitals; units in brackets left alone:
+       'POI 765911 voltage (pu)' -> 'POI 765911 Voltage (pu)'."""
+    out = []
+    for w in str(text).split(" "):
+        if w and not w.startswith("(") and w[0].islower():
+            w = w[0].upper() + w[1:]
+        out.append(w)
+    return " ".join(out)
+
+
+def _short(label):
+    """'Scenario 1: SGF + EGF (GIA)' -> 'Scenario 1'; 'Base case' stays."""
+    return str(label).split(":")[0].strip()
+
+
 def _panel_on(name):
     """PLOT_QUANTITIES / PLOT_GROUPS: is this panel wanted? The faulted-bus
        voltage is still READ (it finds the fault time) even when not drawn."""
@@ -596,9 +613,10 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
         for p0 in range(0, len(panels), PANELS_PER_PAGE):
             page = panels[p0:p0 + PANELS_PER_PAGE]
             fig, axes = plt.subplots(len(page), 1, figsize=(11.0, 8.5), squeeze=False)
-            fig.suptitle("%s  %s  --  base vs scenario 1 vs scenario 2   (%s)"
-                         % (proj, fault, have), fontsize=11, fontweight="bold")
+            fig.suptitle("%s  %s" % (proj, fault), fontsize=11, fontweight="bold", y=0.985)
+            legend = {}                     # case -> line, for the ONE legend at the top of the page
             for ax, name in zip(axes[:, 0], page):
+                ends = []
                 for ci, t, sig in traces:
                     v = sig.get(name)
                     if not v:
@@ -612,10 +630,11 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                             if t[_k] <= T_MAX:
                                 _ve = v[_k]
                                 break
-                    ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw,
-                            label="%s  (end %.3g)" % (lab, _ve))
+                    ln, = ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw)
+                    legend.setdefault(ci, ln)
+                    ends.append("%s %.3g" % (_cap(_short(lab)), _ve))
                 _w = _where(name, fbus, bmap, dist) if SHOW_NODES else ""
-                ax.set_title(name + (("   --  " + _w) if _w else ""), fontsize=9, loc="left")
+                ax.set_title(_cap(name + (("   --  " + _w) if _w else "")), fontsize=9, loc="left")
                 ax.grid(True, color="#d9d9d9", linewidth=0.6)
                 ax.tick_params(labelsize=8)
                 ax.set_ylabel(_ylabel(name), fontsize=8)
@@ -624,8 +643,15 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                     ax.set_xlim(left=T_MIN, right=T_MAX)
                 if ALIGN_TO_FAULT:
                     ax.axvline(0.0, color="#999999", linewidth=0.8, linestyle=":")
-                ax.legend(fontsize=7, loc="best", frameon=False)
-            fig.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.07, hspace=0.75)
+                if SHOW_END_VALUES and ends:
+                    ax.text(1.0, 1.02, "End:  " + "   ".join(ends), transform=ax.transAxes,
+                            ha="right", va="bottom", fontsize=7, color="#444444")
+            if legend:
+                order = sorted(legend)
+                fig.legend([legend[c] for c in order], [_cap(CASES[c][0]) for c in order],
+                           loc="upper center", bbox_to_anchor=(0.5, 0.955), ncol=len(order),
+                           fontsize=8, frameon=False, handlelength=3.5)
+            fig.subplots_adjust(left=0.08, right=0.98, top=0.89, bottom=0.07, hspace=0.75)
             pdf.savefig(fig)
             plt.close(fig)
     return pdf_path
