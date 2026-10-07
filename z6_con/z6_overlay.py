@@ -57,6 +57,7 @@ CASES = [
 
 PAGE_SUBTITLE = "Base Case vs Scenario 1 vs Scenario 2"   # right of the page title
 FOOTER_TEXT = "SPP Dynamic Stability Study -- Surplus Interconnection"   # bottom left of every page
+FAULT_LINE = True                        # thin red dotted line at the fault instant (no label); False = none
 SHOW_END_VALUES = False                   # each panel's value at T_MAX per case, small, top right of the panel
 PDF_NAME = "{project}_{fault}.pdf"        # file name per fault, e.g. SantaFe_F01.pdf ({project}, {fault}, {mode})
 OUT_DIR = r"overlay_plots"               # under ROOT unless absolute
@@ -700,10 +701,8 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                 if T_MIN is not None or T_MAX is not None:
                     ax.set_xlim(left=T_MIN, right=T_MAX)
                 ax.margins(y=0.08)
-                if fault_t[0] is not None:
+                if FAULT_LINE and fault_t[0] is not None:
                     ax.axvline(fault_t[0], color="#C92A2A", linewidth=0.9, linestyle=":", zorder=1)
-                    ax.text(fault_t[0], 1.0, " fault", transform=ax.get_xaxis_transform(),
-                            fontsize=7, color="#C92A2A", ha="left", va="top")
             # ---- one legend for the page ----
             if legend:
                 order = sorted(legend)
