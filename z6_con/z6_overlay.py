@@ -369,7 +369,7 @@ def _extract(t, ids, data):
                 sg = -1.0 if d == "P" else 1.0
                 for i in range(min(n, len(v))):
                     tot[i] += sg * v[i]
-            out["POI %s %s delivered, sum of %d tie(s) (%s)" % (poi, nm, len(lst), u)] = tot
+            out["POI %s %s (%s)" % (poi, "power" if nm == "P" else "reactive power", u)] = tot
     return t, out
 
 
@@ -380,7 +380,7 @@ def _read_cached(dyntools, path, ci):
         return _read(dyntools, path)
     import pickle
     st = os.stat(path)
-    key = "v2|%s|%d|%d|%s|%s|%s" % (os.path.abspath(path), st.st_size, int(st.st_mtime),
+    key = "v3|%s|%d|%d|%s|%s|%s" % (os.path.abspath(path), st.st_size, int(st.st_mtime),
                                  INCLUDE_SGF_UNITS, INCLUDE_EGF_UNITS, "|".join(EXTRA_TITLE_REGEX))
     cdir = os.path.join(_abs(OUT_DIR), "cache")
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.relpath(os.path.abspath(path), ROOT)) + ".pkl"
@@ -560,7 +560,7 @@ def _ylabel(name):
 def _order(name):
     """Faulted bus, POI V, POI P, POI Q, then the SGF units, then the EGF units."""
     if name.startswith("POI"):
-        return (1, 0 if "voltage" in name else (1 if " P " in name else 2), name)
+        return (1, 0 if "voltage" in name else (2 if "reactive" in name else 1), name)
     for i, p in enumerate(("Faulted bus", "", "SGF", "EGF")):
         if p and name.startswith(p):
             return (i, 0, name)
