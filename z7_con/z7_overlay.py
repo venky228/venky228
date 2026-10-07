@@ -96,10 +96,19 @@ def _abs(p):
 
 
 def _case_dir(res_root, proj, suffix):
+    """ONLY <results root>\<project>\<project>_<mode><suffix>, or the same folder
+       directly under the results root. Nothing else is searched: a backup or
+       any other folder beside the project's (results_base_f\backup\..., an
+       old copy, another project) is never read."""
     name = "%s_%s%s" % (proj, MODE, suffix)
-    for d in (os.path.join(_abs(res_root), proj, name), os.path.join(_abs(res_root), name)):
-        if os.path.isdir(d):
-            return d
+    root = _abs(res_root)
+    for d in (os.path.join(root, proj, name), os.path.join(root, name)):
+        if not os.path.isdir(d):
+            continue
+        rel = os.path.relpath(d, root).split(os.sep)
+        if rel not in ([proj, name], [name]):
+            continue
+        return d
     return None
 
 
