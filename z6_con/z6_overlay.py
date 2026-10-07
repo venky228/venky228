@@ -44,12 +44,18 @@ FAULTS = []                              # [] = every fault with an .out in Scen
 # The three runs: label, results root (under ROOT), folder suffix, colour, style, width.
 # Folder = <results root>\<project>\<project>_<mode><suffix>  (or without the
 # <project>\ level -- both layouts are searched).
+# Styles are chosen to stay readable when the traces lie on top of each other:
+# the base case is a wide grey band underneath, scenario 1 a solid blue line on
+# it, scenario 2 an orange dashed line on top -- all three remain visible.
+# (label, results root, folder suffix, colour, line style, width, opacity)
 CASES = [
-    ("Base case",                          r"Base\results_base_f",     "",           "#000000", "--", 1.6),
-    ("Scenario 1: SGF + EGF (GIA)",        r"Projects\results_proj_f", "",           "#0072B2", "-",  1.4),
-    ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#D55E00", "-.", 1.4),
+    ("Base case",                          r"Base\results_base_f",     "",           "#8C8C8C", "-",  4.0, 0.55),
+    ("Scenario 1: SGF + EGF (GIA)",        r"Projects\results_proj_f", "",           "#1F5AA6", "-",  1.5, 1.0),
+    ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#E8590C", "--", 1.5, 1.0),
 ]
 
+PAGE_SUBTITLE = "Base Case vs Scenario 1 vs Scenario 2"   # right of the page title
+FOOTER_TEXT = "SPP Dynamic Stability Study -- Surplus Interconnection"   # bottom left of every page
 SHOW_END_VALUES = True                   # each panel's value at T_MAX per case, small, top right of the panel
 PDF_NAME = "{project}_{fault}.pdf"        # file name per fault, e.g. SantaFe_F01.pdf ({project}, {fault}, {mode})
 OUT_DIR = r"overlay_plots"               # under ROOT unless absolute
@@ -510,6 +516,17 @@ def _cap(text):
     return " ".join(out)
 
 
+def _fmt_end(v):
+    """An end value to a sensible number of digits for its size."""
+    try:
+        a = abs(float(v))
+    except Exception:
+        return str(v)
+    if a != a:
+        return "n/a"
+    return ("%.0f" % v) if a >= 100 else (("%.1f" % v) if a >= 10 else "%.3f" % v)
+
+
 def _short(label):
     """'Scenario 1: SGF + EGF (GIA)' -> 'Scenario 1'; 'Base case' stays."""
     return str(label).split(":")[0].strip()
@@ -552,6 +569,7 @@ def _order(name):
 
 def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     traces = []                   # (case index, t, {panel: values})
+    fault_t = [None]              # fault instant on the plotted time axis
     for ci, d in enumerate(dirs):
         if not d:
             continue
@@ -564,11 +582,13 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
         except Exception as e:
             print("    %-30s %s: could not read (%s)" % (CASES[ci][0], fault, e))
             continue
-        if ALIGN_TO_FAULT:
-            tf = _fault_time(t, sig)
-            if tf is not None:
-                t = [x - tf for x in t]
+        tf = _fault_time(t, sig)
+        if ALIGN_TO_FAULT and tf is not None:
+            t = [x - tf for x in t]
+            tf = 0.0
         traces.append((ci, t, sig))
+        if fault_t[0] is None and tf is not None:
+            fault_t[0] = tf
     if not traces:
         print("    %s: no case has an .out -- skipped" % fault)
         return None
@@ -609,12 +629,19 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
         os.makedirs(out_dir)
     pdf_path = os.path.join(out_dir, PDF_NAME.format(project=proj, fault=fault, mode=MODE))
     have = ", ".join(CASES[c][0].split(":")[0] for c, _t, _s in traces)
+    n_pages = (len(panels) + PANELS_PER_PAGE - 1) // PANELS_PER_PAGE
+    stamp = time.strftime("%Y-%m-%d")
     with PdfPages(pdf_path) as pdf:
-        for p0 in range(0, len(panels), PANELS_PER_PAGE):
+        for pg, p0 in enumerate(range(0, len(panels), PANELS_PER_PAGE), start=1):
             page = panels[p0:p0 + PANELS_PER_PAGE]
             fig, axes = plt.subplots(len(page), 1, figsize=(11.0, 8.5), squeeze=False)
-            fig.suptitle("%s  %s" % (proj, fault), fontsize=11, fontweight="bold", y=0.985)
-            legend = {}                     # case -> line, for the ONE legend at the top of the page
+            # ---- title bar ----
+            fig.text(0.06, 0.965, "%s  |  %s" % (proj, fault), fontsize=14, fontweight="bold",
+                     color="#1A1A1A", ha="left", va="center")
+            fig.text(0.94, 0.965, PAGE_SUBTITLE, fontsize=9, color="#555555", ha="right", va="center")
+            fig.add_artist(plt.Line2D([0.06, 0.94], [0.945, 0.945], transform=fig.transFigure,
+                                      color="#1F5AA6", linewidth=1.2))
+            legend = {}
             for ax, name in zip(axes[:, 0], page):
                 ends = []
                 for ci, t, sig in traces:
@@ -622,36 +649,66 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                     if not v:
                         continue
                     lab, col, ls, lw = CASES[ci][0], CASES[ci][3], CASES[ci][4], CASES[ci][5]
+                    al = CASES[ci][6] if len(CASES[ci]) > 6 else 1.0
                     tt, vv = _thin(t, v)
-                    # "end" = the last value shown (at T_MAX), not the end of the file
                     _ve = v[-1]
                     if T_MAX is not None:
                         for _k in range(min(len(t), len(v)) - 1, -1, -1):
                             if t[_k] <= T_MAX:
                                 _ve = v[_k]
                                 break
-                    ln, = ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw)
+                    _kw = {"dashes": (6, 3)} if ls == "--" else {}
+                    ln, = ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw, alpha=al,
+                                  zorder=2 + ci, solid_capstyle="round", **_kw)
                     legend.setdefault(ci, ln)
-                    ends.append("%s %.3g" % (_cap(_short(lab)), _ve))
+                    ends.append((col, "%s: %s" % (_cap(_short(lab)), _fmt_end(_ve))))
+                # ---- panel title: quantity in bold, where it is in grey ----
                 _w = _where(name, fbus, bmap, dist) if SHOW_NODES else ""
-                ax.set_title(_cap(name + (("   --  " + _w) if _w else "")), fontsize=9, loc="left")
-                ax.grid(True, color="#d9d9d9", linewidth=0.6)
-                ax.tick_params(labelsize=8)
-                ax.set_ylabel(_ylabel(name), fontsize=8)
-                ax.set_xlabel("Time from fault (s)" if ALIGN_TO_FAULT else "Time (s)", fontsize=8)
+                ax.set_title(_cap(name), fontsize=9.5, fontweight="bold", loc="left",
+                             color="#1A1A1A", pad=14)
+                if _w:
+                    ax.text(0.0, 1.015, _cap(_w), transform=ax.transAxes, fontsize=7.5,
+                            color="#666666", ha="left", va="bottom")
+                if SHOW_END_VALUES and ends:
+                    x = 1.0
+                    for col, txt in reversed(ends):
+                        t_ = ax.text(x, 1.015, txt, transform=ax.transAxes, fontsize=7.5,
+                                     color=col if col != "#8C8C8C" else "#555555",
+                                     ha="right", va="bottom", fontweight="bold")
+                        x -= 0.008 + 0.0068 * len(txt)
+                # ---- axes ----
+                for sp in ("top", "right"):
+                    ax.spines[sp].set_visible(False)
+                for sp in ("left", "bottom"):
+                    ax.spines[sp].set_color("#888888")
+                    ax.spines[sp].set_linewidth(0.8)
+                ax.grid(True, color="#E5E5E5", linewidth=0.6, zorder=0)
+                ax.set_axisbelow(True)
+                ax.tick_params(labelsize=8, colors="#333333", length=3)
+                ax.set_ylabel(_ylabel(name), fontsize=8.5, color="#333333")
+                ax.set_xlabel("Time from fault (s)" if ALIGN_TO_FAULT else "Time (s)",
+                              fontsize=8.5, color="#333333")
                 if T_MIN is not None or T_MAX is not None:
                     ax.set_xlim(left=T_MIN, right=T_MAX)
-                if ALIGN_TO_FAULT:
-                    ax.axvline(0.0, color="#999999", linewidth=0.8, linestyle=":")
-                if SHOW_END_VALUES and ends:
-                    ax.text(1.0, 1.02, "End:  " + "   ".join(ends), transform=ax.transAxes,
-                            ha="right", va="bottom", fontsize=7, color="#444444")
+                ax.margins(y=0.08)
+                if fault_t[0] is not None:
+                    ax.axvline(fault_t[0], color="#C92A2A", linewidth=0.9, linestyle=":", zorder=1)
+                    ax.text(fault_t[0], 1.0, " fault", transform=ax.get_xaxis_transform(),
+                            fontsize=7, color="#C92A2A", ha="left", va="top")
+            # ---- one legend for the page ----
             if legend:
                 order = sorted(legend)
-                fig.legend([legend[c] for c in order], [_cap(CASES[c][0]) for c in order],
-                           loc="upper center", bbox_to_anchor=(0.5, 0.955), ncol=len(order),
-                           fontsize=8, frameon=False, handlelength=3.5)
-            fig.subplots_adjust(left=0.08, right=0.98, top=0.89, bottom=0.07, hspace=0.75)
+                lg = fig.legend([legend[c] for c in order], [_cap(CASES[c][0]) for c in order],
+                                loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=len(order),
+                                fontsize=9, frameon=True, fancybox=False, edgecolor="#CCCCCC",
+                                handlelength=4.0, columnspacing=2.5, borderpad=0.6)
+                lg.get_frame().set_linewidth(0.8)
+            # ---- footer ----
+            fig.text(0.06, 0.015, "%s  |  %s  |  %s" % (FOOTER_TEXT, proj, fault),
+                     fontsize=7, color="#888888", ha="left", va="bottom")
+            fig.text(0.94, 0.015, "Page %d of %d   |   %s" % (pg, n_pages, stamp),
+                     fontsize=7, color="#888888", ha="right", va="bottom")
+            fig.subplots_adjust(left=0.08, right=0.97, top=0.865, bottom=0.075, hspace=0.95)
             pdf.savefig(fig)
             plt.close(fig)
     return pdf_path
