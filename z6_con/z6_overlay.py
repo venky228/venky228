@@ -37,7 +37,7 @@ import time
 #   SETTINGS
 # ============================================================================
 ROOT = r"C:\KV\ENGIE\CQ_MIT_f"          # the study folder holding Base\ and Projects\
-PROJECTS = ["SantaFe"]                   # ["SantaFe", "IronStar", "EmpirePrairie", "EastFork"]
+PROJECTS = ["SantaFe", "IronStar", "EmpirePrairie", "EastFork"]   # all 4 (remove any you do not want)
 MODE = "spp"
 FAULTS = []                              # [] = every fault with an .out in Scenario 1 | e.g. ["F134", "F01"]
 
@@ -59,6 +59,9 @@ INCLUDE_SGF_UNITS = True                 # per-unit SGF P / Q / ETERM
 INCLUDE_EGF_UNITS = True                 # per-unit EGF P / Q / ETERM
 EXTRA_TITLE_REGEX = []                   # more channels by .out title, e.g. [r"^GEN584713_PELEC$"]
 SBASE_MVA = 100.0                        # machine PELEC / QELEC are pu on the system base
+WORKERS = 4                              # faults drawn at once, each in its own process (1 = one at a time)
+USE_CACHE = True                         # keep each .out's traces in <OUT_DIR>\cache: a re-run only reads new / changed .out files
+STATUS_FILE = "OVERLAY_STATUS.txt"       # live progress, in OUT_DIR ("" = off)
 SHOW_NODES = True                        # "N nodes from fault bus, area" on each panel (from flags\BUS_MAP.csv)
 SGF_UNIT_BUS_START = 999001              # SGF unit n is bus SGF_UNIT_BUS_START + n - 1 (NEW_PLANT "bus_start")
 PSSE_DIRS = [r"C:\Program Files (x86)\PTI\PSSE34\PSSPY34",
@@ -196,6 +199,39 @@ def _read(dyntools, path):
     return t, out
 
 
+def _read_cached(dyntools, path, ci):
+    """_read(), kept in <OUT_DIR>\cache keyed by the .out's size and time, so a
+       second run with other plot settings reads nothing it already has."""
+    if not USE_CACHE:
+        return _read(dyntools, path)
+    import pickle
+    st = os.stat(path)
+    key = "%s|%d|%d|%s|%s|%s" % (os.path.abspath(path), st.st_size, int(st.st_mtime),
+                                 INCLUDE_SGF_UNITS, INCLUDE_EGF_UNITS, "|".join(EXTRA_TITLE_REGEX))
+    cdir = os.path.join(_abs(OUT_DIR), "cache")
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.relpath(os.path.abspath(path), ROOT)) + ".pkl"
+    cp = os.path.join(cdir, name)
+    try:
+        with open(cp, "rb") as fh:
+            k, t, sig = pickle.load(fh)
+        if k == key:
+            return t, sig
+    except Exception:
+        pass
+    t, sig = _read(dyntools, path)
+    try:
+        if not os.path.isdir(cdir):
+            os.makedirs(cdir)
+        with open(cp + ".tmp", "wb") as fh:
+            pickle.dump((key, t, sig), fh, protocol=2)
+        if os.path.exists(cp):
+            os.remove(cp)
+        os.rename(cp + ".tmp", cp)
+    except Exception:
+        pass
+    return t, sig
+
+
 def _fault_time(t, sig):
     """First instant the faulted-bus voltage drops below 90 % of its start."""
     for k, v in sig.items():
@@ -315,7 +351,7 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
             print("    %-30s %s: no .out" % (CASES[ci][0], fault))
             continue
         try:
-            t, sig = _read(dyntools, p)
+            t, sig = _read_cached(dyntools, p, ci)
         except Exception as e:
             print("    %-30s %s: could not read (%s)" % (CASES[ci][0], fault, e))
             continue
@@ -372,18 +408,60 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     return pdf_path
 
 
+_W = {}                       # per worker process: dyntools, plt, PdfPages
+
+
+def _worker_init():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    _W["plt"], _W["PdfPages"] = plt, PdfPages
+    _W["dyntools"] = _import_dyntools()
+
+
+def _job(args):
+    """One fault: read its three .out files and write its PDF. Runs in a worker."""
+    proj, fault, dirs = args
+    t0 = time.time()
+    try:
+        if not _W:
+            _worker_init()
+        p = draw_fault(proj, fault, dirs, _W["dyntools"], _W["plt"], _W["PdfPages"])
+        return proj, fault, p, time.time() - t0, ""
+    except Exception as e:
+        return proj, fault, None, time.time() - t0, str(e)
+
+
+def _hms(sec):
+    sec = int(round(sec))
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return ("%dh %02dm" % (h, m)) if h else (("%dm %02ds" % (m, s)) if m else "%ds" % s)
+
+
+def _status(lines):
+    if not STATUS_FILE:
+        return
+    try:
+        d = _abs(OUT_DIR)
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        with open(os.path.join(d, STATUS_FILE), "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
 def main():
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
+        import matplotlib  # noqa: F401
     except Exception as e:
         raise SystemExit("matplotlib is needed (%s):  \"%s\" -m pip install matplotlib"
                          % (e, sys.executable))
-    dyntools = _import_dyntools()
+    _import_dyntools()            # fail here, once, rather than in every worker
     t0 = time.time()
-    n = 0
+    jobs = []
     for proj in PROJECTS:
         dirs = [_case_dir(c[1], proj, c[2]) for c in CASES]
         print("")
@@ -392,13 +470,52 @@ def main():
             print("    %-30s %s" % (c[0], d or "*** folder not found ***"))
         faults = _faults(dirs)
         print("    %d fault(s)" % len(faults))
-        for f in faults:
-            p = draw_fault(proj, f, dirs, dyntools, plt, PdfPages)
-            if p:
-                n += 1
-                print("    %-8s -> %s" % (f, p))
+        jobs.extend((proj, f, dirs) for f in faults)
+    total = len(jobs)
+    nw = max(1, min(int(WORKERS or 1), total or 1))
     print("")
-    print("[overlay] %d PDF(s) in %s  (%.0f s)" % (n, _abs(OUT_DIR), time.time() - t0))
+    print("[overlay] %d fault(s), %d worker(s)%s -- status: %s"
+          % (total, nw, ", cache on" if USE_CACHE else "",
+             os.path.join(_abs(OUT_DIR), STATUS_FILE) if STATUS_FILE else "console only"))
+    done, ok, fails, rows = 0, 0, [], []
+
+    if nw == 1:
+        it = (_job(j) for j in jobs)
+        pool = None
+    else:
+        import multiprocessing
+        pool = multiprocessing.Pool(nw, initializer=_worker_init)
+        it = pool.imap_unordered(_job, jobs)
+    try:
+        for proj, fault, pdf, sec, err in it:
+            done += 1
+            if pdf:
+                ok += 1
+            else:
+                fails.append("%s %s%s" % (proj, fault, (": " + err) if err else ""))
+            el = time.time() - t0
+            eta = el / done * (total - done)
+            bar = "#" * int(30 * done / max(1, total))
+            line = ("[overlay] [%-30s] %d/%d  %s %-8s %s  (%s)  elapsed %s  ETA %s"
+                    % (bar, done, total, proj, fault, "OK" if pdf else "FAILED",
+                       _hms(sec), _hms(el), _hms(eta)))
+            print(line)
+            sys.stdout.flush()
+            rows.append("%-14s %-8s %-7s %8s  %s" % (proj, fault, "OK" if pdf else "FAILED",
+                                                    _hms(sec), pdf or err or ""))
+            _status(["OVERLAY PLOTS -- %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+                     "progress  %d / %d done (%d OK, %d failed), %d worker(s)"
+                     % (done, total, ok, len(fails), nw),
+                     "elapsed   %s   ETA %s" % (_hms(el), _hms(eta)),
+                     "-" * 90] + rows)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+    print("")
+    print("[overlay] %d PDF(s) in %s  (%s)" % (ok, _abs(OUT_DIR), _hms(time.time() - t0)))
+    for f in fails:
+        print("[overlay]   not drawn: %s" % f)
 
 
 if __name__ == "__main__":
