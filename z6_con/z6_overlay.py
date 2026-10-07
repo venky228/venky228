@@ -64,9 +64,12 @@ OUT_DIR = r"overlay_plots"               # under ROOT unless absolute
 ALIGN_TO_FAULT = False                   # False = simulation time, as the study plots | True = time from the fault (0 s = fault)
 T_MIN, T_MAX = 0.0, 20.0                 # seconds shown; None = the whole record
 PANELS_PER_PAGE = 4
-MAX_POINTS = 4000                        # points per trace (thinned evenly above this)
+MAX_POINTS = 800                        # points per trace; above this each block keeps its min AND max,
+                                         #   so spikes survive (smaller PDFs; 4000 = finer, bigger files)
 CHANNEL_KEYWORDS = ["PROJ", "POI", "FLT", "GEN"]   # every channel whose title holds one of these is drawn --
                                          #   the study PDFs' own set (INDIVIDUAL_KEYWORDS); [] = only the panels below
+GEN_NEAR_HOPS = 3                        # other machines ("Gen ..." panels): only those within this many buses of the fault
+GEN_MAX = 8                              # ... and at most this many of them, nearest first (0 = no other machines)
 PLOT_QUANTITIES = ["V", "P", "Q", "A", "S"]   # "V" voltage (pu), "P" (MW), "Q" (MVAr), "A" angle (deg), "S" speed (pu)
 PLOT_GROUPS = ["FAULT", "POI", "SGF", "EGF", "GEN"]   # faulted bus, POI, SGF units, EGF units, other machines
 INCLUDE_SGF_UNITS = True                 # per-unit SGF P / Q / ETERM
@@ -473,11 +476,34 @@ def _fault_time(t, sig):
 
 
 def _thin(t, v):
+    """At most MAX_POINTS points, keeping each block's lowest and highest
+       sample in time order -- a fault dip or a spike is never thinned away."""
     n = min(len(t), len(v))
-    if MAX_POINTS and n > MAX_POINTS:
-        s = int(n / MAX_POINTS) + 1
-        return t[:n:s], v[:n:s]
-    return t[:n], v[:n]
+    if not MAX_POINTS or n <= MAX_POINTS:
+        return t[:n], v[:n]
+    if T_MIN is not None or T_MAX is not None:      # only what is shown
+        lo = 0
+        hi = n
+        while lo < n and T_MIN is not None and t[lo] < T_MIN:
+            lo += 1
+        while hi > lo and T_MAX is not None and t[hi - 1] > T_MAX:
+            hi -= 1
+        t, v, n = t[lo:hi], v[lo:hi], hi - lo
+        if n <= MAX_POINTS:
+            return t, v
+    b = max(1, int(2 * n / MAX_POINTS) + 1)         # samples per block; 2 points out per block
+    tt, vv = [], []
+    for i0 in range(0, n, b):
+        blk = range(i0, min(n, i0 + b))
+        ok = [i for i in blk if v[i] == v[i]]
+        if not ok:
+            tt.append(t[i0]); vv.append(float("nan"))
+            continue
+        imin = min(ok, key=lambda i: v[i])
+        imax = max(ok, key=lambda i: v[i])
+        for i in sorted(set((imin, imax))):
+            tt.append(t[i]); vv.append(v[i])
+    return tt, vv
 
 
 # ---- distance from the fault bus ------------------------------------------------
@@ -697,6 +723,17 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
             fbus = int(m.group(1))
     if bmap and fbus is not None:
         dist = _hops(bmap[0], fbus)
+    # OTHER MACHINES: the nearest few to the fault, as the study PDFs show them --
+    # the GEN keyword alone matches every machine recorded in the study areas
+    gbus = sorted(set(int(m.group(1)) for k in panels for m in [re.match(r"^Gen (\d+)", k)] if m))
+    if gbus:
+        if dist:
+            near = sorted((dist[b], b) for b in gbus if b in dist and dist[b] <= GEN_NEAR_HOPS)
+            keep = set(b for _d, b in near[:max(0, int(GEN_MAX or 0))])
+        else:
+            keep = set(gbus[:max(0, int(GEN_MAX or 0))])
+        panels = [k for k in panels
+                  if not (re.match(r"^Gen (\d+)", k) and int(re.match(r"^Gen (\d+)", k).group(1)) not in keep)]
     out_dir = _abs(OUT_DIR)
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
@@ -805,6 +842,12 @@ _W = {}                       # per worker process: dyntools, plt, PdfPages
 def _worker_init():
     import matplotlib
     matplotlib.use("Agg")
+    try:                                    # smaller PDFs, same look
+        matplotlib.rcParams["pdf.compression"] = 9
+        matplotlib.rcParams["path.simplify"] = True
+        matplotlib.rcParams["path.simplify_threshold"] = 0.5
+    except Exception:
+        pass
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
     _W["plt"], _W["PdfPages"] = plt, PdfPages
