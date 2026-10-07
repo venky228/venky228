@@ -14492,6 +14492,11 @@ def _poi_hold_area_after_solve(project, tries=None):
 
 def _sgf_off_machines(project, pairs, is_new):
     """SPP_SGF_OFF: the surplus machines OUT OF SERVICE (STATUS 0, not 0 MW)."""
+    # THE SGF IS THE NEW-BLOCK MACHINES. During a build in this process they are
+    # PROJECT_GENS themselves (is_new is then False), so the bus block decides.
+    lo, hi = _new_block_range()
+    if pairs and not is_new and lo and all(lo <= int(b) <= hi for b, _m in pairs):
+        is_new = True
     if not pairs or not is_new:
         raise RuntimeError("SPP_SGF_OFF: the surplus facility (%s* block) was not found "
                            "behind %s's POI, so it cannot be told apart from the existing "

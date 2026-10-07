@@ -25865,9 +25865,18 @@ def main():
                 print("[proj-off] the project-off run failed (%s) -- the comparison "
                       "above is unaffected" % e)
 
-    if _res_n and CAP_BANK_RUN and pipeline != "compare":
-        _cb_pj = _cap_bank_projects([r["project"] for r in _res_n])
-        for res in [r for r in _res_n if r["project"] in _cb_pj]:
+    # EVERY PANEL PROJECT, like the surplus scenarios: a cap-bank run is its own
+    # project-case study, so it runs whether or not the base side is on disk.
+    if CAP_BANK_RUN and pipeline != "compare":
+        _cb_runs = [r for r in _res_n]
+        for _cp in (list(_panel_projects() or []) or []):
+            if _cp in _egf_skip:
+                continue
+            for _cm in (list(MODES) or ["spp"]):
+                if not any(r["project"] == _cp and r["mode"] == _cm for r in _cb_runs):
+                    _cb_runs.append({"project": _cp, "mode": _cm})
+        _cb_pj = _cap_bank_projects(sorted(set(r["project"] for r in _cb_runs)))
+        for res in [r for r in _cb_runs if r["project"] in _cb_pj]:
             try:
                 rows = run_cap_bank(res["project"], res["mode"])
                 with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
