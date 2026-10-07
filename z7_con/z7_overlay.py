@@ -45,13 +45,14 @@ FAULTS = []                              # [] = every fault with an .out in Scen
 # Folder = <results root>\<project>\<project>_<mode><suffix>  (or without the
 # <project>\ level -- both layouts are searched).
 # Styles are chosen to stay readable when the traces lie on top of each other:
-# the base case is a thicker black line underneath, scenario 1 a thinner solid
-# blue line on it, scenario 2 an orange dashed line on top -- all three remain visible.
+# all three the same width: the base case solid black underneath, scenario 1
+# dashed blue on it, scenario 2 dash-dot orange on top -- where they coincide
+# the gaps in the upper lines let the lower ones show, so all three stay visible.
 # (label, results root, folder suffix, colour, line style, width, opacity)
 CASES = [
-    ("Base case",                          r"Base\results_base_f",     "",           "#000000", "-",  2.2, 1.0),
-    ("Scenario 1: SGF + EGF (GIA)",        r"Projects\results_proj_f", "",           "#1F5AA6", "-",  1.3, 1.0),
-    ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#E8590C", "--", 1.3, 1.0),
+    ("Base case",                          r"Base\results_base_f",     "",           "#000000", "-",  1.3, 1.0),
+    ("Scenario 1: SGF + EGF (GIA)",        r"Projects\results_proj_f", "",           "#1F5AA6", "--", 1.3, 1.0),
+    ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#E8590C", "-.", 1.3, 1.0),
 ]
 
 PAGE_SUBTITLE = "Base Case vs Scenario 1 vs Scenario 2"   # right of the page title
@@ -660,7 +661,8 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                             if t[_k] <= T_MAX:
                                 _ve = v[_k]
                                 break
-                    _kw = {"dashes": (6, 3)} if ls == "--" else {}
+                    _kw = ({"dashes": (6, 3)} if ls == "--" else
+                           ({"dashes": (8, 3, 2, 3)} if ls == "-." else {}))
                     ln, = ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw, alpha=al,
                                   zorder=2 + ci, **_kw)
                     legend.setdefault(ci, ln)
@@ -705,7 +707,7 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
             # ---- one legend for the page ----
             if legend:
                 order = sorted(legend)
-                _lk = dict(loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=len(order),
+                _lk = dict(loc="upper center", bbox_to_anchor=(0.5, 0.938), ncol=len(order),
                            fontsize=9, frameon=True, fancybox=False,
                            handlelength=4.0, columnspacing=2.5, borderpad=0.6)
                 lg = fig.legend([legend[c] for c in order], [_cap(CASES[c][0]) for c in order], **_lk)
@@ -719,7 +721,7 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                      fontsize=7, color="#888888", ha="left", va="bottom")
             fig.text(0.94, 0.015, "Page %d of %d   |   %s" % (pg, n_pages, stamp),
                      fontsize=7, color="#888888", ha="right", va="bottom")
-            fig.subplots_adjust(left=0.08, right=0.97, top=0.865, bottom=0.075, hspace=0.95)
+            fig.subplots_adjust(left=0.08, right=0.97, top=0.835, bottom=0.075, hspace=0.95)
             try:
                 pdf.savefig(fig)
             finally:
