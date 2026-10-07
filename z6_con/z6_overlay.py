@@ -45,18 +45,18 @@ FAULTS = []                              # [] = every fault with an .out in Scen
 # Folder = <results root>\<project>\<project>_<mode><suffix>  (or without the
 # <project>\ level -- both layouts are searched).
 # Styles are chosen to stay readable when the traces lie on top of each other:
-# the base case is a wide grey band underneath, scenario 1 a solid blue line on
-# it, scenario 2 an orange dashed line on top -- all three remain visible.
+# the base case is a thicker black line underneath, scenario 1 a thinner solid
+# blue line on it, scenario 2 an orange dashed line on top -- all three remain visible.
 # (label, results root, folder suffix, colour, line style, width, opacity)
 CASES = [
-    ("Base case",                          r"Base\results_base_f",     "",           "#8C8C8C", "-",  4.0, 0.55),
-    ("Scenario 1: SGF + EGF (GIA)",        r"Projects\results_proj_f", "",           "#1F5AA6", "-",  1.5, 1.0),
-    ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#E8590C", "--", 1.5, 1.0),
+    ("Base case",                          r"Base\results_base_f",     "",           "#000000", "-",  2.2, 1.0),
+    ("Scenario 1: SGF + EGF (GIA)",        r"Projects\results_proj_f", "",           "#1F5AA6", "-",  1.3, 1.0),
+    ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#E8590C", "--", 1.3, 1.0),
 ]
 
 PAGE_SUBTITLE = "Base Case vs Scenario 1 vs Scenario 2"   # right of the page title
 FOOTER_TEXT = "SPP Dynamic Stability Study -- Surplus Interconnection"   # bottom left of every page
-SHOW_END_VALUES = True                   # each panel's value at T_MAX per case, small, top right of the panel
+SHOW_END_VALUES = False                   # each panel's value at T_MAX per case, small, top right of the panel
 PDF_NAME = "{project}_{fault}.pdf"        # file name per fault, e.g. SantaFe_F01.pdf ({project}, {fault}, {mode})
 OUT_DIR = r"overlay_plots"               # under ROOT unless absolute
 ALIGN_TO_FAULT = False                   # False = simulation time, as the study plots | True = time from the fault (0 s = fault)
@@ -636,7 +636,7 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
             page = panels[p0:p0 + PANELS_PER_PAGE]
             fig, axes = plt.subplots(len(page), 1, figsize=(11.0, 8.5), squeeze=False)
             # ---- title bar ----
-            fig.text(0.06, 0.965, "%s  |  %s" % (proj, fault), fontsize=14, fontweight="bold",
+            fig.text(0.06, 0.965, "%s  |  %s" % (proj, fault), fontsize=14,
                      color="#1A1A1A", ha="left", va="center")
             fig.text(0.94, 0.965, PAGE_SUBTITLE, fontsize=9, color="#555555", ha="right", va="center")
             # the rule under the title -- fig.lines works on every matplotlib
@@ -662,16 +662,16 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                                 break
                     _kw = {"dashes": (6, 3)} if ls == "--" else {}
                     ln, = ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw, alpha=al,
-                                  zorder=2 + ci, solid_capstyle="round", **_kw)
+                                  zorder=2 + ci, **_kw)
                     legend.setdefault(ci, ln)
                     ends.append((col, "%s: %s" % (_cap(_short(lab)), _fmt_end(_ve))))
                 # ---- panel title: quantity in bold, where it is in grey ----
                 _w = _where(name, fbus, bmap, dist) if SHOW_NODES else ""
                 try:
-                    ax.set_title(_cap(name), fontsize=9.5, fontweight="bold", loc="left",
+                    ax.set_title(_cap(name), fontsize=9.5, loc="left",
                                  color="#1A1A1A", pad=14)
                 except (TypeError, AttributeError):      # matplotlib before 2.0: no pad
-                    ax.set_title(_cap(name) + "\n", fontsize=9.5, fontweight="bold",
+                    ax.set_title(_cap(name) + "\n", fontsize=9.5,
                                  loc="left", color="#1A1A1A")
                 if _w:
                     ax.text(0.0, 1.015, _cap(_w), transform=ax.transAxes, fontsize=7.5,
@@ -681,7 +681,7 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                     for col, txt in reversed(ends):
                         t_ = ax.text(x, 1.015, txt, transform=ax.transAxes, fontsize=7.5,
                                      color=col if col != "#8C8C8C" else "#555555",
-                                     ha="right", va="bottom", fontweight="bold")
+                                     ha="right", va="bottom")
                         x -= 0.008 + 0.0068 * len(txt)
                 # ---- axes ----
                 for sp in ("top", "right"):
