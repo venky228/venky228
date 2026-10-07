@@ -159,7 +159,7 @@ _RX_EGF = re.compile(r"^XGEN(\d+)(?:_(\w{1,2}))?_(PELEC|QELEC|ETERM|SPD|SPEED|AN
 # the panels the study PDFs draw ALWAYS (its _plot_always), whatever the keywords say
 _RX_ALWAYS = re.compile(r"^(PROJ\d|POI(?![A-Z])|NPGEN|PBUS|XGEN|FLT|SWING)", re.I)
 _QTY = {"PELEC": ("P", "MW"), "QELEC": ("Q", "MVAr"), "ETERM": ("terminal V", "pu"),
-        "SPD": ("speed deviation", "pu speed"), "SPEED": ("speed deviation", "pu speed"),
+        "SPD": ("speed deviation", "pu"), "SPEED": ("speed deviation", "pu"),
         "ANGL": ("angle", "deg")}
 
 
@@ -297,8 +297,8 @@ def _fast_read(path):
 _RX_GEN = re.compile(r"^(?:NP)?GEN(\d+)(?:_(\w{1,2}))?_(ANGL|PELEC|QELEC|ETERM|SPD|SPEED)$", re.I)
 _RX_BUSQ = re.compile(r"^(PBUS|POI|FLT) ?(\d+) (V|ANG)$", re.I)
 _GEN_QTY = {"ANGL": ("angle", "deg", 1.0), "PELEC": ("P", "MW", None), "QELEC": ("Q", "MVAr", None),
-            "ETERM": ("terminal V", "pu", 1.0), "SPD": ("speed deviation", "pu speed", 1.0),
-            "SPEED": ("speed deviation", "pu speed", 1.0)}
+            "ETERM": ("terminal V", "pu", 1.0), "SPD": ("speed deviation", "pu", 1.0),
+            "SPEED": ("speed deviation", "pu", 1.0)}
 
 
 def _generic(ttl, v):
@@ -608,7 +608,7 @@ def _ylabel(name):
     u = (m.group(1) if m else "").strip()
     if u == "deg":
         return "Angle (deg)"
-    if u == "pu speed":
+    if u == "pu" and "speed" in name.lower():
         return "Speed (pu)"
     if u == "pu":
         return "Voltage (pu)"
