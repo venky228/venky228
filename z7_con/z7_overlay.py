@@ -59,6 +59,8 @@ INCLUDE_SGF_UNITS = True                 # per-unit SGF P / Q / ETERM
 INCLUDE_EGF_UNITS = True                 # per-unit EGF P / Q / ETERM
 EXTRA_TITLE_REGEX = []                   # more channels by .out title, e.g. [r"^GEN584713_PELEC$"]
 SBASE_MVA = 100.0                        # machine PELEC / QELEC are pu on the system base
+SHOW_NODES = True                        # "N nodes from fault bus, area" on each panel (from flags\BUS_MAP.csv)
+SGF_UNIT_BUS_START = 999001              # SGF unit n is bus SGF_UNIT_BUS_START + n - 1 (NEW_PLANT "bus_start")
 PSSE_DIRS = [r"C:\Program Files (x86)\PTI\PSSE34\PSSPY34",
              r"C:\Program Files (x86)\PTI\PSSE34\PSSBIN",
              r"C:\Program Files\PTI\PSSE34\PSSPY34",
@@ -204,6 +206,86 @@ def _thin(t, v):
     return t[:n], v[:n]
 
 
+# ---- distance from the fault bus ------------------------------------------------
+def _bus_map(dirs):
+    """(adjacency, {bus: (kV, area, name)}, {area: name}) from the first
+       flags\BUS_MAP.csv found -- Scenario 1 first, since it also holds the
+       SGF buses. The branches are the PRE-fault network, as in the study PDFs."""
+    for d in dirs[1:] + dirs[:1]:
+        if not d:
+            continue
+        p = os.path.join(d, "flags", "BUS_MAP.csv")
+        if not os.path.isfile(p):
+            continue
+        adj, bus, area = {}, {}, {}
+        with open(p) as fh:
+            for ln in fh:
+                f = ln.rstrip("\r\n").split(",")
+                try:
+                    if f[0] == "B" and len(f) >= 4:
+                        bus[int(f[1])] = (float(f[2]), f[3], ",".join(f[4:]).strip())
+                    elif f[0] == "A" and len(f) >= 3:
+                        area[f[1]] = ",".join(f[2:]).strip()
+                    elif f[0] == "L" and len(f) >= 3:
+                        a, b = int(f[1]), int(f[2])
+                        adj.setdefault(a, set()).add(b)
+                        adj.setdefault(b, set()).add(a)
+                except ValueError:
+                    continue
+        return adj, bus, area
+    return None
+
+
+def _hops(adj, src, limit=40):
+    dist, frontier = {src: 0}, [src]
+    for k in range(1, limit + 1):
+        nxt = []
+        for x in frontier:
+            for y in adj.get(x, ()):
+                if y not in dist:
+                    dist[y] = k
+                    nxt.append(y)
+        if not nxt:
+            break
+        frontier = nxt
+    return dist
+
+
+def _panel_bus(name):
+    m = re.match(r"^(?:Faulted bus|POI) (\d+)", name)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"^SGF unit (\d+) ", name)
+    if m:
+        return SGF_UNIT_BUS_START + int(m.group(1)) - 1
+    m = re.match(r"^EGF (\d+)", name)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d{4,6})", name)
+    return int(m.group(1)) if m else None
+
+
+def _where(name, fbus, bmap, dist):
+    """'1 node from fault bus 531469, AREA 534 SUNC' -- as the study PDFs say it."""
+    b = _panel_bus(name)
+    if b is None or bmap is None:
+        return ""
+    _adj, bus, area = bmap
+    ar = ""
+    if b in bus:
+        an = bus[b][1]
+        ar = ", AREA %s %s" % (an, area.get(an, "")) if an else ""
+        ar = ar.rstrip()
+    if fbus is None:
+        return ar.lstrip(", ")
+    if b == fbus:
+        return "at fault bus%s" % ar
+    if b in dist:
+        n = dist[b]
+        return "%d node%s from fault bus %d%s" % (n, "" if n == 1 else "s", fbus, ar)
+    return "more than 40 nodes from fault bus %d%s" % (fbus, ar)
+
+
 def _order(name):
     """Faulted bus, POI V, POI P, POI Q, then the SGF units, then the EGF units."""
     if name.startswith("POI"):
@@ -237,6 +319,13 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
         print("    %s: no case has an .out -- skipped" % fault)
         return None
     panels = sorted(set(k for _c, _t, s in traces for k in s), key=_order)
+    bmap, fbus, dist = (_bus_map(dirs) if SHOW_NODES else None), None, {}
+    for k in panels:
+        m = re.match(r"^Faulted bus (\d+)", k)
+        if m:
+            fbus = int(m.group(1))
+    if bmap and fbus is not None:
+        dist = _hops(bmap[0], fbus)
     out_dir = _abs(OUT_DIR)
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
@@ -257,7 +346,8 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                     tt, vv = _thin(t, v)
                     ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw,
                             label="%s  (end %.3g)" % (lab, v[-1]))
-                ax.set_title(name, fontsize=9, loc="left")
+                _w = _where(name, fbus, bmap, dist) if SHOW_NODES else ""
+                ax.set_title(name + (("   --  " + _w) if _w else ""), fontsize=9, loc="left")
                 ax.grid(True, color="#d9d9d9", linewidth=0.6)
                 ax.tick_params(labelsize=8)
                 if T_MIN is not None or T_MAX is not None:
