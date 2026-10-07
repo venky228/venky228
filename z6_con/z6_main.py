@@ -793,6 +793,8 @@ NEW_PLANT = {
 SURPLUS_SCENARIOS = [
      {"tag": "s1_egfoff", "label": "SGF 100 %, EGF off",
       "egf_off": True,  "poi_mw": None},
+    # {"tag": "s3_sgfoff", "label": "EGF 100 % (Pmax), SGF off",
+    #  "sgf_off": True, "poi_mw": None},
     # {"tag": "s2_poi_is", "label": "SGF 100 %, EGF set so POI = IS (600 MW)",
     #  "egf_off": False, "poi_mw": 600.0},
 ]
@@ -803,6 +805,17 @@ SWEEP_AT_CAPACITY_LEVELS = True              # repeat sweeps at every level
 PROJECT_OFF_RUN = False                      # True = extra study with the project machines off
 PROJECT_OFF_PROJECTS = []                    # [] = every project
 PROJECT_OFF_COMPARE = False
+# CAP_BANK_RUN: extra study of the PROJECT case with capacitor banks added (own
+# folder <proj>_<mode>_cbank, compared with the base; the main results are not touched).
+# "bus": a bus number or "poi"; "mvar" at 1.0 pu; "fixed" = in service from the power
+# flow | "switched" = IN after the final clearing once V < v_on for delay_s, OUT once
+# V > v_off for delay_s.
+CAP_BANK_RUN = False                         # True = run the cap-bank study for the projects below
+CAP_BANK_COMPARE = True                      # full comparison of it against the base
+CAP_BANKS = {
+    # "SantaFe": [{"bus": "poi", "mvar": 100.0, "mode": "switched",
+    #              "v_on": 0.90, "v_off": 1.10, "delay_s": 0.10}],
+}
 
 # QUICK_DYR_TEST: ONLY the sweep simulates. The EGF-off base run and the surplus
 # runs launch into EXISTING folders, and so would the "missing" fill-in; at other
@@ -814,6 +827,7 @@ if QUICK_DYR_TEST:
     SURPLUS_SCENARIOS = []
     NEW_PLANT_RUN = False
     PROJECT_OFF_RUN = False
+    CAP_BANK_RUN = False
     CAPACITY_LEVELS = []
     POI_P_LEVELS = []
     POI_P_LEVELS_PCT = []
@@ -9828,9 +9842,14 @@ def surplus_scenarios():
         if not tag:
             print("[surplus] SURPLUS_SCENARIOS[%d] has no tag -- skipped" % i)
             continue
+        if sc.get("egf_off") and sc.get("sgf_off"):
+            print("[surplus] SURPLUS_SCENARIOS[%d] (%s) has egf_off AND sgf_off -- "
+                  "that leaves no plant; skipped" % (i, tag))
+            continue
         out.append({"tag": tag,
                     "label": str(sc.get("label") or tag),
                     "egf_off": bool(sc.get("egf_off")),
+                    "sgf_off": bool(sc.get("sgf_off")),
                     "poi_mw": sc.get("poi_mw")})
     return out
 
@@ -9839,6 +9858,7 @@ def _surplus_env(sc):
     """The environment one scenario is run under."""
     env = {"SPP_RUN_TAG": sc["tag"],
            "SPP_EGF_OFF": "1" if sc["egf_off"] else "0",
+           "SPP_SGF_OFF": "1" if sc.get("sgf_off") else "0",
            # ITS OWN REPORT, at the end of its own run: the panel's scoring
            # pass has already run by the time the surplus runs start.
            "SPP_DEFER_REPORTS": "0"}
@@ -12573,6 +12593,8 @@ def _variant_note(label):
         return ".dyr: " + ", ".join(bits)
     if s == NEW_PLANT_TAG:
         return "a NEW plant built at the POI"
+    if s == CAP_BANK_TAG:
+        return "capacitor bank(s) added"
     if s.startswith("cap") and "_dyr_" in s:
         return s
     return s
@@ -13141,6 +13163,155 @@ def run_project_off(proj, mode):
     return rows
 
 
+CAP_BANK_TAG = "cbank"
+
+
+def _cap_bank_dir(proj, mode):
+    return _run_path(CASE_TEST, proj, "%s_%s_%s" % (proj, mode, CAP_BANK_TAG))
+
+
+def _cap_bank_projects(names):
+    want = [k for k, v in (CAP_BANKS or {}).items() if v]
+    missing = sorted(set(want) - set(names))
+    if missing:
+        print("[cap-bank] *** CAP_BANKS names %s, which this launch does not cover "
+              "-- not run ***" % ", ".join(missing))
+    return [n for n in names if n in want]
+
+
+def _cap_bank_text(proj):
+    out = []
+    for c in (CAP_BANKS or {}).get(proj) or []:
+        m = str(c.get("mode") or "fixed").lower()
+        t = "%s %.0f MVAr %s" % (c.get("bus", "poi"), float(c.get("mvar") or 0), m)
+        if m.startswith("sw"):
+            t += " (in < %.2f pu, out > %.2f pu, %.2f s)" % (
+                float(c.get("v_on", 0.90)), float(c.get("v_off", 1.10)),
+                float(c.get("delay_s", 0.10)))
+        out.append(t)
+    return "; ".join(out)
+
+
+def run_cap_bank(proj, mode):
+    """One study of the project case with CAP_BANKS[proj] added.
+
+       Returns [(fault, base verdict, cap-bank verdict, as-studied verdict)]."""
+    faults = _all_faults(proj, mode)
+    if not faults:
+        print("[cap-bank] %s %s: nothing to run -- the project case scored no fault"
+              % (proj, mode))
+        return []
+    _banner("CAP BANK -- %s (%s): %s" % (proj, mode, _cap_bank_text(proj)))
+    env = {"SPP_CAP_BANKS": json.dumps(list(CAP_BANKS[proj])),
+           "SPP_RUN_TAG": CAP_BANK_TAG, "SPP_DEFER_REPORTS": "0"}
+    env.update(_sweep_resume_env())
+    rc = run_study(CASE_TEST, projects=[proj], modes=[mode], extra_env=env)
+    if rc not in (0, None):
+        print("[cap-bank] the run ended with rc=%s -- reading whatever it scored" % rc)
+    rdir = _cap_bank_dir(proj, mode)
+    cb, _s1 = read_criteria(rdir, proj)
+    on, _s2 = read_criteria(results_dir(CASE_TEST, proj, mode), proj)
+    base, _s3 = read_criteria(results_dir(CASE_BASE, proj, mode), proj)
+    if not cb:
+        print("")
+        print("[cap-bank] *** THE CAP-BANK RUN PRODUCED NO CRITERIA REPORT ***")
+        print("[cap-bank]     folder: %s" % rdir)
+        _tail_log(rdir)
+        print("")
+        return []
+    return [(f,
+             (base.get(f, {}).get("verdict") or "?").upper(),
+             (cb.get(f, {}).get("verdict") or "?").upper(),
+             (on.get(f, {}).get("verdict") or "?").upper()) for f in faults]
+
+
+def _cap_bank_verdict(b, cb, on):
+    if on != "FAIL" and cb == "FAIL":
+        return "the bank makes it worse: passes without it, fails with it"
+    if on != "FAIL":
+        return "passes without the bank too"
+    if cb == "PASS":
+        return "the bank fixes it"
+    if cb == "FAIL":
+        return "still fails with the bank"
+    return "cannot tell -- the cap-bank run has no verdict for this fault"
+
+
+def write_cap_bank_report(proj, mode, rows):
+    """CAP_BANK_<proj>_<mode>.txt/.xlsx -- base, with the bank, as studied."""
+    if not rows:
+        return ""
+    path = os.path.join(cmp_detail(), "CAP_BANK_%s_%s.txt" % (proj, mode))
+    head = "%-22s %-12s %-14s %-13s %s" % ("fault", "base", "with bank",
+                                           "without bank", "what it says")
+    with open(path, "w") as fh:
+        fh.write("CAP BANK -- %s (%s)\n" % (proj, mode))
+        fh.write("generated %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.write("bank(s): %s\n" % _cap_bank_text(proj))
+        fh.write("=" * 110 + "\n")
+        fh.write(head + "\n" + "-" * len(head) + "\n")
+        for f, b, cb, on in rows:
+            fh.write("%-22s %-12s %-14s %-13s %s\n"
+                     % (f, b, cb, on, _cap_bank_verdict(b, cb, on)))
+        fh.write("=" * 110 + "\n%d fault(s)\n" % len(rows))
+    print("[cap-bank] -> %s" % path)
+    if WRITE_XLSX:
+        try:
+            _hdr = ["fault", "base", "with_bank", "without_bank", "what_it_says"]
+            _rows = [[f, b, cb, on, _cap_bank_verdict(b, cb, on)] for f, b, cb, on in rows]
+
+            def _st(row):
+                t = str(row[4])
+                if t.startswith("the bank fixes"):
+                    return 5
+                if t.startswith("the bank makes") or t.startswith("still fails"):
+                    return 2
+                return 5 if t.startswith("passes") else 3
+            write_xlsx_multi(path[:-4] + ".xlsx",
+                             [("Cap bank", _hdr, _rows, [22, 12, 13, 13, 52], _st)],
+                             legend=[(5, "GREEN", "passes with the bank"),
+                                     (2, "RED", "fails with the bank"),
+                                     (3, "AMBER", "no verdict")],
+                             title_rows=["CAP BANK -- %s (%s)" % (proj, mode),
+                                         "generated %s" % time.strftime("%Y-%m-%d %H:%M"),
+                                         "bank(s): %s" % _cap_bank_text(proj)])
+        except Exception as e:
+            print("[cap-bank] could not write the .xlsx (%s)" % e)
+    return path
+
+
+def write_cap_bank_comparison(proj, mode):
+    """A FULL comparison of the cap-bank run against the base case."""
+    if not os.path.isdir(_cap_bank_dir(proj, mode)):
+        print("[cap-bank] no results at %s -- no comparison written"
+              % _cap_bank_dir(proj, mode))
+        return
+    try:
+        res = compare_project(proj, mode, test_suffix="_" + CAP_BANK_TAG)
+    except Exception as e:
+        print("[cap-bank] could not compare the cap-bank run (%s)" % e)
+        return
+    if res is None or not res.get("rows"):
+        return
+    with _cmp_into(proj if COMPARE_BY_PROJECT else "", CAP_BANK_TAG):
+        _banner("COMPARISON WITH THE CAP BANK -- %s (%s)" % (proj, mode))
+        _RUN_LABEL[0] = "cap bank added: %s" % _cap_bank_text(proj)
+        try:
+            if ONE_REPORT:
+                write_one_report([res], [], [])
+            else:
+                write_summary([res], [], [])
+                write_project_report(res)
+                write_project_csv(res)
+                write_elements(res)
+            write_spp_event_tables([res])
+            write_runtime_comparison(proj, mode, test_suffix="_" + CAP_BANK_TAG)
+        except Exception as e:
+            print("[cap-bank] the comparison could not be written (%s)" % e)
+        finally:
+            _RUN_LABEL[0] = ""
+
+
 def write_project_off_report(proj, mode, rows):
     """PROJECT_OFF_<proj>_<mode>.txt/.csv/.xlsx -- base, project off, project on."""
     if not rows:
@@ -13281,6 +13452,7 @@ def _run_suffixes(proj, mode):
                         or re.match(r"^_cap\d+_dyr_\w+$", sfx)
                         or sfx == "_" + NEW_PLANT_TAG
                         or sfx == "_" + PROJECT_OFF_TAG
+                        or sfx == "_" + CAP_BANK_TAG
                         or sfx in ("_" + EGF_TAG, "_" + EGF_OFF_TAG)):
             continue
         # A VALUE RUN IN A SURPLUS SCENARIO OR EGF VARIANT (_dyr_<v>_s1_egfoff)
@@ -13344,6 +13516,8 @@ def _run_label(sfx):
         return "earlier run #%s" % m.group(1)
     if sfx == "_" + PROJECT_OFF_TAG:
         return "project OFF"
+    if sfx == "_" + CAP_BANK_TAG:
+        return "cap bank added"
     if sfx == "_" + NEW_PLANT_TAG:
         return "NEW plant built"
     if sfx == "_" + EGF_TAG:
@@ -14316,6 +14490,9 @@ def _plan_runs(projects, modes):
             if PROJECT_OFF_RUN and proj in _project_off_projects(projects):
                 out.append((proj, mode, "project machines OFF",
                             "_" + PROJECT_OFF_TAG))
+            if CAP_BANK_RUN and proj in _cap_bank_projects(projects):
+                out.append((proj, mode, "cap bank: %s" % _cap_bank_text(proj),
+                            "_" + CAP_BANK_TAG))
             # THE SURPLUS SCENARIOS (project case, compared with the plain base).
             # DYR_CHANGES_ONLY: they are on disk, not re-run -- listed as the reference.
             for sc in surplus_scenarios():
@@ -15995,6 +16172,8 @@ def run_study(case, projects=None, modes=None, extra_env=None, background=False,
     # EGF variants only when a variant run asks for one (extra_env below)
     env.pop("SPP_EGF_DYR_EDITS", None)
     env.pop("SPP_EGF_OFF", None)
+    env.pop("SPP_SGF_OFF", None)       # SGF-off / cap-bank runs only via extra_env
+    env.pop("SPP_CAP_BANKS", None)
     if extra_env:
         env.update(extra_env)
     print("[compare] launching %s : %s%s" % (case["key"], script,
@@ -16323,6 +16502,8 @@ def build_all_savs():
         _push_settings(env, case)
         env.pop("SPP_EGF_DYR_EDITS", None)
         env.pop("SPP_EGF_OFF", None)
+        env.pop("SPP_SGF_OFF", None)
+        env.pop("SPP_CAP_BANKS", None)
         env.pop("SPP_RUN_TAG", None)
         env.update(extra)
         env["SPP_STUDY_DIR"] = case["dir"]
@@ -19135,6 +19316,9 @@ def _tag_env_from_name(proj, tag, rdir=None):
         env["SPP_NEW_PLANT"] = json.dumps(_np)
     elif rest == PROJECT_OFF_TAG:
         env["SPP_PROJECT_OFF"] = "1"
+    elif rest == CAP_BANK_TAG:
+        if (CAP_BANKS or {}).get(proj):
+            env["SPP_CAP_BANKS"] = json.dumps(list(CAP_BANKS[proj]))
     elif rest == EGF_OFF_TAG:
         env["SPP_EGF_OFF"] = "1"
     elif not (rest.startswith("dyr_") or rest == EGF_TAG or (m and not rest)):
@@ -24788,6 +24972,10 @@ def main():
             print("[compare]           MPT and a tie. NOTHING existing is switched off.")
             print("[compare]           The bus numbers must be FREE -- the build stops")
             print("[compare]           if any is already in the case.")
+        if CAP_BANK_RUN:
+            print("[compare] cap bank: one EXTRA study of the project case with the banks")
+            print("[compare]           in CAP_BANKS added (%s)"
+                  % (", ".join(k for k, v in (CAP_BANKS or {}).items() if v) or "none set"))
         if PROJECT_OFF_RUN:
             print("[compare] project off: one EXTRA study per project, its machines out")
             print("[compare]           of service, the rest of the network unchanged.")
@@ -25673,6 +25861,19 @@ def main():
                     write_project_off_comparison(res["project"], res["mode"])
             except Exception as e:
                 print("[proj-off] the project-off run failed (%s) -- the comparison "
+                      "above is unaffected" % e)
+
+    if _res_n and CAP_BANK_RUN and pipeline != "compare":
+        _cb_pj = _cap_bank_projects([r["project"] for r in _res_n])
+        for res in [r for r in _res_n if r["project"] in _cb_pj]:
+            try:
+                rows = run_cap_bank(res["project"], res["mode"])
+                with _cmp_into(res["project"] if COMPARE_BY_PROJECT else ""):
+                    write_cap_bank_report(res["project"], res["mode"], rows)
+                if CAP_BANK_COMPARE:
+                    write_cap_bank_comparison(res["project"], res["mode"])
+            except Exception as e:
+                print("[cap-bank] the cap-bank run failed (%s) -- the comparison "
                       "above is unaffected" % e)
 
     # ---- .dyr PARAMETER SWEEP ------------------------------------------------

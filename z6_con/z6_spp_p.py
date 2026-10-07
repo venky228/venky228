@@ -8532,7 +8532,7 @@ def _resolve_project_gens():
     if fixed and fixed != [(int(b), str(m).strip()) for b, m in PROJECT_GENS]:
         PROJECT_GENS = fixed
         print("  [proj]   -> PROJECT_GENS = %s" % (PROJECT_GENS,))
-    if bad and PROJECT_OFF and all(w == "out of service" for _b, _m, w in bad):
+    if bad and (PROJECT_OFF or SGF_OFF) and all(w == "out of service" for _b, _m, w in bad):
         # THIS RUN ASKED FOR EXACTLY THIS. SPP_PROJECT_OFF takes the machines out
         # of service on purpose, so finding them out of service is the feature
         # working -- not a reason to warn that the results cannot be trusted.
@@ -12149,6 +12149,13 @@ def _dyr_disable_stamp():
 # as the model documentation numbers its CONs (REGCA1 con 6 = Volim).
 EGF_DYR_EDITS = []
 EGF_OFF = _env_bool("SPP_EGF_OFF", False)
+# SPP_SGF_OFF = "1": the opposite surplus scenario -- the SURPLUS machines (the
+# new %s* block) OUT OF SERVICE and every EXISTING machine of the plant at its
+# Pmax. The POI then carries the EGF alone at full output; the area is put back
+# as for any POI dispatch (POI_HOLD_AREA_MW). The POI target is not checked.
+SGF_OFF = _env_bool("SPP_SGF_OFF", False)
+if SGF_OFF and EGF_OFF:
+    raise RuntimeError("SPP_SGF_OFF and SPP_EGF_OFF are both set -- that leaves no plant")
 _egfj = (os.environ.get("SPP_EGF_DYR_EDITS") or "").strip()
 if _egfj:
     try:
@@ -12838,6 +12845,137 @@ for _so in (os.environ.get("SPP_SHUNTS_OFF") or "").split(";"):
 if SHUNTS_OFF:
     print("[caps-off] shunts to switch OFF: %s"
           % ", ".join("%d '%s' %s" % s_ for s_ in SHUNTS_OFF))
+
+
+# ---- CAPACITOR BANKS ADDED TO THE PROJECT CASE (CAP_BANK_RUN in z7_main.py) --
+# SPP_CAP_BANKS = JSON list, one dict per bank:
+#   {"bus": 765911 | "poi", "mvar": 100.0, "mode": "fixed" | "switched",
+#    "v_on": 0.90, "v_off": 1.10, "delay_s": 0.10, "id": "CB"}
+# "fixed"    in service from the power flow on: it is in the snapshot, so the
+#            pre-fault case already carries it.
+# "switched" built OUT of service. After the final clearing it goes IN once the
+#            bus has stayed below v_on for delay_s, and OUT once it has stayed
+#            above v_off for delay_s -- a voltage-controlled switched bank.
+# MVAr at 1.0 pu; a capacitor's output falls with V squared.
+CAP_BANKS = []
+try:
+    import json as _json_cb
+    for _cb in (_json_cb.loads(os.environ.get("SPP_CAP_BANKS") or "[]") or []):
+        _m = str(_cb.get("mode") or "fixed").strip().lower()
+        CAP_BANKS.append({
+            "bus": _cb.get("bus", "poi"),
+            "mvar": float(_cb.get("mvar") or 0.0),
+            "mode": "switched" if _m.startswith("sw") else "fixed",
+            "v_on": float(_cb.get("v_on", 0.90)),
+            "v_off": float(_cb.get("v_off", 1.10)),
+            "delay_s": max(0.0, float(_cb.get("delay_s", 0.10))),
+            "id": (str(_cb.get("id") or "").strip() or "C%d" % (len(CAP_BANKS) + 1))[:2]})
+except Exception as _e:
+    raise RuntimeError("SPP_CAP_BANKS could not be read (%s): %r"
+                       % (_e, os.environ.get("SPP_CAP_BANKS")))
+CAP_CHECK_S = 1.0 / 60.0          # the switched banks look at their bus every cycle
+if CAP_BANKS:
+    print("[cap-bank] banks ADDED to this case: %s"
+          % "; ".join("%s %.1f MVAr %s%s" % (c["bus"], c["mvar"], c["mode"],
+                                            (" (in < %.2f pu, out > %.2f pu, %.2f s)"
+                                             % (c["v_on"], c["v_off"], c["delay_s"]))
+                                            if c["mode"] == "switched" else "")
+                      for c in CAP_BANKS))
+
+
+def _cap_bus(c):
+    b = c["bus"]
+    if str(b).strip().lower() == "poi":
+        return int(POI_BUS)
+    return int(b)
+
+
+def _add_cap_banks():
+    """Every CAP_BANKS entry as a FIXED SHUNT record on its bus, before the solve:
+       in service for "fixed", out of service (ready to switch) for "switched"."""
+    left = []
+    for c in CAP_BANKS:
+        try:
+            b = _cap_bus(c)
+        except Exception as e:
+            left.append("%r (%s)" % (c["bus"], e))
+            continue
+        if not bus_in_case(b):
+            left.append("%d (bus not in this case)" % b)
+            continue
+        st = 1 if c["mode"] == "fixed" else 0
+        try:
+            ie = psspy.shunt_data(int(b), c["id"], st, [0.0, float(c["mvar"])])
+            ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+        except Exception as e:
+            ie = e
+        if ie in (0, None):
+            print("  [cap-bank] %d '%s' %.1f MVAr %s -- %s"
+                  % (b, c["id"], c["mvar"], c["mode"],
+                     "IN SERVICE" if st else "built OUT of service, switched by voltage"))
+        else:
+            left.append("%d '%s' (shunt_data ierr=%s)" % (b, c["id"], ie))
+    if left:
+        raise RuntimeError("SPP_CAP_BANKS: could not add %s -- this run would not test "
+                           "what it is named for" % ", ".join(left))
+
+
+def _cap_switch(c, on, t, v):
+    b = _cap_bus(c)
+    try:
+        ie = psspy.shunt_chng(int(b), c["id"], 1 if on else 0, [_f, _f])
+        ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+    except Exception as e:
+        ie = e
+    print("  [cap-bank] t=%.3f s  %d '%s' %.1f MVAr switched %s (V = %.3f pu)%s"
+          % (t, b, c["id"], c["mvar"], "IN" if on else "OUT", v,
+             "" if ie in (0, None) else "  *** shunt_chng ierr=%s ***" % ie))
+    sys.stdout.flush()
+    return ie in (0, None)
+
+
+def _post_fault_with_caps(fid):
+    """The post-fault run in CAP_CHECK_S steps, switching the "switched" banks on
+       their bus voltage. Same checks as _run_to (wall clock, divergence)."""
+    global _SIM_T
+    sw = [c for c in CAP_BANKS if c["mode"] == "switched"]
+    st = dict((id(c), {"on": False, "t_lo": None, "t_hi": None}) for c in sw)
+    label = "%s post-flt" % fid
+    if _FAULT_WALL.get("fid") and _FAULT_WALL.get("post0") is None:
+        _FAULT_WALL["post0"] = _SIM_T
+    nprt = RUN_NPRT_DIAG if DIAG_SUPPORT_LOG else RUN_NPRT
+    rc, t_said = 0, _SIM_T
+    while _SIM_T < SIM_END_S - 1e-6:
+        if _fault_wall_check(label):
+            break
+        nxt = min(_SIM_T + CAP_CHECK_S, SIM_END_S)
+        rc = psspy.run(0, nxt, nprt, RUN_NPLT, 0)
+        code = rc[0] if isinstance(rc, (list, tuple)) else rc
+        if code not in (0, None):
+            break
+        _SIM_T = nxt
+        for c in sw:
+            k = st[id(c)]
+            v = _read_vpu(_cap_bus(c))
+            if v is None:
+                continue
+            if not k["on"]:
+                k["t_lo"] = (k["t_lo"] if k["t_lo"] is not None else _SIM_T) if v < c["v_on"] else None
+                if k["t_lo"] is not None and _SIM_T - k["t_lo"] >= c["delay_s"] - 1e-9:
+                    if _cap_switch(c, True, _SIM_T, v):
+                        k["on"], k["t_lo"], k["t_hi"] = True, None, None
+            else:
+                k["t_hi"] = (k["t_hi"] if k["t_hi"] is not None else _SIM_T) if v > c["v_off"] else None
+                if k["t_hi"] is not None and _SIM_T - k["t_hi"] >= c["delay_s"] - 1e-9:
+                    if _cap_switch(c, False, _SIM_T, v):
+                        k["on"], k["t_lo"], k["t_hi"] = False, None, None
+        if SHOW_SIM_PROGRESS and PROGRESS_STEP_S > 0 and _SIM_T - t_said >= PROGRESS_STEP_S - 1e-9:
+            t_said = _SIM_T
+            print("  [%s] %-16s sim t = %6.2f / %.2f s" % (_ts(), label, _SIM_T, SIM_END_S))
+            sys.stdout.flush()
+            if _diverge_check(label):
+                break
+    return rc
 
 
 def _swsh_off(bus):
@@ -13679,6 +13817,18 @@ def _poi_target_verify(project, target_mw):
         # so its POI total cannot reach the target; nothing is held or checked.
         print("  [poi-p] project-off study: the POI target is not applied")
         return True
+    if SGF_OFF:
+        try:
+            _poi = int(project.get("poi") or POI_BUS)
+            _pl = sorted(_pocket_buses_behind_poi(_poi)
+                         | set(int(b) for b in (project.get("feeders") or []))
+                         | set(int(b) for b in (project.get("feeders_original") or [])))
+            _d, _n = _poi_delivered_mw(_poi, _pl)
+            print("  [poi-p] SGF OFF: the EGF alone delivers %s MW into POI %d "
+                  "(no target held)" % (("%.1f" % _d) if _d is not None else "?", _poi))
+        except Exception as _e:
+            print("  [poi-p] SGF OFF: POI delivery could not be read (%s)" % _e)
+        return True
     if target_mw is None:
         # NOTHING WAS ASKED FOR, SO NOTHING WAS HELD. Under POI_P_STRICT that is
         # not a study of this project at its interconnection: the plant is left
@@ -14340,6 +14490,23 @@ def _poi_hold_area_after_solve(project, tries=None):
               % (area, now, before, now - before))
 
 
+def _sgf_off_machines(project, pairs, is_new):
+    """SPP_SGF_OFF: the surplus machines OUT OF SERVICE (STATUS 0, not 0 MW)."""
+    if not pairs or not is_new:
+        raise RuntimeError("SPP_SGF_OFF: the surplus facility (%s* block) was not found "
+                           "behind %s's POI, so it cannot be told apart from the existing "
+                           "machines -- build it with NEW_PLANT"
+                           % (NEW_GEN_BUS_PREFIX, (project or {}).get("name")))
+    left = []
+    for b, mid in pairs:
+        if not _set_machine_status(b, mid, 0):
+            left.append("%s '%s'" % (b, mid))
+        else:
+            print("  [poi-p] SGF OFF: %-8s '%s' -> OUT OF SERVICE" % (b, mid))
+    if left:
+        raise RuntimeError("SPP_SGF_OFF: could not take %s out of service" % ", ".join(left))
+
+
 def apply_poi_p_target(project, target_mw):
     """Dispatch the plant to target_mw at the POI and put the area back.
 
@@ -14378,7 +14545,9 @@ def apply_poi_p_target(project, target_mw):
     # a case read back from disk carries whatever the run that wrote it left.
     # "the BESS at its capacity, the other units adding the rest" has to mean the
     # capacity, not a number near it.
-    if (POI_P_PROJECT_AT or "rated").strip().lower() == "rated" and _pm_pairs:
+    if SGF_OFF:
+        _sgf_off_machines(project, _pm_pairs, _pm_new)
+    elif (POI_P_PROJECT_AT or "rated").strip().lower() == "rated" and _pm_pairs:
         _rate = _pm_rate
         if _rate is None:
             print("  [poi-p] the project's rating is not a number -- the project "
@@ -14438,6 +14607,8 @@ def apply_poi_p_target(project, target_mw):
                 continue
             if e not in (0, None):
                 continue
+            if SGF_OFF and (b, mid) in proj_pairs:
+                continue            # out of service: neither the project nor existing
             rec = (b, mid, float(p),
                    float(pmax) if e2 in (0, None) else float(p),
                    float(pmin) if e3 in (0, None) else 0.0)
@@ -14460,7 +14631,7 @@ def apply_poi_p_target(project, target_mw):
     # existing units are dispatched to the full POI value with the plant's output
     # on top of it -- 1485 MW into a 984 MW interconnection, with every number in
     # the log looking reasonable. That is not a study of this project.
-    if _pm_pairs and (len(plant) - len(exist)) == 0:
+    if _pm_pairs and (len(plant) - len(exist)) == 0 and not SGF_OFF:
         print("  [poi-p] *** the project's machines (%s) were NOT found among the "
               "machines behind the POI ***"
               % ", ".join("%s '%s'" % (b, m) for b, m in _pm_pairs))
@@ -14588,7 +14759,19 @@ def apply_poi_p_target(project, target_mw):
         exist = []
 
     want = float(target_mw) - proj_mw
-    if not exist and egf_off:
+    if SGF_OFF:
+        if not exist:
+            raise RuntimeError("SPP_SGF_OFF: no existing machine was found behind the POI, "
+                               "so this run would study nothing")
+        placed = 0.0
+        print("  [poi-p] SGF OFF: every existing machine to its Pmax:")
+        for (b, mid, p0, pmax, pmin) in exist:
+            if _set_machine_p(b, mid, pmax):
+                placed += pmax
+                print("  [poi-p]   %-8d '%s'  %8.1f -> %8.1f MW   (Pmax)" % (b, mid, p0, pmax))
+        print("  [poi-p] EGF total %.1f MW (machine terminals; the POI is less by the "
+              "plant losses)" % placed)
+    elif not exist and egf_off:
         # NOTHING TO PLACE: the target is the SGF's own delivery (see
         # _egf_off_target), so there is no remainder for missing machines.
         print("  [poi-p] EGF OFF: POI carries the SGF alone, %.1f MW (target %.1f)"
@@ -15569,7 +15752,21 @@ def _collector_stamp():
     # REECAU1 constant is as wrong to reuse as one built with a different
     # collector, and for the same reason: the change happens during the build.
     return (coll + " | " + _dyr_stamp() + " | " + _poi_stamp()
-            + " | " + _monitor_stamp() + " | " + _poi_q_stamp() + _np_stamp() + _tmpl_stamp())
+            + " | " + _monitor_stamp() + " | " + _poi_q_stamp() + _np_stamp() + _tmpl_stamp()
+            + _cb_stamp())
+
+
+def _cb_stamp():
+    """Cap banks added / SGF off: "" when neither is set, so every other run's
+       stamp -- and the snapshot it already has -- is exactly as before."""
+    out = ""
+    if CAP_BANKS:
+        out += " | cap banks: " + "; ".join(
+            "%s %s %s %s %s %s %s" % (c["bus"], c["mvar"], c["mode"], c["v_on"],
+                                      c["v_off"], c["delay_s"], c["id"]) for c in CAP_BANKS)
+    if SGF_OFF:
+        out += " | SGF OFF, EGF at Pmax"
+    return out
 
 
 def _tmpl_stamp():
@@ -17273,6 +17470,8 @@ def build_case(outages=None, cnv=CNV_CASE, snp=SNP_FILE, tag="BUILD"):
             _switch_shunts_off()
         if BRANCHES_OFF:
             _switch_branches_off()
+        if CAP_BANKS:
+            _add_cap_banks()
         # THE POI TOTAL, AND THE AREA PUT BACK. After the project machines exist
         # (they are what the existing ones make up the difference to) and before
         # the solve, so the converted case and the snapshot carry this dispatch.
@@ -18284,7 +18483,10 @@ def _project_online_check(tag="pre-fault"):
     except Exception:
         gens = []
     n_on = n_fixed = 0
-    for (b, mid) in gens:
+    # A RUN THAT TOOK THE PROJECT MACHINES OUT ON PURPOSE (SPP_PROJECT_OFF,
+    # SPP_SGF_OFF) keeps them out: forcing them back here would start every
+    # fault with the plant the run is named for switching off.
+    for (b, mid) in ([] if (PROJECT_OFF or SGF_OFF) else gens):
         try:
             ie = psspy.machine_chng_2(int(b), str(mid),
                                       [1, _i, _i, _i, _i, _i], [_f] * 17)
@@ -18785,7 +18987,11 @@ def fault_run(fault, idx=None, total=None):
             chk_branch(_switch_branch(int(frm), int(to), str(ck), False)[0],
                        "final trip %s-%s" % (frm, to), int(frm), int(to), str(ck))
 
-    _set_out(out); chk(_run_to(SIM_END_S, SIM_END_S, "%s post-flt" % fid), "run post-fault")
+    _set_out(out)
+    if any(c["mode"] == "switched" for c in CAP_BANKS):
+        chk(_post_fault_with_caps(fid), "run post-fault (switched cap banks)")
+    else:
+        chk(_run_to(SIM_END_S, SIM_END_S, "%s post-flt" % fid), "run post-fault")
     if PSSE_SILENT_RUNS or PSSE_FAULT_LOG:
         _silence_psse(False)      # restore PSS/E output after the fault window
         _FAULT_LOG["path"] = None
