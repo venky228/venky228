@@ -14531,6 +14531,8 @@ def _plan_where(sfx):
         return CASE_TEST, sfx, ""
     if DYR_CHANGES_ONLY and sfx.startswith("_dyr_"):
         return CASE_TEST, sfx, ""       # compared with the base as it is
+    if sfx in ("_" + CAP_BANK_TAG, "_" + PROJECT_OFF_TAG, "_" + NEW_PLANT_TAG):
+        return CASE_TEST, sfx, ""       # project-case-only runs: compared with the plain base
     return CASE_TEST, sfx, sfx
 
 
