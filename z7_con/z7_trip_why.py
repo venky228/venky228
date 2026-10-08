@@ -460,6 +460,10 @@ R_BAND_ROW = re.compile(r"(\d{3,7})\s*\[([^\]]*)\]\s*(\d+\.\d+|\*+)\s*(HI|LO)")
 R_STATUS = re.compile(r"Status of circuit\s+\"([^\"]*)\"\s+from\s+(\d+)\s*\[[^\]]*\]\s+to\s+(\d+)\s*\[[^\]]*\]"
                       r"(?:\s+to\s+(\d+)\s*\[[^\]]*\])?\s+is set to out-of-service")
 R_BRELAY = re.compile(r"^\s*RELAY\s+(\S+)\s+#.*?CIRCUIT\s+(\S+)\s+FROM\s+(\d+)\s+TO\s+(\d+)\s+MESSAGES AT TIME\s*=\s*(-?[\d.]+)")
+# PSS/E's generator power scan (BAT_SET_GENPWR / psspy.set_genpwr): when a machine's power
+# unbalance goes past the threshold PSS/E prints this line and trips the machine on the next
+# line ("MACHINE ... TRIPPED AT TIME"). The line does not name the machine -- the trip line does.
+R_GENPWR = re.compile(r"Power unbalance\s*=\s*(-?[\d.]+)\s*;\s*Threshold\s*=\s*(-?[\d.]+)", re.I)
 
 
 class LogData(object):
@@ -478,6 +482,7 @@ class LogData(object):
         self.models = {}     # inst -> relay model name
         self.t_last = None   # the last time the log mentions
         self.mctx = {}       # index in mtrip -> the log lines just before that trip
+        self.mpw = {}        # index in mtrip -> (unbalance, threshold) of the GENPWR line that tripped it
 
 
 def parse_log(path, wbus, winst, quick):
@@ -499,6 +504,8 @@ def parse_log(path, wbus, winst, quick):
     last_start = {}
     brelay = {}                                          # (from, to, ckt) -> (t, model) of a line relay trip
     ctx = collections.deque(maxlen=12)                   # the last meaningful lines, quoted for an unexplained trip
+    pw_q = []                                            # GENPWR lines waiting for their MACHINE ... TRIPPED line
+    pw_gap = 0                                           # other lines since the last GENPWR line
     for line in text.splitlines():
         if line.startswith("FLOW"):                      # 'FLOW1 BUS ... NOT FOUND' noise
             continue
@@ -507,6 +514,16 @@ def parse_log(path, wbus, winst, quick):
                       or "B U S" in s or "BUS#" in s or s.startswith("***** ") or s.startswith("*****")):
             if not ctx or ctx[-1] != s:
                 ctx.append(s[:150])
+        if "Power unbalance" in s:
+            m = R_GENPWR.search(s)
+            if m:
+                pw_q.append((_num(m.group(1)), _num(m.group(2))))
+                pw_gap = 0
+                continue
+        if s and pw_q and not ("MACHINE" in s and "TRIPPED AT TIME" in s):
+            pw_gap += 1
+            if pw_gap > 1:                               # no machine trip line right after it: not a trip
+                pw_q = []
         if not s:
             hdr = None
             if island is not None:
@@ -587,7 +604,11 @@ def parse_log(path, wbus, winst, quick):
         if "TRIPPED AT TIME" in line:
             if "MACHINE" in line:
                 m = R_MTRIP.match(line)
+                # each GENPWR line belongs to the next machine trip line, watched unit or not
+                pw = pw_q.pop(0) if (m and pw_q) else None
                 if m and m.group(2) in wbus:
+                    if pw:
+                        ld.mpw[len(ld.mtrip)] = pw
                     ld.mctx[len(ld.mtrip)] = [c for c in list(ctx)[:-1]]
                     ld.mtrip.append((_num(m.group(4)), m.group(1).strip(), m.group(2), len(ld.brk)))
                     ld.names.setdefault(m.group(2), _name(m.group(3)))
@@ -653,10 +674,11 @@ CAUSE = {"UV": "UNDER-VOLTAGE", "OV": "OVER-VOLTAGE", "UF": "UNDER-FREQUENCY", "
          "UF/OF": "FREQUENCY (under or over -- PSS/E printed no value)",
          "ISO": "ISOLATED -- not a voltage or frequency trip",
          "STAB": "LOSS OF SYNCHRONISM (probable -- no relay message; rotor angle / out-of-step in the log)",
+         "PWR": "PSS/E GENERATOR POWER CHECK (GENPWR) -- power unbalance above the run's threshold; not a relay",
          "?": "NOT FOUND IN THE LOG"}
 CAUSE_SHORT = {"STAB": "LOSS OF SYNCHRONISM", "UV": "UNDER-VOLTAGE", "OV": "OVER-VOLTAGE", "UF": "UNDER-FREQUENCY", "OF": "OVER-FREQUENCY",
                "UV/OV": "VOLTAGE (under or over)", "UF/OF": "FREQUENCY (under or over)",
-               "ISO": "ISOLATED", "?": "CAUSE NOT IN THE LOG"}
+               "PWR": "GENPWR POWER CHECK", "ISO": "ISOLATED", "?": "CAUSE NOT IN THE LOG"}
 
 
 def _gid_ok(want, got):
@@ -754,7 +776,7 @@ def explain(unit, gid, ld, unit_relays):
     """What PSS/E did to one unit in one fault log.
        -> {"events": [{t, kind, gid, cause, text, short, key}], "pickups": [...],
            "sides": [(t, side, how)], "band": [...], "notes": [...]}"""
-    out = {"events": [], "pickups": [], "sides": [], "band": [], "notes": [], "quote": []}
+    out = {"events": [], "pickups": [], "sides": [], "band": [], "notes": [], "quote": [], "genpwr": None}
     used_brk = set()
 
     def brk_for(t, want_gid, n_before):
@@ -799,8 +821,23 @@ def explain(unit, gid, ld, unit_relays):
         if bus != unit or not _gid_ok(gid, g):
             continue
         i = brk_for(t, g, nb)
+        pw = ld.mpw.get(k_tr)
         if i is not None:
             cause, text, short, key = by_relay(i, "trip")
+            if pw:
+                out["notes"].append("PSS/E's generator power check (GENPWR) also fired just before this trip "
+                                    "(power unbalance %s, threshold %s)." % (_g(pw[0], 3), _g(pw[1], 3)))
+        elif pw:
+            cause = "PWR"
+            text = ("PSS/E's generator power check (GENPWR) tripped it at %s s: its power unbalance was %s, above "
+                    "the %s threshold set for the run (BAT_SET_GENPWR / psspy.set_genpwr). This is a check of the "
+                    "simulation, not a protection relay of the unit. The log lines just before the trip are "
+                    "quoted below." % ("%.4f" % t if t is not None else "?", _g(pw[0], 3), _g(pw[1], 3)))
+            short = "GENPWR %s>%s" % (_g(pw[0], 2), _g(pw[1], 2))
+            key = "PSS/E's generator power check (GENPWR): power unbalance above the %s threshold" % _g(pw[1], 3)
+            if not out["genpwr"]:                        # the first trip is the one that counts
+                out["quote"] = ld.mctx.get(k_tr) or []
+                out["genpwr"] = pw
         else:
             it = [x for x in ld.itrip if x[2] == unit and x[0] is not None and t is not None
                   and abs(x[0] - t) <= LINK_WINDOW_S]
@@ -1442,7 +1479,9 @@ def judge(res):
 
 CAT_WORDS = {"RELAY": "PROTECTION RELAY", "STABILITY": "STABILITY (lost synchronism)",
              "NETWORK": "NETWORK (its bus lost its connection)", "OWN": "THE MODEL'S OWN PROTECTION",
-             "CONTROL": "UNIT CONTROL (no relay; power went to zero)", "UNKNOWN": "NOT IDENTIFIED"}
+             "CONTROL": "UNIT CONTROL (no relay; power went to zero)",
+             "SIMCHECK": "PSS/E SIMULATION CHECK (GENPWR power unbalance, not a relay)",
+             "UNKNOWN": "NOT IDENTIFIED"}
 
 
 def _near_v(res):
@@ -1498,6 +1537,8 @@ def reason(res):
             res["cat"] = "RELAY"
         elif e and e["cause"] == "ISO":
             res["cat"] = "NETWORK"
+        elif e and e["cause"] == "PWR":
+            res["cat"] = "SIMCHECK"
         elif e:                                          # PSS/E trip, nothing named
             res["cat"] = "STABILITY" if _lost_sync(res) else "UNKNOWN"
             if res["cat"] == "STABILITY":
@@ -1512,13 +1553,17 @@ def reason(res):
             res["cat"] = "CONTROL"
         else:
             res["cat"] = "UNKNOWN"
+        gp = ex.get("genpwr")
         lead = {"RELAY": "a protection relay of the unit tripped it",
-                "STABILITY": "it lost synchronism (pole slip) -- " + (
+                "STABILITY": "it lost synchronism (out-of-step at the unit) -- " + (
                     "PSS/E tripped it with no relay message" if e else "no relay acted"),
                 "NETWORK": "its bus lost its connection to the grid",
                 "OWN": "the unit model's own protection tripped it",
                 "CONTROL": "no relay acted; its own control took its power to zero under %s"
                            % CAUSE_SHORT.get(res.get("cause"), "?").lower(),
+                "SIMCHECK": "PSS/E's generator power check (GENPWR) tripped it -- power unbalance %s against "
+                            "the %s threshold; no relay of the unit acted"
+                            % ((_g(gp[0], 3), _g(gp[1], 3)) if gp else ("?", "?")),
                 "UNKNOWN": "PSS/E's log does not show what tripped it"}[res["cat"]]
         res["why"] = "%s%s." % (lead, ("; " + "; ".join(extra)) if extra else "")
         return res
@@ -1646,6 +1691,20 @@ def observations(rows):
         else:
             txt += " In every other fault this relay never picked up: the %s never crossed %s." % (
                 what, setting_words(st["rec"]).replace("V ", "").replace("f ", ""))
+        obs.append(txt)
+    # 1b. PSS/E's generator power check (GENPWR)
+    pw = [(x, (x["r"].get("exp") or {}).get("genpwr")) for x in T if x["r"]["cause"] == "PWR"]
+    if pw:
+        vals = [g[0] for _x, g in pw if g and g[0] is not None]
+        thr = sorted(set(g[1] for _x, g in pw if g and g[1] is not None))
+        txt = "PSS/E's generator power check (GENPWR) trips it in %s" % _flist([x["f"] for x, _g0 in pw])
+        if vals:
+            txt += ": its power unbalance reached %s against the %s threshold" % (
+                _g(min(vals), 3) if min(vals) == max(vals) else "%s-%s" % (_g(min(vals), 3), _g(max(vals), 3)),
+                "/".join(_g(v, 3) for v in thr) or "?")
+        txt += (". PSS/E prints the unbalance only when it passes the threshold, so in the faults it rides "
+                "through it stayed below it. This is a check of the simulation (BAT_SET_GENPWR in the run "
+                "set-up), not a protection relay of the unit.")
         obs.append(txt)
     # 2. no relay: the condition at the unit
     nr = [x for x in T if not (x["cr"] and x["cr"][1]["tripped"]) and x["r"]["cause"] in ("UV", "OV", "UF", "OF")]
@@ -1827,8 +1886,15 @@ def compare_lines(f, rb, rs, ls):
         row("frequency at the unit (Hz)", "%s / %s" % (_f2(mb["fmin"]), _f2(mb["fmax"])),
             "%s / %s" % (_f2(ms["fmin"]), _f2(ms["fmax"])), "(lowest / highest)")
     if mb["dev"] is not None or ms["dev"] is not None:
-        row("rotor angle swing (deg)", ("%.0f %s" % (mb["dev"], mb["concl"].lower())) if mb["dev"] is not None else "-",
-            ("%.0f %s" % (ms["dev"], ms["concl"].lower())) if ms["dev"] is not None else "-", _d(mb["dev"], ms["dev"], "%+.0f"))
+        # a unit that trips has no meaningful angle after its trip -- say so instead of a swing
+        def atxt(m, r):
+            if m["dev"] is None:
+                return "-"
+            if (r or {}).get("status") == "trip":
+                return "%.0f (after trip)" % m["dev"]
+            return "%.0f %s" % (m["dev"], m["concl"].lower())
+        tripped = (rb or {}).get("status") == "trip" or (rs or {}).get("status") == "trip"
+        row("rotor angle swing (deg)", atxt(mb, rb), atxt(ms, rs), "" if tripped else _d(mb["dev"], ms["dev"], "%+.0f"))
     for nm, m in (("b", mb), ("s", ms)):
         pass
     rb_rel = mb["relay"]
@@ -1925,6 +1991,15 @@ def suggest(rb, rs, mb, ms, ls):
         if dv("vmin") is not None and abs(dv("vmin")) >= 0.02:
             bits.append("the voltage near the unit dipped %s (%.2f against %.2f pu)" % (
                 "deeper" if mw["vmin"] < mo["vmin"] else "less", mw["vmin"], mo["vmin"]))
+    elif cat == "SIMCHECK":
+        gp = (who.get("exp") or {}).get("genpwr")
+        bits.append("PSS/E's generator power check (GENPWR) tripped it in %s%s, while in %s its power unbalance "
+                    "stayed below the threshold (PSS/E printed no unbalance line there)"
+                    % (where, (" -- power unbalance %s against the %s threshold" % (_g(gp[0], 3), _g(gp[1], 3)))
+                       if gp else "", there))
+        if gp and gp[0] is not None and gp[1] is not None and gp[0] - gp[1] <= 0.15:
+            bits.append("it is only %s above the threshold, so a small change in the swing at the moment of "
+                        "switching decides it" % _g(gp[0] - gp[1], 3))
     else:
         bits.append("PSS/E's log does not show what tripped it")
     nw, no = len(mw["near"]), len(mo["near"])
@@ -1938,8 +2013,7 @@ def suggest(rb, rs, mb, ms, ls):
         for k, nm in (("vmin", "lowest voltage near it"), ("vend", "settled voltage"), ("vmax", "highest voltage")):
             if dv(k) is not None and abs(dv(k)) >= 0.02:
                 diffs.append("%s %+.2f pu" % (nm, dv(k)))
-        if dv("dev") is not None and abs(dv("dev")) >= 10:
-            diffs.append("rotor swing %+.0f deg" % dv("dev"))
+        # (no rotor swing here: the unit tripped in this run, so its angle afterwards means nothing)
         if diffs:
             out.append("What the SGF changes around the unit in this fault: %s." % ", ".join(diffs))
     return out
@@ -2010,7 +2084,8 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
     L.append(" A TRIP here is what the study counts (each run's 02_VIOLATIONS list). Units the event")
     L.append(" itself disconnects are shown separately and are not trips -- the study's rule.")
     L.append(" CAUSE is one of: UNDER-VOLTAGE, OVER-VOLTAGE, UNDER-FREQUENCY, OVER-FREQUENCY,")
-    L.append(" ISOLATED (its bus lost its connection -- not a voltage or frequency trip).")
+    L.append(" ISOLATED (its bus lost its connection -- not a voltage or frequency trip), LOSS OF")
+    L.append(" SYNCHRONISM, or GENPWR POWER CHECK (PSS/E's own power-unbalance check -- not a relay).")
     L.append("")
     # causes at a glance
     glance = {}
@@ -2023,7 +2098,7 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
     L.append(" CAUSES AT A GLANCE (trips the study counts, all projects and runs)")
     L.append(SUB)
     if glance:
-        for c in ("UV", "OV", "UF", "OF", "UV/OV", "UF/OF", "STAB", "ISO", "?"):
+        for c in ("UV", "OV", "UF", "OF", "UV/OV", "UF/OF", "STAB", "PWR", "ISO", "?"):
             if c in glance:
                 L.append("   %-30s %4d trip(s)" % (CAUSE_SHORT.get(c, c), len(glance[c])))
     else:
@@ -2132,8 +2207,8 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
     else:
         L.append(" Relays   NONE. No VTGTPAT / VTGDCAT / FRQTPAT / FRQDCAT record (nor a USRMDL VTGTPA /")
         L.append("          FRQTPA / VTGDCA / FRQDCA) acts on this unit: PSS/E has no relay that can trip")
-        L.append("          it. Its trips come from the study's check on its power and terminal voltage;")
-        L.append("          section 3 gives the condition at the unit each time.")
+        L.append("          it. PSS/E's generator power check (GENPWR) can still trip it, and the study")
+        L.append("          counts a unit whose power goes to zero; section 4 gives what happened each time.")
     if dinfo["other"]:
         L.append(" Other records that name bus %s (not decoded here):" % unit)
         for txt, p in dinfo["other"][:15]:
@@ -2176,7 +2251,7 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
                 elif r["status"] == "trip":
                     L.append("        Study: no 02_VIOLATIONS / SPP_CRITERIA_REPORT in this run folder -- PSS/E's log decides")
                 L.append("        How:   %s" % _wrap(r["how"] or "", 62, "               "))
-                if ex and ex.get("quote") and r.get("cat") in ("UNKNOWN", "STABILITY"):
+                if ex and ex.get("quote") and r.get("cat") in ("UNKNOWN", "STABILITY", "SIMCHECK"):
                     L.append("        Log lines just before the trip (logs\\psse\\%s.txt):" % f)
                     for q in ex["quote"][-10:]:
                         L.append("          | %s" % q)
@@ -2252,6 +2327,7 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
     L.append(SUB)
     L.append(" Probable reason of each trip: RELAY, STABILITY (lost synchronism), NETWORK (bus isolated),")
     L.append(" OWN (the model's own protection), CONTROL (no relay; its control took the power to zero),")
+    L.append(" SIMCHECK (PSS/E's generator power check, GENPWR -- not a relay)")
     L.append(" or NOT IDENTIFIED. For a fault it rides through: how close its relays came, the voltage near")
     L.append(" the unit, its rotor angle, and how far the fault is. Sorted by distance from the unit (the")
     L.append(" number after the fault = buses between the fault and the unit).")
@@ -2304,6 +2380,10 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
         "relay of the .dyr tripped the unit; 'no relay' = PSS/E never tripped it: the study counts it "
         "because its power went to zero, and the condition shown is what the log saw at the unit (its "
         "relays' pickups and PSS/E's voltage-band reports). ISOLATED = its bus lost its connection.",
+        "GENPWR POWER CHECK = PSS/E's generator power scan tripped it: the log line just before the trip "
+        "reads 'Power unbalance= x; Threshold= y' and x passed y. The threshold is a run setting "
+        "(BAT_SET_GENPWR, SCAN_GENPWR in the study engine), not a relay of the unit; PSS/E prints the line "
+        "only when the threshold is passed.",
         "'spike' = the relay acted on a numerical spike (a voltage above %s pu or a frequency more than %s "
         "Hz from 60 Hz at a switching instant): no real voltage or frequency does that." % (_g(SPIKE_PU), _g(SPIKE_HZ)),
         "A relay picks up when its voltage or frequency crosses the setting, must stay past it for the "
@@ -2347,7 +2427,9 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
                                  "" if num.get("e0") is None else num["e0"], "" if num.get("e1") is None else num["e1"],
                                  " | ".join(ex["pickups"]) if ex else "",
                                  CAT_WORDS.get(r.get("cat"), "") if r.get("cat") else "",
-                                 r.get("why") or ""])
+                                 r.get("why") or "",
+                                 _g(ex["genpwr"][0], 5) if (ex and ex.get("genpwr")) else "",
+                                 _g(ex["genpwr"][1], 5) if (ex and ex.get("genpwr")) else ""])
     return path
 
 
@@ -2453,7 +2535,8 @@ def main():
                         "Clear (cy)", "Buses from unit", "Lowest V (pu)", "Highest V (pu)", "Closest relay",
                         "Held (s)", "Needs (s)", "Study", "Cause", "Time (s)", "Short",
                         "How", "Study MW", "P before (MW)", "P end (MW)", "Eterm before (pu)", "Eterm end (pu)",
-                        "Relays that picked up", "Probable reason", "Why (or why not)"])
+                        "Relays that picked up", "Probable reason", "Why (or why not)",
+                        "GENPWR unbalance", "GENPWR threshold"])
             for row in csv_rows:
                 w.writerow(row)
         written.append(cp)
