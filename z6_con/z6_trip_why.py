@@ -312,13 +312,96 @@ def find_dyr_files():
     return out
 
 
+def _dyr_scope(path):
+    """The runs a .dyr applies to, as {(side, project)}. Side from the folder it is in: "base"
+       (Base\\), "proj" (Projects\\) or "*" (anywhere else). Project from its file name
+       (..._with_BESS_SantaFe.dyr -> SantaFe), "*" when it names none. The project (SGF) buses
+       999001... are in every project's own .dyr, so each project must read only its own."""
+    r = _rel(path).replace("/", "\\")
+    top = r.split("\\")[0].lower() if "\\" in r else ""
+    side = "base" if top == "base" else "proj" if top == "projects" else "*"
+    nm = os.path.basename(path).lower()
+    hits = [p for p in find_projects() if p.lower() in nm]
+    return set((side, p) for p in hits) if hits else set([(side, "*")])
+
+
+def _in_scope(scope, is_base, proj):
+    side = "base" if is_base else "proj"
+    return any(s in (side, "*") and p in (proj, "*") for (s, p) in (scope or set([("*", "*")])))
+
+
+def _relays_for(relays, is_base, proj):
+    """The relay records that apply to one run (its side and its project). When one relay instance
+       has records of different scope -- the plain .dyr and a project's own .dyr -- the most specific
+       one wins: the project's own, then the run's side."""
+    side = "base" if is_base else "proj"
+    cand = [r for r in relays if _in_scope(r.get("scope"), is_base, proj)]
+
+    def spec(r):
+        return max([(2 if p == proj else 0) + (1 if a == side else 0)
+                    for (a, p) in (r.get("scope") or set([("*", "*")]))
+                    if a in (side, "*") and p in (proj, "*")] or [0])
+    by_inst = {}
+    for r in cand:
+        by_inst.setdefault((r["model"], r["inst"]), []).append(r)
+    out = []
+    for rs in by_inst.values():
+        top = max(spec(r) for r in rs)
+        out.extend(r for r in rs if spec(r) == top)
+    out.sort(key=lambda r: (r["model"], r["inst"]))
+    return out
+
+
+def _scopes_meet(s1, s2):
+    """True when two .dyr scopes share a run (same side or any, same project or any)."""
+    s1 = s1 or set([("*", "*")])
+    s2 = s2 or set([("*", "*")])
+    return any((a in (c, "*") or c == "*") and (p in (q, "*") or q == "*") for (a, p) in s1 for (c, q) in s2)
+
+
+def _scope_norm(scope):
+    """A scope with base + project runs of the same project folded into 'all runs' of it."""
+    s = set(scope or [("*", "*")])
+    out = set()
+    for p in set(q for _a, q in s):
+        sides = set(a for a, q in s if q == p)
+        if "*" in sides or ("base" in sides and "proj" in sides):
+            out.add(("*", p))
+        else:
+            out |= set((a, p) for a in sides)
+    if ("*", "*") in out:
+        return set([("*", "*")])
+    return out
+
+
+def _scope_words(scope):
+    """'' for a record of every run, else e.g. 'project runs of IronStar, SantaFe' / 'base case'."""
+    s = _scope_norm(scope)
+    if ("*", "*") in s:
+        return ""
+    by_side = {}
+    for a, p in s:
+        by_side.setdefault(a, []).append(p)
+    bits = []
+    for a in ("*", "base", "proj"):
+        if a not in by_side:
+            continue
+        what = {"*": "runs", "base": "base case", "proj": "project runs"}[a]
+        ps = sorted(by_side[a])
+        bits.append(({"*": "all runs", "base": "base case", "proj": "project runs"}[a]) if "*" in ps
+                    else "%s of %s" % (what, ", ".join(ps)))
+    return "; ".join(bits)
+
+
 def read_dyr(units):
-    """{bus: {"models": [(model, id, file)], "relays": [rec + "files"], "other": [(text, file)]}}"""
+    """{bus: {"models": [(model, id, file)], "relays": [rec + "files" + "scope"], "other": [(text, file)],
+              "mscope": {(side, project)} where the unit has a dynamic model}}"""
     keep = set(b for b, _i in units)
-    info = dict((b, {"models": [], "relays": [], "other": []}) for b in keep)
+    info = dict((b, {"models": [], "relays": [], "other": [], "mscope": set()}) for b in keep)
     files = find_dyr_files()
     for p in files:
         t0 = time.time()
+        scope = _dyr_scope(p)
         try:
             recs = dyr_records(p, keep)
         except Exception as e:
@@ -333,13 +416,16 @@ def read_dyr(units):
                     if (r["model"], r["inst"], r["mon"], r["id"], r["cons"]) == \
                             (d["model"], d["inst"], d["mon"], d["id"], d["cons"]):
                         r["files"].append(p)
+                        r["scope"] |= scope
                         break
                 else:
                     d["files"] = [p]
                     d["line"] = ln
+                    d["scope"] = set(scope)
                     lst.append(d)
                 used = True
             elif d and d["kind"] == "model" and d["bus"] in keep:
+                info[d["bus"]]["mscope"] |= scope
                 row = (d["model"], d["id"])
                 if row not in [(m, i) for m, i, _f in info[d["bus"]]["models"]]:
                     info[d["bus"]]["models"].append((d["model"], d["id"], p))
@@ -1568,6 +1654,11 @@ def reason(res):
         res["why"] = "%s%s." % (lead, ("; " + "; ".join(extra)) if extra else "")
         return res
     # NOT TRIPPED: how close it came
+    if res.get("absent"):
+        res["why"] = ("not in this case: the unit is part of the project (no dynamic model for it in this "
+                      "run's .dyr, and the study and the log never name it).")
+        res["quiet"] = False
+        return res
     cr = closest_relay(ex)
     bits = []
     if cr and cr[1]["n"]:
@@ -1605,6 +1696,8 @@ def _cell(res):
         return "not run"
     if res["status"] in ("trip", "event", "psse"):
         return (res["short"] or "?")[:26]
+    if res.get("absent"):
+        return "not in this case"
     if not res.get("log"):
         return "no log"
     return "-"
@@ -1843,6 +1936,8 @@ def _metrics(r):
 def _res_txt(r):
     if r is None:
         return "not run"
+    if r.get("absent"):
+        return "not in this case"
     if not r.get("log") and r.get("status") == "none":
         return "no PSS/E log"
     if r["status"] == "trip":
@@ -2030,15 +2125,26 @@ def base_vs_scenario(runs):
         if is_base:
             continue
         L.append("   Base case vs %s" % lbl)
-        diff, both = [], []
+        diff, both, new_unit = [], [], []
         for f in sorted(set(faults) | set(bf), key=_fkey):
             rb, rs = bf.get(f), faults.get(f)
             tb = (rb or {}).get("status") == "trip"
             ts = (rs or {}).get("status") == "trip"
-            if tb and ts:
+            if ts and (rb or {}).get("absent"):
+                new_unit.append(f)                       # a project unit: nothing to compare with
+            elif tb and ts:
                 both.append(f)
             elif tb != ts and rb is not None and rs is not None:
                 diff.append(f)
+        if new_unit:
+            L.append("      The unit is not in the base case -- it is part of the project. It trips here in:")
+            for f in new_unit:
+                rs = faults[f]
+                L.append("        %-6s %s" % (f, _wrap("%s: %s" % (CAT_WORDS.get(rs.get("cat"), rs.get("cat") or "?"),
+                                                                rs.get("why") or ""), 60, "               ")))
+            L.append("")
+            if not diff and not both:
+                continue
         if not diff:
             L.append("      the unit trips in the same faults in both (%s)" % (_flist(both, 30) if both else "none"))
             L.append("")
@@ -2122,6 +2228,10 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
             evf = sorted([f for f, r in faults.items() if r and r["status"] == "event"], key=_fkey)
             ps = sorted([f for f, r in faults.items() if r and r["status"] == "psse"], key=_fkey)
             L.append("   %s" % lbl)
+            n_abs = len([f for f, r in faults.items() if r and r.get("absent")])
+            if not tr and n_abs and n_abs >= len([f for f, r in faults.items() if r]):
+                L.append("      not in this case -- the unit is part of the project")
+                continue
             if tr:
                 L.append("      TRIPS in %d of %d fault(s):" % (len(tr), n_log))
                 keys = {}
@@ -2151,7 +2261,9 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
                     if r and r["status"] == "trip":
                         b = base_f.get(f)
                         if b is not None and b["status"] != "trip":
-                            only.setdefault(f, []).append("%s: %s" % (_short(lbl), CAUSE_SHORT.get(r["cause"], "?")))
+                            only.setdefault(f, []).append("%s: %s%s" % (
+                                _short(lbl), CAUSE_SHORT.get(r["cause"], "?"),
+                                " (unit not in the base case)" if b.get("absent") else ""))
             if only:
                 L.append("   TRIPS WITH THE SGF IN SERVICE BUT NOT IN THE BASE CASE:")
                 for f in sorted(only, key=_fkey):
@@ -2191,15 +2303,20 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
         L.append("   %-10s %-8s %-9s %-7s %-34s %-8s %s" % ("instance", "model", "mon. bus", "machine",
                                                          "trips when", "pickup", "breaker"))
         for r in relays:
-            L.append("   %-10s %-8s %-9s %-7s %-34s %-8s %s" % (
+            sw = _scope_words(r.get("scope"))
+            L.append("   %-10s %-8s %-9s %-7s %-34s %-8s %s%s" % (
                 r["inst"], r["model"], r["mon"], "'%s'" % r["id"], setting_words(r),
-                _g(_t(r, 2)) + " s", _g(_t(r, 3)) + " s"))
+                _g(_t(r, 2)) + " s", _g(_t(r, 3)) + " s", ("   (%s only)" % sw) if sw else ""))
         clash = {}
         for r in relays:
             clash.setdefault((r["model"], r["inst"]), []).append(r)
-        clash = [v for v in clash.values() if len(v) > 1]
+        # different settings for different projects are expected (each SGF has its own .dyr);
+        # a clash is two settings for the SAME runs
+        clash = [v for v in clash.values() if len(v) > 1 and any(
+            _scopes_meet(a.get("scope"), c.get("scope")) for i, a in enumerate(v) for c in v[i + 1:])]
         if clash:
-            L.append("   THE SAME INSTANCE HAS DIFFERENT SETTINGS IN DIFFERENT .dyr FILES:")
+            L.append("   THE SAME INSTANCE HAS DIFFERENT SETTINGS IN DIFFERENT .dyr FILES (for a project's")
+            L.append("   runs its own file is used -- the one named after the project):")
             for v in clash:
                 for r in v:
                     L.append("     %s %s  %s, %s s  in %s" % (r["model"], r["inst"], setting_words(r),
@@ -2229,7 +2346,9 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
             L.append(" %s -- %s" % (proj, lbl))
             L.append("   folder %s" % _rel(d))
             if not shown:
-                L.append("   no trip in any fault")
+                _all = [r for r in faults.values() if r]
+                L.append("   not in this case -- the unit is part of the project"
+                         if (_all and all(r.get("absent") for r in _all)) else "   no trip in any fault")
                 L.append("")
                 continue
             for f in shown:
@@ -2279,6 +2398,8 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
                     b = base_f.get(f)
                     if b is None:
                         L.append("        Base case: this fault was not run")
+                    elif b.get("absent"):
+                        L.append("        Base case: the unit is not in the base case -- it is part of the project")
                     elif b["status"] == "trip":
                         L.append("        Base case: ALSO trips -- %s" % CAUSE_SHORT.get(b["cause"], "?"))
                     elif b["status"] == "event":
@@ -2342,6 +2463,12 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
             if not items:
                 L.append("      no PSS/E log")
                 continue
+            absent = [f for f, r in items if r.get("absent")]
+            if absent:
+                items = [(f, r) for f, r in items if not r.get("absent")]
+                L.append("      %d fault(s): not in this case -- the unit is part of the project" % len(absent))
+                if not items:
+                    continue
             items.sort(key=lambda fr: (fr[1].get("hops") if fr[1].get("hops") is not None else 999, _fkey(fr[0])))
             quiet = []
             for f, r in items:
@@ -2416,6 +2543,7 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
                                  (_relay_short(_cr[1]) if (_cr and _cr[1]["n"]) else ""),
                                  ("%.3f" % _cr[1]["held"]) if (_cr and _cr[1]["n"]) else "",
                                  (_g(_cr[1]["tp"]) if (_cr and _cr[1]["n"] and _cr[1]["tp"] is not None) else ""),
+                                 "not in this case (project unit)" if r.get("absent") else
                                  {"trip": "TRIPPED", "event": "disconnected by the event (not a trip)",
                                   "psse": "tripped in PSS/E, not counted", "none": "no"}[r["status"]],
                                  CAUSE.get(r["cause"], "") if r["status"] != "none" else "",
@@ -2485,6 +2613,11 @@ def main():
                 ", ".join(os.path.basename(p) for p in st["files"]) or
                 "none (02_VIOLATIONS / SPP_CRITERIA_REPORT not found -- PSS/E's log decides)"))
             per = dict((u, {}) for u in units)
+            # this run's relays only (a project's own .dyr for its SGF buses), and whether the unit
+            # is modelled in this run at all (the SGF buses are not in the base case)
+            rel_run = dict((b, _relays_for(dinfo[b]["relays"], is_base, proj)) for b in wbus)
+            not_here = dict((b, bool(dinfo[b]["mscope"]) and not _in_scope(dinfo[b]["mscope"], is_base, proj))
+                            for b in wbus)
             for k, f in enumerate(faults):
                 ld = None
                 if f in logs_u:
@@ -2509,10 +2642,12 @@ def main():
                                                  if x[0] != b and (hops_u.get(b) or {}).get(x[0]) is not None
                                                  and (hops_u.get(b) or {}).get(x[0]) <= NEAR_TRIP_HOPS],
                                                 key=lambda y: (y[2], -(y[1] or 0))),
-                           "relays_n": len([r for r in dinfo[b]["relays"] if _gid_ok(gid, r["id"])])}
+                           "relays_n": len([r for r in rel_run[b] if _gid_ok(gid, r["id"])])}
                     if ld is not None:
-                        res["exp"] = explain(b, gid, ld, dinfo[b]["relays"])
+                        res["exp"] = explain(b, gid, ld, rel_run[b])
                         res["name"] = ld.names.get(b, "")
+                    res["absent"] = bool(not_here[b] and sv in ("none", "unscored", "unknown") and not res["num"]
+                                         and not (ld is not None and b in ld.names))
                     per[(b, gid)][f] = judge(res)
             for u in units:
                 results[u][proj].append((lbl, d, is_base, per[u]))
