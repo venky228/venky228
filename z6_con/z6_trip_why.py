@@ -86,6 +86,7 @@ LINK_WINDOW_S = 0.05           # a trip is put down to a relay whose breaker tim
 FAULT_LIST = r"FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"   # under ROOT ({project} filled in);
                                #   also looked for in ROOT, Base\, Projects\ as SPP_FAULTS*_{project}.csv
 CLOSEST_ROWS = 12              # faults it rides through shown next to the trips, closest calls first
+NEAR_TRIP_HOPS = 3             # other units that trip within this many buses of the unit are shown with it
 # ============================================================================
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1208,7 +1209,7 @@ def run_study(folder, units, near=None):
          meas    {(fault, bus): {...}}                 SPP_MEASURE_MACHINES (numbers only)"""
     want = set(b for b, _i in units)
     st = {"trips": {}, "crit": {}, "meas": {}, "files": [], "have_vio": False, "have_crit": False,
-          "ang": {}, "volt": {}}
+          "ang": {}, "volt": {}, "all_trips": {}, "poi": {}}
     for p in _csvs(folder, "02_VIOLATIONS"):
         try:
             rows = _read_csv(p)
@@ -1217,18 +1218,22 @@ def run_study(folder, units, near=None):
             continue
         st["have_vio"] = True
         st["files"].append(p)
-        got = {}
+        got, allt = {}, {}
         for r in rows:
             f = (r.get("fault_id") or "").strip().upper()
             if not f:
                 continue
             d = got.setdefault(f, {})
+            allt.setdefault(f, [])
             if (r.get("violation") or "").strip().lower() != "tripped":
                 continue
             b, _u = _label_bus(r.get("element"))
+            if b:
+                allt[f].append((b, (r.get("element") or "").strip(), _num(r.get("value"))))
             if b in want:
                 d.setdefault(b, []).append(((r.get("element") or "").strip(), _num(r.get("value"))))
         st["trips"].update(got)
+        st["all_trips"].update(allt)
     for p in _csvs(folder, "SPP_CRITERIA_REPORT"):
         try:
             rows = _read_csv(p)
@@ -1275,6 +1280,22 @@ def run_study(folder, units, near=None):
                                     "e0": _num(row.get("Pre-fault Eterm (pu)")),
                                     "e1": _num(row.get("Final Eterm (pu)")),
                                     "evidence": (row.get("Evidence") or "").strip()}
+    # THE PROJECT AT THE POI: total MW delivered before / lowest / highest / final
+    for p in _csvs(folder, "SPP_MEASURE_POI"):
+        try:
+            rows = _read_csv(p)
+        except Exception as e:
+            print("[trip-why] could not read %s (%s)" % (p, e))
+            continue
+        st["files"].append(p)
+        for row in rows:
+            if (row.get("Quantity") or "").strip().upper() != "MW":
+                continue
+            if not (row.get("Component") or "").strip().upper().startswith("TOTAL"):
+                continue
+            f = (row.get("Scenario") or "").strip().upper()
+            st["poi"][f] = {"p0": _num(row.get("Pre-fault")), "pmin": _num(row.get("Min after clearing")),
+                            "pmax": _num(row.get("Max after clearing")), "pend": _num(row.get("Final"))}
     # ROTOR ANGLE: how far the unit swung and whether it damped (synchronous machines)
     for p in _csvs(folder, "SPP_MEASURE_ANGLES"):
         try:
@@ -1740,6 +1761,230 @@ def why_section(runs, flist, hops):
     return L
 
 
+# ------------------------------------------- base vs scenario, around the unit --
+def _metrics(r):
+    """The conditions around the unit in one run of one fault."""
+    r = r or {}
+    ex = r.get("exp") or {}
+    v = r.get("volt") or {}
+    a = r.get("ang") or {}
+    num = r.get("num") or {}
+    cr = closest_relay(ex) if ex else None
+    return {"p0": num.get("p0"), "vmin": v.get("vmin"), "tmin": v.get("tmin"), "vmax": v.get("vmax"),
+            "vend": v.get("vend"), "vbus": v.get("bus"), "uvmin": ex.get("vmin"), "uvmax": ex.get("vmax"),
+            "fmin": ex.get("fmin"), "fmax": ex.get("fmax"),
+            "dev": a.get("dev") if "ASYNC" not in (a.get("kind") or "").upper() else None,
+            "concl": (a.get("concl") or "").split(" --")[0], "relay": cr[1] if (cr and cr[1]["n"]) else None,
+            "stats": ex.get("relay_stats") or {},
+            "oos": [n for n in ex.get("notes") or [] if "OUT-OF-STEP" in n],
+            "iso": [e for e in ex.get("events") or [] if e["cause"] == "ISO"],
+            "near": r.get("near_trips") or [], "poi": r.get("poi") or {}}
+
+
+def _res_txt(r):
+    if r is None:
+        return "not run"
+    if not r.get("log") and r.get("status") == "none":
+        return "no PSS/E log"
+    if r["status"] == "trip":
+        return "TRIP %s" % (r.get("cat") or "?")
+    if r["status"] == "event":
+        return "event disconnects it"
+    if r["status"] == "psse":
+        return "PSS/E trip (n/c)"
+    return "no trip"
+
+
+def _d(a, b, fmt="%+.2f"):
+    return (fmt % (b - a)) if (a is not None and b is not None) else ""
+
+
+def _f2(x, fmt="%.2f"):
+    return (fmt % x) if x is not None else "-"
+
+
+def compare_lines(f, rb, rs, ls):
+    """The table of conditions around the unit, base vs one scenario, for one fault."""
+    mb, ms = _metrics(rb), _metrics(rs)
+    L = []
+
+    def row(name, vb, vs, chg=""):
+        L.append("        %-32s %-20s %-20s %s" % (name, vb, vs, chg))
+    row("", "Base case", _short(ls)[:20], "change")
+    row("result", _res_txt(rb), _res_txt(rs))
+    if mb["p0"] is not None or ms["p0"] is not None:
+        row("unit output before the fault MW", _f2(mb["p0"], "%.1f"), _f2(ms["p0"], "%.1f"), _d(mb["p0"], ms["p0"], "%+.1f"))
+    if mb["vmin"] is not None or ms["vmin"] is not None:
+        row("lowest V near the unit (pu)", _f2(mb["vmin"]) + (" @%.2fs" % mb["tmin"] if mb["tmin"] is not None else ""),
+            _f2(ms["vmin"]) + (" @%.2fs" % ms["tmin"] if ms["tmin"] is not None else ""), _d(mb["vmin"], ms["vmin"]))
+        row("highest V near the unit (pu)", _f2(mb["vmax"]), _f2(ms["vmax"]), _d(mb["vmax"], ms["vmax"]))
+        row("settled V near the unit (pu)", _f2(mb["vend"]), _f2(ms["vend"]), _d(mb["vend"], ms["vend"]))
+    if mb["uvmin"] is not None or ms["uvmin"] is not None:
+        row("lowest V at the unit, log (pu)", _f2(mb["uvmin"]), _f2(ms["uvmin"]), _d(mb["uvmin"], ms["uvmin"]))
+    if mb["uvmax"] is not None or ms["uvmax"] is not None:
+        row("highest V at the unit, log (pu)", _f2(mb["uvmax"]), _f2(ms["uvmax"]), _d(mb["uvmax"], ms["uvmax"]))
+    if any(m[k] is not None for m in (mb, ms) for k in ("fmin", "fmax")):
+        row("frequency at the unit (Hz)", "%s / %s" % (_f2(mb["fmin"]), _f2(mb["fmax"])),
+            "%s / %s" % (_f2(ms["fmin"]), _f2(ms["fmax"])), "(lowest / highest)")
+    if mb["dev"] is not None or ms["dev"] is not None:
+        row("rotor angle swing (deg)", ("%.0f %s" % (mb["dev"], mb["concl"].lower())) if mb["dev"] is not None else "-",
+            ("%.0f %s" % (ms["dev"], ms["concl"].lower())) if ms["dev"] is not None else "-", _d(mb["dev"], ms["dev"], "%+.0f"))
+    for nm, m in (("b", mb), ("s", ms)):
+        pass
+    rb_rel = mb["relay"]
+    rs_rel = ms["relay"]
+    if rb_rel or rs_rel:
+        def rtxt(st):
+            return ("%s %s/%s s%s" % (st["inst"], _g(st["held"], 2), _g(st["tp"]) if st["tp"] is not None else "?",
+                                     " TRIP" if st["tripped"] else "")) if st else "none picked up"
+        row("closest relay: held / needed", rtxt(rb_rel), rtxt(rs_rel))
+    if mb["oos"] or ms["oos"]:
+        row("out-of-step at the unit (PSS/E)", "yes" if mb["oos"] else "no", "yes" if ms["oos"] else "no")
+    if mb["iso"] or ms["iso"]:
+        row("its bus isolated (PSS/E)", ("yes %.2fs" % mb["iso"][0]["t"]) if (mb["iso"] and mb["iso"][0]["t"] is not None) else
+            ("yes" if mb["iso"] else "no"),
+            ("yes %.2fs" % ms["iso"][0]["t"]) if (ms["iso"] and ms["iso"][0]["t"] is not None) else ("yes" if ms["iso"] else "no"))
+    nb_mw = sum((x[1] or 0.0) for x in mb["near"])
+    ns_mw = sum((x[1] or 0.0) for x in ms["near"])
+    if mb["near"] or ms["near"]:
+        row("units tripped within %d buses" % NEAR_TRIP_HOPS, "%d (%.0f MW)" % (len(mb["near"]), nb_mw),
+            "%d (%.0f MW)" % (len(ms["near"]), ns_mw), "")
+    if mb["poi"] or ms["poi"]:
+        def ptxt(pp):
+            return ("%s>%s>%s" % (_f2(pp.get("p0"), "%.0f"), _f2(pp.get("pmin"), "%.0f"), _f2(pp.get("pend"), "%.0f"))) if pp else "-"
+        row("project MW at POI (pre>min>end)", ptxt(mb["poi"]), ptxt(ms["poi"]))
+    return L, mb, ms
+
+
+def suggest(rb, rs, mb, ms, ls):
+    """Plain sentences: the most likely reason the result differs (or that it does not)."""
+    sc = _short(ls)
+    tb = (rb or {}).get("status") == "trip"
+    ts = (rs or {}).get("status") == "trip"
+    out = []
+    dv = lambda k: (ms[k] - mb[k]) if (ms[k] is not None and mb[k] is not None) else None
+    if tb and ts:
+        cb, cs = rb.get("cat"), rs.get("cat")
+        out.append("It trips in both: an existing condition of the system, not caused by the SGF (base: %s, %s: %s)."
+                   % (CAT_WORDS.get(cb, cb).lower(), sc, CAT_WORDS.get(cs, cs).lower()))
+        return out
+    if not tb and not ts:
+        return out
+    who, other = (rs, rb) if ts else (rb, rs)
+    mw, mo = (ms, mb) if ts else (mb, ms)
+    where = sc if ts else "the base case"
+    there = "the base case" if ts else sc
+    cat = who.get("cat")
+    lead = "It trips in %s and not in %s" % (where, there)
+    bits = []
+    st = mw["relay"] if (mw["relay"] and mw["relay"]["tripped"]) else None
+    if cat == "RELAY" and st:
+        so = mo["stats"].get(st["inst"])
+        held_o = so["held"] if (so and so["n"]) else 0.0
+        what = "voltage" if _is_volt(st["model"]) else "frequency"
+        bits.append("its relay %s (%s for %s s) ran out in %s, while in %s the same relay %s"
+                    % (st["inst"], setting_short(st["rec"]), _g(st["tp"]) if st["tp"] is not None else "?", where, there,
+                       ("held only %.3f s" % held_o) if (so and so["n"]) else "never picked up"))
+        if st["side"] == "UV":
+            vb = []
+            if dv("vmin") is not None and abs(dv("vmin")) >= 0.02:
+                vb.append("dipped %s (%.2f against %.2f pu)" % (
+                    "deeper" if (mw["vmin"] < mo["vmin"]) else "less", mw["vmin"], mo["vmin"]))
+            if dv("vend") is not None and abs(dv("vend")) >= 0.02:
+                vb.append("settled %s (%.2f against %.2f pu)" % (
+                    "lower" if mw["vend"] < mo["vend"] else "higher", mw["vend"], mo["vend"]))
+            if vb:
+                bits.append("the voltage near the unit %s" % " and ".join(vb))
+            bits.append("so the %s stayed below %s long enough to trip it" % (what, setting_short(st["rec"]).replace("V below ", "")))
+        elif st["side"] == "OV":
+            if mw["vmax"] is not None and mo["vmax"] is not None:
+                bits.append("the voltage near the unit rose higher after clearing (%.2f against %.2f pu)" % (mw["vmax"], mo["vmax"]))
+            elif mw["uvmax"] is not None:
+                bits.append("its voltage reached %.2f pu" % mw["uvmax"])
+        else:
+            fx = mw["fmin"] if st["side"] == "UF" else mw["fmax"]
+            fo = mo["fmin"] if st["side"] == "UF" else mo["fmax"]
+            if fx is not None:
+                bits.append("the frequency at the unit reached %.2f Hz%s" % (fx, (" against %.2f Hz" % fo) if fo is not None else ""))
+    elif cat == "STABILITY":
+        if mw["dev"] is not None and mo["dev"] is not None:
+            bits.append("its rotor angle swung %.0f deg against %.0f deg in %s -- it lost synchronism" % (mw["dev"], mo["dev"], there))
+        else:
+            bits.append("it lost synchronism (rotor angle / out-of-step in the log)")
+        if dv("vmin") is not None and abs(dv("vmin")) >= 0.02:
+            bits.append("the voltage near it dipped %s (%.2f against %.2f pu), weakening its synchronising support"
+                        % ("deeper" if mw["vmin"] < mo["vmin"] else "less", mw["vmin"], mo["vmin"]))
+    elif cat == "NETWORK":
+        e = mw["iso"][0] if mw["iso"] else None
+        bits.append("its bus is disconnected in %s%s and stays connected in %s" % (
+            where, (" at %.3f s" % e["t"]) if (e and e["t"] is not None) else "", there))
+        if e and "took out" in (e.get("text") or ""):
+            bits.append(e["text"].split("Just before,")[-1].strip().rstrip(".").replace("PSS/E took out:", "PSS/E took out").strip())
+    elif cat == "CONTROL":
+        bits.append("no relay acted; its own control took its power to zero")
+        if dv("vmin") is not None and abs(dv("vmin")) >= 0.02:
+            bits.append("the voltage near the unit dipped %s (%.2f against %.2f pu)" % (
+                "deeper" if mw["vmin"] < mo["vmin"] else "less", mw["vmin"], mo["vmin"]))
+    else:
+        bits.append("PSS/E's log does not show what tripped it")
+    nw, no = len(mw["near"]), len(mo["near"])
+    if nw != no:
+        bits.append("%d other unit(s) within %d buses trip in %s against %d in %s%s" % (
+            nw, NEAR_TRIP_HOPS, where, no, there,
+            (" (%s)" % ", ".join("%s %.0f MW" % (x[0], x[1] or 0) for x in mw["near"][:4])) if nw > no else ""))
+    out.append("%s: %s." % (lead, "; ".join(bits)))
+    if ts and not tb:
+        diffs = []
+        for k, nm in (("vmin", "lowest voltage near it"), ("vend", "settled voltage"), ("vmax", "highest voltage")):
+            if dv(k) is not None and abs(dv(k)) >= 0.02:
+                diffs.append("%s %+.2f pu" % (nm, dv(k)))
+        if dv("dev") is not None and abs(dv("dev")) >= 10:
+            diffs.append("rotor swing %+.0f deg" % dv("dev"))
+        if diffs:
+            out.append("What the SGF changes around the unit in this fault: %s." % ", ".join(diffs))
+    return out
+
+
+def base_vs_scenario(runs):
+    """Section lines for one project: every fault where the base and a scenario differ, side by side."""
+    L = []
+    base = [r for r in runs if r[2]]
+    if not base:
+        return ["   (no base case run read -- nothing to compare)"]
+    bl, _bd, _bb, bf = base[0]
+    for (lbl, _d, is_base, faults) in runs:
+        if is_base:
+            continue
+        L.append("   Base case vs %s" % lbl)
+        diff, both = [], []
+        for f in sorted(set(faults) | set(bf), key=_fkey):
+            rb, rs = bf.get(f), faults.get(f)
+            tb = (rb or {}).get("status") == "trip"
+            ts = (rs or {}).get("status") == "trip"
+            if tb and ts:
+                both.append(f)
+            elif tb != ts and rb is not None and rs is not None:
+                diff.append(f)
+        if not diff:
+            L.append("      the unit trips in the same faults in both (%s)" % (_flist(both, 30) if both else "none"))
+            L.append("")
+            continue
+        for f in diff:
+            rb, rs = bf.get(f), faults.get(f)
+            fi = (rs or rb or {}).get("fi")
+            h = (rs or rb or {}).get("hops")
+            L.append("    %s  %s" % (f, _fault_words(fi, h) if fi else ""))
+            tab, mb, ms = compare_lines(f, rb, rs, lbl)
+            L.extend(tab)
+            for sline in suggest(rb, rs, mb, ms, lbl):
+                L.append("        => %s" % _wrap(sline, 66, "           "))
+            L.append("")
+        if both:
+            L.append("      It trips in both (existing, not caused by the SGF) in: %s" % _wrap(_flist(both, 40), 50, "        "))
+        L.append("")
+    return L
+
+
 def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, pinfo):
     tag = unit + ("_" + re.sub(r"\W", "", gid) if gid else "")
     path = os.path.join(out_dir, "TRIP_REASON_%s.txt" % tag)
@@ -2037,6 +2282,18 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
                 L.append("        stayed above 0.90 pu: %s" % _wrap(_flist(quiet, 40), 66, "        "))
         L.append("")
     L.append(SUB)
+    L.append(" 7. BASE CASE vs SCENARIO -- THE CONDITIONS AROUND THE UNIT, AND WHY IT TRIPS IN ONE ONLY")
+    L.append(SUB)
+    L.append(" For each fault where the unit trips in one run and not in the other: the voltage near it, at")
+    L.append(" it, its frequency, rotor angle, its closest relay, PSS/E's switching, other units that trip")
+    L.append(" within %d buses, and the project at the POI -- then the most likely reason (=>)." % NEAR_TRIP_HOPS)
+    for proj in results:
+        runs = results[proj]
+        if not runs:
+            continue
+        L.append(" %s" % proj)
+        L.extend(base_vs_scenario(runs))
+    L.append(SUB)
     L.append(" HOW TO READ THIS")
     L.append(SUB)
     for t in (
@@ -2164,6 +2421,12 @@ def main():
                            "num": st["meas"].get((f, b)) or {}, "exp": None, "name": "",
                            "fi": fi, "hops": (hops_u.get(b) or {}).get(fi["bus"]) if fi else None,
                            "ang": st["ang"].get((f, b)), "volt": st["volt"].get((f, b)),
+                           "poi": st["poi"].get(f),
+                           "near_trips": sorted([(x[0], x[2], (hops_u.get(b) or {}).get(x[0]))
+                                                 for x in (st["all_trips"].get(f) or [])
+                                                 if x[0] != b and (hops_u.get(b) or {}).get(x[0]) is not None
+                                                 and (hops_u.get(b) or {}).get(x[0]) <= NEAR_TRIP_HOPS],
+                                                key=lambda y: (y[2], -(y[1] or 0))),
                            "relays_n": len([r for r in dinfo[b]["relays"] if _gid_ok(gid, r["id"])])}
                     if ld is not None:
                         res["exp"] = explain(b, gid, ld, dinfo[b]["relays"])
