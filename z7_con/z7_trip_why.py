@@ -14,12 +14,17 @@ from three sources:
                        relay picked up, the voltage or frequency it saw, when
                        its breaker timer ran out, and PSS/E's
                        "MACHINE ... TRIPPED AT TIME" / "BUS ... DISCONNECTED" lines
-    the study scorer   <run>\\reports\\SPP_MEASURE_MACHINES_*.csv, when present:
-                       whether the study counted the unit as tripped, and on
-                       what evidence (power to zero, terminal voltage collapsed)
+    the study itself   what decides whether it IS a trip, exactly as the study
+                       counts it: <run>\\02_VIOLATIONS_*.csv (the units the
+                       verdict calls tripped), <run>\\reports\\SPP_CRITERIA_REPORT_*.csv
+                       (the units the EVENT removes -- not trips) and
+                       <run>\\reports\\SPP_MEASURE_MACHINES_*.csv (power and terminal
+                       voltage before / after)
 
 and writes ONE TEXT FILE PER UNIT:  <ROOT>\\trip_reasons\\TRIP_REASON_<bus>.txt
-(plus TRIP_REASONS.csv with every fault of every unit, for Excel).
+(plus TRIP_REASONS.csv with every fault of every unit, for Excel). Every trip is
+given a CAUSE: UNDER-VOLTAGE, OVER-VOLTAGE, UNDER-FREQUENCY, OVER-FREQUENCY, or
+ISOLATED (its bus lost its connection -- not a voltage or frequency trip).
 
 Nothing is simulated and nothing in the results folders is changed: the logs,
 .dyr files and CSVs are only read.
@@ -439,6 +444,11 @@ R_TIME = re.compile(r"TIME\s*=\s*(-?\d+(?:\.\d+)?)")
 R_OOS = re.compile(r"OUT OF STEP CONDITION AT TIME\s*=\s*(-?[\d.]+)")
 R_BUSNO = re.compile(r"(?:^|\s)(\d{3,7})(?=\s)")
 R_TOBUS = re.compile(r"(?<![\d.])(\d{3,7})(?![\d.])")
+R_BAND_HDR = re.compile(r"VOLTAGES OUTSIDE OF BAND\s+(-?[\d.]+)\s+TO\s+(-?[\d.]+)")
+R_BAND_ROW = re.compile(r"(\d{3,7})\s*\[([^\]]*)\]\s*(\d+\.\d+|\*+)\s*(HI|LO)")
+R_STATUS = re.compile(r"Status of circuit\s+\"([^\"]*)\"\s+from\s+(\d+)\s*\[[^\]]*\]\s+to\s+(\d+)\s*\[[^\]]*\]"
+                      r"(?:\s+to\s+(\d+)\s*\[[^\]]*\])?\s+is set to out-of-service")
+R_BRELAY = re.compile(r"^\s*RELAY\s+(\S+)\s+#.*?CIRCUIT\s+(\S+)\s+FROM\s+(\d+)\s+TO\s+(\d+)\s+MESSAGES AT TIME\s*=\s*(-?[\d.]+)")
 
 
 class LogData(object):
@@ -451,6 +461,8 @@ class LogData(object):
         self.ipick = []      # (t, model, bus, state, qty, value, relay no)
         self.island = []     # (t, set of buses)
         self.oos = []        # (t, from bus, to bus)
+        self.band = []       # (t, bus, value or None, "LO"|"HI", band low, band high)
+        self.branch = []     # (t, from, to, ckt, how) -- every branch PSS/E took out of service
         self.names = {}      # bus -> name as PSS/E prints it
         self.models = {}     # inst -> relay model name
 
@@ -470,7 +482,9 @@ def parse_log(path, wbus, winst, quick):
     last_t = None
     island = None
     oos = None
+    band = (None, None, None)                            # (time, low, high) of the last band report
     last_start = {}
+    brelay = {}                                          # (from, to, ckt) -> (t, model) of a line relay trip
     for line in text.splitlines():
         if line.startswith("FLOW"):                      # 'FLOW1 BUS ... NOT FOUND' noise
             continue
@@ -478,8 +492,7 @@ def parse_log(path, wbus, winst, quick):
         if not s:
             hdr = None
             if island is not None:
-                hit = set(island) & wbus
-                if hit:
+                if set(island) & wbus:
                     ld.island.append((last_t, set(island)))
                 island = None
             if oos is not None and oos[0] == "rows":
@@ -502,10 +515,22 @@ def parse_log(path, wbus, winst, quick):
                     ld.oos.append((oos[1], a, b))
                 continue
             oos = None
+        if ("HI" in line or "LO" in line) and "[" in line and any(b in line for b in wbus):
+            rows = R_BAND_ROW.findall(line)
+            if rows:
+                for (bb, nm, val, side) in rows:
+                    if bb in wbus:
+                        ld.band.append((band[0], bb, _num(val), side, band[1], band[2]))
+                        ld.names.setdefault(bb, _name(nm))
+                continue
         if "TIME" in line:
             mt = R_TIME.search(line)
             if mt:
                 last_t = _num(mt.group(1))
+            if "OUTSIDE OF BAND" in line:
+                mb = R_BAND_HDR.search(line)
+                band = (last_t, _num(mb.group(1)) if mb else None, _num(mb.group(2)) if mb else None)
+                continue
         if "Model Instance" in line:
             m = R_RELAY_HDR.match(line)
             if m:
@@ -536,11 +561,31 @@ def parse_log(path, wbus, winst, quick):
                                    last_start.get(inst) if inst else None))
                     ld.names.setdefault(gb, _name(nm))
                 continue
-        if "TRIPPED AT TIME" in line and "MACHINE" in line:
-            m = R_MTRIP.match(line)
-            if m and m.group(2) in wbus:
-                ld.mtrip.append((_num(m.group(4)), m.group(1).strip(), m.group(2), len(ld.brk)))
-                ld.names.setdefault(m.group(2), _name(m.group(3)))
+        if line.lstrip().startswith("RELAY ") and "MESSAGES AT TIME" in line:
+            m = R_BRELAY.match(line)
+            if m:
+                hdr = ("B", m.group(1).upper(), m.group(2), m.group(3), m.group(4))
+                continue
+        if "TRIPPED AT TIME" in line:
+            if "MACHINE" in line:
+                m = R_MTRIP.match(line)
+                if m and m.group(2) in wbus:
+                    ld.mtrip.append((_num(m.group(4)), m.group(1).strip(), m.group(2), len(ld.brk)))
+                    ld.names.setdefault(m.group(2), _name(m.group(3)))
+            elif hdr and hdr[0] == "B":
+                mt = R_TIME.search(line)
+                tt = _num(mt.group(1)) if mt else last_t
+                brelay[(hdr[3], hdr[4], hdr[2])] = (tt, hdr[1])
+                brelay[(hdr[4], hdr[3], hdr[2])] = (tt, hdr[1])
+            continue
+        if "Status of circuit" in line and "out-of-service" in line:
+            m = R_STATUS.search(line)
+            if m:
+                ck, a, b = m.group(1).strip(), m.group(2), m.group(3)
+                rl = brelay.get((a, b, ck))
+                how = ("line relay %s" % rl[1]) if (rl and last_t is not None and rl[0] is not None
+                                                     and last_t - rl[0] <= 0.05) else "switched out"
+                ld.branch.append((last_t, a, b, ck, how))
             continue
         if "DISCONNECTED AT TIME" in line:
             m = R_BDISC.match(line)
@@ -583,6 +628,16 @@ def parse_log(path, wbus, winst, quick):
 
 
 # ---------------------------------------------------------------- analysis --
+CAUSE = {"UV": "UNDER-VOLTAGE", "OV": "OVER-VOLTAGE", "UF": "UNDER-FREQUENCY", "OF": "OVER-FREQUENCY",
+         "UV/OV": "VOLTAGE (under or over -- PSS/E printed no value)",
+         "UF/OF": "FREQUENCY (under or over -- PSS/E printed no value)",
+         "ISO": "ISOLATED -- not a voltage or frequency trip",
+         "?": "NOT FOUND IN THE LOG"}
+CAUSE_SHORT = {"UV": "UNDER-VOLTAGE", "OV": "OVER-VOLTAGE", "UF": "UNDER-FREQUENCY", "OF": "OVER-FREQUENCY",
+               "UV/OV": "VOLTAGE (under or over)", "UF/OF": "FREQUENCY (under or over)",
+               "ISO": "ISOLATED", "?": "CAUSE NOT IN THE LOG"}
+
+
 def _gid_ok(want, got):
     return want is None or str(want).strip().upper() == str(got).strip().upper()
 
@@ -596,8 +651,21 @@ def _val_txt(qty, val):
     return ("%.2f pu" % v if qty.lower().startswith("v") else "%.2f Hz" % v), v
 
 
+def _own_side(text):
+    t = (text or "").upper().replace(" ", "").replace("-", "")
+    if "UNDERVOLT" in t or "LOWVOLT" in t or "LVRT" in t:
+        return "UV"
+    if "OVERVOLT" in t or "HIGHVOLT" in t or "HVRT" in t:
+        return "OV"
+    if "UNDERFREQ" in t or "LOWFREQ" in t or "UNDERSPEED" in t:
+        return "UF"
+    if "OVERFREQ" in t or "HIGHFREQ" in t or "OVERSPEED" in t:
+        return "OF"
+    return "?"
+
+
 def relay_reason(model, inst, rec, pick, t_bs, t_bt, act):
-    """The sentence for a trip by a relay, and its short label."""
+    """(cause, sentence, short label, grouping key) of a trip by a relay."""
     qty = pick[1] if pick else ("Voltage" if _is_volt(model) else "Frequency")
     vtxt, val = _val_txt(qty, pick[3]) if pick else ("", None)
     side = which_side(rec, model, val)
@@ -610,40 +678,37 @@ def relay_reason(model, inst, rec, pick, t_bs, t_bt, act):
     mon = (pick[2] if pick else None) or (rec["mon"] if rec else "?")
     tp, tb = (_t(rec, 2), _t(rec, 3)) if rec else (None, None)
     instant = tp is not None and tp <= 0.02
-    head = "%s relay %s %s (monitored bus %s, setting: %s, pickup %s s, breaker %s s)" % (
-        WORDS.get(side, side), model, inst, mon, setting_words(rec),
-        _g(tp) if tp is not None else "?", _g(tb) if tb is not None else "?")
-    bits = [head + "."]
+    what = "voltage" if qty.lower().startswith("v") else "frequency"
+    bits = ["%s relay %s %s tripped it -- setting %s for %s s (+ %s s breaker), measured at bus %s."
+            % ("Under-voltage" if side == "UV" else "Over-voltage" if side == "OV" else
+               "Under-frequency" if side == "UF" else "Over-frequency" if side == "OF" else "The",
+               model, inst, setting_words(rec), _g(tp) if tp is not None else "?",
+               _g(tb) if tb is not None else "?", mon)]
     if pick:
-        what = "voltage" if qty.lower().startswith("v") else "frequency"
         if spike and instant:
-            bits.append("Its pickup timer started at %.3f s on a %s of %s -- a NUMERICAL SPIKE at a "
-                        "switching instant, not a real %s." % (pick[0], what, vtxt, what))
+            bits.append("Its timer started at %.3f s on a %s of %s -- a NUMERICAL SPIKE at a switching "
+                        "instant, not a real %s; with a zero pickup time one time step was enough."
+                        % (pick[0], what, vtxt, what))
         elif spike:
-            bits.append("Its pickup timer started at %.3f s on a %s of %s -- a numerically impossible "
-                        "value at a switching instant -- and the %s stayed beyond the setting for "
-                        "the whole pickup time (see the unit's plot: a non-converged solution can "
-                        "hold such values)." % (pick[0], what, vtxt, what))
+            bits.append("Its timer started at %.3f s on a %s of %s -- a numerically impossible value at a "
+                        "switching instant -- and the %s stayed past the setting for the whole pickup time%s. "
+                        "See the unit's plot: a non-converged solution can hold such values."
+                        % (pick[0], what, vtxt, what,
+                           (", %.3f -> %.3f s" % (pick[0], t_bs)) if t_bs is not None else ""))
         else:
-            bits.append("Its pickup timer started at %.3f s when the %s at bus %s was %s." % (
-                pick[0], what, mon, vtxt))
-        if t_bs is not None and pick[0] is not None:
-            held = t_bs - pick[0]
-            if tp is not None and tp <= 0.0005:
-                bits.append("With a zero pickup time one time step was enough.")
-            else:
-                bits.append("The condition held for %.3f s (pickup timer %.3f -> %.3f s)." % (
-                    held, pick[0], t_bs))
+            bits.append("The %s was %s when its timer started at %.3f s." % (what, vtxt, pick[0]))
+            if t_bs is not None and pick[0] is not None and not instant:
+                bits.append("It stayed past the setting for %.3f s (%.3f -> %.3f s)." % (t_bs - pick[0], pick[0], t_bs))
     else:
-        bits.append("PSS/E did not print the value that started its pickup timer.")
+        bits.append("PSS/E did not print the value that started its timer.")
     if t_bt is not None:
-        bits.append("Breaker timer ran out at %.3f s and the relay %s." % (
+        bits.append("The breaker timer ran out at %.3f s and the relay %s." % (
             t_bt, "disconnected the unit's bus" if act == "disc" else "tripped the unit"))
-    short = "%s%s %s" % (side, "-spike" if (spike and instant) else "", inst)
-    key = "%s relay %s %s (%s)%s" % (side, model, inst, setting_words(rec),
-                                    (", on a numerical spike" if instant else ", started on a numerical spike")
-                                    if spike else "")
-    return " ".join(bits), short, key
+    short = "%s relay %s%s" % (side, inst, " spike" if (spike and instant) else "")
+    key = "relay %s %s (%s, %s s)%s" % (model, inst, setting_words(rec), _g(tp) if tp is not None else "?",
+                                        (", on a numerical spike" if instant else ", started on a numerical spike")
+                                        if spike else "")
+    return side, " ".join(bits), short, key
 
 
 def _relay_rec(unit_relays, inst):
@@ -653,10 +718,22 @@ def _relay_rec(unit_relays, inst):
     return None
 
 
+def _isolation_words(ld, t):
+    """What PSS/E switched out just before the bus went dead."""
+    if t is None:
+        return ""
+    near = [b for b in ld.branch if b[0] is not None and t - 0.03 <= b[0] <= t + 0.002]
+    if not near:
+        return ""
+    return " Just before, PSS/E took out: %s." % "; ".join(
+        "%s-%s ckt %s at %.3f s (%s)" % (b[1], b[2], b[3], b[0], b[4]) for b in near[-4:])
+
+
 def explain(unit, gid, ld, unit_relays):
-    """What happened to one unit in one fault log.
-       -> {"events": [ {t, kind, gid, short, key, text} ], "pickups": [...], "notes": [...]}"""
-    out = {"events": [], "pickups": [], "notes": []}
+    """What PSS/E did to one unit in one fault log.
+       -> {"events": [{t, kind, gid, cause, text, short, key}], "pickups": [...],
+           "sides": [(t, side, how)], "band": [...], "notes": [...]}"""
+    out = {"events": [], "pickups": [], "sides": [], "band": [], "notes": []}
     used_brk = set()
 
     def brk_for(t, want_gid, n_before):
@@ -678,14 +755,13 @@ def explain(unit, gid, ld, unit_relays):
         return ts
 
     def pick_before(inst, t_ref, snap):
-        """The pickup start that led to the breaker timer: the last one before it."""
         best = None
         for (tt, st, qty, mb, val) in ld.pick.get(inst, []):
             if st == "started" and tt is not None and (t_ref is None or tt <= t_ref + 0.002):
                 best = (tt, qty, mb, val)
         return best or snap
 
-    def by_relay(i, t, kind):
+    def by_relay(i, kind):
         b = ld.brk[i]
         used_brk.add(i)
         t_bt, model, inst, snap = b[0], b[2], b[3], b[6]
@@ -694,113 +770,156 @@ def explain(unit, gid, ld, unit_relays):
         pick = pick_before(inst, t_bs if t_bs is not None else t_bt, snap)
         return relay_reason(model, inst, rec, pick, t_bs, t_bt, kind)
 
-    # 1. MACHINE ... TRIPPED
-    for (t, g, bus, nb) in ld.mtrip:
+    def add(t, kind, g, cause, text, short, key):
+        out["events"].append({"t": t, "kind": kind, "gid": g, "cause": cause, "text": text,
+                              "short": short, "key": key})
+
+    for (t, g, bus, nb) in ld.mtrip:                     # MACHINE ... TRIPPED
         if bus != unit or not _gid_ok(gid, g):
             continue
         i = brk_for(t, g, nb)
         if i is not None:
-            text, short, key = by_relay(i, t, "trip")
+            cause, text, short, key = by_relay(i, "trip")
         else:
             it = [x for x in ld.itrip if x[2] == unit and x[0] is not None and t is not None
                   and abs(x[0] - t) <= LINK_WINDOW_S]
             if it:
-                text = "The unit model's own protection (%s): %s." % (it[0][1], it[0][4])
-                short, key = "own prot. %s" % it[0][1], "own protection of %s: %s" % (it[0][1], it[0][4])
+                cause = _own_side(it[0][4])
+                text = "The unit model's own protection (%s) tripped it: %s." % (it[0][1], it[0][4])
+                short, key = "%s own prot." % cause, "the model's own protection (%s): %s" % (it[0][1], it[0][4])
             else:
-                text = ("PSS/E tripped it, but its log does not name the model that did "
-                        "(no relay message for this unit just before).")
-                short, key = "tripped (no model named)", "tripped, no model named in the log"
-        out["events"].append({"t": t, "kind": "trip", "gid": g, "text": text, "short": short, "key": key})
-    # 2. BUS ... DISCONNECTED
-    for (t, bus, nb) in ld.bdisc:
+                cause = "?"
+                text = "PSS/E tripped it, but its log names no relay or model for it."
+                short, key = "tripped, no model named", "tripped, no relay or model named in the log"
+        add(t, "trip", g, cause, text, short, key)
+    for (t, bus, nb) in ld.bdisc:                        # BUS ... DISCONNECTED
         if bus != unit:
             continue
         i = brk_for(t, gid, nb)
         if i is not None and i not in used_brk:
-            text, short, key = by_relay(i, t, "disc")
+            cause, text, short, key = by_relay(i, "disc")
         else:
-            text = ("PSS/E disconnected the unit's bus at %.3f s, and none of the unit's own relays "
-                    "had acted: the switching of the event (or another element's protection) left "
-                    "the bus without a connection." % t)
-            short, key = "bus disconnected", "bus disconnected by the network, not its own relay"
-        out["events"].append({"t": t, "kind": "disc", "gid": None, "text": text, "short": short, "key": key})
-    # 3. the model's own trip with no MACHINE line
-    for (t, model, bus, g, txt) in ld.itrip:
+            cause = "ISO"
+            text = ("PSS/E disconnected the unit's bus at %.3f s and no relay of the unit had acted: the "
+                    "network around it was switched out." % t) + _isolation_words(ld, t)
+            short, key = "ISOLATED", "its bus was disconnected; no relay of the unit acted"
+        add(t, "disc", None, cause, text, short, key)
+    for (t, model, bus, g, txt) in ld.itrip:             # a model's own trip with no MACHINE line
         if bus != unit or not _gid_ok(gid, g or gid):
             continue
         if any(e["t"] is not None and t is not None and abs(e["t"] - t) <= LINK_WINDOW_S
                for e in out["events"]):
             continue
-        out["events"].append({"t": t, "kind": "trip", "gid": g,
-                              "text": "The unit model's own protection (%s): %s." % (model, txt),
-                              "short": "own prot. %s" % model,
-                              "key": "own protection of %s: %s" % (model, txt)})
-    # 4. isolated (PSS/E's list of disconnected buses) with no line above
-    for (t, buses) in ld.island:
+        cause = _own_side(txt)
+        add(t, "trip", g, cause, "The unit model's own protection (%s) tripped it: %s." % (model, txt),
+            "%s own prot." % cause, "the model's own protection (%s): %s" % (model, txt))
+    for (t, buses) in ld.island:                         # PSS/E's list of disconnected buses
         if unit not in buses:
             continue
         if out["events"]:
-            out["notes"].append("PSS/E also lists bus %s among the buses left disconnected (at about %s s)."
+            out["notes"].append("PSS/E also lists bus %s among the buses left disconnected (about %s s)."
                                 % (unit, "%.3f" % t if t is not None else "?"))
             continue
-        out["events"].append({"t": t, "kind": "iso", "gid": None,
-                              "text": ("PSS/E lists the unit's bus among the buses left disconnected "
-                                       "(island with no connection) at about %s s: the event's "
-                                       "switching isolated it; no relay of the unit acted."
-                                       % ("%.3f" % t if t is not None else "?")),
-                              "short": "isolated", "key": "isolated by the event's switching"})
+        add(t, "iso", None, "ISO",
+            ("PSS/E lists the unit's bus among the buses left with no connection at about %s s: the "
+             "network around it was switched out, and no relay of the unit acted."
+             % ("%.3f" % t if t is not None else "?")) + _isolation_words(ld, t),
+            "ISOLATED", "its bus was left with no connection; no relay of the unit acted")
     for (t, a, b) in ld.oos:
-        if unit not in (a, b):
-            continue
-        out["notes"].append("PSS/E reported an OUT-OF-STEP condition at %.3f s on the branch %s - %s."
-                            % (t if t is not None else -1, a, b))
-    # 5. the unit's relays that picked up but did not trip it
-    if SHOW_PICKUPS:
-        tripped = set(ld.brk[i][3] for i in used_brk)
-        t_off = min([e["t"] for e in out["events"] if e["t"] is not None] or [None]) \
-            if out["events"] else None
-        insts = [r["inst"] for r in unit_relays if _gid_ok(gid, r["id"])]
-        for b in ld.brk:
-            if b[5] == unit and b[3] and b[3] not in insts and _gid_ok(gid, b[4]):
-                insts.append(b[3])
-        for inst in insts:
-            ev = ld.pick.get(inst, [])
-            starts = [e for e in ev if e[1] == "started"]
-            if not starts or inst in tripped:
-                continue
-            rec = _relay_rec(unit_relays, inst)
-            model = rec["model"] if rec else ld.models.get(inst, "?")
-            vtxt, _v = _val_txt(starts[0][2], starts[0][4])
-            if rec and _v is not None:
-                sd = which_side(rec, model, _v)
-                vtxt += " (%s side)" % WORDS.get(sd, sd).lower()
-            last = ev[-1]
-            if last[1] == "reset":
-                end = "reset at %.3f s" % last[0]
-            elif t_off is not None:
-                end = "had not reset when the unit went off at %.3f s" % t_off
-            else:
-                end = "still timing at the end of the log"
-            bto = [b for b in ld.brk if b[3] == inst and b[1] == "timed out"]
-            if bto:
-                end += "; breaker timer ran out at %.3f s" % bto[-1][0]
-            out["pickups"].append("%s %s (%s, pickup %s s): picked up %d time(s), first at %.3f s on %s, %s"
-                                  % (model, inst, setting_words(rec),
-                                     _g(_t(rec, 2)) if rec else "?", len(starts),
-                                     starts[0][0], vtxt, end))
-        for (t, model, bus, st, qty, val, rn) in ld.ipick:
-            if bus == unit and st == "started":
-                vtxt, _v = _val_txt(qty, val)
-                out["pickups"].append("%s relay #%s of the unit model: picked up at %.3f s on %s %s"
-                                      % (model, rn, t if t is not None else -1, qty.lower(), vtxt))
+        if unit in (a, b):
+            out["notes"].append("PSS/E reported an OUT-OF-STEP condition at %.3f s on branch %s - %s."
+                                % (t if t is not None else -1, a, b))
     out["events"].sort(key=lambda e: (e["t"] is None, e["t"]))
+    t_off = out["events"][0]["t"] if out["events"] else None
+    # the unit's relays that picked up: which side, and whether they reset
+    tripped = set(ld.brk[i][3] for i in used_brk)
+    insts = [r["inst"] for r in unit_relays if _gid_ok(gid, r["id"])]
+    for b in ld.brk:
+        if b[5] == unit and b[3] and b[3] not in insts and _gid_ok(gid, b[4]):
+            insts.append(b[3])
+    for inst in insts:
+        ev = ld.pick.get(inst, [])
+        starts = [e for e in ev if e[1] == "started"]
+        if not starts:
+            continue
+        rec = _relay_rec(unit_relays, inst)
+        model = rec["model"] if rec else ld.models.get(inst, "?")
+        vtxt, v0 = _val_txt(starts[0][2], starts[0][4])
+        sd = which_side(rec, model, v0) if (rec or v0 is not None) else None
+        if sd and v0 is not None:
+            out["sides"].append((starts[0][0], sd, "relay %s %s saw %s" % (model, inst, vtxt)))
+        if inst in tripped:
+            continue
+        last = ev[-1]
+        if last[1] == "reset":
+            end = "reset at %.3f s" % last[0]
+        elif t_off is not None:
+            end = "had not reset when the unit went off at %.3f s" % t_off
+        else:
+            end = "still timing at the end of the log"
+        out["pickups"].append("%s %s (%s, %s s): %s side, picked up %d time(s), first at %.3f s on %s, %s"
+                              % (model, inst, setting_words(rec), _g(_t(rec, 2)) if rec else "?",
+                                 WORDS.get(sd, "?").lower() if sd else "?", len(starts),
+                                 starts[0][0], vtxt, end))
+    for (t, model, bus, st, qty, val, rn) in ld.ipick:
+        if bus == unit and st == "started":
+            vtxt, v0 = _val_txt(qty, val)
+            if v0 is not None:
+                sd = ("OV" if v0 > 1.0 else "UV") if qty.lower().startswith("v") else ("OF" if v0 > 60.0 else "UF")
+                out["sides"].append((t, sd, "%s relay #%s saw %s" % (model, rn, vtxt)))
+            out["pickups"].append("%s relay #%s of the unit model: picked up at %.3f s on %s %s"
+                                  % (model, rn, t if t is not None else -1, qty.lower(), vtxt))
+    out["band"] = [(t, v, sd, lo, hi) for (t, bb, v, sd, lo, hi) in ld.band if bb == unit]
+    for (t, v, sd, lo, hi) in out["band"]:
+        out["sides"].append((t, "UV" if sd == "LO" else "OV",
+                             "terminal voltage %s pu, %s the %s-%s pu band"
+                             % ("%.2f" % v if v is not None else "*****", "below" if sd == "LO" else "above",
+                                _g(lo) if lo is not None else "?", _g(hi) if hi is not None else "?")))
+    out["sides"].sort(key=lambda x: (x[0] is None, x[0]))
     return out
+
+
+def no_relay_cause(ex, num):
+    """(cause, sentence) for a trip the study counts but PSS/E never made."""
+    e0, e1 = num.get("e0"), num.get("e1")
+    p0, p1 = num.get("p0"), num.get("p1")
+    pw = (" (power %s -> %s MW)" % (_g(p0, 2), _g(p1, 2))) if (p0 is not None and p1 is not None) else ""
+    if e1 is not None and e1 < 0.2:
+        return "ISO", ("PSS/E did not trip it and no relay acted. Its terminal voltage went to ZERO (%s -> %s "
+                       "pu)%s: its bus lost its connection to the grid, so the unit went with it. The study "
+                       "counts that as a trip because the event's own switching did not remove it."
+                       % (_g(e0, 3), _g(e1, 3), pw))
+    sides = ex["sides"]
+    if sides:
+        first = sides[0]
+        others = sorted(set(s for _t, s, _h in sides if s != first[1]))
+        lows = [x for x in ex["band"] if x[2] == "LO" and x[1] is not None]
+        low_txt = ""
+        if lows and first[1] == "UV":
+            mn = min(lows, key=lambda x: x[1])
+            if first[2].startswith("terminal voltage"):
+                if len(lows) > 1:
+                    low_txt = " Lowest %.2f pu at %.3f s." % (mn[1], mn[0] if mn[0] is not None else -1)
+            else:
+                low_txt = (" Its terminal voltage was below %s pu from %.3f s (lowest %.2f pu at %.3f s)."
+                           % (_g(lows[0][3]), lows[0][0] if lows[0][0] is not None else -1, mn[1],
+                              mn[0] if mn[0] is not None else -1))
+        return first[1], ("PSS/E did not trip it -- no relay acted and the log has no trip line for it. The "
+                          "study counts it as tripped because its power went to zero%s. The condition at the "
+                          "unit was %s: first seen at %.3f s (%s).%s%s The unit's own control model took its "
+                          "output to zero under that condition."
+                          % (pw, CAUSE[first[1]].lower(), first[0] if first[0] is not None else -1, first[2],
+                             low_txt, (" Later also %s." % ", ".join(CAUSE[o].lower() for o in others))
+                             if others else ""))
+    return "?", ("PSS/E did not trip it -- no relay acted and the log has no trip line for it, and the log shows "
+                 "no under/over-voltage or frequency condition at the unit (its relays did not pick up and its "
+                 "voltage stayed inside the band PSS/E reports). The study counts it as tripped because its "
+                 "power went to zero%s." % pw)
 
 
 # ------------------------------------------------------------ run folders --
 def _case_dir(res_root, proj, suffix):
-    """ONLY <results>\<project>\<project>_<mode><suffix> or <results>\<project>_<mode><suffix>."""
+    """ONLY <results>\\<project>\\<project>_<mode><suffix> or <results>\\<project>_<mode><suffix>."""
     name = "%s_%s%s" % (proj, MODE, suffix)
     root = _abs(res_root)
     for d in (os.path.join(root, proj, name), os.path.join(root, name)):
@@ -873,115 +992,130 @@ def run_logs(folder):
     return out
 
 
-def run_scorer(folder, units):
-    """{(fault, bus): [{"tripped": bool, "evidence": str, "signal": str, ...}]} from SPP_MEASURE_MACHINES."""
-    paths = []
-    for sub in ("reports", ""):
+# ------------------------------------------------- the study's own verdicts --
+R_LABEL = re.compile(r"((?:[A-Z]+ )?(\d{3,})(?:-([A-Z0-9]{1,2}))?)\s*\(([^()]*)\)")
+
+
+def _label_bus(lbl):
+    m = re.search(r"(\d{3,})(?:-([A-Z0-9]{1,2}))?\s*$", str(lbl or "").strip())
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def _csvs(folder, prefix):
+    out = []
+    for sub in ("", "reports"):
         d = os.path.join(folder, sub) if sub else folder
-        if os.path.isdir(d):
-            for nm in os.listdir(d):
-                if nm.upper().startswith("SPP_MEASURE_MACHINES") and nm.lower().endswith(".csv"):
-                    paths.append(os.path.join(d, nm))
-    paths.sort(key=lambda p: os.path.getmtime(p))
+        if not os.path.isdir(d):
+            continue
+        for nm in os.listdir(d):
+            if nm.lower().endswith(".csv") and nm.upper().startswith(prefix):
+                out.append(os.path.join(d, nm))
+    out.sort(key=lambda p: os.path.getmtime(p))         # oldest first: a newer file wins per fault
+    return out
+
+
+def _read_csv(p):
+    with open(p, "r", errors="replace") as fh:
+        return list(csv.DictReader(fh))
+
+
+def run_study(folder, units):
+    """The study's own findings for one run, per fault:
+         trips   {fault: {bus: [(label, MW before)]}}   02_VIOLATIONS (the verdict's list)
+         crit    {fault: {"event": {bus: evidence}, "gt": {bus: evidence}}}   SPP_CRITERIA_REPORT
+         meas    {(fault, bus): {...}}                 SPP_MEASURE_MACHINES (numbers only)"""
     want = set(b for b, _i in units)
-    out = {}
-    for p in paths:
+    st = {"trips": {}, "crit": {}, "meas": {}, "files": [], "have_vio": False, "have_crit": False}
+    for p in _csvs(folder, "02_VIOLATIONS"):
         try:
-            with open(p, "r", errors="replace") as fh:
-                for row in csv.DictReader(fh):
-                    bus = (row.get("Bus") or "").strip()
-                    if bus.endswith(".0"):
-                        bus = bus[:-2]
-                    sig = row.get("Signal") or ""
-                    if bus not in want:
-                        hit = [b for b in want if re.search(r"(?<!\d)%s(?!\d)" % b, sig)]
-                        if not hit:
-                            continue
-                        bus = hit[0]
-                    f = (row.get("Scenario") or "").strip()
-                    rows = out.setdefault((f.upper(), bus), [])
-                    rows[:] = [r for r in rows if r["signal"] != sig]
-                    rows.append({"signal": sig,
-                                 "tripped": (row.get("Tripped") or "").strip() in ("1", "True", "YES", "yes"),
-                                 "evidence": (row.get("Evidence") or "").strip(),
-                                 "p0": row.get("Pre-fault P (MW)", ""), "p1": row.get("Final P (MW)", ""),
-                                 "e0": row.get("Pre-fault Eterm (pu)", ""), "e1": row.get("Final Eterm (pu)", "")})
+            rows = _read_csv(p)
         except Exception as e:
             print("[trip-why] could not read %s (%s)" % (p, e))
-    return out, paths
+            continue
+        st["have_vio"] = True
+        st["files"].append(p)
+        got = {}
+        for r in rows:
+            f = (r.get("fault_id") or "").strip().upper()
+            if not f:
+                continue
+            d = got.setdefault(f, {})
+            if (r.get("violation") or "").strip().lower() != "tripped":
+                continue
+            b, _u = _label_bus(r.get("element"))
+            if b in want:
+                d.setdefault(b, []).append(((r.get("element") or "").strip(), _num(r.get("value"))))
+        st["trips"].update(got)
+    for p in _csvs(folder, "SPP_CRITERIA_REPORT"):
+        try:
+            rows = _read_csv(p)
+        except Exception as e:
+            print("[trip-why] could not read %s (%s)" % (p, e))
+            continue
+        st["have_crit"] = True
+        st["files"].append(p)
+        got = {}
+        for r in rows:
+            f = (r.get("Case") or "").strip().upper()
+            if not f:
+                continue
+            c = got.setdefault(f, {"event": {}, "gt": {}})
+            crit = (r.get("Criterion") or "").strip()
+            det = r.get("Detail") or ""
+            if crit.startswith("Generator tripping: units the EVENT removes"):
+                for m in R_LABEL.finditer(det):
+                    if m.group(2) in want:
+                        c["event"][m.group(2)] = m.group(4)
+            elif crit.startswith("No generator tripping"):
+                for m in R_LABEL.finditer(det):
+                    if m.group(2) in want:
+                        c["gt"][m.group(2)] = m.group(4)
+        st["crit"].update(got)
+    for p in _csvs(folder, "SPP_MEASURE_MACHINES"):
+        try:
+            rows = _read_csv(p)
+        except Exception as e:
+            print("[trip-why] could not read %s (%s)" % (p, e))
+            continue
+        st["files"].append(p)
+        for row in rows:
+            bus = (row.get("Bus") or "").strip()
+            if bus.endswith(".0"):
+                bus = bus[:-2]
+            if bus not in want:
+                b2, _u = _label_bus(row.get("Signal"))
+                if b2 not in want:
+                    continue
+                bus = b2
+            f = (row.get("Scenario") or "").strip().upper()
+            st["meas"][(f, bus)] = {"p0": _num(row.get("Pre-fault P (MW)")), "p1": _num(row.get("Final P (MW)")),
+                                    "e0": _num(row.get("Pre-fault Eterm (pu)")),
+                                    "e1": _num(row.get("Final Eterm (pu)")),
+                                    "evidence": (row.get("Evidence") or "").strip()}
+    return st
+
+
+def study_verdict(st, f, bus):
+    """('trip', MW) | ('event', evidence) | ('unscored', None) | ('none', None) | ('unknown', None)."""
+    f = f.upper()
+    if st["have_vio"] or st["have_crit"]:
+        tr = st["trips"].get(f, {}).get(bus)
+        c = st["crit"].get(f)
+        if tr:
+            return "trip", tr[0][1]
+        if c and bus in c["gt"]:
+            return "trip", None
+        if c and bus in c["event"]:
+            return "event", c["event"][bus]
+        if st["have_crit"] and f not in st["crit"]:
+            return "unscored", None
+        return "none", None
+    return "unknown", None
 
 
 # ------------------------------------------------------------------ report --
-def _scorer_line(rows):
-    if not rows:
-        return None, None
-    tr = [r for r in rows if r["tripped"]]
-    r = tr[0] if tr else rows[0]
-    ev = r["evidence"] if r["evidence"] and r["evidence"].lower() not in ("tripped", "connected") else ""
-    bits = []
-    if (r["p0"] or r["p1"]) and "MW" not in ev:
-        bits.append("P %s -> %s MW" % (r["p0"] or "?", r["p1"] or "?"))
-    if (r["e0"] or r["e1"]) and "ETERM" not in ev.upper():
-        bits.append("terminal voltage %s -> %s pu" % (r["e0"] or "?", r["e1"] or "?"))
-    txt = "%s%s%s" % ("TRIPPED" if tr else "not tripped",
-                      (": %s" % ev) if ev else "", ("; " + ", ".join(bits)) if bits else "")
-    return bool(tr), txt
-
-
-def _no_trip_reason(r):
-    """Why the study calls a unit tripped that PSS/E never tripped -- from the scorer's numbers."""
-    rows = r.get("scorer_rows") or []
-    tr = [x for x in rows if x["tripped"]] or rows
-    e1 = _num(tr[0]["e1"]) if tr else None
-    if e1 is not None and e1 < 0.2:
-        return ("dead bus", "PSS/E never tripped this unit -- no relay acted and its log has no trip or "
-                "disconnection line for it. The study counts it as tripped because its terminal "
-                "voltage went to ZERO (%s pu at the end): the unit's bus lost its connection to the "
-                "grid -- the event's switching left it isolated -- so the unit stopped with it." % _g(e1, 3))
-    if e1 is not None:
-        return ("power to zero", "PSS/E never tripped this unit -- no relay acted and its log has no "
-                "trip or disconnection line for it. The study counts it as tripped because its "
-                "power ended at zero while its terminal voltage stayed up (%s pu at the end): the "
-                "machine model itself took its output to zero (for a converter: its low-voltage "
-                "power logic or current limit; for a synchronous machine: loss of synchronism)."
-                % _g(e1, 3))
-    return ("study only", "PSS/E never tripped this unit -- no relay acted and its log has no trip "
-            "or disconnection line for it. The study counts it as tripped from the .out (%s): its "
-            "output fell to zero without a protection trip." % (r.get("scorer_ev") or
-                                                                "power or terminal voltage went to zero"))
-
-
-def _status(res):
-    """The short side-by-side code of one fault in one run."""
-    if res is None:
-        return "not run"
-    if res.get("nolog"):
-        return "study: tripped, no log" if res.get("scorer_tripped") else "no PSS/E log"
-    ev = res["exp"]["events"]
-    if ev:
-        e = ev[0]
-        t = (" %.2fs" % e["t"]) if e["t"] is not None else ""
-        return (e["short"] + t)[:26]
-    if res.get("scorer_tripped"):
-        return {"dead bus": "bus dead, no relay", "power to zero": "P to zero, no relay"}.get(
-            _no_trip_reason(res)[0], "study only, no relay")
-    return "-"
-
-
-def _short(label):
-    return label.split(" (")[0]
-
-
-def _tripped(res):
-    if res is None:
-        return False
-    if res.get("nolog"):
-        return bool(res.get("scorer_tripped"))
-    return bool(res["exp"]["events"]) or bool(res.get("scorer_tripped"))
-
-
 def _wrap(txt, width=70, indent=""):
-    words = txt.split()
+    words = str(txt).split()
     lines, cur = [], ""
     for w in words:
         if cur and len(cur) + 1 + len(w) > width:
@@ -994,16 +1128,75 @@ def _wrap(txt, width=70, indent=""):
     return ("\n" + indent).join(lines)
 
 
+def _short(label):
+    return label.split(" (")[0]
+
+
+def judge(res):
+    """Fill res["status"], res["cause"], res["how"], res["short"], res["key"] for one fault."""
+    sv = res["study"]
+    ex = res.get("exp")
+    ev = ex["events"] if ex else []
+    e = ev[0] if ev else None
+    num = res.get("num") or {}
+    res["status"] = "none"
+    res["cause"] = res["how"] = res["short"] = res["key"] = None
+    if sv == "trip" or (sv == "unknown" and e):
+        res["status"] = "trip"
+        if e:
+            res["cause"], res["how"], res["key"] = e["cause"], e["text"], e["key"]
+            res["short"] = "%s %.2fs" % (e["short"], e["t"]) if e["t"] is not None else e["short"]
+        elif ex is not None:
+            res["cause"], res["how"] = no_relay_cause(ex, num)
+            res["key"] = {"ISO": "its bus went dead; no relay acted",
+                          "?": "no relay acted; no voltage or frequency condition in the log"}.get(
+                res["cause"], "no relay acted; the unit's own control took its power to zero")
+            res["short"] = {"ISO": "ISOLATED (no relay)", "?": "P to zero, cause ?"}.get(
+                res["cause"], "%s, no relay" % res["cause"])
+        else:
+            res["cause"], res["how"] = "?", "There is no PSS/E log for this fault, so the cause cannot be read."
+            res["key"], res["short"] = "no PSS/E log for this fault", "tripped, no log"
+    elif sv == "event":
+        res["status"] = "event"
+        res["cause"] = "ISO"
+        res["how"] = ((e["text"] + " ") if e else "") + (
+            "The study does NOT count this as a trip: the event itself removes the unit (%s)." % res["study_ev"]
+            if res.get("study_ev") else "The study does NOT count this as a trip: the event itself removes the unit.")
+        res["key"], res["short"] = "disconnected by the event (not counted)", "event, not counted"
+    elif e:
+        res["status"] = "psse"
+        res["cause"], res["key"] = e["cause"], e["key"]
+        why = ("the study has no result for this fault (the run was not scored)" if sv == "unscored" else
+               "it carried less than 0.5 MW before the fault" if (num.get("p0") is not None and abs(num["p0"]) < 0.5)
+               else "it is not in the study's trip list (02_VIOLATIONS) for this fault -- most likely the event "
+                    "itself removes it")
+        res["how"] = e["text"] + " NOT COUNTED BY THE STUDY: %s." % why
+        res["short"] = "%s (n/c)" % e["short"]
+    return res
+
+
+def _cell(res):
+    if res is None:
+        return "not run"
+    if res["status"] in ("trip", "event", "psse"):
+        return (res["short"] or "?")[:26]
+    if not res.get("log"):
+        return "no log"
+    return "-"
+
+
+HEAD = {"trip": "TRIPPED", "event": "DISCONNECTED BY THE EVENT", "psse": "TRIPPED IN PSS/E, NOT COUNTED"}
+
+
 def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows):
     tag = unit + ("_" + re.sub(r"\W", "", gid) if gid else "")
     path = os.path.join(out_dir, "TRIP_REASON_%s.txt" % tag)
     name = ""
     for proj in results:
-        for (_lbl, _d, _b, faults) in results[proj]:
+        for (_l, _d, _b, faults) in results[proj]:
             for f, res in faults.items():
                 if res and res.get("name"):
                     name = res["name"]
-                    break
     relays = [r for r in dinfo["relays"] if _gid_ok(gid, r["id"])]
     L = []
     L.append(BAR)
@@ -1012,11 +1205,32 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows):
     L.append(" Unit          bus %s  %s" % (unit, name))
     L.append(" Study folder  %s" % _root())
     L.append(" Runs read     %s" % ", ".join(c[0] for c in CASES) + (" + every other run folder" if ALL_RUNS else ""))
-    L.append("               %d project(s), %d PSS/E fault log(s)" % (
-        len([p for p in results if results[p]]), nlogs))
+    L.append("               %d project(s), %d PSS/E fault log(s)" % (len([p for p in results if results[p]]), nlogs))
     L.append(" .dyr read     %s" % ("\n               ".join(_rel(p) for p in dyr_files) if dyr_files else
                                     "none found -- relay settings cannot be shown (set DYR_FILES)"))
     L.append(" Written       %s by %s" % (time.strftime("%Y-%m-%d %H:%M"), os.path.basename(__file__)))
+    L.append("")
+    L.append(" A TRIP here is what the study counts (each run's 02_VIOLATIONS list). Units the event")
+    L.append(" itself disconnects are shown separately and are not trips -- the study's rule.")
+    L.append(" CAUSE is one of: UNDER-VOLTAGE, OVER-VOLTAGE, UNDER-FREQUENCY, OVER-FREQUENCY,")
+    L.append(" ISOLATED (its bus lost its connection -- not a voltage or frequency trip).")
+    L.append("")
+    # causes at a glance
+    glance = {}
+    for proj in results:
+        for (lbl, _d, _b, faults) in results[proj]:
+            for f, r in faults.items():
+                if r and r["status"] == "trip":
+                    glance.setdefault(r["cause"] or "?", []).append("%s %s %s" % (proj, _short(lbl), f))
+    L.append(SUB)
+    L.append(" CAUSES AT A GLANCE (trips the study counts, all projects and runs)")
+    L.append(SUB)
+    if glance:
+        for c in ("UV", "OV", "UF", "OF", "UV/OV", "UF/OF", "ISO", "?"):
+            if c in glance:
+                L.append("   %-44s %d trip(s)" % (CAUSE[c], len(glance[c])))
+    else:
+        L.append("   no trip counted by the study in any run read")
     L.append("")
     # 1. in short
     L.append(SUB)
@@ -1030,56 +1244,47 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows):
         base = [r for r in runs if r[2]]
         base_f = base[0][3] if base else None
         for (lbl, _d, is_base, faults) in runs:
-            n_run = len([f for f, r in faults.items() if r and not r.get("nolog")])
-            tr = [(f, r) for f, r in faults.items() if _tripped(r)]
-            if not tr:
-                L.append("   %-30s does not trip in any of the %d fault(s) with a log" % (lbl, n_run))
-                continue
-            keys = {}
-            for f, r in tr:
-                if r.get("nolog"):
-                    k = "no PSS/E log (study says tripped)"
-                elif r["exp"]["events"]:
-                    k = r["exp"]["events"][0]["key"]
-                else:
-                    k = {"dead bus": "no relay -- its bus went dead (isolated by the event); "
-                                     "PSS/E never tripped it",
-                         "power to zero": "no relay -- its power went to zero with the terminal "
-                                          "voltage up; PSS/E never tripped it"}.get(
-                        _no_trip_reason(r)[0], "no relay -- the study counts it from the .out; "
-                                               "PSS/E never tripped it")
-                keys.setdefault(k, []).append(f)
-            L.append("   %-30s trips in %d of %d fault(s) with a log:" % (lbl, len(tr), n_run))
-            for k, fs in sorted(keys.items(), key=lambda kv: -len(kv[1])):
-                fs = sorted(fs, key=_fkey)
-                L.append("      %3d x %s" % (len(fs), _wrap(k, 62, "            ")))
-                L.append("            %s" % _wrap(", ".join(fs), 62, "            "))
+            n_log = len([f for f, r in faults.items() if r and r.get("log")])
+            tr = [(f, r) for f, r in faults.items() if r and r["status"] == "trip"]
+            evf = sorted([f for f, r in faults.items() if r and r["status"] == "event"], key=_fkey)
+            ps = sorted([f for f, r in faults.items() if r and r["status"] == "psse"], key=_fkey)
+            L.append("   %s" % lbl)
+            if tr:
+                L.append("      TRIPS in %d of %d fault(s):" % (len(tr), n_log))
+                keys = {}
+                for f, r in tr:
+                    keys.setdefault((r["cause"] or "?", r["key"] or ""), []).append(f)
+                for (c, k), fs in sorted(keys.items(), key=lambda kv: -len(kv[1])):
+                    L.append("        %3d x %s" % (len(fs), _wrap("%s -- %s" % (CAUSE_SHORT.get(c, c), k), 62,
+                                                               "              ")))
+                    L.append("              %s" % _wrap(", ".join(sorted(fs, key=_fkey)), 60, "              "))
+            else:
+                L.append("      no trip in the %d fault(s) with a log" % n_log)
+            if evf:
+                L.append("      disconnected by the event (not trips): %s" % _wrap(", ".join(evf), 40, "        "))
+            if ps:
+                L.append("      tripped in PSS/E but not counted by the study: %s" % _wrap(", ".join(ps), 30, "        "))
         if base_f is not None:
-            only = []
+            only = {}
             for (lbl, _d, is_base, faults) in runs:
                 if is_base:
                     continue
                 for f, r in faults.items():
-                    if _tripped(r):
+                    if r and r["status"] == "trip":
                         b = base_f.get(f)
-                        if b is not None and not b.get("nolog") and not _tripped(b):
-                            only.append((f, lbl))
+                        if b is not None and b["status"] != "trip":
+                            only.setdefault(f, []).append("%s: %s" % (_short(lbl), CAUSE_SHORT.get(r["cause"], "?")))
             if only:
-                agg = {}
-                for f, lbl in only:
-                    agg.setdefault(f, []).append(_short(lbl))
-                L.append("   Trips with the SGF in service but NOT in the base case:")
-                L.append("      %s" % _wrap("; ".join("%s (%s)" % (f, ", ".join(v)) for f, v in
-                                              sorted(agg.items(), key=lambda kv: _fkey(kv[0]))),
-                                              70, "      "))
+                L.append("   TRIPS WITH THE SGF IN SERVICE BUT NOT IN THE BASE CASE:")
+                for f in sorted(only, key=_fkey):
+                    L.append("      %-6s %s" % (f, "; ".join(only[f])))
         L.append("")
     # 2. the .dyr
     L.append(SUB)
     L.append(" 2. THE UNIT IN THE .dyr")
     L.append(SUB)
     if dinfo["models"]:
-        L.append(" Models   %s" % _wrap(", ".join("%s '%s'" % (m, i) for m, i, _f in dinfo["models"]), 66,
-                                         "          "))
+        L.append(" Models   %s" % _wrap(", ".join("%s '%s'" % (m, i) for m, i, _f in dinfo["models"]), 66, "          "))
     else:
         L.append(" Models   none found for bus %s in the .dyr files read" % unit)
     if relays:
@@ -1098,15 +1303,13 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows):
             L.append("   THE SAME INSTANCE HAS DIFFERENT SETTINGS IN DIFFERENT .dyr FILES:")
             for v in clash:
                 for r in v:
-                    L.append("     %s %s  %s, pickup %s s  in %s" % (
-                        r["model"], r["inst"], setting_words(r), _g(_t(r, 2)),
-                        ", ".join(_rel(p) for p in r["files"])))
+                    L.append("     %s %s  %s, %s s  in %s" % (r["model"], r["inst"], setting_words(r),
+                                                            _g(_t(r, 2)), ", ".join(_rel(p) for p in r["files"])))
     else:
-        L.append(" Relays   NONE. No VTGTPAT / VTGDCAT / FRQTPAT / FRQDCAT record (nor a USRMDL")
-        L.append("          VTGTPA / FRQTPA / VTGDCA / FRQDCA) acts on this unit, so PSS/E has no")
-        L.append("          generic relay that can trip it. Where the study reports it tripped,")
-        L.append("          PSS/E did not trip it: its bus was isolated, a model's own protection")
-        L.append("          acted, or its output fell to zero on its own (see section 3).")
+        L.append(" Relays   NONE. No VTGTPAT / VTGDCAT / FRQTPAT / FRQDCAT record (nor a USRMDL VTGTPA /")
+        L.append("          FRQTPA / VTGDCA / FRQDCA) acts on this unit: PSS/E has no relay that can trip")
+        L.append("          it. Its trips come from the study's check on its power and terminal voltage;")
+        L.append("          section 3 gives the condition at the unit each time.")
     if dinfo["other"]:
         L.append(" Other records that name bus %s (not decoded here):" % unit)
         for txt, p in dinfo["other"][:15]:
@@ -1116,123 +1319,127 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows):
     L.append("")
     # 3. fault by fault
     L.append(SUB)
-    L.append(" 3. FAULT BY FAULT (only the faults in which the unit trips)")
+    L.append(" 3. FAULT BY FAULT")
     L.append(SUB)
     for proj in results:
         runs = results[proj]
         base = [r for r in runs if r[2]]
         base_f = base[0][3] if base else None
         for (lbl, d, is_base, faults) in runs:
-            tr = sorted([f for f, r in faults.items() if _tripped(r)], key=_fkey)
+            shown = sorted([f for f, r in faults.items() if r and r["status"] in ("trip", "event", "psse")], key=_fkey)
             L.append(" %s -- %s" % (proj, lbl))
             L.append("   folder %s" % _rel(d))
-            if not tr:
+            if not shown:
                 L.append("   no trip in any fault")
                 L.append("")
                 continue
-            for f in tr:
+            for f in shown:
                 r = faults[f]
-                if r.get("nolog"):
-                    L.append(" %-6s TRIPPED (the study says so), but there is no PSS/E log for this fault"
-                             % f)
-                    if r.get("scorer_txt"):
-                        L.append("        Study: %s" % r["scorer_txt"])
-                    L.append("")
-                    continue
-                ex = r["exp"]
-                if ex["events"]:
-                    e = ex["events"][0]
-                    what = {"trip": "TRIPPED", "disc": "BUS DISCONNECTED", "iso": "ISOLATED"}.get(e["kind"], "TRIPPED")
-                    L.append(" %-6s %s at %s%s" % (f, what, ("%.4f s" % e["t"]) if e["t"] is not None else "?",
-                                                    (" (machine '%s')" % e["gid"]) if e["gid"] else ""))
-                    L.append("        Reason: %s" % _wrap(e["text"], 62, "                "))
+                ex = r.get("exp")
+                e = ex["events"][0] if (ex and ex["events"]) else None
+                mw = r.get("study_mw")
+                L.append(" %-6s %s%s" % (f, HEAD[r["status"]],
+                                         (" at %.4f s" % e["t"]) if (e and e["t"] is not None) else ""))
+                L.append("        CAUSE: %s" % CAUSE.get(r["cause"], "?"))
+                if r["status"] == "trip" and r["study"] == "trip":
+                    L.append("        Study: counted as a trip%s" % ((" (%.1f MW before the fault)" % mw) if mw is not None else ""))
+                elif r["status"] == "trip":
+                    L.append("        Study: no 02_VIOLATIONS / SPP_CRITERIA_REPORT in this run folder -- PSS/E's log decides")
+                L.append("        How:   %s" % _wrap(r["how"] or "", 62, "               "))
+                if ex:
                     for e2 in ex["events"][1:]:
-                        L.append("        Then at %s: %s" % (("%.4f s" % e2["t"]) if e2["t"] is not None else "?",
-                                                          _wrap(e2["text"], 56, "                ")))
-                else:
-                    L.append(" %-6s TRIPPED in the study's results, but PSS/E did not trip it" % f)
-                    L.append("        Reason: %s" % _wrap(_no_trip_reason(r)[1], 62, "                "))
-                for n in ex["notes"]:
-                    L.append("        Note: %s" % _wrap(n, 62, "              "))
-                if ex["pickups"]:
-                    L.append("        Also picked up (did not trip it):")
-                    for pk in ex["pickups"][:8]:
-                        L.append("          - %s" % _wrap(pk, 64, "            "))
-                    if len(ex["pickups"]) > 8:
-                        L.append("          ... and %d more" % (len(ex["pickups"]) - 8))
-                if r.get("scorer_txt"):
-                    L.append("        Study: %s" % _wrap(r["scorer_txt"], 63, "               "))
-                if not is_base and base_f is not None:
+                        L.append("        Then:  %s" % _wrap(e2["text"], 62, "               "))
+                    for n in ex["notes"]:
+                        L.append("        Note:  %s" % _wrap(n, 62, "               "))
+                    if SHOW_PICKUPS and ex["pickups"]:
+                        L.append("        Also picked up (did not trip it):")
+                        for pk in ex["pickups"][:6]:
+                            L.append("          - %s" % _wrap(pk, 64, "            "))
+                        if len(ex["pickups"]) > 6:
+                            L.append("          ... and %d more" % (len(ex["pickups"]) - 6))
+                num = r.get("num") or {}
+                if num:
+                    L.append("        Measured: P %s -> %s MW, terminal voltage %s -> %s pu"
+                             % (_g(num.get("p0"), 2) if num.get("p0") is not None else "?",
+                                _g(num.get("p1"), 2) if num.get("p1") is not None else "?",
+                                _g(num.get("e0"), 3) if num.get("e0") is not None else "?",
+                                _g(num.get("e1"), 3) if num.get("e1") is not None else "?"))
+                if r["status"] == "trip" and not is_base and base_f is not None:
                     b = base_f.get(f)
                     if b is None:
                         L.append("        Base case: this fault was not run")
-                    elif b.get("nolog"):
-                        L.append("        Base case: no PSS/E log%s" % (" (study: tripped)" if b.get("scorer_tripped") else ""))
-                    elif _tripped(b):
-                        L.append("        Base case: ALSO trips -- %s" % _status(b))
+                    elif b["status"] == "trip":
+                        L.append("        Base case: ALSO trips -- %s" % CAUSE_SHORT.get(b["cause"], "?"))
+                    elif b["status"] == "event":
+                        L.append("        Base case: disconnected by the event there (not a trip)")
                     else:
-                        pk = b["exp"]["pickups"]
-                        if pk:
+                        bpk = (b.get("exp") or {}).get("pickups") or []
+                        if bpk:
                             L.append("        Base case: does NOT trip. Its relays picked up and reset:")
-                            for p in pk[:4]:
+                            for p in bpk[:4]:
                                 L.append("          - %s" % _wrap(p, 64, "            "))
                         else:
-                            L.append("        Base case: does NOT trip, and none of its relays picked up")
+                            L.append("        Base case: does NOT trip%s" % ("" if b.get("log") else " (no PSS/E log)"))
                 L.append("")
     # 4. side by side
     L.append(SUB)
-    L.append(" 4. SIDE BY SIDE (faults in which the unit trips in at least one run)")
+    L.append(" 4. SIDE BY SIDE")
     L.append(SUB)
     for proj in results:
         runs = results[proj]
         allf = set()
         for (_l, _d, _b, faults) in runs:
-            allf |= set(f for f, r in faults.items() if _tripped(r))
+            allf |= set(f for f, r in faults.items() if r and r["status"] in ("trip", "event", "psse"))
         if not allf:
             continue
         L.append(" %s" % proj)
         L.append("   %-7s" % "fault" + "".join(" %-26s" % _short(l)[:26] for (l, _d, _b, _f) in runs))
         for f in sorted(allf, key=_fkey):
-            L.append("   %-7s" % f + "".join(" %-26s" % _status(fs.get(f)) for (_l, _d, _b, fs) in runs))
+            L.append("   %-7s" % f + "".join(" %-26s" % _cell(fs.get(f)) for (_l, _d, _b, fs) in runs))
         L.append("")
     L.append(SUB)
     L.append(" HOW TO READ THIS")
     L.append(SUB)
     for t in (
-        "UV / OV = under- / over-voltage relay, UF / OF = under- / over-frequency relay, then the "
-        "relay instance and the time the unit tripped. '-spike' = the relay acted on a numerical "
-        "spike (a voltage above %s pu or a frequency more than %s Hz from 60 Hz at a switching "
-        "instant): no real voltage or frequency does that, and a relay with a zero pickup time "
-        "trips on one time step of it." % (_g(SPIKE_PU), _g(SPIKE_HZ)),
-        "A relay picks up when its voltage or frequency crosses the setting, must stay past it for "
-        "the pickup time, and then trips the unit after the breaker time. VTGTPAT / FRQTPAT trip "
-        "the machine; VTGDCAT / FRQDCAT disconnect its bus.",
-        "'study only' = the study counts the unit as tripped from the .out (its power ended at "
-        "zero, or its terminal voltage collapsed) but PSS/E never tripped it: no relay acted.",
-        "Values are what PSS/E printed in the fault's log (logs\\psse\\<fault>.txt); settings are "
-        "from the .dyr files listed at the top."):
+        "TRIPPED = the study counts it (02_VIOLATIONS). DISCONNECTED BY THE EVENT = the fault clearing "
+        "itself removes the unit, so the study does not count it. TRIPPED IN PSS/E, NOT COUNTED = PSS/E "
+        "tripped it but the study did not count it (n/c in the table), with the reason.",
+        "UV / OV = under- / over-voltage, UF / OF = under- / over-frequency. 'relay <instance>' = that "
+        "relay of the .dyr tripped the unit; 'no relay' = PSS/E never tripped it: the study counts it "
+        "because its power went to zero, and the condition shown is what the log saw at the unit (its "
+        "relays' pickups and PSS/E's voltage-band reports). ISOLATED = its bus lost its connection.",
+        "'spike' = the relay acted on a numerical spike (a voltage above %s pu or a frequency more than %s "
+        "Hz from 60 Hz at a switching instant): no real voltage or frequency does that." % (_g(SPIKE_PU), _g(SPIKE_HZ)),
+        "A relay picks up when its voltage or frequency crosses the setting, must stay past it for the "
+        "pickup time, and trips after the breaker time. VTGTPAT / FRQTPAT trip the machine; VTGDCAT / "
+        "FRQDCAT disconnect its bus.",
+        "Values are what PSS/E printed in the fault's log (logs\\psse\\<fault>.txt); settings are from the "
+        ".dyr files listed at the top; the study's list and numbers from 02_VIOLATIONS, SPP_CRITERIA_REPORT "
+        "and SPP_MEASURE_MACHINES in each run folder."):
         L.append(" " + _wrap(t, 76, " "))
         L.append("")
     with open(path, "w") as fh:
         fh.write("\n".join(L) + "\n")
-    # the CSV rows
     for proj in results:
         for (lbl, d, is_base, faults) in results[proj]:
             for f in sorted(faults, key=_fkey):
                 r = faults[f]
                 if r is None:
                     continue
-                ev = r["exp"]["events"] if not r.get("nolog") else []
-                e = ev[0] if ev else None
+                ex = r.get("exp")
+                e = ex["events"][0] if (ex and ex["events"]) else None
+                num = r.get("num") or {}
                 csv_rows.append([unit, gid or "", proj, lbl, f,
-                                 "YES" if _tripped(r) else "no",
-                                 ("%.4f" % e["t"]) if e and e["t"] is not None else "",
-                                 e["short"] if e else ("no PSS/E log" if r.get("nolog") else
-                                                       (_status(r) if r.get("scorer_tripped") else "")),
-                                 e["text"] if e else (_no_trip_reason(r)[1] if (r.get("scorer_tripped")
-                                                                               and not r.get("nolog")) else ""),
-                                 r.get("scorer_txt") or "",
-                                 " | ".join(r["exp"]["pickups"]) if not r.get("nolog") else ""])
+                                 {"trip": "TRIPPED", "event": "disconnected by the event (not a trip)",
+                                  "psse": "tripped in PSS/E, not counted", "none": "no"}[r["status"]],
+                                 CAUSE.get(r["cause"], "") if r["status"] != "none" else "",
+                                 ("%.4f" % e["t"]) if (e and e["t"] is not None) else "",
+                                 (r["short"] or "") if r["status"] != "none" else "",
+                                 (r["how"] or "") if r["status"] != "none" else "",
+                                 "" if r.get("study_mw") is None else "%.1f" % r["study_mw"],
+                                 "" if num.get("p0") is None else num["p0"], "" if num.get("p1") is None else num["p1"],
+                                 "" if num.get("e0") is None else num["e0"], "" if num.get("e1") is None else num["e1"],
+                                 " | ".join(ex["pickups"]) if ex else ""])
     return path
 
 
@@ -1260,7 +1467,6 @@ def main():
     if not projects:
         print("[trip-why] no project folders found under %s -- check ROOT and CASES" % _root())
         return 2
-    # results[unit][proj] = [(label, folder, is_base, {fault: res})]
     results = dict((u, {}) for u in units)
     nlogs = 0
     t0 = time.time()
@@ -1270,40 +1476,35 @@ def main():
             results[u][proj] = []
         for (lbl, d, is_base) in runs:
             logs = run_logs(d)
-            score, spaths = run_scorer(d, units)
-            faults = sorted(set([f for f in logs if _fault_wanted(f, want)] +
-                                [f for (f, b) in score if b in wbus and _fault_wanted(f, want)
-                                 and any(r["tripped"] for r in score[(f, b)])]), key=_fkey)
-            print("[trip-why] %s -- %s: %d log(s)%s" % (proj, lbl, len([f for f in faults if f in logs]),
-                                                      ", scorer %s" % ", ".join(os.path.basename(p) for p in spaths)
-                                                      if spaths else ""))
+            st = run_study(d, units)
+            study_faults = set(st["crit"]) | set(f for f, v in st["trips"].items() if set(v) & wbus)
+            faults = sorted(set([f.upper() for f in logs] + list(study_faults)), key=_fkey)
+            logs_u = dict((f.upper(), p) for f, p in logs.items())
+            faults = [f for f in faults if _fault_wanted(f, want)]
+            print("[trip-why] %s -- %s: %d log(s); study files: %s" % (
+                proj, lbl, len([f for f in faults if f in logs_u]),
+                ", ".join(os.path.basename(p) for p in st["files"]) or
+                "none (02_VIOLATIONS / SPP_CRITERIA_REPORT not found -- PSS/E's log decides)"))
             per = dict((u, {}) for u in units)
             for k, f in enumerate(faults):
                 ld = None
-                if f in logs:
-                    ld, why = parse_log(logs[f], wbus, winst, quick)
+                if f in logs_u:
+                    ld, why = parse_log(logs_u[f], wbus, winst, quick)
                     nlogs += 1
                     if ld is None:
                         print("[trip-why]   %s: log %s" % (f, why))
                 if (k + 1) % 25 == 0:
                     print("[trip-why]   %d/%d faults, %.0f s" % (k + 1, len(faults), time.time() - t0))
                 for (b, gid) in units:
-                    srows = score.get((f.upper(), b)) or []
-                    s_tr, s_txt = _scorer_line(srows)
-                    ev = ""
-                    if srows:
-                        trr = [r for r in srows if r["tripped"]]
-                        ev = (trr[0]["evidence"] if trr else "") or ""
-                        if ev.lower() in ("tripped", "connected"):
-                            ev = ""
-                    if ld is None:
-                        per[(b, gid)][f] = {"nolog": True, "scorer_tripped": s_tr, "scorer_txt": s_txt,
-                                            "scorer_ev": ev, "scorer_rows": srows}
-                        continue
-                    ex = explain(b, gid, ld, [r for r in dinfo[b]["relays"]])
-                    per[(b, gid)][f] = {"exp": ex, "scorer_tripped": s_tr, "scorer_txt": s_txt,
-                                        "scorer_ev": ev, "scorer_rows": srows,
-                                        "name": ld.names.get(b, "")}
+                    sv, extra = study_verdict(st, f, b)
+                    res = {"log": ld is not None, "study": sv,
+                           "study_mw": extra if sv == "trip" else None,
+                           "study_ev": extra if sv == "event" else None,
+                           "num": st["meas"].get((f, b)) or {}, "exp": None, "name": ""}
+                    if ld is not None:
+                        res["exp"] = explain(b, gid, ld, dinfo[b]["relays"])
+                        res["name"] = ld.names.get(b, "")
+                    per[(b, gid)][f] = judge(res)
             for u in units:
                 results[u][proj].append((lbl, d, is_base, per[u]))
     out_dir = _abs(OUT_DIR)
@@ -1321,8 +1522,9 @@ def main():
     try:
         with open(cp, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["Bus", "Machine", "Project", "Run", "Fault", "Tripped", "Time (s)", "Reason (short)",
-                        "Reason", "Study scorer", "Relays that picked up and reset"])
+            w.writerow(["Bus", "Machine", "Project", "Run", "Fault", "Study", "Cause", "Time (s)", "Short",
+                        "How", "Study MW", "P before (MW)", "P end (MW)", "Eterm before (pu)", "Eterm end (pu)",
+                        "Relays that picked up"])
             for row in csv_rows:
                 w.writerow(row)
         written.append(cp)
