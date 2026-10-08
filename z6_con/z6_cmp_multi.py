@@ -1959,7 +1959,10 @@ def _sbs_poi(z4, ref, group, tags, rk, lay=None):
               ("total Q end (MVAr)", "base total Q end (MVAr)", "project total Q end (MVAr)", 14),
               ("min P after clearing (MW)", "base min P after clearing (MW)",
                "project min P after clearing (MW)", 18),
-              ("how measured", None, "how the project total was measured", 40)]
+              ("how measured", None, "how the project total was measured", 40),
+              # THE OVER-DELIVERY CHECK (POI_P_END_OVER_MW), last so nothing moves
+              ("end minus pre-fault (MW)", None, "project end minus pre-fault (MW)", 14),
+              ("ends above pre-fault", None, "project ends above pre-fault", 34)]
     blocks = [b for b in blocks if b[2] in PC]
     header, widths = ["fault", "project", "POI"], [8, 12, 9]
     for name, bcol, _pcol, w in blocks:
@@ -1989,7 +1992,17 @@ def _sbs_poi(z4, ref, group, tags, rk, lay=None):
     _pe = dict((t, header.index("total end (MW) | %s" % t)) for t in lay["tests"]
                if ("total end (MW) | %s" % t) in header)
 
+    _ov = [header.index("ends above pre-fault | %s" % t) for t in lay["tests"]
+           if ("ends above pre-fault | %s" % t) in header]
+
     def _style(row):
+        # red when a scenario's POI total ENDS above pre-fault (POI_P_END_OVER_MW)
+        for i in _ov:
+            try:
+                if "YES" in str(row[i]):
+                    return 2
+            except IndexError:
+                pass
         # red when any scenario's POI total did not come back to 90 % of P0
         for t in lay["tests"]:
             try:

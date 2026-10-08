@@ -2594,6 +2594,11 @@ V_RECOVERY_S   = float(_env_num("SPP_V_RECOVERY_S", V_RECOVERY_S))
 # from the FINAL clearing until the power delivered into the POI is back to this
 # fraction of its pre-fault value, and whether it then stays there to the end.
 POI_P_RECOVERY_FRAC = float(_env_num("SPP_POI_P_RECOVERY_FRAC", 0.90))
+# POI POWER AT THE END AGAINST PRE-FAULT (recorded, INFO -- not an SPP criterion):
+# the POI power at the end of the run against its pre-fault value, flagged when
+# it ENDS more than this many MW ABOVE it -- a plant delivering more after the
+# fault than before. POI_P_END_OVER_MW in the panel; 0 = the row is not written.
+POI_P_END_OVER_MW = float(_env_num("SPP_POI_P_END_OVER_MW", 2.0))
 # POI RIPPLE (recorded, INFO): peak-to-peak of the POI voltage and power over the
 # last RIPPLE_WINDOW_S of the run; RIPPLE when it is above these AND not dying out
 RIPPLE_WINDOW_S = float(_env_num("SPP_RIPPLE_WINDOW_S", 2.0))
@@ -23213,6 +23218,34 @@ def evaluate_case(path, kind, tclear, kb):
                 add(_pc, None, _d)
         except Exception as _e:
             add(_pc, None, "not measured (%s)" % _e)
+
+    # POI POWER AT THE END AGAINST PRE-FAULT -- a record (INFO), never a verdict.
+    # The recovery row above reads a plant that comes back ABOVE its pre-fault
+    # power as "held" (983.8 MW before F134, 1,069.8 MW at the end, inside the
+    # +/-10 % band), so a plant delivering more after the fault than before is
+    # said here: the pre-fault and final POI power -- the same two numbers
+    # SPP_MEASURE_POI and the POI power sheet carry -- and whether the end is
+    # more than POI_P_END_OVER_MW above it. 0 = not written.
+    if kind != "flat" and POI_P_END_OVER_MW > 0:
+        _poe_c = "POI power at the end against pre-fault"
+        try:
+            if not _prec_src:
+                add(_poe_c, None, "no POI power channel in this .out")
+            else:
+                _poe_v = _prec_src[0][1]
+                _poe_0 = round(float(_poe_v[0]), 2) if len(_poe_v) else float("nan")
+                _poe_e = round(float(_poe_v[-1]), 2) if len(_poe_v) else float("nan")
+                if not (_poe_0 == _poe_0 and _poe_e == _poe_e):
+                    add(_poe_c, None, "POI %s: no finite pre-fault or final sample" % _prec_src[0][0])
+                else:
+                    _poe_d = _poe_e - _poe_0
+                    add(_poe_c, None, "POI %s: pre-fault %.1f MW, end %.1f MW, change %+.2f MW -- %s"
+                        % (_prec_src[0][0], _poe_0, _poe_e, _poe_d,
+                           ("ABOVE PRE-FAULT by more than %g MW" % POI_P_END_OVER_MW)
+                           if _poe_d > POI_P_END_OVER_MW else
+                           ("not more than %g MW above pre-fault" % POI_P_END_OVER_MW)))
+        except Exception as _e:
+            add(_poe_c, None, "not measured (%s)" % _e)
 
     # POI RIPPLE AFTER RECOVERY -- a record (INFO). A voltage and power that
     # are back inside every band can still step up and down to the end of the

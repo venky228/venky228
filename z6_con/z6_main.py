@@ -587,6 +587,8 @@ REVIEW_ROWS_IN_COMPARISON = False            # False = machines below 16 deg set
 WORSE_DEG_DELTA = 2.0                        # PASS both sides but this many deg worse = WORSENED
 # records beside the criteria (INFO, no PASS/FAIL) -- changing one re-scores finished gen-test runs
 POI_P_RECOVERY_FRAC = 0.90                   # POI power back to this fraction of pre-fault (and held +/- 1-this)
+POI_P_END_OVER_MW = 2.0                      # POI power ENDING more than this many MW ABOVE pre-fault is flagged:
+                                             #   reports (POI power sheets, notes) + list at the end of the launch | 0 = off
 RIPPLE_WINDOW_S = 2.0                        # ripple: the last this many s of each fault run
 RIPPLE_V_PU = 0.01                           # ripple: POI voltage peak-to-peak above this (pu) ...
 RIPPLE_P_MW = 10.0                            # ... or POI power peak-to-peak above this many MW
@@ -4629,7 +4631,8 @@ def _criterion_family(criterion):
     # the column, so the SPP table printed "Transient Voltage Response > 0.7 =
     # No (worst 0.000 pu)" for faults whose voltage recovery PASSED. They are
     # INFO records, read by their own names where they are used (_gt_* parsers).
-    if c.startswith(("poi active power recovery", "poi ripple", "settled at the end")):
+    if c.startswith(("poi active power recovery", "poi ripple", "settled at the end",
+                     "poi power at the end")):
         return ""
     # BEFORE the "swing" test below: "Rotor angles measured relative to the
     # system swing machine" is a yes/no statement, and matched "swing" first --
@@ -8054,8 +8057,11 @@ _POI_COLS = ["project", "fault", "POI",
              "base total Q0 (MVAr)", "project total Q0 (MVAr)", "project total Q end (MVAr)",
              "project min P after clearing (MW)", "how the project total was measured",
              "base total Q end (MVAr)", "base min P after clearing (MW)",
-             "project P change vs base at end (MW)"]
-_POI_WIDTHS = [14, 8, 9, 14, 14, 14, 14, 16, 16, 16, 16, 14, 14, 16, 18, 48, 14, 16, 16]
+             "project P change vs base at end (MW)",
+             # THE OVER-DELIVERY CHECK (POI_P_END_OVER_MW): the project total at the
+             # end against its own pre-fault value, and whether it ends above it
+             "project end minus pre-fault (MW)", "project ends above pre-fault"]
+_POI_WIDTHS = [14, 8, 9, 14, 14, 14, 14, 16, 16, 16, 16, 14, 14, 16, 18, 48, 14, 16, 16, 16, 44]
 
 
 def _xl_style_poi(row):
@@ -8067,6 +8073,9 @@ def _xl_style_poi(row):
             return 2
     except (TypeError, ValueError, IndexError):
         pass
+    # ...and red when it ENDS above pre-fault by more than POI_P_END_OVER_MW
+    if row and str(row[-1]).startswith("YES"):
+        return 2
     return None
 
 
@@ -8120,6 +8129,7 @@ def _poi_power_rows(results):
                         "fault yet -- see sheet 4 if it was not scored)")
             else:
                 _how = "no POI power row on the base side (its measurements do not cover this fault yet)"
+            _end_dp, _end_flag = _poi_end_over(tt)
             _row = [proj, fid, poi,
                     _num(bt, "p0"), _num(bt, "end"),
                     _num(tt, "p0"), _num(tt, "end"),
@@ -8130,7 +8140,8 @@ def _poi_power_rows(results):
                     _num(bq, "end"), _num(bt, "min"),
                     (round(float(tt["end"]) - float(bt["end"]), 1)
                      if (tt and bt and tt.get("end") is not None and bt.get("end") is not None)
-                     else "")]
+                     else ""),
+                    _end_dp, _end_flag]
             # SAID, NOT "n/a": the project side HAS a total but no 999xxx tie --
             # there is no new plant in this run, so its split is the whole total
             if tt and not tn:
@@ -8516,6 +8527,10 @@ def _poi_note(rows):
             seen = True
         elif crit.startswith("Settled at the end"):
             _gt_settled_parse(d, det)
+        elif crit.startswith("POI power at the end against pre-fault"):
+            _m = re.search(r"pre-fault ([-\d.]+) MW, end ([-\d.]+) MW, change ([-+\d.]+) MW", det or "")
+            if _m:
+                d["_end_over"] = (float(_m.group(1)), float(_m.group(2)), float(_m.group(3)))
     if not seen:
         if ev:
             return "; ".join(ev)
@@ -8539,6 +8554,10 @@ def _poi_note(rows):
             out.append("RIPPLE at the POI")
     if d.get("settled") == "no":
         out.append("not settled at the end: %s" % (d.get("unsettled") or "?"))
+    _eo = d.get("_end_over")
+    if _eo and 0 < _poi_end_over_mw() < _eo[2]:
+        out.append("POI power ENDS %.2f MW ABOVE pre-fault (%.1f -> %.1f MW; flagged above +%g MW)"
+                   % (_eo[2], _eo[0], _eo[1], _poi_end_over_mw()))
     return "; ".join(out)
 
 
@@ -9381,6 +9400,29 @@ def write_one_report(results, only_base, only_test):
         L.append(" PASSED IN BOTH CASES (%d)" % len(ok))
         rule("-")
         L.append("   " + ", ".join(r["fault"] for _res, r in ok))
+        L.append("")
+
+    # POI POWER ABOVE PRE-FAULT AT THE END -- TEXT ONLY, no pass or fail
+    if _poi_end_over_mw() > 0:
+        _over = []
+        for _res in results:
+            _mt = (_res.get("meas_t") or {}).get("poi") or {}
+            for _r in _res.get("rows") or []:
+                _rec = (_mt.get(_r["fault"]) or {}).get(("MW", "TOTAL delivered into the POI"))
+                _dp, _fl = _poi_end_over(_rec)
+                if str(_fl).startswith("YES"):
+                    _over.append((_res.get("project") or "", _r["fault"], _rec, _dp))
+        rule("-")
+        L.append(" POI POWER ABOVE PRE-FAULT AT THE END -- with the projects, more than +%g MW "
+                 "(POI_P_END_OVER_MW; text only, no verdict)" % _poi_end_over_mw())
+        rule("-")
+        for _pj, _f, _rec, _dp in sorted(_over, key=lambda x: (x[0], _fault_key(x[1]))):
+            L.append("   %s%-6s pre-fault %.1f MW, end %.1f MW (%+.2f MW)"
+                     % ((_pj + " ") if len(results) > 1 else "", _f,
+                        float(_rec["p0"]), float(_rec["end"]), _dp))
+        if not _over:
+            L.append("   none -- every fault with a POI power row ends within +%g MW of its pre-fault value"
+                     % _poi_end_over_mw())
         L.append("")
 
     # POI POWER RECOVERY / RIPPLE -- TEXT ONLY, no pass or fail
@@ -22584,9 +22626,37 @@ def _gt_rescorable(r, faults):
             and _gt_passes(rdir) < _GT_RESCORE_TRIES)
 
 
+def _poi_end_over_mw():
+    """POI_P_END_OVER_MW as MW (0 = the check is off). A panel written before
+       the setting existed gets the 2 MW default."""
+    try:
+        return max(0.0, float(globals().get("POI_P_END_OVER_MW", 2.0) or 0.0))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def _poi_end_over(rec):
+    """(end minus pre-fault MW, flag) for one side's POI total -- the numbers
+       of SPP_MEASURE_POI, as the POI power sheet shows them. ("", "") with no
+       POI total on that side."""
+    try:
+        if not rec or rec.get("p0") is None or rec.get("end") is None:
+            return "", ""
+        d = float(rec["end"]) - float(rec["p0"])
+    except (TypeError, ValueError, AttributeError):
+        return "", ""
+    thr = _poi_end_over_mw()
+    if thr <= 0:
+        return round(d, 2), "check off (POI_P_END_OVER_MW = 0)"
+    if d > thr:
+        return round(d, 2), "YES -- ends %.2f MW above pre-fault (flagged above +%g MW)" % (d, thr)
+    return round(d, 2), "no"
+
+
 def _push_records(env):
     """The POI power-recovery and ripple levels, to the study (runs AND plotter)."""
     env["SPP_POI_P_RECOVERY_FRAC"] = repr(float(POI_P_RECOVERY_FRAC))
+    env["SPP_POI_P_END_OVER_MW"] = repr(_poi_end_over_mw())
     env["SPP_RIPPLE_WINDOW_S"] = repr(float(RIPPLE_WINDOW_S))
     env["SPP_RIPPLE_V_PU"] = repr(float(RIPPLE_V_PU))
     env["SPP_RIPPLE_P_MW"] = repr(float(RIPPLE_P_MW))
@@ -26513,6 +26583,95 @@ def main():
     return 0
 
 
+def poi_end_over_notice():
+    """THE OVER-DELIVERY LIST, AT THE END OF EVERY LAUNCH. Every run folder of
+       this launch's projects in the PROJECT case (the study, its surplus
+       scenarios, capacity levels ...), every fault whose POI power ENDS more
+       than POI_P_END_OVER_MW above its pre-fault value -- read from
+       SPP_MEASURE_POI, the numbers the POI power sheets show. Printed, and
+       written to POI_ABOVE_PREFAULT.txt in the comparison folder. It only
+       READS the results: no marker, .out or report is touched."""
+    thr = _poi_end_over_mw()
+    if thr <= 0 or GEN_TEST or QUICK_DYR_TEST:
+        return 0
+    try:
+        projs = list(_panel_projects() or PROJECTS or [])
+    except Exception:
+        projs = list(PROJECTS or [])
+    if not projs:
+        return 0
+    hits, n_f, n_d = [], 0, 0
+    for d in _run_glob(_res_root(CASE_TEST), "*"):
+        nm = os.path.basename(d)
+        if (not os.path.isdir(d) or "_gt_" in nm
+                or (os.sep + GT_SORT_DIR + os.sep) in (d + os.sep)):
+            continue
+        proj = None
+        for _p in sorted(projs, key=len, reverse=True):
+            if nm.startswith(_p + "_"):
+                proj = _p
+                break
+        if not proj:
+            continue
+        fp = rfile(d, "SPP_MEASURE_POI", "csv", proj)
+        if not fp:
+            continue
+        n_d += 1
+        try:
+            with csv_open(fp) as fh:
+                rd = csv.reader(fh)
+                H = dict((h.strip(), i) for i, h in enumerate(next(rd, None) or []))
+                i_sc, i_poi, i_q, i_c = H.get("Scenario"), H.get("POI"), H.get("Quantity"), H.get("Component")
+                i_0, i_e = H.get("Pre-fault"), H.get("Final")
+                if None in (i_sc, i_q, i_c, i_0, i_e):
+                    continue
+                for r in rd:
+                    try:
+                        if r[i_q].strip() != "MW" or not r[i_c].strip().startswith("TOTAL"):
+                            continue
+                        p0, pe = float(r[i_0]), float(r[i_e])
+                    except (IndexError, ValueError):
+                        continue
+                    n_f += 1
+                    if pe - p0 > thr:
+                        hits.append((proj, nm, r[i_sc].strip(),
+                                     (r[i_poi].strip() if i_poi is not None and i_poi < len(r) else ""),
+                                     p0, pe, pe - p0))
+        except Exception as _e:
+            print("[poi-end] could not read %s (%s)" % (fp, _err_text(_e)))
+    hits.sort(key=lambda x: (x[0], x[1], _fault_key(x[2])))
+    L = []
+    L.append("=" * 72)
+    L.append(" POI POWER ABOVE PRE-FAULT AT THE END -- more than +%g MW (POI_P_END_OVER_MW)" % thr)
+    L.append(" project case, every run folder of %s; text only, no verdict changed" % ", ".join(projs))
+    L.append("=" * 72)
+    for proj, nm, fid, poi, p0, pe, dp in hits:
+        L.append(" %-14s %-30s %-6s POI %-7s %8.1f -> %8.1f MW   %+8.2f MW"
+                 % (proj, nm, fid, poi, p0, pe, dp))
+    if hits:
+        L.append(" %d fault(s) end above pre-fault by more than %g MW -- %d checked in %d run folder(s)"
+                 % (len(hits), thr, n_f, n_d))
+    elif n_f:
+        L.append(" none -- all %d fault(s) checked in %d run folder(s) end within +%g MW of pre-fault"
+                 % (n_f, n_d, thr))
+    else:
+        L.append(" nothing to check -- no POI power measurements in the project case yet")
+    try:
+        if not os.path.isdir(COMPARE_DIR):
+            os.makedirs(COMPARE_DIR)
+        _fp = os.path.join(COMPARE_DIR, "POI_ABOVE_PREFAULT.txt")
+        with open(_fp, "w") as fh:
+            fh.write("written %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            fh.write("\n".join(L) + "\n")
+        L.append(" written to %s" % _fp)
+    except Exception as _e:
+        L.append(" (not written to the comparison folder: %s)" % _e)
+    print("")
+    for ln in L:
+        print(ln)
+    return len(hits)
+
+
 if __name__ == "__main__" and os.environ.get(_EXTRA_STEP_ENV):
     # A CHILD STARTED BY _in_own_process: one extra comparison, then exit.
     sys.exit(_run_extra_step(json.loads(os.environ[_EXTRA_STEP_ENV])))
@@ -26526,6 +26685,10 @@ if __name__ == "__main__":
     try:
         _rc = main()
     finally:
+        try:
+            poi_end_over_notice()
+        except Exception as _e:
+            print("[poi-end] the list of faults ending above pre-fault was not made (%s)" % _e)
         try:
             _print_phase_times(time.time() - _T0)
         except Exception:
