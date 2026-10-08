@@ -25,9 +25,12 @@ Nothing is simulated and nothing in the results folders is changed: the logs,
 .dyr files and CSVs are only read.
 
 RUN (any Python 3.4 or later -- PSS/E is not needed):
-    python z6_trip_why.py                      asks for the bus number(s)
-    python z6_trip_why.py 584713 539114        or give them on the command line
-    python z6_trip_why.py 999001:B             bus:machine-id for one machine only
+    1. Type the generator bus numbers into GEN_BUSES at the top of SETTINGS below
+       and run:   python z6_trip_why.py
+    2. Or give them on the command line (they then replace GEN_BUSES for that run):
+                  python z6_trip_why.py 584713 539114
+    3. With GEN_BUSES = [] and nothing on the command line, it asks for them.
+    "bus:id" picks one machine only, e.g. "999001:B".
 Put the file in the study folder (the one holding Base\\ and Projects\\), or set
 ROOT below.
 """
@@ -40,7 +43,15 @@ import time
 # ============================================================================
 #   SETTINGS
 # ============================================================================
-GEN_BUSES = []                 # e.g. [584713, 539114, 764984, 531601]; [] = asked when run
+# >>> ENTER THE GENERATOR BUS NUMBERS HERE <<< -------------------------------
+# One or more bus numbers, separated by commas. "bus:id" = that machine only.
+#   GEN_BUSES = [584713]
+#   GEN_BUSES = [584713, 539114, 764984, 531601]
+#   GEN_BUSES = [584713, "999001:B"]
+#   GEN_BUSES = []        -> asked when the script runs
+# Numbers given on the command line replace this list for that run.
+GEN_BUSES = [584713, 539114, 764984, 531601]
+# ----------------------------------------------------------------------------
 ROOT = ""                      # the study folder holding Base\ and Projects\ ("" = this file's folder)
 PROJECTS = ["SantaFe", "IronStar", "EmpirePrairie", "EastFork"]   # [] = every project found
 MODE = "spp"
@@ -167,9 +178,12 @@ def _units_from(args):
 
 
 def get_units():
+    """The command line first, then GEN_BUSES in SETTINGS, else ask."""
     if len(sys.argv) > 1:
+        print("[trip-why] bus numbers from the command line (GEN_BUSES not used this run)")
         return _units_from(sys.argv[1:])
     if GEN_BUSES:
+        print("[trip-why] bus numbers from GEN_BUSES in the script")
         return _units_from([str(b) for b in GEN_BUSES])
     try:
         ans = input("Generator bus number(s), e.g. 584713 539114 (bus:id for one machine): ")
