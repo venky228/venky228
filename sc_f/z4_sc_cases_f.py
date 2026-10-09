@@ -138,6 +138,27 @@ DEFAULT_SC_PARAMS = {"mbase": None, "r": 0.0, "xpp": 0.8}
 # X'' written and X'' used by the fault calc must agree.
 SC_XPP_BY_PROJECT = {}                     # empty: X'' = 0.8 pu on MBASE for EVERY project (DEFAULT_SC_PARAMS)
 
+# ---- X'' OF THE EXISTING UNITS (EGF) ----------------------------------------
+# The fault calculation (ASCC) takes every unit's X'' from the SHORT CIRCUIT tab
+# of its machine record (the sequence data: Subtransient X), not from the Power
+# Flow tab's X Source. The X'' above goes on the SGF units only; the existing
+# units are studied as the case holds them -- and EastFork's two units hold
+# 9999 pu there (531607 also as X Source): an open circuit, so they feed NO
+# fault current in any case, the POI current without the SGF is understated and
+# the SGF's % change overstated.
+# A project named here gets that X'' (pu on each unit's OWN MVA base) written
+# on its keep_online units before the fault sweeps: the Subtransient X of the
+# short-circuit data (the one ASCC uses; with GENXOP = 1 the Transient X too)
+# and the X Source of the power-flow record. R, the MVA base and every other
+# short-circuit value stay as the case holds them; the .sav is never changed
+# (the saved SC cases carry the value, as they carry the SGF's).
+#       EGF_XPP_BY_PROJECT = {"EastFork": 0.8}                          every EGF unit
+#       EGF_XPP_BY_PROJECT = {"EastFork": {531620: 0.8, 531607: 0.8}}   per unit bus
+# {} = every existing unit exactly as the case holds it (the old behaviour).
+# Projects not named are not touched. The "SC model parameters" sheet lists
+# every existing unit with the X'' written and the X'' the fault calc uses.
+EGF_XPP_BY_PROJECT = {"EastFork": 0.8}
+
 # ---- SAVE THE CASES THEMSELVES ---------------------------------------------
 # True = each case is saved as a .sav the moment it is set up and solved, with
 # the SGF's short-circuit model already written on it (MBASE / R / X'' on the
@@ -1311,6 +1332,96 @@ def apply_sc_params(gens):
                  (" + sequence data via %s" % via) if via else ""))
 
 
+def _egf_xpp_for(name, bus):
+    """EGF_XPP_BY_PROJECT: the X'' (pu on the unit's own MVA base) to write on
+       existing unit `bus` of project `name`, or None = as the case holds it."""
+    ov = (EGF_XPP_BY_PROJECT or {}).get(name)
+    if isinstance(ov, dict):
+        ov = ov.get(int(bus), ov.get(str(bus)))
+    return None if ov is None else float(ov)
+
+
+def _read_zsorce(bus, mid):
+    """(R, X) of the machine record's source impedance -- the Power Flow tab's
+       R Source / X Source -- or (None, None)."""
+    for fn in ("macdt2", "macdat"):
+        f = getattr(psspy, fn, None)
+        if not f:
+            continue
+        try:
+            ie, z = f(int(bus), str(mid), "ZSORCE")
+            if ie in _OK_MAC and z is not None:
+                return float(z.real), float(z.imag)
+        except Exception:
+            continue
+    return None, None
+
+
+def apply_egf_xpp(name, existing):
+    """EGF_XPP_BY_PROJECT on this project's existing units, then every existing
+       unit as the fault calculation will see it, written or not:
+       [(bus, id, MBASE, R Source, X Source, X'' used by ASCC, note)].
+
+       What is written: the Subtransient X of the short-circuit (sequence) data --
+       the reactance ASCC uses with GENXOP = 0 (with GENXOP = 1 the Transient X as
+       well) -- and the X Source of the power-flow record, so both tabs read the
+       same. Every other value goes in as the API default, which leaves it as the
+       case holds it: R, MVA base, the other sequence reactances. Both are read
+       back before anything is reported."""
+    out = []
+    for g in existing:
+        x = _egf_xpp_for(name, g["num"])
+        tried = []
+        if x is not None:
+            # power-flow record: X Source only (PSS/E 34 machine_chng_2 REALAR: ZX at 8,
+            # the layout the SGF's X'' goes in with)
+            realar = [_f] * 17
+            realar[_LAYOUTS[0]["xpp"]] = x
+            try:
+                _mchng(g["num"], g["id"], [_i] * 7, realar)
+            except RuntimeError as e:
+                tried.append("X Source: %s" % e)
+            # short-circuit data: the positive-sequence reactance(s) ASCC reads
+            seq = [_f] * 8
+            seq[1] = x                    # ZXPPDV  subtransient
+            if GENXOP == 1:
+                seq[2] = x                # ZXPDV   transient
+            for nm, args in (("seq_machine_data_4", ([_i], seq + [_f] * 4)),
+                             ("seq_machine_data_4", ([_i], seq)),
+                             ("seq_machine_data_3", ([_i], seq)),
+                             ("seq_machine_data_3", (seq,)),
+                             ("seq_machine_data_2", (seq,))):
+                f = getattr(psspy, nm, None)
+                if not f:
+                    continue
+                try:
+                    ie = f(g["num"], str(g["id"]), *args)
+                    ie = ie[0] if isinstance(ie, (list, tuple)) else ie
+                    if ie in (0, None):
+                        break
+                    tried.append("%s ierr=%s" % (nm, ie))
+                except TypeError as e:
+                    tried.append("%s: %s" % (nm, str(e)[:60]))
+        mb = _read_mbase(g["num"], g["id"])
+        zr, zx = _read_zsorce(g["num"], g["id"])
+        sq = _read_seq_x(g["num"], g["id"])
+        note = "existing unit (EGF): as in case"
+        if x is not None:
+            took = sq is not None and abs(sq - x) <= max(0.0005, 0.001 * x)
+            if took:
+                note = "existing unit (EGF): X'' %s written (EGF_XPP_BY_PROJECT)" % _n(x)
+            else:
+                note = ("existing unit (EGF): X'' %s asked (EGF_XPP_BY_PROJECT) but the fault calculation "
+                        "still uses %s -- NOT taken" % (_n(x), _n(sq)))
+            print("  [%s] EGF X'' %d '%s': %s pu -> X Source %s, X'' used by the fault calc %s%s"
+                  % (_ts(), g["num"], g["id"], _n(x), _n(zx), _n(sq),
+                     "" if took else "   *** NOT taken (%s) -- studied as the case holds it ***"
+                     % ("; ".join(tried) or "no sequence-data API")))
+        out.append((g["num"], g["id"], mb, zr, zx, sq, note))
+    _EGF_PARAMS[name] = out
+    return out
+
+
 def _off_label():
     """What the WITHOUT case is called, everywhere it is named.
 
@@ -1457,6 +1568,7 @@ def _convergence_gate(name, cases):
 
 
 _ENERGIZED_EGF = []     # keep_online units EGF_ENERGIZE switched in for the running project
+_EGF_PARAMS = {}         # project -> apply_egf_xpp() rows: every existing unit as ASCC sees it
 
 
 _PROJECT_GENS = []      # the running project's machines, so an abort can switch them back in
@@ -1887,6 +1999,10 @@ def _write_cases_txt(name, poi, snaps, powers, params, gens):
         L.append("  %d '%s'  MBASE %s  R %s  X'' (machine record) %s  X'' (sequence record, used by ASCC) %s"
                  % (g["num"], g["id"], _n(rec[0]), _n(rec[1]), _n(rec[2]),
                     _n(rec[3] if len(rec) > 3 else None)))
+    for _rec in (_EGF_PARAMS.get(name) or []):
+        L.append("  existing %d '%s'  MBASE %s  R %s  X'' (machine record) %s  X'' (sequence record, used by "
+                 "ASCC) %s  -- %s" % (_rec[0], _rec[1], _n(_rec[2]), _n(_rec[3]), _n(_rec[4]), _n(_rec[5]),
+                                     _rec[6].replace("existing unit (EGF): ", "")))
     L.append("")
     pw = dict(powers or [])
     for (lbl, sgf_on, sgf_off, egf_on, egf_off, sgf_mw, egf_mw) in _onoff_by_case(snaps):
@@ -2200,6 +2316,10 @@ def study_project(p):
                 existing.append({"num": mb, "id": mi, "mbase0": mm, "st0": st})
     if kept:
         print("  keep-online machines as saved: %s" % ", ".join(kept))
+    # THE EXISTING UNITS' X'' (EGF_XPP_BY_PROJECT): written before anything reads
+    # it, so the check below, every case, the per-unit contribution and the
+    # saved SC cases all see the same value.
+    egf_params = apply_egf_xpp(name, existing)
     # AN EGF UNIT THAT CANNOT FEED A FAULT. The existing units are studied as the
     # case holds them, and a unit carrying the dynamics default (9999) or no
     # usable X'' contributes nothing however it is dispatched -- EastFork's
@@ -2225,8 +2345,7 @@ def study_project(p):
     if _egf_bad:
         print("  *** %d existing (EGF) unit(s) have no usable short-circuit X'' -- they will contribute"
               " nothing to any fault: %s. The EGF contribution for %s is understated until the"
-              " submitted X'' is written on them (z4_sc_seqfix.py, or SC_XPP_BY_PROJECT with an"
-              " explicit list). ***"
+              " submitted X'' is written on them: EGF_XPP_BY_PROJECT in the settings. ***"
               % (len(_egf_bad), ", ".join("%d '%s' X''=%s" % (g["num"], g["id"], _n(x)) for g, x in _egf_bad), name))
     # THE EGF IN SERVICE. What moves the EGF's fault contribution is which of
     # its units are CONNECTED -- each one is a parallel source branch -- not
@@ -2557,7 +2676,8 @@ def study_project(p):
     _restore_energized()
     return {"project": name, "sav": sav, "poi": poi, "gens": gens, "rows": rows, "poi_row": poi_row,
             "energized_egf": ["%d '%s'" % (g["num"], g["id"]) for g in energized_egf],
-            "n_radius": len(hops), "kept": kept, "params": params, "powers": powers, "snaps": snaps,
+            "n_radius": len(hops), "kept": kept, "params": params, "egf_params": egf_params,
+            "powers": powers, "snaps": snaps,
             "contrib": contrib, "three": bool(nogen), "egf_note": egf_note,
             "gia_mw": p.get("gia_mw"),
             "conv": conv, "conv_ok": conv_ok, "conv_note": conv_note,
@@ -2793,6 +2913,10 @@ def _summary_text(p, sav, gens, rows, poi_row, hops, cap_notes=(), params=(), po
         # above, the submitted value never reached the calculation.
         L.append("  %-18s %s" % ("X'' used (pu)",
                                  " ".join("%14s" % _n(r[3] if len(r) > 3 else None) for r in params)))
+    for _rec in (_EGF_PARAMS.get(p["name"]) or []):
+        L.append("Existing unit %d '%s': MBASE %s, X'' written (X Source) %s, X'' used %s -- %s"
+                 % (_rec[0], _rec[1], _n(_rec[2]), _n(_rec[4]), _n(_rec[5]),
+                    _rec[6].replace("existing unit (EGF): ", "")))
     L.append("Capacities studied: %s   (CAPACITY_SCOPE = %s)" % (", ".join("%d%%" % x for x in CAPACITY_PCT), CAPACITY_SCOPE))
     L.append("WITHOUT case: %s   (WITHOUT_SCOPE = %s -- \"new\" = project machines only, "
              "\"site\" = project and existing units)" % (_off_label(), WITHOUT_SCOPE))
@@ -3228,6 +3352,12 @@ def write_report_all(results):
             prm_rows.append([R_["project"], g["num"], g["id"], round(mb, 4) if mb is not None else "n/a",
                              round(zr, 6) if zr is not None else "n/a", round(zx, 6) if zx is not None else "n/a",
                              round(_sq, 6) if _sq is not None else "n/a", _note])
+        # THE EXISTING UNITS as the fault calculation sees them (EGF_XPP_BY_PROJECT)
+        for _num, _mid, _mb, _zr, _zx, _sx, _enote in (R_.get("egf_params") or []):
+            prm_rows.append([R_["project"], _num, _mid, round(_mb, 4) if _mb is not None else "n/a",
+                             round(_zr, 6) if _zr is not None else "n/a",
+                             round(_zx, 6) if _zx is not None else "n/a",
+                             round(_sx, 6) if _sx is not None else "n/a", _enote])
     contrib_rows = []
     for R_ in results:
         C = R_.get("contrib")
@@ -3342,6 +3472,14 @@ def write_report_all(results):
                                      "A keep_online unit saved out of service stays out in every case and contributes nothing.",
                                      "; ".join("%s: %s" % (R["project"], ", ".join(R.get("energized_egf") or []) or "none")
                                                for R in results) or "(none)"))],
+              ["EGF X''", ("EGF_XPP_BY_PROJECT = %r. %s"
+                           % (EGF_XPP_BY_PROJECT or {},
+                              "The X'' named there is written on that project's existing units before the sweeps -- "
+                              "the short-circuit data's Subtransient X (the reactance ASCC uses) and the power-flow "
+                              "X Source; R and MVA base unchanged. Every other existing unit is studied with the X'' "
+                              "the case holds. Each unit is on the SC model parameters sheet."
+                              if EGF_XPP_BY_PROJECT else
+                              "Every existing unit is studied with the X'' the case holds (SC model parameters sheet)."))],
               ["Capacity cases", "WITH project at %s; CAPACITY_SCOPE = %s (new = project machines only; both = project and existing units each scaled; site = existing kept, project scaled so the site total meets the percentage). MVA base scaled; source impedance in pu on MBASE unchanged." % (", ".join("%d%%" % x for x in CAPACITY_PCT), CAPACITY_SCOPE)],
               ["Cases", "; ".join("%s: %s (POI %d)" % (R["project"], os.path.basename(R["sav"]), R["poi"]) for R in results)],
               ["Per-unit contribution", "With every unit in service (the WITH-project state) each machine -- existing units and project machines -- is switched out alone and the bus(es) in CONTRIB_FAULT_BUSES (%s) faulted again; the drop in fault current is that unit's contribution, the report's ON-minus-OFF definition applied unit by unit. Group rows take all new / all existing units out together (the all-new row equals the WITHOUT column). Sources feed a fault in parallel, so per-unit values do not sum exactly to the group total. A unit saved out of service is never switched on. %s" % (CONTRIB_FAULT_BUSES, "" if PER_MACHINE_CONTRIB else "(PER_MACHINE_CONTRIB is off -- not run)")],
