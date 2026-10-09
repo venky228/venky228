@@ -44,6 +44,164 @@
 
 import os, sys, re, csv, glob, time, traceback, contextlib
 
+# ============================================================================
+# NO EXISTING FILE IS EVER DELETED
+# ============================================================================
+# A file or folder that was already on disk when this launch started is never
+# deleted by these scripts. Every os.remove / os.unlink / shutil.rmtree of one
+# MOVES it instead, under the path it had, into the kept folder beside the
+# study folder, and lists it in KEPT_FILES.txt there:
+#     <study folder>_KEPT_FILES\<launch date_time>\<path inside the study folder>
+# The run carries on exactly as if it had been deleted -- it is simply no
+# longer where it was. Still deleted as before: temporary files this launch
+# made itself (locks, claims, temp copies) and anything in the system temp
+# folder. A file that cannot be moved (held open by PSS/E) is left where it is
+# and the caller sees the same error a delete would have given. Nothing ever
+# removes anything from the kept folder: clear it yourself when you are sure.
+def _keep_install():
+    import os as _o, shutil as _sh, sys as _sy, time as _ti, errno as _er
+    import threading as _th, tempfile as _tf
+    if getattr(_o, "_spp_keep_on", False):
+        return
+    _rm, _rt = _o.remove, _sh.rmtree
+    _lk = _th.Lock()
+    _t0 = _ti.time()
+    _said = []
+    try:
+        _tmp = _o.path.normcase(_o.path.abspath(_tf.gettempdir())).rstrip("\\/") + _o.sep
+    except Exception:
+        _tmp = None
+    # Creation time: Windows keeps it as st_ctime; elsewhere it is unknown, and
+    # an unknown age counts as "was there before" -- the file is kept.
+    _ctime_is_birth = _o.name == "nt" or _o.environ.get("SPP_KEEP_CTIME_IS_BIRTH") == "1"
+
+    def _since():
+        try:
+            return float(_o.environ.get("SPP_KEEP_SINCE") or _t0)
+        except ValueError:
+            return _t0
+
+    def _stamp():
+        s = (_o.environ.get("SPP_KEEP_STAMP") or "").strip()
+        return s or _ti.strftime("%Y%m%d_%H%M%S", _ti.localtime(_since()))
+
+    def _born(p):
+        try:
+            st = _o.lstat(p)
+        except OSError:
+            return None
+        b = getattr(st, "st_birthtime", None)
+        if b:
+            return b
+        return st.st_ctime if _ctime_is_birth else None
+
+    def _existing(p, folder):
+        """p -- or, for a folder, anything in it -- was on disk before this launch."""
+        t = _since() - 2.0
+        b = _born(p)
+        if b is None or b < t:
+            return True
+        if folder:
+            for r, ds, fs in _o.walk(p):
+                for n in ds + fs:
+                    b = _born(_o.path.join(r, n))
+                    if b is None or b < t:
+                        return True
+        return False
+
+    def _in_temp(ap):
+        return bool(_tmp) and _o.path.normcase(ap).startswith(_tmp)
+
+    def _where(ap):
+        """(kept folder, path inside it) for the absolute path ap."""
+        for root in (_o.environ.get("SPP_KEEP_ROOTS") or "").split(_o.pathsep):
+            root = root.strip()
+            if not root:
+                continue
+            ra = _o.path.abspath(root).rstrip("\\/")
+            if _o.path.normcase(ap).startswith(_o.path.normcase(ra) + _o.sep):
+                _d, _rest = _o.path.splitdrive(ra)
+                base = (ra + "_KEPT_FILES") if _rest.strip("\\/") else (ra + _o.sep + "_SPP_KEPT_FILES")
+                return base, ap[len(ra) + 1:]
+        _d, _rest = _o.path.splitdrive(ap)
+        return (_d + _o.sep if _d else _o.sep) + "_SPP_KEPT_FILES", _rest.lstrip("\\/")
+
+    def _keep(ap, kind):
+        base, rel = _where(ap)
+        stp = _stamp()
+        dst = _o.path.join(base, stp, rel)
+        with _lk:
+            n = 1
+            while True:
+                cand = dst if n == 1 else "%s.kept%d" % (dst, n)
+                if _o.path.lexists(cand):
+                    n += 1
+                    continue
+                _o.makedirs(_o.path.dirname(cand), exist_ok=True)
+                try:
+                    _o.rename(ap, cand)
+                except OSError as e:
+                    if getattr(e, "errno", None) == _er.EEXIST:
+                        n += 1
+                        continue
+                    if getattr(e, "errno", None) != _er.EXDEV:
+                        print("[keep] could not keep %s (%s) -- it is left where it is" % (ap, e))
+                        raise
+                    if kind == "folder":
+                        _sh.copytree(ap, cand, symlinks=True)
+                        _rt(ap)
+                    else:
+                        _sh.copy2(ap, cand)
+                        _rm(ap)
+                break
+            try:
+                with open(_o.path.join(base, stp, "KEPT_FILES.txt"), "a") as fh:
+                    fh.write("%s  pid %-6d %-6s %s\n%33skept as %s\n"
+                             % (_ti.strftime("%Y-%m-%d %H:%M:%S"), _o.getpid(), kind, ap, "", cand))
+            except Exception:
+                pass
+            if not _said:
+                _said.append(1)
+                print("[keep] nothing that was on disk before this launch is deleted -- it is "
+                      "moved to %s" % _o.path.join(base, stp))
+
+    def remove(path, *a, **k):
+        if a or k or not isinstance(path, str) or not path:
+            return _rm(path, *a, **k)
+        ap = _o.path.abspath(path)
+        if (_in_temp(ap) or not _o.path.lexists(ap)
+                or (_o.path.isdir(ap) and not _o.path.islink(ap))
+                or not _existing(ap, False)):
+            return _rm(path)
+        _keep(ap, "file")
+
+    def rmtree(path, ignore_errors=False, onerror=None):
+        try:
+            ap = _o.path.abspath(path)
+            ok = (isinstance(path, str) and _o.path.isdir(ap) and not _o.path.islink(ap)
+                  and not _in_temp(ap) and _existing(ap, True))
+        except Exception:
+            ok = False
+        if not ok:
+            return _rt(path, ignore_errors, onerror)
+        try:
+            _keep(ap, "folder")
+        except Exception:
+            if ignore_errors:
+                return
+            if onerror is not None:
+                onerror(_o.rename, path, _sy.exc_info())
+                return
+            raise
+
+    _o.remove = remove
+    _o.unlink = remove
+    _sh.rmtree = rmtree
+    _o._spp_keep_on = True
+
+
+_keep_install()
+
 # NO WINDOWS ERROR BOXES. A crashed process (an access violation in PSS/E, a
 # floating-point trap) otherwise waits on "python.exe has stopped working" --
 # alive, holding its slot, until someone clicks. With these flags it exits with
