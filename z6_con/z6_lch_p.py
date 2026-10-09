@@ -213,6 +213,15 @@ if _envd in ("1", "true", "yes", "on"):
 elif _envd in ("0", "false", "no", "off"):
     DEFER_REPORTS = False
 
+# >>> NO SCORING AT ALL (panel: RUN_SCORING = False). The run simulates and its
+# plotters draw; the report phase never starts, whatever SPP_DEFER_REPORTS says.
+# A later PIPELINE = "compare" launch scores every finished .out.
+NO_SCORING = (os.environ.get("SPP_NO_SCORING") or "").strip().lower() in ("1", "true", "yes", "on")
+if NO_SCORING and not REPORT_ONLY:
+    DEFER_REPORTS = True
+    print("[parallel] RUN_SCORING = False in the panel -- simulation (and plots) only, "
+          "no report phase")
+
 # --- SCORE ONLY SOME SCENARIOS ----------------------------------------------
 # Empty = score every .out in the folder.
 # Non-empty = score ONLY these, and write the result to SPP_CRITERIA_REPORT_
@@ -6272,6 +6281,14 @@ def _run_one_study():
     # collection happens in main() once every project has run.
     if DEFER_REPORTS and not REPORT_ONLY:
         el = time.time() - t0
+        if NO_SCORING:
+            _banner("RUNS COMPLETE for %s -- %s (NOT SCORED: RUN_SCORING = False in the "
+                    "panel; PIPELINE = \"compare\" scores it later)"
+                    % (_CUR_PROJECT or "this project", _fmt_hms(el)))
+            _write_run_summary(t0, launches=None,
+                               why="written after the WORK phase; nothing scored "
+                                   "(RUN_SCORING = False in the panel)")
+            return 0
         _banner("RUNS COMPLETE for %s -- %s (report DEFERRED: z6_main.py scores "
                 "every project once all of them have simulated)"
                 % (_CUR_PROJECT or "this project", _fmt_hms(el)))

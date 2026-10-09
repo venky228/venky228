@@ -3476,7 +3476,9 @@ PLOT_IN_WORKER      = _env_bool("SPP_PLOT_IN_WORKER", False)
 SCORE_IN_WORKER     = _env_bool("SPP_SCORE_IN_WORKER", False)
 NAN_CHECK_IN_WORKER = _env_bool("SPP_NAN_CHECK_IN_WORKER", False)
 
-SCORE_AT_RUN_TIME = True
+# RUN_SCORING = False in the panel (SPP_NO_SCORING=1): the plotters draw and score
+# nothing; a later PIPELINE = "compare" launch scores every finished .out.
+SCORE_AT_RUN_TIME = not _env_bool("SPP_NO_SCORING", False)
 
 # ---- KEEP THE REPORT CURRENT WHILE THE RUN IS GOING ------------------------
 # True = after each scenario is scored, the SPP criteria report, compliance
@@ -35645,6 +35647,9 @@ def plot_missing_outs():
                 print("               not scored here -- no clearing time is "
                       "recorded anywhere for this scenario; the report phase "
                       "scores it from the fault list it builds itself")
+            elif _scorable:
+                print("               not scored -- RUN_SCORING = False in the panel; "
+                      "PIPELINE = \"compare\" scores it later")
             t = None
             ch = None                    # stop pinning ~500 MB across the whole draw
             if not had_pdf:

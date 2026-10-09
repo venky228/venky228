@@ -335,6 +335,8 @@ ONLY_EVENTS = []                             # [] = every event
 FORCE_REBUILD = None                         # True = rebuild the snapshot even if the flat run is done
 RUN_FLAT = None                              # no-fault initial-condition run (None = on)
 RUN_FAULTS = None                            # False = build and score only, simulate no fault
+RUN_SCORING = True                           # False = simulate and plot only: nothing scored, no comparison written -- later PIPELINE = "compare" scores
+MAKE_PLOTS = None                            # None = draw | False = no PDFs (faster)
 MERGE_ONLY = False                           # True = only rebuild the reports from parts, then compare
 COMPARE_REQUIRE_COMPLETE = False             # True = no comparison if a project did not finish
 RUN_STUDIES = False                          # old setting -- PIPELINE wins
@@ -871,7 +873,7 @@ FAST_COMPARE = False                         # PIPELINE "compare": compare disk 
 FAST_COMPARE_PARALLEL = 4                    # projects at once
 
 # ---- 18. PLOTS -----------------------------------------------------------------
-MAKE_PLOTS = None                            # None = draw | False = no PDFs (faster)
+# MAKE_PLOTS -- moved to section 1 (WHAT TO RUN), next to RUN_FAULTS and RUN_SCORING
 # plotter counts
 PLOT_INRUN = 1                               # plotters per running folder
 PLOT_WORKERS = 2                             # plotters per case
@@ -17938,6 +17940,15 @@ def _early_scorer_start(pjs, t_go):
                     continue
                 if not _sim_finished(proj, t_go):
                     continue
+                if _NO_SCORE[0]:
+                    # RUN_SCORING = False: not scored -- only its PDFs, queued
+                    done.add(proj)
+                    if PLOT_MISSING_OUTS and MAKE_PLOTS is not False:
+                        with lock:
+                            plot_q.append(proj)
+                        print("[early-score] %s has finished simulating in both cases -- "
+                              "RUN_SCORING = False: not scored; its PDFs are queued" % proj)
+                    continue
                 free = _cores_ceiling() - _alive_sims() - busy["plot"]
                 if free < _EARLY_MIN_CORES:
                     break
@@ -17986,8 +17997,12 @@ def _early_scorer_start(pjs, t_go):
     hb = threading.Thread(target=_beat)
     hb.daemon = True
     _thread_start(hb, "the early-score heartbeat")
-    print("[early-score] on: each project is scored as soon as both cases have "
-          "simulated it, on the cores the workers leave idle")
+    if _NO_SCORE[0]:
+        print("[early-score] on, RUN_SCORING = False: nothing is scored; a project's "
+              "PDFs are drawn as soon as both cases have simulated it")
+    else:
+        print("[early-score] on: each project is scored as soon as both cases have "
+              "simulated it, on the cores the workers leave idle")
 
     def _stop():
         stop.set()
@@ -18023,6 +18038,87 @@ def _early_plots_wait(max_s=None):
                 return False
             t.join(1.0)
     return True
+
+
+_NO_SCORE = [False]             # RUN_SCORING = False for this launch (set in main())
+
+
+def _no_scoring_finish(pipeline, egf_skip, live_stop):
+    """RUN_SCORING = False, once the simulations are done: draw what has no PDF
+       yet, run the surplus scenarios and the capacity levels the same way
+       (simulate and draw), and stop. Nothing is scored and no comparison or
+       table is written, so the reports and comparisons already on disk stay
+       exactly as they are; no marker is renamed or removed either. A later
+       launch with RUN_SCORING = True and PIPELINE = "compare" scores every
+       finished .out it finds and compares them."""
+    if live_stop:
+        live_stop()
+    _banner("RUN_SCORING = False -- DRAWING, THEN THE OTHER RUNS; NOTHING IS SCORED")
+
+    def _plots(when):
+        if MAKE_PLOTS is False:
+            return
+        _early_plots_wait()
+        try:
+            plot_missing_everywhere(pipeline, after_runs=True, cap=_plot_idle_cap())
+        except Exception as e:
+            print("[no-score] the plot pass %s failed (%s) -- the simulations are on "
+                  "disk" % (when, e))
+
+    _plots("after the main runs")
+    pm = [(p, m) for p in (list(_panel_projects() or [])) if p not in egf_skip
+          for m in (list(MODES) or ["spp"])]
+    ran = []
+    if SURPLUS_SCENARIOS:
+        for p, m in pm:
+            try:
+                run_surplus_scenarios(p, m)
+                ran.append("%s surplus scenario(s)" % p)
+            except Exception as e:
+                print("[no-score] %s: the surplus scenario runs failed (%s)" % (p, e))
+    if CAPACITY_LEVELS:
+        for p, m in pm:
+            # The capacity runs take their fault list from the project case's
+            # scores already on disk. With none yet there is no list to run.
+            try:
+                _have = (_failing_faults(p, m)
+                         if (CAPACITY_FAULTS or "all").strip().lower() == "failing"
+                         else _all_faults(p, m))
+            except Exception:
+                _have = []
+            if not _have:
+                print("[no-score] %s: CAPACITY_LEVELS not run -- the capacity runs take "
+                      "their fault list from the project case's scores, and it has none "
+                      "yet; they run on a launch with RUN_SCORING = True" % p)
+                continue
+            print("[no-score] %s: capacity runs for the %d fault(s) in the scores already "
+                  "on disk" % (p, len(_have)))
+            try:
+                run_capacity_sweep(p, m)      # simulates; its table needs scores, so none
+                ran.append("%s capacity level(s)" % p)
+            except Exception as e:
+                print("[no-score] %s: the capacity runs failed (%s)" % (p, e))
+    if ran:
+        _plots("after the surplus / capacity runs")
+    skipped = [n for n, on in (
+        ("NEW_PLANT_RUN", NEW_PLANT_RUN), ("PROJECT_OFF_RUN", PROJECT_OFF_RUN),
+        ("DYR_SWEEP", DYR_SWEEP or DYR_SWEEP_BY_PROJECT),
+        ("PROJECT_MW", any(_project_mw_levels(p) for p, _m in pm)),
+        ("POI_P_LEVELS", POI_P_LEVELS or POI_P_LEVELS_PCT),
+        ("EGF_DYR_RUN / EGF_OFF_RUN", EGF_DYR_RUN or EGF_OFF_RUN or EGF_OFF_BASE_RUN)) if on]
+    if skipped:
+        print("[no-score] not run with RUN_SCORING = False (each reports from scores): %s"
+              % ", ".join(skipped))
+    print("")
+    print("[no-score] " + "=" * 70)
+    print("[no-score] DONE: simulated%s%s. NOTHING was scored and NO comparison was"
+          % (" and drawn" if MAKE_PLOTS is not False else "",
+             (" (+ %s)" % "; ".join(ran)) if ran else ""))
+    print("[no-score] written; the reports and comparisons on disk are unchanged and do")
+    print("[no-score] not include these runs. To score them and compare: RUN_SCORING = True")
+    print("[no-score] and PIPELINE = \"compare\" (no simulation).")
+    print("[no-score] " + "=" * 70)
+    return 0
 
 
 def _case_thread_begin(case_key):
@@ -25332,6 +25428,22 @@ def main():
         "missing": "simulate only what is missing, then compare",
         "all":     "simulate BOTH cases, report both, then compare",
     }[pipeline])
+
+    # RUN_SCORING = False (section 1): this launch simulates and draws, and scores
+    # nothing. One switch for every process it starts -- launchers, workers and
+    # plotters all read SPP_NO_SCORING from the environment they inherit.
+    _NO_SCORE[0] = bool(not RUN_SCORING and pipeline != "compare")
+    if not RUN_SCORING and pipeline == "compare":
+        print("[no-score] RUN_SCORING = False does not apply to PIPELINE = \"compare\": "
+              "that pass exists to score and compare, so it scores as usual")
+    os.environ["SPP_NO_SCORING"] = "1" if _NO_SCORE[0] else "0"
+    if _NO_SCORE[0]:
+        print("[no-score] RUN_SCORING = False: simulate%s only -- nothing is scored and no "
+              "comparison is written; the reports and comparisons on disk stay as they are"
+              % (" and plot" if MAKE_PLOTS is not False
+                 else " (MAKE_PLOTS = False, so no PDFs either)"))
+        print("[no-score] to score these runs and compare them later: RUN_SCORING = True "
+              "and PIPELINE = \"compare\" (no simulation)")
     # EGF_ONLY, PER PROJECT: a project with edits runs only its edited run --
     # its as-is study is not simulated (its results on disk are the reference)
     # and none of its other extra runs; every other project runs as normal.
@@ -25641,7 +25753,8 @@ def main():
 
     # The live view starts BEFORE the studies do, so the first scenarios each
     # side finishes are compared as soon as both have one.
-    _live_stop = _live_compare_start() if pipeline != "compare" else None
+    _live_stop = (_live_compare_start() if pipeline != "compare" and not _NO_SCORE[0]
+                  else None)          # RUN_SCORING = False: nothing to compare
     # THE WHOLE CAMPAIGN, BEFORE THE FIRST STUDY. Written once here so the plan
     # exists from the outset -- what is already on disk and what this launch
     # will run -- and then refreshed on its own timer while the studies go.
@@ -26121,6 +26234,11 @@ def main():
             print("")
         except Exception as _e:
             print("[compare] completeness check failed (%s) -- continuing" % _e)
+
+    # RUN_SCORING = False: simulated -- draw, run the surplus / capacity runs the
+    # same way, and stop here. Phases 2 and 3 score and compare.
+    if _NO_SCORE[0]:
+        return _no_scoring_finish(pipeline, _egf_skip, _live_stop)
 
     # STOP THE LIVE COMPARISON BEFORE SCORING. Left running, its refresh read
     # every folder's measurements into this process while phase 2 started its
