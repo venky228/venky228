@@ -1042,6 +1042,37 @@ def run_reads(jobs):
     return out
 
 
+def nc_window(nc, st=None, rdir=None):
+    """(count, first t, last t, every step?, end t if it came back) for PSS/E's 'Network not
+       converged' times. PSS/E does not stop on a failed network solution -- it carries on
+       from the unconverged values -- so a run can fail for seconds and still reach its end.
+       The PSS/E log covers the fault run to its end, so no message after the last one means
+       every later step converged."""
+    ts = sorted(set(round(t, 4) for t in nc if t is not None))
+    if not ts:
+        return len(nc), None, None, False, None
+    a, b = ts[0], ts[-1]
+    gaps = [y - x for x, y in zip(ts, ts[1:]) if y - x > 1e-4]
+    every = bool(len(ts) >= 20 and gaps and len(ts) >= 0.9 * ((b - a) / min(gaps) + 1))
+    back = None
+    if st and st.get("done") and not st.get("diverged"):
+        te = st.get("t_end") or (typical_out(rdir)[1] if rdir else None)
+        if te and b < float(te) - 0.5:
+            back = float(te)
+    return len(nc), a, b, every, back
+
+
+def nc_text(nc, st=None, rdir=None):
+    """'N time(s) between t=a and b s (every time step in that window)', end t if it came back."""
+    n, a, b, every, back = nc_window(nc, st, rdir)
+    if a is None:
+        return "%d time(s)" % n, None
+    if b - a < 1e-6:
+        return "%d time(s) at t=%.3f s" % (n, a), back
+    return ("%d time(s) between t=%.3f and %.3f s%s" % (n, a, b, " (every time step in that window)" if every else ""),
+            back)
+
+
 def reason(A):
     """The most likely reason, in plain words, from what analyse_run found."""
     bm, ev = A["bm"], A["ev"]
@@ -1065,7 +1096,7 @@ def reason(A):
             parts.append("the faulted-bus voltage already read NaN during the fault (a run that completes reads "
                          "a few hundredths of a pu there), so the network solution was failing from the fault on")
         if P.get("nc"):
-            parts.append("PSS/E reported 'network not converged' %d time(s) from t=%.3f s" % (len(P["nc"]), P["nc"][0] or 0))
+            parts.append("PSS/E reported 'network not converged' %s" % nc_text(P["nc"])[0])
         hi = sorted([x for x in P.get("band_hi", []) if x[2] is not None], key=lambda x: -x[2])[:2]
         if hi:
             parts.append("highest voltages PSS/E reported: %s" % ", ".join(
@@ -1120,8 +1151,15 @@ def reason(A):
         out.append("OUT OF STEP: PSS/E reported an out-of-step condition on %s at t=%.3f s"
                    % (", ".join("%d-%d" % (a, b) for _t, a, b in oos[:3]), oos[0][0] or 0))
     if P.get("nc"):
-        out.append("NETWORK NOT CONVERGED: PSS/E's network solution failed %d time(s) from t=%.3f s; values after "
-                   "that are not a solution" % (len(P["nc"]), P["nc"][0] or 0))
+        s, back = nc_text(P["nc"], A["state"], A["rdir"])
+        _w = nc_window(P["nc"])
+        s = ("NETWORK NOT CONVERGED: PSS/E's network solution failed %s; the values %s are not a solution"
+             % (s, "at that step" if _w[1] is not None and _w[2] - _w[1] < 1e-6 else "in that window"))
+        if back:
+            s += ("; PSS/E does not stop on a failed step (it carries on from the unconverged values), and it "
+                  "converged again after t=%.3f s through to the end (t=%.1f s), which is why the run still finished"
+                  % (nc_window(P["nc"])[2], back))
+        out.append(s)
     if A["stab"] and not A["offscale"] and not out:
         sgf = [b for b in named if str(b).startswith("999") or
                re.search(r"NEWGEN|PROJ|SGF", str(bm["bus"].get(b, ("", "", ""))[2]).upper())]
@@ -1271,7 +1309,9 @@ def block(A, others):
         if P["oos"]:
             L.append("   out of step: %s" % ", ".join("t=%.3f %d-%d" % (t or 0, a, b) for t, a, b in P["oos"][:6]))
         if P["nc"]:
-            L.append("   network not converged %d time(s), t=%.3f .. %.3f s" % (len(P["nc"]), P["nc"][0] or 0, P["nc"][-1] or 0))
+            s, back = nc_text(P["nc"], A["state"], A["rdir"])
+            L.append("   network not converged %s%s" % (s, ("; converged at every step after that, through to the end "
+                                                            "(t=%.1f s)" % back) if back else ""))
         for t, g, b, nm in P["mtrip"][:6]:
             L.append("   t=%.3f  machine %s at %s tripped" % (t or 0, g, bus_name(bm, b)))
         for t, b in P["bdisc"][:6]:
@@ -1299,7 +1339,9 @@ def block(A, others):
                 if O["psse"] and O["psse"]["islands"]:
                     extra.append("PSS/E island at t=%.3f" % (O["psse"]["islands"][0][0] or 0))
                 if O["psse"] and O["psse"]["nc"]:
-                    extra.append("not converged %d" % len(O["psse"]["nc"]))
+                    n, a, b, every, _bk = nc_window(O["psse"]["nc"], O["state"], O["rdir"])
+                    extra.append("not converged %d%s" % (n, (" between t=%.3f and %.3f s%s" % (
+                        a, b, ", every step" if every else "")) if a is not None else ""))
                 if of and of[0] == "series":
                     if of[1]:
                         extra.append("max %.3g pu (%s)" % (of[1][0]["peak"] or 0, _short(of[1][0]["title"], 24)))
