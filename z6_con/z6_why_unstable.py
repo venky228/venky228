@@ -70,9 +70,10 @@ FAULTS = []                    # [] = every crashed / off-scale / solution-lost 
 COMPARE_OTHER_CASES = True     # show each fault in the other cases too
 COMPARE_READ_OUT = False       # ...and read their .out files too (slower)
 FAULT_LIST = r"FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"   # under ROOT; the run's faults\SPP_FAULTS.csv is the fallback
-READ_OUT = True                # read the .out files (PSS/E dyntools) for the timing; False (or --quick) = logs and score files only
-OUT_WINDOW_S = 4.0             # read each .out only up to this long after the last switching (clearing / reclose)
-ANGLE_WINDOW_S = 6.0           # ...this long for a run flagged for a turning angle (to measure its drift)
+READ_OUT = False               # True = also read the .out files (whole files -- dyntools cannot read part of one -- slow);
+                               #   the PSS/E fault-window log already gives the times (bands, islands, non-convergence)
+OUT_WINDOW_S = 4.0             # with READ_OUT: the timing is looked for up to this long after the last switching
+ANGLE_WINDOW_S = 6.0           # ...and this long for a run flagged for a turning angle
 READ_WORKERS = 4               # .out files read at the same time, one process each (~300 MB of memory each); 1 = one by one
 PSSE_DIRS = []                 # [] = C:\Program Files (x86)\PTI\PSSE34 ... looked for | or e.g. [r"C:\Program Files (x86)\PTI\PSSE34"]
 OFFSCALE_PU = 5.0              # the study's "within scale" limit
@@ -634,6 +635,7 @@ R_BAND_ROW = re.compile(r"(\d{3,7})\s*\[([^\]]*)\]\s*(\d+\.\d+|\*+)\s*(HI|LO)")
 R_STATUS = re.compile(r"Status of circuit\s+\"([^\"]*)\"\s+from\s+(\d+)\s*\[[^\]]*\]\s+to\s+(\d+)\s*\[[^\]]*\]")
 R_GENPWR = re.compile(r"Power unbalance\s*=\s*(-?[\d.]+)\s*;\s*Threshold\s*=\s*(-?[\d.]+)", re.I)
 R_DC = re.compile(r"\bDC\b|CONVERTER|COMMUTAT|\bCDC\w*|\bVSC\b|\bBYPASS", re.I)
+R_MODEL_LINE = re.compile(r"^Model\s+(\S+)\s+Bus\s+(\d+)\s*\[([^\]]*)\]")
 
 
 def psse_log(rdir, fid):
@@ -643,7 +645,9 @@ def psse_log(rdir, fid):
     if txt is None:
         return None
     L = {"path": p, "islands": [], "oos": [], "nc": [], "mtrip": [], "bdisc": [], "band_hi": [],
-         "branch": [], "genpwr": [], "dc": [], "t_last": None, "tail": collections.deque(maxlen=10)}
+         "branch": [], "genpwr": [], "dc": [], "nan_models": [], "t_last": None,
+         "tail": collections.deque(maxlen=10)}
+    last_model = None
     last_t = None
     island = None
     oos = None
@@ -676,6 +680,12 @@ def psse_log(rdir, fid):
             oos = None
         if not R_NOISE.match(s):
             L["tail"].append(_short(s, 150))
+        mm_ = R_MODEL_LINE.match(s)
+        if mm_:
+            last_model = (mm_.group(1), mm_.group(2), mm_.group(3).strip())
+        elif last_model and "not converged" in s and "NaN" in s:
+            if last_model not in L["nan_models"] and len(L["nan_models"]) < 8:
+                L["nan_models"].append(last_model)
         if R_DC.search(s) and len(L["dc"]) < 12:
             _mt = R_TIME.search(s)
             L["dc"].append((_num(_mt.group(1)) if _mt else last_t, _short(s, 140)))
@@ -816,10 +826,7 @@ def read_out(path, t_upto=None, t_end=None):
         return None, None, _DYN["why"]
     data = ids = None
     size = os.path.getsize(path)
-    head = size
-    if t_upto and t_end and t_end > 0:
-        head = int(size * min(1.0, (t_upto + 0.5) / float(t_end))) + 1048576
-    head -= head % 4
+    head = size                      # dyntools refuses a head copy of a .out -- the whole file is read
     src, tmpd, t0 = path, None, time.time()
     try:
         if head < size:
@@ -1059,6 +1066,15 @@ def reason(A):
                          "a few hundredths of a pu there), so the network solution was failing from the fault on")
         if P.get("nc"):
             parts.append("PSS/E reported 'network not converged' %d time(s) from t=%.3f s" % (len(P["nc"]), P["nc"][0] or 0))
+        hi = sorted([x for x in P.get("band_hi", []) if x[2] is not None], key=lambda x: -x[2])[:2]
+        if hi:
+            parts.append("highest voltages PSS/E reported: %s" % ", ".join(
+                "%s [%s] %.3g pu at t=%.3f s" % (b, _short(nm, 18), v, t or 0) for t, b, v, nm in hi))
+        if P.get("genpwr"):
+            parts.append("PSS/E's generator power-unbalance check (GENPWR) tripped %d machine(s)" % len(P["genpwr"]))
+        if P.get("nan_models"):
+            parts.append("then %s returned NaN, and PSS/E stopped -- the NaN is the last symptom, not the cause" % ", ".join(
+                "%s at %s [%s]" % (m, b, _short(nm, 18)) for m, b, nm in P["nan_models"][:3]))
         if not parts:
             parts.append("no message survives: the process vanished without a log line -- see the attempts below")
         return "; ".join(parts) + "."
