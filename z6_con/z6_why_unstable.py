@@ -71,6 +71,12 @@ OFFSCALE_PU = 5.0              # the study's "within scale" limit
 RUNAWAY_PU = 1.5               # "starts running away": the first time a voltage passes this after the fault
 ANGLE_SPAN_DEG = 720.0         # the study's "lost its solution" angle span
 ISLAND_MAX_BUSES = 40          # a pocket larger than this counts as still connected (the study's value)
+# AC buses where a DC converter connects. The bus map holds AC branches only, so a DC
+# tie is invisible to the island test: an island holding one of these buses is fed
+# ONLY through that DC link. {bus: "what it is"}
+DC_TERMINALS = {
+    599950: "the Lamar back-to-back DC tie SPP_43_LAMAR (599950 LAMAR7 - 599951 LAMAR 6, area 999 WECC)",
+}
 EXIT_MATCH_MIN = 45            # a worker exit this many minutes after an attempt's last log line still belongs to it
 OUT_DIR = "unstable_reasons"   # under ROOT unless a full path
 # ============================================================================
@@ -619,6 +625,7 @@ R_BAND_HDR = re.compile(r"VOLTAGES OUTSIDE OF BAND\s+(-?[\d.]+)\s+TO\s+(-?[\d.]+
 R_BAND_ROW = re.compile(r"(\d{3,7})\s*\[([^\]]*)\]\s*(\d+\.\d+|\*+)\s*(HI|LO)")
 R_STATUS = re.compile(r"Status of circuit\s+\"([^\"]*)\"\s+from\s+(\d+)\s*\[[^\]]*\]\s+to\s+(\d+)\s*\[[^\]]*\]")
 R_GENPWR = re.compile(r"Power unbalance\s*=\s*(-?[\d.]+)\s*;\s*Threshold\s*=\s*(-?[\d.]+)", re.I)
+R_DC = re.compile(r"\bDC\b|CONVERTER|COMMUTAT|\bCDC\w*|\bVSC\b|\bBYPASS", re.I)
 
 
 def psse_log(rdir, fid):
@@ -628,7 +635,7 @@ def psse_log(rdir, fid):
     if txt is None:
         return None
     L = {"path": p, "islands": [], "oos": [], "nc": [], "mtrip": [], "bdisc": [], "band_hi": [],
-         "branch": [], "genpwr": [], "t_last": None, "tail": collections.deque(maxlen=10)}
+         "branch": [], "genpwr": [], "dc": [], "t_last": None, "tail": collections.deque(maxlen=10)}
     last_t = None
     island = None
     oos = None
@@ -661,6 +668,9 @@ def psse_log(rdir, fid):
             oos = None
         if not R_NOISE.match(s):
             L["tail"].append(_short(s, 150))
+        if R_DC.search(s) and len(L["dc"]) < 12:
+            _mt = R_TIME.search(s)
+            L["dc"].append((_num(_mt.group(1)) if _mt else last_t, _short(s, 140)))
         mnc = R_NC.search(line)
         if mnc:
             t = _num(mnc.group(1))
@@ -998,7 +1008,17 @@ def reason(A):
     in_pocket = named & A["pocket"]
     in_psse = named & isl_psse
     out = []
-    if in_pocket or in_psse:
+    dc = [(b, DC_TERMINALS[b]) for b in sorted(A["pocket"] | isl_psse) if b in DC_TERMINALS]
+    if dc and (in_pocket or in_psse or not named):
+        bb = sorted(in_pocket | in_psse) or sorted(A["pocket"] | isl_psse)
+        out.append("ISLANDED ONTO A DC TIE: the fault's own switching leaves %s connected to the rest of the "
+                   "system only through %s. A line-commutated DC converter cannot hold the voltage of an AC "
+                   "island: it keeps pushing its power into a few buses with no generator, and its filter "
+                   "capacitors keep producing MVAr, so the island's voltage runs away. In reality the tie's "
+                   "protection blocks the converter (and switches its filters out) within a few cycles; that "
+                   "blocking is not in the simulation. This is not a real overvoltage"
+                   % (", ".join(str(b) for b in bb[:6]), "; ".join(n for _b, n in dc)))
+    elif in_pocket or in_psse:
         bb = sorted(in_pocket | in_psse)
         mach = sorted(set("%s-%s" % (b, i) for b in (A["pocket"] | isl_psse) for i in bm["mach"].get(b, [])))
         out.append("ISLANDED BY THE FAULT: %s %s cut off from the system by the fault's own switching%s. "
@@ -1126,9 +1146,11 @@ def block(A, others):
             L.append(" DIVERGED NOTE: %s" % _short(st["diverged"], 150))
         if A["pocket"]:
             mach = sorted(set("%s-%s" % (b, i) for b in A["pocket"] for i in bm["mach"].get(b, [])))
-            L.append(" ISLAND (fault list + bus map): %d bus(es) left with no path to the system: %s%s" % (
+            dcs = [b for b in sorted(A["pocket"]) if b in DC_TERMINALS]
+            L.append(" ISLAND (fault list + bus map): %d bus(es) left with no AC path to the system: %s%s%s" % (
                 len(A["pocket"]), ", ".join(str(b) for b in sorted(A["pocket"])[:12]),
-                ("; machines %s" % ", ".join(mach[:8])) if mach else ""))
+                ("; machines %s" % ", ".join(mach[:8])) if mach else "",
+                ("; DC terminal %s -- %s" % (dcs[0], DC_TERMINALS[dcs[0]])) if dcs else ""))
         elif not A["frow"]:
             L.append(" ISLAND: not checked (%s is not in the fault list)" % A["fault"])
         elif bm["ok"]:
@@ -1175,6 +1197,8 @@ def block(A, others):
                                                          ("%.3g pu" % v) if v is not None else "overflow (****)"))
         if P["genpwr"]:
             L.append("   PSS/E power-unbalance trips (GENPWR): %d" % len(P["genpwr"]))
+        for t, ln in P["dc"][:6]:
+            L.append("   t=%s  DC: %s" % (("%.3f" % t) if t is not None else "?", ln))
         if A["kind"] == "CRASHED" and P["tail"]:
             L.append("   last lines: %s" % " | ".join(list(P["tail"])[-4:]))
     elif A["kind"] == "CRASHED" or A["offscale"] or A["stab"]:
