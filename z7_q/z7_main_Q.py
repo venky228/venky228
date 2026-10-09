@@ -19214,6 +19214,58 @@ def _note_forced_pass(case, projects, modes, env, rc):
         pass
 
 
+def _claim_pid_reused(pid, written):
+    """True when the process that has this PID now cannot be the one that wrote
+       a claim at time `written`: it started after that (Windows gives the PID
+       of a finished process to the next process it starts), it runs under
+       another account, or there is no such process. False when it may be the
+       writer, or when that cannot be found out -- unsure keeps the claim."""
+    try:
+        pid = int(str(pid).strip())
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    started = None
+    if os.name == "nt":
+        try:
+            import ctypes
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            _pft = ctypes.POINTER(ctypes.c_ulonglong)        # FILETIME, as one count
+            k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            k.OpenProcess.restype = ctypes.c_void_p          # HANDLE, not int
+            k.GetProcessTimes.argtypes = [ctypes.c_void_p, _pft, _pft, _pft, _pft]
+            k.GetProcessTimes.restype = ctypes.c_int
+            k.CloseHandle.argtypes = [ctypes.c_void_p]
+            k.CloseHandle.restype = ctypes.c_int
+            h = k.OpenProcess(0x1000, 0, pid)               # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                # 87: no such process. 5: another account's -- not a shard of ours.
+                return ctypes.get_last_error() in (5, 87)
+            try:
+                ft = [ctypes.c_ulonglong(0) for _i in range(4)]
+                if not k.GetProcessTimes(h, ctypes.byref(ft[0]), ctypes.byref(ft[1]),
+                                         ctypes.byref(ft[2]), ctypes.byref(ft[3])):
+                    return False
+                # 100 ns ticks since 1601-01-01 UTC -> seconds since 1970
+                started = (ft[0].value - 116444736000000000) / 1e7
+            finally:
+                k.CloseHandle(h)
+        except Exception:
+            return False
+    else:
+        try:
+            with open("/proc/%d/stat" % pid) as fh:
+                st = fh.read()
+            ticks = float(st[st.rfind(")") + 2:].split()[19])
+            with open("/proc/stat") as fh:
+                boot = [float(ln.split()[1]) for ln in fh if ln.startswith("btime")][0]
+            started = boot + ticks / float(os.sysconf(os.sysconf_names["SC_CLK_TCK"]))
+        except Exception:
+            return False
+    return started is not None and started > float(written) + 2.0
+
+
 def _clear_score_claims(rdir, ids):
     """Drop the scoring claims an EARLIER pass left on these ids.
 
@@ -19222,10 +19274,27 @@ def _clear_score_claims(rdir, ids):
        them as it starts -- but the other shards start at the same time, and a
        shard that reaches an id before shard 0 has cleared it finds the old
        .fin and skips it: one more pass that does not score the file. Called
-       between passes, when no shard of this folder is running; a claim whose
-       process is still alive is left alone."""
+       between passes, when no shard of this folder is running.
+
+       A LOCK FROM A PASS THAT IS OVER IS REMOVED, WHATEVER ITS PID SAYS. Only
+       "is that PID running" was asked, and Windows gives a finished shard's
+       PID to the next process it starts: the lock read as held, every shard
+       of every later pass left the file alone without a word, and the audit
+       then called it unreadable (SantaFe_spp_s1_egfoff, 9 Oct: 13 finished
+       runs never scored, launch after launch, until the locks were deleted by
+       hand). A lock is now removed when
+         * it was written during this launch -- every pass this launch started
+           on the folder has ended when this is called;
+         * the process with its PID started after the lock was written, runs
+           under another account, or is gone;
+         * it is older than CLAIM_STALE_S.
+       It is kept only when a process of an EARLIER launch that started before
+       writing it is still running -- another launch may be scoring that file
+       now -- and then it is named, not skipped in silence."""
     d = os.path.join(rdir, "outs", "rclaim")
     n = 0
+    freed, kept = [], []
+    _host = (socket.gethostname() or "?").strip().replace(" ", "_")
     for sid in ids:
         for p in ([os.path.join(d, sid + ".rclaim"), os.path.join(d, sid + ".rclaim.fin"),
                    os.path.join(rdir, "outs", sid + ".rclaim")]
@@ -19234,11 +19303,24 @@ def _clear_score_claims(rdir, ids):
                 continue
             if p.endswith(".rclaim"):
                 try:
+                    _mt = os.path.getmtime(p)
                     with open(p, "r") as fh:
                         _txt = fh.read(200)
                     _pid = [t[3:] for t in _txt.split() if t.startswith("pid")]
-                    if _pid and _pid_alive_here(_pid[0]):
-                        continue
+                    _hst = [t[5:] for t in _txt.split() if t.startswith("host=")]
+                    # AN EARLIER LAUNCH'S, AND YOUNGER THAN CLAIM_STALE_S: the
+                    # only kind a running process may still be using.
+                    _maybe = (_mt < _LAUNCH_T0
+                              and time.time() - _mt < float(CLAIM_STALE_S))
+                    if _pid and _hst and _hst[0] != _host:
+                        if _maybe:
+                            kept.append((sid, _txt))    # another machine: cannot ask it
+                            continue
+                    elif _pid and _pid_alive_here(_pid[0]):
+                        if _maybe and not _claim_pid_reused(_pid[0], _mt):
+                            kept.append((sid, _txt))
+                            continue
+                        freed.append(sid)               # "running" by its PID only
                 except Exception:
                     pass
             try:
@@ -19246,7 +19328,44 @@ def _clear_score_claims(rdir, ids):
                 n += 1
             except Exception:
                 pass
+    if freed:
+        print("[coverage]     %d scoring lock(s) left by a pass that is over were removed "
+              "(their PID now belongs to another process, or that pass has ended): %s"
+              % (len(freed), ", ".join(freed[:12]) + (" ..." if len(freed) > 12 else "")))
+    for sid, txt in kept:
+        print("[coverage]     %s: its scoring lock (outs\\rclaim\\%s.rclaim -- %s) is held "
+              "by a process of an earlier launch that is still running, so no shard reads "
+              "it now. If no other launch is running, delete that file."
+              % (sid, sid, " ".join(txt.split())[:70]))
     return n
+
+
+# THE FILES A COVERAGE PASS OF THIS LAUNCH ASKED FOR AND NO SHARD TOOK, as
+# (_forced_key(folder), id) -- for the audit's reason. See _score_retry_dyntools.
+_NOT_TAKEN = set()
+_SCORE_TAKEN_RE = re.compile(r"\[score\]\s+\d+/\d+\s+(\S+)")
+
+
+def _score_ids_taken(rdir, t0):
+    """The ids the scoring shards of a pass that started at t0 TOOK in this
+       folder. Each shard rewrites its logs\\DYN_STUDY_report*.log when it
+       starts and prints "[score] k/N  <id>" for every file it takes (reads,
+       or takes the worker's score). An id named in none of them was never
+       handed to a scorer: a lock or a marker kept every shard off it, and
+       the shards say nothing about a file they leave alone."""
+    got = set()
+    for lg in glob.glob(os.path.join(rdir, "logs", "DYN_STUDY_report*.log")):
+        try:
+            if os.path.getmtime(lg) < t0 - 2.0:
+                continue                    # an earlier pass's shard
+            with open(lg, "r", errors="replace") as fh:
+                for ln in fh:
+                    m = _SCORE_TAKEN_RE.search(ln)
+                    if m:
+                        got.add(m.group(1))
+        except Exception:
+            pass
+    return got
 
 
 def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
@@ -19296,11 +19415,14 @@ def _score_tagged_folder(case, proj, mode, rdir, missing, force=False):
             if os.path.isfile(stamp):
                 _was = open(stamp).read().strip()
                 _wt = _was.split()
-                _dyn = "dyn" in _wt
+                # "dyn read": a shard TOOK it with the dyntools read allowed. A
+                # bare "dyn" was stamped before that was checked -- on files no
+                # shard took as well -- so such a file is asked for once more.
+                _dyn = "dyn" in _wt and "read" in _wt
                 # UNFORCED: THE .out's DATE ONLY. A forced pass stamps
                 # "<mtime> force=<T0>", which never equalled the bare mtime, so
                 # a run it could not score was asked for again at once.
-                _asked = (" ".join(t for t in _wt if t != "dyn") == omt
+                _asked = (" ".join(t for t in _wt if t not in ("dyn", "read")) == omt
                           or (not force and _wt[:1] == [omt]))
         except Exception:
             pass
@@ -19409,6 +19531,7 @@ def _score_retry_dyntools(case, proj, mode, rdir, env, missing, items):
     except Exception:
         env2["SPP_LAUNCH_REPORT_WORKERS"] = "1"
     rc2 = "exception"
+    _t2 = time.time()
     try:
         rc2 = run_study(case, projects=[proj], modes=[mode], extra_env=env2)
         if rc2 not in (0, None):
@@ -19418,10 +19541,21 @@ def _score_retry_dyntools(case, proj, mode, rdir, env, missing, items):
     if rc2 in (0, None):
         # ASKED WITH DYNTOOLS: not again until the .out changes. A pass that
         # did not finish leaves the stamp as it was, so the next launch retries.
+        # ONLY A FILE A SHARD TOOK. Every file the pass was given used to be
+        # stamped " dyn", so one that a stale lock kept every shard off was
+        # never asked for again, and the audit said "read with the dyntools
+        # read allowed too" of a file nothing had read. Such a file keeps the
+        # stamp it had and the next launch asks again; " dyn read" now means
+        # the shard log names it.
+        _taken = _score_ids_taken(rdir, _t2)
         for _sid, stamp, omt in items:
+            if _sid not in _taken:
+                _NOT_TAKEN.add((_forced_key(rdir), _sid))
+                continue
+            _NOT_TAKEN.discard((_forced_key(rdir), _sid))
             try:
                 with open(stamp, "w") as fh:
-                    fh.write(omt + " dyn")
+                    fh.write(omt + " dyn read")
             except Exception:
                 pass
     _merge_one_folder(case, rdir)
@@ -19430,6 +19564,11 @@ def _score_retry_dyntools(case, proj, mode, rdir, env, missing, items):
     _OUT_SET_CACHE.clear()
     outs, scored = _out_and_scored_sets(rdir, proj)
     after = sorted((outs - scored) & set(missing), key=_fault_key)
+    _nt = [s for s in after if (_forced_key(rdir), s) in _NOT_TAKEN]
+    if _nt:
+        print("[coverage]     %d of them were taken by NO scoring shard (a lock or marker "
+              "kept every shard off them) -- not marked as read; the next launch asks "
+              "again: %s" % (len(_nt), ", ".join(_nt[:12]) + (" ..." if len(_nt) > 12 else "")))
     print("[coverage]     %d of %d now scored" % (len(missing) - len(after), len(missing)))
     return after
 
@@ -19674,8 +19813,14 @@ def scoring_audit(quiet=False):
                             why = "finished, no verdict"
                             try:
                                 _st = os.path.join(od, sid + ".scoretry")
-                                if os.path.isfile(_st):
-                                    _dy = "dyn" in open(_st).read().split()
+                                if (_forced_key(rdir), sid) in _NOT_TAKEN:
+                                    why += (" -- no scoring shard took it in this launch "
+                                            "(usually a scoring lock in outs\\rclaim held by "
+                                            "a process that is still running -- see the "
+                                            "[coverage] lines); the next launch asks again")
+                                elif os.path.isfile(_st):
+                                    _wt = open(_st).read().split()
+                                    _dy = "dyn" in _wt and "read" in _wt
                                     why += (" -- %s; the reason is in that folder's "
                                             "logs\\DYN_STUDY_report_w*.log (search %s)"
                                             % ("read with the dyntools read allowed too and "
@@ -20566,7 +20711,7 @@ def ensure_reports(mode_list, only_projects=None, shards=None, early=False):
                     _omt = "%.0f" % os.path.getmtime(_q)
                     try:
                         # FIRST WORD: the coverage check's dyntools pass stamps
-                        # "<mtime> dyn" -- asked too, for this .out.
+                        # "<mtime> dyn read" -- asked too, for this .out.
                         if (os.path.isfile(_stamp)
                                 and open(_stamp).read().split()[:1] == [_omt]):
                             continue          # asked once already for this .out
