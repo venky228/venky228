@@ -34,9 +34,12 @@ are only read.
 RUN (Python 3.4 or later, from the study folder that holds Base\\ and Projects\\):
     python z6_why_unstable.py                 every crashed or unstable run it finds
     python z6_why_unstable.py F124 F148       only these faults (in every case)
+    python z6_why_unstable.py --quick         logs and score files only, no .out read (seconds)
 READ_OUT = True reads the .out files with PSS/E's dyntools (the PSS/E Python
-folders are looked for in the usual places, or set PSSE_DIRS). If that cannot
-be done the rest of the report is still written.
+folders are looked for in the usual places, or set PSSE_DIRS) -- only the first
+part of each file, up to OUT_WINDOW_S after the last switching, which is where a
+blow-up shows; a crashed run's partial .out is never read. If the .out cannot be
+read the rest of the report is still written.
 
 Output: <ROOT>\\unstable_reasons\\WHY_UNSTABLE.txt and WHY_UNSTABLE.csv
 """
@@ -46,6 +49,8 @@ import sys
 import csv
 import glob
 import time
+import shutil
+import tempfile
 import datetime
 import collections
 
@@ -63,9 +68,12 @@ CASES = [
 ]
 FAULTS = []                    # [] = every crashed / off-scale / solution-lost run found | e.g. ["F124", "F10-F20"]
 COMPARE_OTHER_CASES = True     # show each fault in the other cases too
-COMPARE_READ_OUT = True        # ...and read their .out files for the largest voltage (slower)
+COMPARE_READ_OUT = False       # ...and read their .out files too (slower)
 FAULT_LIST = r"FAULT_LISTS_BPM\SPP_FAULTS_CON_{project}.csv"   # under ROOT; the run's faults\SPP_FAULTS.csv is the fallback
-READ_OUT = True                # read the .out files (PSS/E dyntools) for the timing; False = logs and score files only
+READ_OUT = True                # read the .out files (PSS/E dyntools) for the timing; False (or --quick) = logs and score files only
+OUT_WINDOW_S = 4.0             # read each .out only up to this long after the last switching (clearing / reclose)
+ANGLE_WINDOW_S = 6.0           # ...this long for a run flagged for a turning angle (to measure its drift)
+READ_WORKERS = 4               # .out files read at the same time, one process each (~300 MB of memory each); 1 = one by one
 PSSE_DIRS = []                 # [] = C:\Program Files (x86)\PTI\PSSE34 ... looked for | or e.g. [r"C:\Program Files (x86)\PTI\PSSE34"]
 OFFSCALE_PU = 5.0              # the study's "within scale" limit
 RUNAWAY_PU = 1.5               # "starts running away": the first time a voltage passes this after the fault
@@ -725,7 +733,7 @@ def psse_log(rdir, fid):
 
 
 # -------------------------------------------------------------- .out read --
-_DYN = {"mod": None, "tried": False, "why": None, "init": False}
+_DYN = {"mod": None, "tried": False, "why": None}
 
 
 def _dyntools():
@@ -779,32 +787,68 @@ def _cat(title):
     return "OTHER"
 
 
-def read_out(path):
-    """(time list, {title: values}, why-not) for the voltage and angle channels."""
+def _fp_mask():
+    """Keep floating-point exceptions masked on this thread (as the study does), so a NaN
+       in a .out is a NaN, not a PSS/E 'Floating-Point Exception' box that kills the run."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        cur = ctypes.c_uint(0)
+        for dll in ("msvcr100", "msvcr110", "msvcrt"):
+            try:
+                lib = ctypes.CDLL(dll + ".dll")
+            except Exception:
+                continue
+            fn = getattr(lib, "_controlfp_s", None)
+            if fn is not None and fn(ctypes.byref(cur), ctypes.c_uint(0x0008001F), ctypes.c_uint(0x0008001F)) == 0:
+                return
+    except Exception:
+        pass
+
+
+def read_out(path, t_upto=None, t_end=None):
+    """(time list, {title: values}, why-not) for the voltage and angle channels -- of the
+       first part of the file only (to t_upto), read from a copy of its head, as the
+       study's own reader calibrates. PSS/E is never initialised here."""
     dyn = _dyntools()
     if dyn is None:
         return None, None, _DYN["why"]
     data = ids = None
+    size = os.path.getsize(path)
+    head = size
+    if t_upto and t_end and t_end > 0:
+        head = int(size * min(1.0, (t_upto + 0.5) / float(t_end))) + 1048576
+    head -= head % 4
+    src, tmpd, t0 = path, None, time.time()
     try:
-        print("[why]   reading %s (%s) ..." % (_rel(path), _mb(os.path.getsize(path))))
-    except Exception:
-        pass
-    for attempt in (0, 1):
+        if head < size:
+            tmpd = tempfile.mkdtemp(prefix="why_out_")
+            src = os.path.join(tmpd, os.path.basename(path))
+            with open(path, "rb") as fi, open(src, "wb") as fo:
+                left = head
+                while left > 0:
+                    b = fi.read(min(left, 4194304))
+                    if not b:
+                        break
+                    fo.write(b)
+                    left -= len(b)
+            print("[why]   reading %s -- the first %s of %s (to t=%.1f s) ..." % (_rel(path), _mb(head), _mb(size), t_upto))
+        else:
+            print("[why]   reading %s (%s) ..." % (_rel(path), _mb(size)))
+        _fp_mask()
         try:
-            _sh, ids, data = dyn.CHNF(path).get_data()
-            break
+            _sh, ids, data = dyn.CHNF(src).get_data()
         except MemoryError:
             return None, None, "not enough memory to read %s in this Python" % os.path.basename(path)
         except Exception as e:
-            if attempt == 0 and not _DYN["init"]:
-                _DYN["init"] = True
-                try:
-                    import psspy                          # noqa -- some builds need PSS/E initialised
-                    psspy.psseinit(150000)
-                    continue
-                except Exception:
-                    pass
             return None, None, "dyntools could not read %s (%s)" % (os.path.basename(path), e)
+    finally:
+        if tmpd:
+            shutil.rmtree(tmpd, ignore_errors=True)
+    if not isinstance(data, dict) or not isinstance(ids, dict):
+        return None, None, "dyntools returned nothing for %s" % os.path.basename(path)
+    print("[why]     read in %.0f s" % (time.time() - t0))
     try:
         t = list(data["time"])
     except Exception:
@@ -867,21 +911,6 @@ def series_facts(t, ch, t_from):
     return volts, angs
 
 
-def end_facts(t, ch):
-    """For a partial .out: where it stopped and what was already wrong at that point."""
-    bad = []
-    for key, v in ch.items():
-        cat, title = key.split("|", 1)
-        if not v:
-            continue
-        last = v[-1]
-        if last != last:
-            bad.append((title, "NaN"))
-        elif cat == "VOLT" and abs(last) > OFFSCALE_PU:
-            bad.append((title, "%.3g pu" % last))
-    return (t[-1] if t else None), bad
-
-
 # ---------------------------------------------------------------- analysis --
 def when_txt(t, ev):
     if t is None:
@@ -904,18 +933,15 @@ def when_txt(t, ev):
 _ANALYSED = {}
 
 
-def analyse_run(proj, case, rdir, fid, want_out=True):
-    """Everything known about one run of one fault (each run read once)."""
+def analyse_run(proj, case, rdir, fid):
+    """Everything the logs and score files say about one run of one fault (once per run)."""
     key = (rdir, fid)
-    if key in _ANALYSED and (_ANALYSED[key]["_out"] or not want_out):
-        return _ANALYSED[key]
-    A = _analyse_run(proj, case, rdir, fid, want_out)
-    A["_out"] = bool(want_out)
-    _ANALYSED[key] = A
-    return A
+    if key not in _ANALYSED:
+        _ANALYSED[key] = _analyse_run(proj, case, rdir, fid)
+    return _ANALYSED[key]
 
 
-def _analyse_run(proj, case, rdir, fid, want_out):
+def _analyse_run(proj, case, rdir, fid):
     fl = fault_list(proj, rdir)
     frow = fl.get(fid.upper())
     st = run_state(rdir, fid)
@@ -945,18 +971,68 @@ def _analyse_run(proj, case, rdir, fid, want_out):
         A["status"] = status_rows(rdir, fid)
         A["init"] = init_check(rdir, fid)
         A["typical"] = typical_out(rdir)
-    if READ_OUT and want_out and st["out"]:
-        t, ch, why = read_out(st["out"])
-        if why:
-            A["out_why"] = why
-        elif t:
-            t_from = A["ev"]["fault"] if A["ev"]["fault"] is not None else (A["ev"]["clear"] or t[0])
-            if crashed:
-                A["out_facts"] = ("end",) + end_facts(t, ch)
-            else:
-                A["out_facts"] = ("series",) + series_facts(t, ch, t_from)
-            ch = None
     return A
+
+
+def read_plan(A, window=None):
+    """The .out read this run needs, or None. A CRASHED RUN'S PARTIAL .out IS NEVER
+       READ: PSS/E died while writing it and dyntools cannot take it ("Error reading
+       file") -- its size already says how far the run got."""
+    st, ev = A["state"], A["ev"]
+    if not READ_OUT or not st["out"] or A["kind"] == "CRASHED":
+        return None
+    last_sw = max([x for x in (ev["fault"], ev["clear"], ev["reclose"]) if x is not None] or [0.0])
+    angle = window == "angle" or (A["stab"] and not A["offscale"])
+    t_upto = (last_sw + (ANGLE_WINDOW_S if angle else OUT_WINDOW_S)) if last_sw else None
+    t_end = st["t_end"] or typical_out(A["rdir"])[1]
+    t_from = ev["fault"] if ev["fault"] is not None else ev["clear"]
+    return ((A["rdir"], A["fault"]), st["out"], t_upto, t_end, t_from)
+
+
+def _read_job(job):
+    """One .out read -> (key, facts, last time read, why-not). Runs in a worker process."""
+    key, path, t_upto, t_end, t_from = job
+    try:
+        t, ch, why = read_out(path, t_upto, t_end)
+        if why or not t:
+            return key, None, None, why or "nothing read from %s" % os.path.basename(path)
+        facts = series_facts(t, ch, t_from if t_from is not None else t[0])
+        return key, ("series",) + facts, t[-1], None
+    except Exception as e:
+        return key, None, None, "reading %s failed (%s)" % (os.path.basename(path), e)
+
+
+def run_reads(jobs):
+    """{key: (facts, last time, why-not)} -- READ_WORKERS files at a time."""
+    out = {}
+    if not jobs:
+        return out
+    if _dyntools() is None:
+        for j in jobs:
+            out[j[0]] = (None, None, _DYN["why"])
+        return out
+    n = max(1, min(int(READ_WORKERS or 1), len(jobs)))
+    t0 = time.time()
+    print("[why] reading %d .out file(s), %d at a time ..." % (len(jobs), n))
+    if n > 1:
+        try:
+            import multiprocessing
+            pool = multiprocessing.Pool(n)
+            try:
+                for key, facts, upto, why in pool.imap_unordered(_read_job, jobs):
+                    out[key] = (facts, upto, why)
+            finally:
+                pool.close()
+                pool.join()
+            print("[why] .out files read in %.0f s" % (time.time() - t0))
+            return out
+        except Exception as e:
+            print("[why] reading in parallel failed (%s) -- one at a time instead" % e)
+    for j in jobs:
+        key, facts, upto, why = _read_job(j)
+        out[key] = (facts, upto, why)
+    print("[why] .out files read in %.0f s" % (time.time() - t0))
+    return out
 
 
 def reason(A):
@@ -983,10 +1059,6 @@ def reason(A):
                          "a few hundredths of a pu there), so the network solution was failing from the fault on")
         if P.get("nc"):
             parts.append("PSS/E reported 'network not converged' %d time(s) from t=%.3f s" % (len(P["nc"]), P["nc"][0] or 0))
-        of = A.get("out_facts")
-        if of and of[0] == "end" and of[2]:
-            parts.append("the partial .out already shows %s at its last sample (t=%.3f s)"
-                         % (", ".join("%s %s" % (_short(x, 30), y) for x, y in of[2][:3]), of[1] or 0))
         if not parts:
             parts.append("no message survives: the process vanished without a log line -- see the attempts below")
         return "; ".join(parts) + "."
@@ -1130,11 +1202,6 @@ def block(A, others):
                     (" -- a finished run (%s) has %s" % (oth[0], ", ".join(oth[1]) or "none")) if oth else ""))
             if ic["nc"]:
                 L.append("          'network not converged' %d time(s) during init" % ic["nc"])
-        of = A.get("out_facts")
-        if of and of[0] == "end":
-            L.append(" PARTIAL .out  last sample t=%.3f s%s" % (
-                of[1] or 0, ("; already wrong there: " + ", ".join("%s = %s" % (_short(x, 34), y) for x, y in of[2][:6]))
-                if of[2] else "; every voltage and angle still finite and in scale"))
     else:
         if A["offscale"]:
             L.append(" OFF-SCALE (study): %s" % ", ".join("%s %.1f pu" % (lab, pk) for lab, pk in A["offscale"][:8]))
@@ -1160,7 +1227,7 @@ def block(A, others):
         of = A.get("out_facts")
         if of and of[0] == "series":
             if of[1]:
-                L.append(" FROM THE .out -- voltages above %.0f pu (or NaN), first first:" % OFFSCALE_PU)
+                L.append(" FROM THE .out -- voltages above %.0f pu (or NaN), earliest first:" % OFFSCALE_PU)
                 for v in of[1][:8]:
                     L.append("   %-34s pre %.3f pu; >%.1f pu %s; >%.0f pu %s; peak %.3g pu at t=%.3f s%s" % (
                         _short(v["title"], 34), v["pre"] if v["pre"] == v["pre"] else float("nan"), RUNAWAY_PU,
@@ -1171,8 +1238,10 @@ def block(A, others):
                 for a in of[2][:8]:
                     L.append("   %-34s span %.0f deg; past 360 deg %s; %s" % (
                         _short(a["title"], 34), a["span"], when_txt(a["t360"], ev),
-                        ("still turning %.1f deg/s at the end (%.3f Hz off the system)" % (a["rate"], a["rate"] / 360.0))
-                        if a["rate"] is not None and abs(a["rate"]) > 1.0 else "settled by the end"))
+                        ("still turning %.1f deg/s at t=%.1f s (%.3f Hz off the system)"
+                         % (a["rate"], A.get("out_upto") or 0, a["rate"] / 360.0))
+                        if a["rate"] is not None and abs(a["rate"]) > 1.0 else
+                        "settled by t=%.1f s" % (A.get("out_upto") or 0)))
     if A.get("out_why"):
         L.append(" .out NOT READ: %s" % A["out_why"])
     if P:
@@ -1271,7 +1340,11 @@ def find_targets(folders, want):
 
 
 def main():
+    global READ_OUT
     t0 = time.time()
+    if "--quick" in sys.argv:
+        READ_OUT = False
+        print("[why] --quick: logs and score files only, no .out read")
     want = _want_faults()
     folders = run_folders()
     if not folders:
@@ -1294,6 +1367,7 @@ def main():
     head = [BAR, " WHY DID THESE RUNS CRASH OR LOSE THEIR SOLUTION?   %s" % time.strftime("%Y-%m-%d %H:%M"),
             " study folder %s" % _root(), BAR, ""]
     summary = []
+    plan = []
     for proj in sorted(by_proj):
         fdirs = [(c, d) for p, c, d in folders if p == proj]
         for fid in sorted(by_proj[proj], key=_fkey):
@@ -1305,14 +1379,29 @@ def main():
                 A = analyse_run(proj, case, rdir, fid)
                 others = []
                 if COMPARE_OTHER_CASES:
-                    for c2, d2 in fdirs:
-                        if c2 != case:
-                            others.append(analyse_run(proj, c2, d2, fid,
-                                                      want_out=(c2 in cases) or COMPARE_READ_OUT))
-                lines += block(A, others)
-                rsn = reason(A)
-                summary.append("  %-14s %-6s %-30s %-14s %s" % (proj, fid, case, A["kind"], _short(rsn, 120)))
-                rows.append([proj, fid, case, A["kind"], rsn])
+                    others = [analyse_run(proj, c2, d2, fid) for c2, d2 in fdirs if c2 != case]
+                plan.append((A, others))
+    # THE .out READS, ALL AT ONCE: the runs to explain, and the other cases only
+    # with COMPARE_READ_OUT. Each run is read once however often it is shown.
+    want_read = collections.OrderedDict()
+    for A, others in plan:
+        win = "angle" if (A["stab"] and not A["offscale"]) else None
+        want_read[(A["rdir"], A["fault"])] = (A, win)
+    if COMPARE_READ_OUT:
+        for A, others in plan:
+            win = "angle" if (A["stab"] and not A["offscale"]) else None
+            for O in others:
+                want_read.setdefault((O["rdir"], O["fault"]), (O, win))
+    jobs = [j for j in (read_plan(X, w) for X, w in want_read.values()) if j]
+    for key, (facts, upto, why) in run_reads(jobs).items():
+        X = want_read[key][0]
+        X["out_facts"], X["out_upto"], X["out_why"] = facts, upto, why
+    for A, others in plan:
+        proj, fid, case = A["project"], A["fault"], A["case"]
+        lines += block(A, others)
+        rsn = reason(A)
+        summary.append("  %-14s %-6s %-30s %-14s %s" % (proj, fid, case, A["kind"], _short(rsn, 120)))
+        rows.append([proj, fid, case, A["kind"], rsn])
     od = _abs(OUT_DIR)
     try:
         os.makedirs(od)
