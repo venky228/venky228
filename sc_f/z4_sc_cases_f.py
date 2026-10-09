@@ -154,10 +154,13 @@ SC_XPP_BY_PROJECT = {}                     # empty: X'' = 0.8 pu on MBASE for EV
 # (the saved SC cases carry the value, as they carry the SGF's).
 #       EGF_XPP_BY_PROJECT = {"EastFork": 0.8}                          every EGF unit
 #       EGF_XPP_BY_PROJECT = {"EastFork": {531620: 0.8, 531607: 0.8}}   per unit bus
-# {} = every existing unit exactly as the case holds it (the old behaviour).
-# Projects not named are not touched. The "SC model parameters" sheet lists
-# every existing unit with the X'' written and the X'' the fault calc uses.
-EGF_XPP_BY_PROJECT = {"EastFork": 0.8}
+# {} = every existing unit exactly as the case holds it -- the default, and
+# what SPP does: only the SGF's short-circuit parameters are adjusted ("No other
+# changes were made to the model"). Name a project only when its existing units'
+# X'' really is to be changed. Projects not named are not touched. The "SC model
+# parameters" sheet lists every existing unit with the X'' written and the X''
+# the fault calc uses.
+EGF_XPP_BY_PROJECT = {}
 
 # ---- SAVE THE CASES THEMSELVES ---------------------------------------------
 # True = each case is saved as a .sav the moment it is set up and solved, with
