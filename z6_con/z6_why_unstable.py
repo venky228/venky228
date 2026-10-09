@@ -12,6 +12,9 @@ that went wrong and says why, as far as the study's own files can tell:
                    OVERFLOW, ACCESS VIOLATION ...), the PSS/E output of the
                    fault window (logs\\psse\\<fault>.txt), the init log
                    (logs\\FAULT_<fault>_strt-prog.txt) and the partial .out.
+  STILL RUNNING    no result yet, but its .out or run log was written in the
+                   last RUNNING_MIN minutes: not a crash. A run whose network
+                   solution fails at every step crawls -- check again later.
   OFF-SCALE        a bus voltage above 5 pu ("Bus voltages within scale" FAIL).
   SOLUTION LOST    "System stability" FAIL: the run reached the end, but part
                    of the network lost its solution (a voltage off-scale, an
@@ -87,6 +90,7 @@ DC_TERMINALS = {
     599950: "the Lamar back-to-back DC tie SPP_43_LAMAR (599950 LAMAR7 - 599951 LAMAR 6, area 999 WECC)",
 }
 EXIT_MATCH_MIN = 45            # a worker exit this many minutes after an attempt's last log line still belongs to it
+RUNNING_MIN = 10               # no result, but the .out / run log written this recently = STILL RUNNING, not crashed
 OUT_DIR = "unstable_reasons"   # under ROOT unless a full path
 # ============================================================================
 
@@ -948,6 +952,22 @@ def analyse_run(proj, case, rdir, fid):
     return _ANALYSED[key]
 
 
+def _last_write(rdir, fid, st):
+    """Newest write time of this run's .out and run logs, or None."""
+    ts = []
+    for p in ([st["out"]] if st["out"] else []) + glob.glob(os.path.join(rdir, "logs", "RUN_%s_w*.log" % fid)):
+        try:
+            ts.append(os.path.getmtime(p))
+        except OSError:
+            pass
+    return max(ts) if ts else None
+
+
+def _ago(sec):
+    sec = max(0.0, float(sec))
+    return ("%.0f s" % sec) if sec < 120 else ("%.0f min" % (sec / 60.0))
+
+
 def _analyse_run(proj, case, rdir, fid):
     fl = fault_list(proj, rdir)
     frow = fl.get(fid.upper())
@@ -960,7 +980,13 @@ def _analyse_run(proj, case, rdir, fid):
     A["stab"] = stability_items(stab[1]) if stab and stab[0] == "FAIL" else []
     A["stab_detail"] = stab[1] if stab else None
     crashed = bool(st["out"] or st["attempts"]) and not st["done"] and not st["partial"] and not (scen and scen["verdict"])
-    A["kind"] = ("CRASHED" if crashed else
+    # A run with no result whose files are still being written is not a crash: a run
+    # failing to converge at every step crawls (60 iterations a step), and looks dead.
+    A["last_write"] = _last_write(rdir, fid, st) if crashed else None
+    running = bool(A["last_write"] and time.time() - A["last_write"] < RUNNING_MIN * 60.0)
+    A["crashed"], A["running"] = crashed, running
+    A["kind"] = ("STILL RUNNING" if running else
+                 "CRASHED" if crashed else
                  "OFF-SCALE" if A["offscale"] else
                  "SOLUTION LOST" if A["stab"] else
                  ("ran, %s" % (scen["verdict"] if scen and scen["verdict"] else "no verdict")))
@@ -986,7 +1012,7 @@ def read_plan(A, window=None):
        READ: PSS/E died while writing it and dyntools cannot take it ("Error reading
        file") -- its size already says how far the run got."""
     st, ev = A["state"], A["ev"]
-    if not READ_OUT or not st["out"] or A["kind"] == "CRASHED":
+    if not READ_OUT or not st["out"] or A["crashed"]:
         return None
     last_sw = max([x for x in (ev["fault"], ev["clear"], ev["reclose"]) if x is not None] or [0.0])
     angle = window == "angle" or (A["stab"] and not A["offscale"])
@@ -1077,7 +1103,17 @@ def reason(A):
     """The most likely reason, in plain words, from what analyse_run found."""
     bm, ev = A["bm"], A["ev"]
     P = A["psse"] or {}
-    if A["kind"] == "CRASHED":
+    if A["running"]:
+        a = A["atts"][-1] if A["atts"] else {}
+        parts = ["no result yet, but this run's files were written %s before this check%s: it is most likely "
+                 "still running, not crashed -- run this script again when it finishes"
+                 % (_ago(time.time() - A["last_write"]),
+                    (" (sim t = %.2f of %.2f s)" % (a["simt"], a["tend"] or 0)) if a.get("simt") is not None else "")]
+        if P.get("nc"):
+            parts.append("PSS/E's network solution has failed %s so far -- every failed step takes the full "
+                         "iteration limit, which is why it is slow" % nc_text(P["nc"])[0])
+        return "; ".join(parts) + "."
+    if A["crashed"]:
         atts = A["atts"]
         parts = []
         steps = [a["ok"][1] for a in atts if a.get("ok")]
@@ -1210,12 +1246,13 @@ def block(A, others):
             ("t=%.3f s" % ev["fault"]) if ev.get("fault") is not None else "?",
             ("t=%.3f s" % ev["clear"]) if ev.get("clear") is not None else "?",
             ("   reclose t=%.3f s" % ev["reclose"]) if ev.get("reclose") is not None else ""))
-    if A["kind"] == "CRASHED":
+    if A["crashed"]:
         full, tend = A["typical"]
         L.append(" MARKERS  %s attempt(s); no .done%s" % (
             st["attempts"] if st["attempts"] is not None else "?",
-            ("; partial .out %s of a typical %s -> it stopped at about t = %.1f s of %.1f s"
-             % (_mb(st["out_size"]), _mb(full), tend * st["out_size"] / float(full), tend))
+            ("; %s .out %s of a typical %s -> %s about t = %.1f s of %.1f s"
+             % ("growing" if A["running"] else "partial", _mb(st["out_size"]), _mb(full),
+                "so far at" if A["running"] else "it stopped at", tend * st["out_size"] / float(full), tend))
             if (st["out_size"] and full and tend) else ("; partial .out %s" % _mb(st["out_size"])) if st["out_size"] else
             "; no .out at all (it died before writing any output)"))
         for r in A["status"]:
@@ -1324,9 +1361,9 @@ def block(A, others):
             L.append("   PSS/E power-unbalance trips (GENPWR): %d" % len(P["genpwr"]))
         for t, ln in P["dc"][:6]:
             L.append("   t=%s  DC: %s" % (("%.3f" % t) if t is not None else "?", ln))
-        if A["kind"] == "CRASHED" and P["tail"]:
+        if A["crashed"] and P["tail"]:
             L.append("   last lines: %s" % " | ".join(list(P["tail"])[-4:]))
-    elif A["kind"] == "CRASHED" or A["offscale"] or A["stab"]:
+    elif A["crashed"] or A["offscale"] or A["stab"]:
         L.append(" PSS/E LOG: no logs\\psse\\%s.txt (PSSE_FAULT_LOG off in the panel?)" % A["fault"])
     if others:
         L.append(" THE SAME FAULT IN THE OTHER CASES")
