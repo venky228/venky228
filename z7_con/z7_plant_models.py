@@ -22,7 +22,10 @@
      dynamics   : that build's snapshot (.snp + .cnv beside the .sav) -- the
                   models as the study ran them, deck changes (DyreChanges, IRF)
                   included -- written out with dyda (every call it took is
-                  in _work\\<name>\\<name>_dyda_calls.txt). A record PSS/E holds
+                  in _work\\<name>\\<name>_dyda_calls.txt). A model this
+                  PSS/E's dyda does not write out (user-written models whose
+                  library does not write itself, relays) comes from the deck
+                  text, and the check file names it. A record PSS/E holds
                   unchanged keeps the deck's own text (the combined deck the
                   build wrote, *_with_BESS_<project>*.dyr), so no EGF value is
                   rounded; a record the study's decks changed is written as
@@ -63,7 +66,10 @@
      PSS/E draws slider diagrams only in its GUI: run from a command prompt,
      this script writes DRAW_SLD_IN_PSSE_GUI.py into the run folder instead.
      Open PSS/E, File > Run Automation File > that file: it draws every
-     package's .sld into its folder, with the same layout.
+     package's .sld into its folder. growbus places buses the way PSS/E's own
+     auto-draw does; the file then moves every bus to its place in the layout
+     through PSS/E's sliderPy module, at PSS/E's own spacing, and writes what
+     sliderPy offered and did to slider_inspect_<name>.txt.
 
    OUTPUT -- nothing that exists is ever overwritten or deleted
      {OUT_DIR}\\<date_time>\\<name>\\<name>.sav / .raw / .dyr / .sld   the package
@@ -1224,24 +1230,30 @@ written by z7_plant_models.py (run @STAMP@).
 
 PSS/E draws slider diagrams only in its GUI, so this file runs THERE:
     open PSS/E  ->  File  ->  Run Automation File...  ->  this file
-For each package it opens <name>.sav, places every bus where the plant-model
-script laid it out -- the picture in _check\\<name>_layout.svg: the POI and its
-infinite bus on top, each feeder straight down to its units -- and saves
-<name>.sld beside the .sav. A package that already has its .sld is left as it
-is; nothing is ever overwritten. A log of what was done is written beside this
-file.
+For each package it opens <name>.sav, draws every bus (growbus), then MOVES
+each bus to its place in the layout -- the picture in _check\\<name>_layout.svg:
+the POI and its infinite bus on top, each feeder straight down to its units --
+and saves <name>.sld beside the .sav. growbus places the buses the way PSS/E's
+own auto-draw does (the zigzag); the move is what tidies them, through PSS/E's
+sliderPy module. What sliderPy offered and what each move did is written to
+slider_inspect_<name>.txt beside this file.
 
-It opens each package's case in the GUI, replacing the case open there: save
-your own work first. The last diagram is left open on the screen.
+A package that already has its .sld is left as it is; nothing is ever
+overwritten. It opens each package's case in the GUI, replacing the case open
+there: save your own work first. The last diagram is left open on the screen.
 
-SCALE spreads the drawing out (1.5) or packs it tighter (0.75).
+SCALE spreads the drawing out (1.5) or packs it tighter (0.75); FLIP_Y = True
+turns it upside down (if the POI comes out at the bottom).
 """
 import os
+import re
 import time
 
 import psspy
 
 SCALE = 1.0
+FLIP_Y = False
+MOVE_BUSES = True           # True = put every bus where the layout wants it (sliderPy)
 SKIP_EXISTING = True        # True = a package that already has <name>.sld is not drawn again
 LEAVE_LAST_OPEN = True      # True = the last diagram stays open on the screen
 ROOT = @ROOT@
@@ -1250,6 +1262,8 @@ PACKAGES = [
 ]
 
 LINES = []
+_BUS_MS = re.compile(r"^\s*BU[A-Z]*\s+(\d+)\s*$", re.I)
+SETTERS = ("SetPosition", "SetLocation", "SetPos", "MoveTo", "Move")
 
 
 def say(msg):
@@ -1290,19 +1304,160 @@ def _out_dir():
     return ROOT if os.path.isdir(ROOT) else _here()
 
 
-def _api_help():
-    """The help text of the diagram calls, kept when one of them failed."""
-    p = _free(os.path.join(_out_dir(), "slider_api_help.txt"))
+def _try(obj, name, *args):
+    """(result, "") from obj.name(*args), or (None, why)."""
+    f = getattr(obj, name, None)
+    if f is None:
+        return None, "no %s" % name
     try:
-        with open(p, "w") as fh:
-            for n in ("newdiagfile", "growbus", "growbuslevels", "savediagfile", "closediagfile",
-                      "opendiagfile"):
-                f = getattr(psspy, n, None)
-                fh.write("==== psspy.%s: %s\n%s\n\n" % (n, "present" if f else "NOT in this PSS/E",
-                                                         (getattr(f, "__doc__", "") or "") if f else ""))
-        say("help text of the diagram calls: %s" % p)
-    except Exception:
-        pass
+        return f(*args), ""
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+def _xy(p):
+    """(x, y) from whatever GetPosition gives, or None."""
+    if p is None:
+        return None
+    if isinstance(p, (list, tuple)) and len(p) >= 2:
+        try:
+            return float(p[0]), float(p[1])
+        except Exception:
+            return None
+    for a, b in (("x", "y"), ("X", "Y")):
+        if hasattr(p, a) and hasattr(p, b):
+            try:
+                return float(getattr(p, a)), float(getattr(p, b))
+            except Exception:
+                pass
+    if hasattr(p, "GetX") and hasattr(p, "GetY"):
+        try:
+            return float(p.GetX()), float(p.GetY())
+        except Exception:
+            pass
+    return None
+
+
+def _methods(obj):
+    return ", ".join(n for n in dir(obj) if not n.startswith("_"))
+
+
+def _nn(pts):
+    """Median distance from each point to its nearest neighbour (0 if fewer than 2)."""
+    ds = []
+    for i, (x, y) in enumerate(pts):
+        d = [((x - u) ** 2 + (y - v) ** 2) ** 0.5 for j, (u, v) in enumerate(pts) if j != i]
+        d = [v for v in d if v > 1e-9]
+        if d:
+            ds.append(min(d))
+    ds.sort()
+    return ds[len(ds) // 2] if ds else 0.0
+
+
+def _move(c, x, y):
+    """Put component c at (x, y); the setter that did it (read back), or None."""
+    for name in SETTERS:
+        f = getattr(c, name, None)
+        if f is None:
+            continue
+        p0, _e = _try(c, "GetPosition")
+        trials = [(x, y), ((x, y),)]
+        if p0 is not None and not isinstance(p0, (list, tuple)):
+            for a, b in (("x", "y"), ("X", "Y")):
+                if hasattr(p0, a) and hasattr(p0, b):
+                    try:
+                        setattr(p0, a, x)
+                        setattr(p0, b, y)
+                        trials.append((p0,))
+                    except Exception:
+                        pass
+        for args in trials:
+            try:
+                f(*args)
+            except Exception:
+                continue
+            got = _xy(_try(c, "GetPosition")[0])
+            if got and abs(got[0] - x) <= 1e-3 * max(1.0, abs(x)) and abs(got[1] - y) <= 1e-3 * max(1.0, abs(y)):
+                return name
+    return None
+
+
+def tidy(pkg, ins):
+    """Every bus of the active diagram moved to its place in the layout."""
+    try:
+        import sliderPy
+    except Exception as e:
+        ins.append("no sliderPy in this PSS/E (%s) -- the buses stay where growbus put them" % e)
+        return "no sliderPy"
+    ins.append("sliderPy: " + _methods(sliderPy))
+    doc, e1 = _try(sliderPy, "GetActiveDocument")
+    diag, e2 = _try(doc, "GetDiagram") if doc is not None else (None, e1)
+    comps, e3 = _try(diag, "GetComponents") if diag is not None else (None, e2)
+    if doc is not None:
+        ins.append("document: " + _methods(doc))
+    if diag is not None:
+        ins.append("diagram: " + _methods(diag))
+    if comps is None:
+        ins.append("no components: %s" % (e3 or e2 or e1))
+        return "sliderPy gave no components (%s)" % (e3 or e2 or e1)
+    buses, seen = {}, set()
+    ins.append("components (%d):" % len(comps))
+    for c in comps:
+        ms, _e = _try(c, "GetMapString")
+        pos, _e = _try(c, "GetPosition")
+        t = type(c).__name__
+        ct, _e = _try(c, "GetType")
+        ins.append("  %-14s %-10s %-26r %r" % (t, ct, ms, _xy(pos) if _xy(pos) else pos))
+        if t not in seen:
+            seen.add(t)
+            ins.append("    methods of %s: %s" % (t, _methods(c)))
+        m = _BUS_MS.match(str(ms or ""))
+        if m:
+            buses.setdefault(int(m.group(1)), c)
+    want = dict((b, (x, y)) for b, x, y in pkg["buses"])
+    found = [b for b in want if b in buses]
+    ins.append("buses found on the diagram: %d of %d" % (len(found), len(want)))
+    if not found:
+        return "no bus found on the diagram by its map string"
+    now = dict((b, _xy(_try(buses[b], "GetPosition")[0])) for b in found)
+    now = dict((b, p) for b, p in now.items() if p)
+    poi = pkg["buses"][0][0]
+    if poi not in now:
+        return "the POI %d has no position on the diagram" % poi
+    s_auto = _nn(list(now.values()))
+    s_ours = _nn([want[b] for b in now])
+    k = (s_auto / s_ours if s_auto > 0 and s_ours > 0 else 1.0) * SCALE
+    ins.append("spacing: PSS/E's %.4g, the layout's %.4g -> scale %.4g" % (s_auto, s_ours, k))
+    x0, y0 = now[poi]
+    px, py = want[poi]
+    sgn = -1.0 if FLIP_Y else 1.0
+    goal = dict((b, (x0 + k * (want[b][0] - px), y0 + sgn * k * (want[b][1] - py))) for b in found)
+    tol = 1e-3 * max(1.0, s_auto)
+    if all(b in now and abs(now[b][0] - goal[b][0]) <= tol and abs(now[b][1] - goal[b][1]) <= tol
+           for b in found):
+        ins.append("every bus is already where the layout wants it")
+        return ""
+    moved, how, left = 0, set(), []
+    for b in found:
+        tx, ty = goal[b]
+        name = _move(buses[b], tx, ty)
+        if name:
+            moved += 1
+            how.add(name)
+        else:
+            left.append(b)
+        if not name and moved == 0 and len(left) >= 3:
+            break                       # no setter works here: stop trying
+    ins.append("moved %d bus(es)%s%s" % (moved, (" with " + "/".join(sorted(how))) if how else "",
+                                        ("; not moved: %s" % ", ".join(str(b) for b in left[:12])) if left else ""))
+    if moved:
+        for obj, nm in ((psspy, "refreshdiagfile"), (diag, "Refresh"), (doc, "Refresh")):
+            r, e = _try(obj, nm)
+            if not e:
+                ins.append("%s() done" % nm)
+                break
+    return "" if moved and not left else ("%d of %d moved" % (moved, len(found)) if moved
+                                          else "no move took (see the inspect file)")
 
 
 def draw(pkg, last):
@@ -1326,11 +1481,19 @@ def draw(pkg, last):
     bad = []
     for b, x, y in pkg["buses"]:
         try:
-            ie = _ie(psspy.growbus(b, x * SCALE, y * SCALE))
+            ie = _ie(psspy.growbus(b, x * SCALE, y * SCALE * (-1.0 if FLIP_Y else 1.0)))
         except Exception as e:
             ie = e
         if ie not in (0, None):
             bad.append("%d (%s)" % (b, ie))
+    ins = ["%s -- %s" % (name, time.strftime("%Y-%m-%d %H:%M"))]
+    note = tidy(pkg, ins) if MOVE_BUSES else "MOVE_BUSES = False"
+    try:
+        p = _free(os.path.join(_out_dir(), "slider_inspect_%s.txt" % name))
+        with open(p, "w") as fh:
+            fh.write("\n".join(str(x) for x in ins) + "\n")
+    except Exception:
+        p = None
     out = _free(sld)
     try:
         ie = _ie(psspy.savediagfile(out))
@@ -1338,12 +1501,13 @@ def draw(pkg, last):
         ie = e
     ok = os.path.isfile(out) and os.path.getsize(out) > 0
     if ok:
-        say("%-22s written %s -- %d of %d buses placed" % (name, out, len(pkg["buses"]) - len(bad),
-                                                          len(pkg["buses"])))
+        say("%-22s written %s -- %d of %d buses drawn%s" % (name, out, len(pkg["buses"]) - len(bad),
+                                                           len(pkg["buses"]),
+                                                           ("; tidied" if not note else "; NOT tidied: " + note)))
     else:
         say("%-22s *** %s not written (savediagfile gave %s)" % (name, os.path.basename(out), ie))
     if bad:
-        say("    %d bus(es) not placed: %s" % (len(bad), ", ".join(bad[:10])))
+        say("    %d bus(es) not drawn: %s" % (len(bad), ", ".join(bad[:10])))
     if not (last and LEAVE_LAST_OPEN and ok):
         try:
             psspy.closediagfile()
@@ -1352,14 +1516,30 @@ def draw(pkg, last):
     return ok and not bad
 
 
+def _api_help():
+    """The help text of the diagram calls, kept when one of them failed."""
+    p = _free(os.path.join(_out_dir(), "slider_api_help.txt"))
+    try:
+        with open(p, "w") as fh:
+            for n in ("newdiagfile", "growbus", "growbuslevels", "savediagfile", "closediagfile",
+                      "opendiagfile", "refreshdiagfile"):
+                f = getattr(psspy, n, None)
+                fh.write("==== psspy.%s: %s\n%s\n\n" % (n, "present" if f else "NOT in this PSS/E",
+                                                         (getattr(f, "__doc__", "") or "") if f else ""))
+            fh.write("==== psspy names about diagrams: %s\n" % ", ".join(
+                n for n in dir(psspy) if re.search(r"diag|grow|slid|draw|sld", n, re.I)))
+        say("help text of the diagram calls: %s" % p)
+    except Exception:
+        pass
+
+
 def main():
     say("One-line diagrams of the plant packages -- %s" % time.strftime("%Y-%m-%d %H:%M"))
     n = 0
     for k, pkg in enumerate(PACKAGES):
         n += 1 if draw(pkg, k == len(PACKAGES) - 1) else 0
     say("%d of %d diagram(s) in place" % (n, len(PACKAGES)))
-    if n < len(PACKAGES):
-        _api_help()
+    _api_help()
     try:
         p = _free(os.path.join(_out_dir(), "DRAW_SLD_IN_PSSE_GUI_log.txt"))
         with open(p, "w") as fh:
@@ -1641,27 +1821,49 @@ def _st_txt(st):
     return "[%s]" % ", ".join("default" if v == _i else str(v) for v in st)
 
 
+_DYDA_FOUND = {}        # the option set the first plant's search settled on, for the others
+DYDA_GRID_MAX = 40      # option sets tried at most, PSS/E's defaults included
+
+
+def _dyda_grid(n):
+    """Option sets for a STATUS of n elements: PSS/E's defaults (an empty
+       STATUS, which psspy fills in), then every mix of 0 / 1 / 2, fewest
+       non-zero options first."""
+    out = [[]]
+    combos = [[]]
+    for _k in range(n):
+        combos = [c + [v] for c in combos for v in (0, 1, 2)]
+    combos.sort(key=lambda c: (sum(1 for v in c if v), sum(c), c))
+    out += combos
+    return out[:DYDA_GRID_MAX]
+
+
 def dyda_dump(work, name, judge, want, log):
     """(text, models the dump lacks) -- the working case's dynamics data as
        PSS/E writes it (dyda) -- or (None, None).
 
-       psspy checks the length of dyda's STATUS array, and a call whose array
-       is too long fails before it writes a line: the study's four guesses (6,
-       9 and 10 elements) all failed that way on this PSS/E. The shapes go from
-       PSS/E's own defaults (an empty STATUS, which psspy fills in) out to
-       explicit values.
+       psspy checks the length of dyda's STATUS array: a list of any other
+       length is refused before a line is written, and the refusal names the
+       length ("must be sequence of length 3"). That is why every call failed
+       before -- the lists tried had 6, 9 and 10 elements. The length is read
+       from that refusal (else found by trying), then option sets are tried:
+       PSS/E's defaults first, then each mix of 0 / 1 / 2 (_dyda_grid).
 
        judge(text) -> (the plant's records in it, the plant's models it has
        none of); want = the plant's records in the deck. A dump is complete
        when it holds at least 90 % of `want` and every model the plant uses in
-       the deck -- a whole model missing means the options left a category
-       out, so the next shape is tried. The size of the whole dump says
-       nothing: a deck holds records PSS/E refused (machines the case does not
-       have). With none complete, the fullest is taken if it reaches the 90 %,
-       and the models it lacks are named (their plant records then come from
-       the deck text); else the deck text is used, as before. Without a deck
-       every option set is tried and the fullest taken. Every call and what it
-       gave goes to <name>_dyda_calls.txt, with dyda's own help text beside."""
+       the deck; the search stops at the first complete one. The size of the
+       whole dump says nothing: a deck holds records PSS/E refused (machines
+       the case does not have).
+
+       Not complete -- this PSS/E's dyda leaves some models out whatever the
+       options (user-written models whose library does not write itself out,
+       for one) -- the fullest dump is still the case as run for the models it
+       has, and is used for those; the plant's records of the models it lacks
+       come from the deck text, and are named. The option set the first plant
+       settles on is tried first for the others, and a search that found
+       nothing complete is not repeated. Every call and what it gave goes to
+       <name>_dyda_calls.txt, with dyda's own help text beside it."""
     f = getattr(psspy, "dyda", None)
     if f is None:
         log("*** this PSS/E has no psspy.dyda")
@@ -1671,62 +1873,80 @@ def dyda_dump(work, name, judge, want, log):
             fh.write((getattr(f, "__doc__", "") or "(psspy.dyda has no help text)") + "\n")
     except Exception:
         pass
-    # Three option sets: PSS/E's defaults, every option 1, every option 0. In
-    # each, lengths are tried until psspy takes one (a refused length raises
-    # before anything is written); the defaults first as an empty STATUS,
-    # which psspy fills in, and the explicit sets longest first -- the longest
-    # length taken is the whole array.
-    groups = [[[]] + [[_i] * k for k in range(1, 11)],
-              [[1] * k for k in range(10, 0, -1)],
-              [[0] * k for k in range(10, 0, -1)]]
-    calls, best = [], None
-    for shapes in groups:
-        done = False
-        for st in shapes:
-            raised, n = False, 0
-            for sid in (0, -1):
-                p = os.path.join(work, "%s_dyda_%d.dyr" % (name, len(calls) + 1))
-                try:
-                    res = "ierr %s" % _ie(f(sid, 1, list(st), 0, _new(p)))
-                except Exception as e:
-                    res = "%s: %s" % (type(e).__name__, " ".join(str(e).split())[:90])
-                    raised = True
-                text = _read_dyr(p)
-                n = len(dyr_records(text)) if text else 0
-                what = "dyda(%d, 1, %s, 0, file)" % (sid, _st_txt(st))
-                if not n:
-                    calls.append("%-40s -> %s, no file" % (what, res))
-                    if raised:
-                        break           # the arguments were refused: sid -1 would be refused too
-                    continue            # taken, but nothing written: try the all-buses subsystem
-                n_plant, lack = judge(text)
-                calls.append("%-40s -> %s, %d record(s), %d of the plant's%s%s"
-                             % (what, res, n, n_plant, (" (the deck has %d)" % want) if want else "",
-                                (", none of its %s" % ", ".join(lack[:8])) if lack else ""))
-                if best is None or (len(lack), -n_plant, -n) < (len(best[3]), -best[0], -best[4]):
-                    best = (n_plant, text, what, lack, n)
-                done = bool(want) and not lack and n_plant >= 0.9 * want
+    calls, best = [], [None]
+
+    def one(st, sid=0):
+        """One call. (refused, records written)."""
+        p = os.path.join(work, "%s_dyda_%d.dyr" % (name, len(calls) + 1))
+        try:
+            res, refused = "ierr %s" % _ie(f(sid, 1, list(st), 0, _new(p))), False
+        except Exception as e:
+            res, refused = "%s: %s" % (type(e).__name__, " ".join(str(e).split())[:90]), True
+        text = _read_dyr(p)
+        n = len(dyr_records(text)) if text else 0
+        what = "dyda(%d, 1, %s, 0, file)" % (sid, _st_txt(st))
+        if not n:
+            calls.append("%-40s -> %s, no file" % (what, res))
+            return refused, 0, res
+        n_plant, lack = judge(text)
+        calls.append("%-40s -> %s, %d record(s), %d of the plant's%s%s"
+                     % (what, res, n, n_plant, (" (the deck has %d)" % want) if want else "",
+                        (", none of its %s" % ", ".join(lack[:8])) if lack else ""))
+        b = best[0]
+        if b is None or (len(lack), -n_plant, -n) < (len(b["lack"]), -b["n_plant"], -b["n"]):
+            best[0] = {"n_plant": n_plant, "text": text, "what": what, "lack": lack, "n": n, "st": list(st)}
+        return False, n, res
+
+    def complete():
+        b = best[0]
+        return bool(b) and bool(want) and not b["lack"] and b["n_plant"] >= 0.9 * want
+
+    # THE LENGTH: from the refusal of a list that is surely too long
+    n_st = _DYDA_FOUND.get("len")
+    if n_st is None:
+        _r, _n, res = one([_i] * 12)
+        m = re.search(r"length\s+(\d+)", res)
+        n_st = int(m.group(1)) if m else None
+        if n_st is None:                      # not named: the longest list psspy takes
+            for k in range(10, 0, -1):
+                refused, _n, _res = one([_i] * k)
+                if not refused:
+                    n_st = k
+                    break
+        _DYDA_FOUND["len"] = n_st
+    if n_st and not complete():                # (finding the length may already have written a full dump)
+        grid = _dyda_grid(n_st)
+        known = _DYDA_FOUND.get("st")
+        if known is not None:                 # what the first plant settled on, then nothing else
+            grid = [known] if _DYDA_FOUND.get("searched_in_vain") else [known] + [g for g in grid if g != known]
+        for st in grid:
+            refused, n, _res = one(st)
+            if not refused and not n:
+                one(st, -1)                    # taken, nothing written: the all-buses subsystem
+            if complete():
                 break
-            if not raised:
-                break                   # this option set's length is found; on to the next set
-        if done:
-            break
+        if best[0] is not None and "st" not in _DYDA_FOUND:
+            _DYDA_FOUND["st"] = best[0]["st"]
+            _DYDA_FOUND["searched_in_vain"] = not complete()
     try:
         with open(_new(os.path.join(work, name + "_dyda_calls.txt")), "w", encoding="utf-8") as fh:
             fh.write("\n".join(calls) + "\n")
     except Exception:
         pass
+    b = best[0]
     of_deck = (" (the deck has %d)" % want) if want else ""
-    if best and best[0] and (not want or best[0] >= 0.9 * want):
-        log("dyda           : %s -> %d records, %d of them the plant's%s" % (best[2], best[4], best[0], of_deck))
-        if best[3]:
-            log("WARNING: the dump has no %s record at the plant, though the deck has -- the plant's records of %s "
-                "come from the deck text" % (", ".join(best[3]), "that model" if len(best[3]) == 1
-                                             else "those models"))
-        return best[1], set(best[3])
-    if best:
-        log("*** dyda wrote at most %d of the plant's records%s -- too few, so the deck text is used; every call "
-            "is in _work\\%s\\%s_dyda_calls.txt" % (best[0], of_deck, name, name))
+    if b and b["n_plant"]:
+        log("dyda           : %s -> %d records, %d of them the plant's%s"
+            % (b["what"], b["n"], b["n_plant"], of_deck))
+        if b["lack"]:
+            log("WARNING: this PSS/E's dyda writes no %s record (%d option set(s) tried, every call in "
+                "_work\\%s\\%s_dyda_calls.txt) -- the plant's records of %s come from the deck text"
+                % (", ".join(b["lack"]), len(calls), name, name,
+                   "that model" if len(b["lack"]) == 1 else "those models"))
+        return b["text"], set(b["lack"])
+    if b:
+        log("*** dyda wrote none of the plant's records, so the deck text is used; every call is in "
+            "_work\\%s\\%s_dyda_calls.txt" % (name, name))
     else:
         log("*** dyda wrote nothing in %d call(s) -- every call is in _work\\%s\\%s_dyda_calls.txt, dyda's help "
             "text in dyda_api_help.txt" % (len(calls), name, name))
