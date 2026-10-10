@@ -21,7 +21,8 @@
                   diagnostic runs) are never picked.
      dynamics   : that build's snapshot (.snp + .cnv beside the .sav) -- the
                   models as the study ran them, deck changes (DyreChanges, IRF)
-                  included -- written out with dyda. A record PSS/E holds
+                  included -- written out with dyda (every call it took is
+                  in _work\\<name>\\<name>_dyda_calls.txt). A record PSS/E holds
                   unchanged keeps the deck's own text (the combined deck the
                   build wrote, *_with_BESS_<project>*.dyr), so no EGF value is
                   rounded; a record the study's decks changed is written as
@@ -59,9 +60,14 @@
      -- EGF feeders on the left, SGF on the right, one column per unit, one row
      per level, so every connection runs straight. The same layout is written
      as _check\\<name>_layout.svg, to compare with what PSS/E drew.
+     PSS/E draws slider diagrams only in its GUI: run from a command prompt,
+     this script writes DRAW_SLD_IN_PSSE_GUI.py into the run folder instead.
+     Open PSS/E, File > Run Automation File > that file: it draws every
+     package's .sld into its folder, with the same layout.
 
    OUTPUT -- nothing that exists is ever overwritten or deleted
      {OUT_DIR}\\<date_time>\\<name>\\<name>.sav / .raw / .dyr / .sld   the package
+     {OUT_DIR}\\<date_time>\\DRAW_SLD_IN_PSSE_GUI.py            draws the .sld (PSS/E GUI)
      {OUT_DIR}\\<date_time>\\_check\\<name>_CHECK.txt, SUMMARY.txt
      {OUT_DIR}\\<date_time>\\_work\\<name>\\                     dumps, validation run
 
@@ -315,6 +321,25 @@ def outputs_to(prefix):
     """Progress and alert output into <prefix>_progress.txt / _alerts.txt."""
     psspy.progress_output(2, _new(prefix + "_progress.txt"), [0, 0])
     psspy.alert_output(2, _new(prefix + "_alerts.txt"), [0, 0])
+
+
+def _prompts_to(path):
+    """PSS/E's prompt output into `path` -- a response file prints an
+       "ACTIVITY?" prompt for every line it reads. True when redirected."""
+    f = getattr(psspy, "prompt_output", None)
+    if f is None:
+        return False
+    try:
+        return _ok(f(2, _new(path), [0, 0]))
+    except Exception:
+        return False
+
+
+def _prompts_back():
+    try:
+        psspy.prompt_output(1, "", [0, 0])
+    except Exception:
+        pass
 
 
 def outputs_back():
@@ -674,26 +699,31 @@ def addlib_path():
     return _abs(ADDLIB_IDV or _file_setting(ENGINE_FILES, "ADDLIB_IDV", "add_library.idv"), _case_dir())
 
 
-def load_libraries(log, whole_idv):
+def load_libraries(log, whole_idv, prompts=None):
     """The study's user-model DLLs, each loaded once. whole_idv: run the
        add-library file as the study does at initialisation (from its own
        folder) when it holds more than library loads; otherwise only the DLLs it
        names are loaded. dsusr.dll is never loaded -- it is built for the full
-       deck's CONEC / CONET, not for a plant."""
+       deck's CONEC / CONET, not for a plant. prompts: a file for the prompts
+       the add-library file prints while it runs, instead of the screen."""
     p = addlib_path()
     dlls, other = idv_dlls(p) if os.path.isfile(p) else ([], False)
     if not os.path.isfile(p):
         log("  no %s -- user-model DLLs from the case-folder search only" % p)
     elif whole_idv and other and _key(p) not in _LOADED:
         cwd = os.getcwd()
+        quiet = bool(prompts) and _prompts_to(prompts)
         try:
             os.chdir(os.path.dirname(p))
             ie = _ie(psspy.runrspnsfile(p))
         finally:
             os.chdir(cwd)
+            if quiet:
+                _prompts_back()
         _LOADED.add(_key(p))
         _LOADED.update(_key(x) for x in dlls)
-        log("  %s run as the study runs it (ierr %s): it holds more than library loads" % (p, ie))
+        log("  %s run as the study runs it (ierr %s): it holds more than library loads%s"
+            % (p, ie, ("; its prompts are in %s" % os.path.basename(prompts)) if quiet else ""))
     for dll in list(dlls) + bess_dlls() + [_abs(x) for x in DLLS]:
         if _key(dll) in _LOADED or os.path.basename(dll).lower().startswith("dsusr"):
             continue
@@ -1124,7 +1154,12 @@ def _esc(t):
 def write_sld(sld_path, pos, order, work, log):
     """<name>.sld drawn by PSS/E: a new diagram, every bus placed with growbus
        at its layout position, saved. The help text of the diagram calls this
-       PSS/E has is kept in the work folder. True when the file was written."""
+       PSS/E has is kept in the work folder. (True, "") when the file was
+       written, else (False, why).
+
+       PSS/E draws slider diagrams only in its GUI. Run from a command prompt
+       the calls answer None and no file appears -- the GUI automation file
+       (write_gui_sld) draws the diagram there instead."""
     names = ("newdiagfile", "growbus", "growbuslevels", "savediagfile", "closediagfile", "opendiagfile")
     try:
         with open(_new(os.path.join(work, "diagram_api_help.txt")), "w", encoding="utf-8") as fh:
@@ -1135,14 +1170,12 @@ def write_sld(sld_path, pos, order, work, log):
     except Exception:
         pass
     if not all(getattr(psspy, n, None) for n in ("newdiagfile", "growbus", "savediagfile")):
-        log("REVIEW: slider diagram not written -- this PSS/E has no newdiagfile / growbus / savediagfile")
-        return False
-    bad, ok = [], False
+        return False, "this PSS/E has no newdiagfile / growbus / savediagfile"
+    bad, ok, why = [], False, ""
     try:
         ie = _ie(psspy.newdiagfile())
         if ie not in (0, None):
-            log("REVIEW: slider diagram not written -- newdiagfile ierr %s" % ie)
-            return False
+            return False, "newdiagfile ierr %s" % ie
         for b in order:
             x, y = pos[b]
             ie = _ie(psspy.growbus(b, x, y))
@@ -1151,17 +1184,192 @@ def write_sld(sld_path, pos, order, work, log):
         ie = _ie(psspy.savediagfile(_new(sld_path)))
         ok = ie in (0, None) and os.path.isfile(sld_path) and os.path.getsize(sld_path) > 0
         if not ok:
-            log("REVIEW: slider diagram not written -- savediagfile ierr %s" % ie)
+            why = ("PSS/E draws slider diagrams only in its GUI (savediagfile gave %s and wrote no file)" % ie
+                   if ie is None else "savediagfile ierr %s" % ie)
     except Exception as e:
-        log("REVIEW: slider diagram not written -- %s" % e)
+        why = "%s" % e
     finally:
         try:
             psspy.closediagfile()
         except Exception:
             pass
-    if bad:
+    if bad and ok:
         log("REVIEW: slider diagram: %d bus(es) not placed: %s" % (len(bad), ", ".join(bad[:10])))
-    return ok
+    return ok, why
+
+
+GUI_SLD = "DRAW_SLD_IN_PSSE_GUI.py"
+
+
+def write_gui_sld(out_root, items, stamp):
+    """The diagrams PSS/E would not draw outside its GUI, as one automation
+       file to run there (File > Run Automation File). items: [{"name",
+       "folder", "buses": [(bus, x, y)]}]. Returns its path."""
+    rows = []
+    for it in items:
+        rows.append('    {"name": %r,\n     "folder": %r,\n     "buses": [\n%s]},'
+                    % (str(it["name"]), str(it["folder"]),
+                       ",\n".join("        (%d, %.4f, %.4f)" % (b, x, y) for b, x, y in it["buses"])))
+    text = (_GUI_SLD_TEMPLATE.replace("@STAMP@", stamp).replace("@ROOT@", repr(str(out_root)))
+            .replace("@PACKAGES@", "\n".join(rows)))
+    path = os.path.join(out_root, GUI_SLD)
+    with open(_new(path), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
+
+
+_GUI_SLD_TEMPLATE = r'''# -*- coding: utf-8 -*-
+"""DRAW_SLD_IN_PSSE_GUI.py -- the one-line diagram (.sld) of each plant package
+written by z7_plant_models.py (run @STAMP@).
+
+PSS/E draws slider diagrams only in its GUI, so this file runs THERE:
+    open PSS/E  ->  File  ->  Run Automation File...  ->  this file
+For each package it opens <name>.sav, places every bus where the plant-model
+script laid it out -- the picture in _check\\<name>_layout.svg: the POI and its
+infinite bus on top, each feeder straight down to its units -- and saves
+<name>.sld beside the .sav. A package that already has its .sld is left as it
+is; nothing is ever overwritten. A log of what was done is written beside this
+file.
+
+It opens each package's case in the GUI, replacing the case open there: save
+your own work first. The last diagram is left open on the screen.
+
+SCALE spreads the drawing out (1.5) or packs it tighter (0.75).
+"""
+import os
+import time
+
+import psspy
+
+SCALE = 1.0
+SKIP_EXISTING = True        # True = a package that already has <name>.sld is not drawn again
+LEAVE_LAST_OPEN = True      # True = the last diagram stays open on the screen
+ROOT = @ROOT@
+PACKAGES = [
+@PACKAGES@
+]
+
+LINES = []
+
+
+def say(msg):
+    print(msg)
+    LINES.append(msg)
+
+
+def _ie(rc):
+    return rc[0] if isinstance(rc, (list, tuple)) else rc
+
+
+def _here():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+def _folder(pkg):
+    for d in (pkg["folder"], os.path.join(ROOT, pkg["name"]), os.path.join(_here(), pkg["name"])):
+        if os.path.isfile(os.path.join(d, pkg["name"] + ".sav")):
+            return d
+    return None
+
+
+def _free(path):
+    """`path`, or the first <stem>_2, _3 ... that is free -- never overwrite."""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    k = 2
+    while os.path.exists("%s_%d%s" % (stem, k, ext)):
+        k += 1
+    return "%s_%d%s" % (stem, k, ext)
+
+
+def _out_dir():
+    return ROOT if os.path.isdir(ROOT) else _here()
+
+
+def _api_help():
+    """The help text of the diagram calls, kept when one of them failed."""
+    p = _free(os.path.join(_out_dir(), "slider_api_help.txt"))
+    try:
+        with open(p, "w") as fh:
+            for n in ("newdiagfile", "growbus", "growbuslevels", "savediagfile", "closediagfile",
+                      "opendiagfile"):
+                f = getattr(psspy, n, None)
+                fh.write("==== psspy.%s: %s\n%s\n\n" % (n, "present" if f else "NOT in this PSS/E",
+                                                         (getattr(f, "__doc__", "") or "") if f else ""))
+        say("help text of the diagram calls: %s" % p)
+    except Exception:
+        pass
+
+
+def draw(pkg, last):
+    name = pkg["name"]
+    d = _folder(pkg)
+    if d is None:
+        say("%-22s no %s.sav found (looked in %s) -- skipped" % (name, name, pkg["folder"]))
+        return False
+    sld = os.path.join(d, name + ".sld")
+    if SKIP_EXISTING and os.path.isfile(sld):
+        say("%-22s %s.sld is already there -- left as it is" % (name, name))
+        return True
+    ie = _ie(psspy.case(os.path.join(d, name + ".sav")))
+    if ie not in (0, None):
+        say("%-22s *** could not open %s.sav (ierr %s)" % (name, name, ie))
+        return False
+    ie = _ie(psspy.newdiagfile())
+    if ie not in (0, None):
+        say("%-22s *** newdiagfile ierr %s" % (name, ie))
+        return False
+    bad = []
+    for b, x, y in pkg["buses"]:
+        try:
+            ie = _ie(psspy.growbus(b, x * SCALE, y * SCALE))
+        except Exception as e:
+            ie = e
+        if ie not in (0, None):
+            bad.append("%d (%s)" % (b, ie))
+    out = _free(sld)
+    try:
+        ie = _ie(psspy.savediagfile(out))
+    except Exception as e:
+        ie = e
+    ok = os.path.isfile(out) and os.path.getsize(out) > 0
+    if ok:
+        say("%-22s written %s -- %d of %d buses placed" % (name, out, len(pkg["buses"]) - len(bad),
+                                                          len(pkg["buses"])))
+    else:
+        say("%-22s *** %s not written (savediagfile gave %s)" % (name, os.path.basename(out), ie))
+    if bad:
+        say("    %d bus(es) not placed: %s" % (len(bad), ", ".join(bad[:10])))
+    if not (last and LEAVE_LAST_OPEN and ok):
+        try:
+            psspy.closediagfile()
+        except Exception:
+            pass
+    return ok and not bad
+
+
+def main():
+    say("One-line diagrams of the plant packages -- %s" % time.strftime("%Y-%m-%d %H:%M"))
+    n = 0
+    for k, pkg in enumerate(PACKAGES):
+        n += 1 if draw(pkg, k == len(PACKAGES) - 1) else 0
+    say("%d of %d diagram(s) in place" % (n, len(PACKAGES)))
+    if n < len(PACKAGES):
+        _api_help()
+    try:
+        p = _free(os.path.join(_out_dir(), "DRAW_SLD_IN_PSSE_GUI_log.txt"))
+        with open(p, "w") as fh:
+            fh.write("\n".join(LINES) + "\n")
+    except Exception:
+        pass
+
+
+main()
+'''
 
 
 # ============================================================================
@@ -1401,13 +1609,130 @@ def one_project(proj, cfg, out_root, log):
             log("  (layout preview not written: %s)" % e)
         rows = max(abs(p[1]) for p in pos.values()) / SLD_DY + 1
         cols = max(p[0] for p in pos.values()) - min(p[0] for p in pos.values())
-        if _ok(psspy.case(sav_o)) and write_sld(os.path.join(pkg, name + ".sld"), pos, order, work, log):
+        ok, why = (write_sld(os.path.join(pkg, name + ".sld"), pos, order, work, log) if _ok(psspy.case(sav_o))
+                   else (False, "the package case could not be opened again"))
+        if ok:
             log("written        : %s (%d buses placed: %d rows, %.0f wide, POI at the %s)"
                 % (os.path.join(pkg, name + ".sld"), len(order), rows, cols,
                    "top" if SLD_POI_ON_TOP else "bottom"))
+        else:
+            log("REVIEW: slider diagram not drawn here -- %s. Draw it in the PSS/E GUI: File > Run Automation "
+                "File > %s" % (why, os.path.join(out_root, GUI_SLD)))
+        sld = {"name": name, "folder": pkg, "done": ok, "buses": [(b, pos[b][0], pos[b][1]) for b in order]}
+    else:
+        sld = None
     return {"proj": proj, "name": name, "poi": poi, "stem": stem, "tags": tags, "work": work, "pkg": pkg,
             "sav_o": sav_o, "buses": buses, "keep": keep, "units": units, "mach_full": mach_full,
-            "loads_full": loads_full}
+            "loads_full": loads_full, "sld": sld}
+
+
+def _read_dyr(path):
+    """The text of the .dyr file at `path`, or "" (none, empty or unreadable)."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return ""
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+
+def _st_txt(st):
+    return "[%s]" % ", ".join("default" if v == _i else str(v) for v in st)
+
+
+def dyda_dump(work, name, judge, want, log):
+    """(text, models the dump lacks) -- the working case's dynamics data as
+       PSS/E writes it (dyda) -- or (None, None).
+
+       psspy checks the length of dyda's STATUS array, and a call whose array
+       is too long fails before it writes a line: the study's four guesses (6,
+       9 and 10 elements) all failed that way on this PSS/E. The shapes go from
+       PSS/E's own defaults (an empty STATUS, which psspy fills in) out to
+       explicit values.
+
+       judge(text) -> (the plant's records in it, the plant's models it has
+       none of); want = the plant's records in the deck. A dump is complete
+       when it holds at least 90 % of `want` and every model the plant uses in
+       the deck -- a whole model missing means the options left a category
+       out, so the next shape is tried. The size of the whole dump says
+       nothing: a deck holds records PSS/E refused (machines the case does not
+       have). With none complete, the fullest is taken if it reaches the 90 %,
+       and the models it lacks are named (their plant records then come from
+       the deck text); else the deck text is used, as before. Without a deck
+       every option set is tried and the fullest taken. Every call and what it
+       gave goes to <name>_dyda_calls.txt, with dyda's own help text beside."""
+    f = getattr(psspy, "dyda", None)
+    if f is None:
+        log("*** this PSS/E has no psspy.dyda")
+        return None, None
+    try:
+        with open(_new(os.path.join(work, "dyda_api_help.txt")), "w", encoding="utf-8") as fh:
+            fh.write((getattr(f, "__doc__", "") or "(psspy.dyda has no help text)") + "\n")
+    except Exception:
+        pass
+    # Three option sets: PSS/E's defaults, every option 1, every option 0. In
+    # each, lengths are tried until psspy takes one (a refused length raises
+    # before anything is written); the defaults first as an empty STATUS,
+    # which psspy fills in, and the explicit sets longest first -- the longest
+    # length taken is the whole array.
+    groups = [[[]] + [[_i] * k for k in range(1, 11)],
+              [[1] * k for k in range(10, 0, -1)],
+              [[0] * k for k in range(10, 0, -1)]]
+    calls, best = [], None
+    for shapes in groups:
+        done = False
+        for st in shapes:
+            raised, n = False, 0
+            for sid in (0, -1):
+                p = os.path.join(work, "%s_dyda_%d.dyr" % (name, len(calls) + 1))
+                try:
+                    res = "ierr %s" % _ie(f(sid, 1, list(st), 0, _new(p)))
+                except Exception as e:
+                    res = "%s: %s" % (type(e).__name__, " ".join(str(e).split())[:90])
+                    raised = True
+                text = _read_dyr(p)
+                n = len(dyr_records(text)) if text else 0
+                what = "dyda(%d, 1, %s, 0, file)" % (sid, _st_txt(st))
+                if not n:
+                    calls.append("%-40s -> %s, no file" % (what, res))
+                    if raised:
+                        break           # the arguments were refused: sid -1 would be refused too
+                    continue            # taken, but nothing written: try the all-buses subsystem
+                n_plant, lack = judge(text)
+                calls.append("%-40s -> %s, %d record(s), %d of the plant's%s%s"
+                             % (what, res, n, n_plant, (" (the deck has %d)" % want) if want else "",
+                                (", none of its %s" % ", ".join(lack[:8])) if lack else ""))
+                if best is None or (len(lack), -n_plant, -n) < (len(best[3]), -best[0], -best[4]):
+                    best = (n_plant, text, what, lack, n)
+                done = bool(want) and not lack and n_plant >= 0.9 * want
+                break
+            if not raised:
+                break                   # this option set's length is found; on to the next set
+        if done:
+            break
+    try:
+        with open(_new(os.path.join(work, name + "_dyda_calls.txt")), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(calls) + "\n")
+    except Exception:
+        pass
+    of_deck = (" (the deck has %d)" % want) if want else ""
+    if best and best[0] and (not want or best[0] >= 0.9 * want):
+        log("dyda           : %s -> %d records, %d of them the plant's%s" % (best[2], best[4], best[0], of_deck))
+        if best[3]:
+            log("WARNING: the dump has no %s record at the plant, though the deck has -- the plant's records of %s "
+                "come from the deck text" % (", ".join(best[3]), "that model" if len(best[3]) == 1
+                                             else "those models"))
+        return best[1], set(best[3])
+    if best:
+        log("*** dyda wrote at most %d of the plant's records%s -- too few, so the deck text is used; every call "
+            "is in _work\\%s\\%s_dyda_calls.txt" % (best[0], of_deck, name, name))
+    else:
+        log("*** dyda wrote nothing in %d call(s) -- every call is in _work\\%s\\%s_dyda_calls.txt, dyda's help "
+            "text in dyda_api_help.txt" % (len(calls), name, name))
+    for c in calls[:4]:
+        log("      " + c)
+    return None, None
 
 
 def plant_dynamics(ctx, log):
@@ -1423,10 +1748,26 @@ def plant_dynamics(ctx, log):
     cnv, snp = SNP_BY_PROJECT.get(proj, (stem + ".cnv", stem + ".snp"))
     cnv, snp = _abs(cnv), _abs(snp)
     deck = find_deck(proj, tags)
-    as_run_txt = None
-    if os.path.isfile(cnv) and os.path.isfile(snp):
+    as_run_txt, dyda_lacks = None, None
+    deck_txt = None
+    if deck and os.path.isfile(deck):
+        with open(deck, encoding="utf-8", errors="replace") as fh:
+            deck_txt = fh.read()
+    allbus = set(buses)
+    ids_at = collections.defaultdict(set)
+    for b, i in list(mach_full) + loads_full:
+        if b in keep:
+            ids_at[b].add(i.upper())
+    drecs = plant_records(deck_txt, keep, poi, allbus, False, ids_at)[0] if deck_txt is not None else None
+    need = sorted(set(r.model for r in drecs or []))
+
+    def judge(text):
+        mine = plant_records(text, keep, poi, allbus, True, ids_at)[0]
+        have = set(r.model for r in mine)
+        return len(mine), [m for m in need if m not in have]
+    have_snp = os.path.isfile(cnv) and os.path.isfile(snp)
+    if have_snp:
         log("dynamics       : snapshot %s (%s) with %s" % (snp, _when(snp), os.path.basename(cnv)))
-        dump = os.path.join(work, name + "_as_run_all.dyr")
         outputs_to(os.path.join(work, name + "_dyda"))
         try:
             if not _ok(psspy.rstr(snp)) or not _ok(psspy.case(cnv)):
@@ -1434,38 +1775,23 @@ def plant_dynamics(ctx, log):
             else:
                 psspy.fact()
                 psspy.tysl(0)
-                load_libraries(log, whole_idv=True)
-                for args in ((0, 1, [1] * 9, 0, dump), (0, 1, [1] * 6, 0, dump),
-                             (-1, 1, [1] * 9, 0, dump), (0, 1, [1] * 10, 0, dump)):
-                    if os.path.isfile(dump) and os.path.getsize(dump) > 0:
-                        break
-                    try:
-                        psspy.dyda(*args)
-                    except Exception:
-                        continue
-                if os.path.isfile(dump) and os.path.getsize(dump) > 0:
-                    with open(dump, encoding="utf-8", errors="replace") as fh:
-                        as_run_txt = fh.read()
-                else:
-                    log("*** dyda wrote nothing")
+                load_libraries(log, whole_idv=True, prompts=os.path.join(work, name + "_idv_prompts.txt"))
+                as_run_txt, dyda_lacks = dyda_dump(work, name, judge, len(drecs or []), log)
         finally:
             outputs_back()
     else:
         log("dynamics       : no snapshot beside the case (%s)" % os.path.basename(snp))
-    deck_txt = None
-    if deck and os.path.isfile(deck):
-        with open(deck, encoding="utf-8", errors="replace") as fh:
-            deck_txt = fh.read()
+    if deck_txt is not None:
         log("deck text      : %s (%s)" % (deck, _when(deck)))
-    allbus = set(buses)
-    ids_at = collections.defaultdict(set)
-    for b, i in list(mach_full) + loads_full:
-        if b in keep:
-            ids_at[b].add(i.upper())
     if as_run_txt is not None:
         recs, dnotes = plant_records(as_run_txt, keep, poi, allbus, True, ids_at)
         if deck_txt is not None:
-            drecs, _n = plant_records(deck_txt, keep, poi, allbus, False, ids_at)
+            if dyda_lacks:                       # models the dump has none of: the deck's records stand in
+                extra = [r for r in drecs if r.model in dyda_lacks]
+                recs += extra
+                if extra:
+                    log("WARNING: %d plant record(s) from the deck text (%s): the dump has none of these models"
+                        % (len(extra), ", ".join(sorted(set(r.model for r in extra)))))
             texts, mnotes, n_deck = merge_records(recs, drecs)
             log("records        : %d as run -- %d keep the deck's own text, %d are written as PSS/E holds them"
                 % (len(recs), n_deck, len(recs) - n_deck))
@@ -1477,8 +1803,9 @@ def plant_dynamics(ctx, log):
     elif deck_txt is not None:
         recs, dnotes = plant_records(deck_txt, keep, poi, allbus, False, ids_at)
         texts = [r.text for r in recs]
-        log("WARNING: records from the deck text only -- without the snapshot, model changes the study's "
-            ".idv decks made (DyreChanges, IRF) are not in them")
+        log("WARNING: records from the deck text only -- %s, so model changes the study's .idv decks made "
+            "(DyreChanges, IRF) are not in them" % ("PSS/E did not write the snapshot's models out" if have_snp
+                                                   else "there is no snapshot"))
         log("records        : %d" % len(recs))
         src = deck
     else:
@@ -1600,7 +1927,7 @@ def main():
     print("[plant-models] output        -> %s" % out_root)
     print("[plant-models] project cases <- %s" % _case_dir())
     cwd = os.getcwd()
-    summary = []
+    summary, gui, gui_path = [], [], None
     os.chdir(os.path.join(out_root, "_work"))     # whatever PSS/E writes on its own lands here
     try:
         psse_start()
@@ -1615,6 +1942,13 @@ def main():
             except Exception:
                 ctxs[proj] = None
                 log("*** stopped: " + traceback.format_exc())
+        gui = [c["sld"] for c in ctxs.values() if c and c.get("sld") and not c["sld"]["done"]]
+        if gui:                                          # the diagrams PSS/E draws only in its GUI
+            try:
+                gui_path = write_gui_sld(out_root, gui, stamp)
+            except Exception as e:
+                gui_path = None
+                print("[plant-models] *** %s not written: %s" % (GUI_SLD, e))
         for proj, log in logs.items():                   # pass 2: .dyr, then loaded back and run flat
             cfg, done = PLANTS[proj], False
             if ctxs.get(proj):
@@ -1632,6 +1966,11 @@ def main():
             log.write(os.path.join(out_root, "_check", cfg["name"] + "_CHECK.txt"))
     finally:
         os.chdir(cwd)
+    if gui and gui_path:
+        summary += ["", "One-line diagrams (.sld): PSS/E draws them only in its GUI. Open PSS/E, then",
+                    "File > Run Automation File > %s" % gui_path,
+                    "It draws %d diagram(s) -- %s -- into the package folders." % (
+                        len(gui), ", ".join(g["name"] for g in gui))]
     with open(_new(os.path.join(out_root, "_check", "SUMMARY.txt")), "w", encoding="utf-8") as fh:
         fh.write("Plant models on an infinite bus -- %s\n\n%s\n" % (stamp, "\n".join(summary)))
     print("")
