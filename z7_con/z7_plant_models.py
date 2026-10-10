@@ -124,10 +124,12 @@ FLAT_TOL = (0.5, 0.5, 0.001)      # MW, MVAr, pu: a larger drift in the flat run
 ADDLIB_IDV = ""                   # "" = the study's own (ADDLIB_IDV of z7_spp_p_f.py, in the case folder)
 DLLS = []                         # extra user-model DLLs (full paths), if any
 DYN_PARAMS = (60, 0.60, 0.0000095, 1.0 / 240.0, 0.033333)   # NITER, ACCEL, TOL, DELT, FREQFILT (the study's)
+EGF_FROM_DECK = True              # EGF records keep the deck's values where the case as run differs (listed)
 SLD = True                        # also <name>.sld: the plant drawn as a tidy tree (POI on top, units at the bottom)
 SLD_DX = 2.0                      # diagram column spacing (PSS/E diagram units -- inches)
 SLD_DY = 1.6                      # diagram row spacing: one row per level below the POI
 SLD_POI_ON_TOP = True             # True = POI and infinite bus on top, units at the bottom | False = upside down
+SLD_UNITS_BOTTOM = True           # True = every generator on the bottom row, each one's path straight up to the POI
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _BATCH = 4000                     # buses per extr call
@@ -951,12 +953,14 @@ def _n_diff(a, b):
                        else x == y))
 
 
-def merge_records(as_run, deck):
+def merge_records(as_run, deck, keep_deck=None):
     """([record text] in the deck's order, notes, how many keep the deck's
        text): every record PSS/E holds; the deck's own text where PSS/E holds
-       the same values, PSS/E's where they differ. Exact matches are paired
-       first, so one changed record among many alike (a relay set on one bus)
-       is never paired with the wrong one."""
+       the same values, PSS/E's where they differ -- unless keep_deck(record)
+       says that record's data are not to be changed (the EGF's): then the
+       deck's text stays and the difference is only listed. Exact matches are
+       paired first, so one changed record among many alike (a relay set on
+       one bus) is never paired with the wrong one."""
     pool = collections.defaultdict(list)
     for k, r in enumerate(deck):
         pool[(r.model, r.anchor)].append([k, r, False])
@@ -975,8 +979,15 @@ def merge_records(as_run, deck):
         if near:
             c = min(near, key=lambda c: _n_diff(r, c[1]))
             c[2] = True
-            notes.append("as run differs from the deck: %s at %s -- %s" % (r.model, r.anchor, _diff_text(r, c[1])))
-            placed.append((c[0], 1, r.text))
+            if keep_deck is not None and keep_deck(r):
+                notes.append("as run differs from the deck: %s at %s -- %s (EGF: the deck's values are kept)"
+                             % (r.model, r.anchor, _diff_text(r, c[1])))
+                placed.append((c[0], 0, c[1].text))
+                n_deck += 1
+            else:
+                notes.append("as run differs from the deck: %s at %s -- %s"
+                             % (r.model, r.anchor, _diff_text(r, c[1])))
+                placed.append((c[0], 1, r.text))
             continue
         notes.append("as run, not in the deck: %s at %s" % (r.model, r.anchor))
         at = [c[0] for c in cands] or [c[0] for (m, a), lst in pool.items() if a == r.anchor for c in lst]
@@ -984,8 +995,9 @@ def merge_records(as_run, deck):
     for lst in pool.values():
         for k, r, used in lst:
             if not used:
-                notes.append("in the deck, not in the case as run (removed by the study's decks, or not "
-                             "accepted by PSS/E): %s at %s" % (r.model, r.anchor))
+                notes.append("in the deck, not in the case as run -- the study ran without it (removed by the "
+                             "study's decks, or not accepted by PSS/E when the study loaded the deck): %s at %s"
+                             % (r.model, r.anchor))
     placed.sort(key=lambda x: (x[0], x[1]))
     return [t for _k, _o, t in placed], notes, n_deck
 
@@ -993,18 +1005,26 @@ def merge_records(as_run, deck):
 # ============================================================================
 # ONE-LINE DIAGRAM -- a tidy tree hanging from the POI
 # ============================================================================
-def tree_layout(adj, poi, keep, unit_buses, dx, dy, tri=()):
+def tree_layout(adj, poi, keep, unit_buses, dx, dy, tri=(), units_bottom=True):
     """(positions {bus: (x, y)}, parent {bus: bus}, children {bus: [bus]}, order).
 
-       The plant as a tree hanging from the POI: the POI at (0, 0), every bus
-       one row (dy) below the bus that feeds it (first reached from the POI),
-       its children side by side under it. Each leaf takes its own column (dx);
-       a bus sits centred over its children, so every connection runs straight
-       down. Children are ordered by the lowest unit number below them: the EGF
-       feeders (their own numbers) come left of the SGF ones (999001..). The
-       other windings of a three-winding transformer (tri: its three buses) stay
-       side by side under the winding that feeds them, so PSS/E draws the
-       transformer in one place."""
+       The plant traced from every generator to the POI: each bus's parent is
+       the next bus on its shortest path to the POI (breadth-first from the
+       POI), so the union of the units' paths is the backbone of the drawing.
+       The POI is at (0, 0) and every bus sits below the bus that feeds it,
+       its children side by side under it. Each leaf takes its own column
+       (dx); a bus sits centred over its children, so every connection runs
+       straight down. Children are ordered by the lowest unit number below
+       them: the EGF feeders (their own numbers) come left of the SGF ones
+       (999001..). The other windings of a three-winding transformer (tri: its
+       three buses) stay side by side under the winding that feeds them, so
+       PSS/E draws the transformer in one place.
+
+       Rows (dy apart): units_bottom = True puts every generator on the bottom
+       row and every bus on a unit's path by its height above the units it
+       feeds -- all units in one row, all GSU high sides in the row above,
+       and so on up to the POI; a branch that feeds no unit hangs one row
+       under its parent. False: one row per step from the POI."""
     nodes = set(keep) | set([poi])
     parent, depth, order, front = {poi: None}, {poi: 0}, [poi], [poi]
     while front:
@@ -1050,7 +1070,24 @@ def tree_layout(adj, poi, keep, unit_buses, dx, dy, tri=()):
         col[b] = (col[kids[b][0]] + col[kids[b][-1]]) / 2.0
     place(poi)
     x0 = col[poi]
-    pos = dict((b, (round((col[b] - x0) * dx, 4), round(-depth[b] * dy, 4))) for b in order)
+    row = dict(depth)
+    if units_bottom and low[poi] is not None:
+        height = {}
+        for b in reversed(order):                   # deepest first: steps down to the lowest unit row
+            spine = [c for c in kids[b] if low[c] is not None]
+            if spine:
+                height[b] = 1 + max(height[c] for c in spine)
+            elif low[b] is not None:
+                height[b] = 0                       # a unit with nothing on a path below it
+        top = height[poi]
+        for b in order:                             # parents before children
+            if b == poi:
+                row[b] = 0
+            elif b in height:
+                row[b] = top - height[b]
+            else:
+                row[b] = row[parent[b]] + 1         # off the units' paths: right under its parent
+    pos = dict((b, (round((col[b] - x0) * dx, 4), round(-row[b] * dy, 4))) for b in order)
     return pos, parent, kids, order
 
 
@@ -1230,20 +1267,26 @@ written by z7_plant_models.py (run @STAMP@).
 
 PSS/E draws slider diagrams only in its GUI, so this file runs THERE:
     open PSS/E  ->  File  ->  Run Automation File...  ->  this file
-For each package it opens <name>.sav, draws every bus (growbus), then MOVES
-each bus to its place in the layout -- the picture in _check\\<name>_layout.svg:
-the POI and its infinite bus on top, each feeder straight down to its units --
-and saves <name>.sld beside the .sav. growbus places the buses the way PSS/E's
-own auto-draw does (the zigzag); the move is what tidies them, through PSS/E's
-sliderPy module. What sliderPy offered and what each move did is written to
-slider_inspect_<name>.txt beside this file.
+For each package it opens <name>.sav, draws every bus (growbus), then moves
+each bus to its place in the layout -- traced from every generator up to the
+POI: the generators on the bottom row, each one's path straight up to the POI
+and its infinite bus on top (the picture in _check\\<name>_layout.svg) -- and
+saves <name>.sld beside the .sav. growbus alone places the buses the way
+PSS/E's own auto-draw does (the zigzag); the move goes through PSS/E's
+sliderPy module.
+
+SAFETY. Before any diagram object is touched, the help text PSS/E gives for
+its diagram calls is written to slider_api.txt. Every sliderPy call is then
+written to slider_trace_<name>.txt -- and flushed to disk -- BEFORE it is made,
+so if PSS/E closes on one, the last line of that file names the call. Send
+both files back if that happens; MOVE_BUSES = False draws without moving.
 
 A package that already has its .sld is left as it is; nothing is ever
-overwritten. It opens each package's case in the GUI, replacing the case open
+overwritten. Each package's case is opened in the GUI, replacing the case open
 there: save your own work first. The last diagram is left open on the screen.
 
 SCALE spreads the drawing out (1.5) or packs it tighter (0.75); FLIP_Y = True
-turns it upside down (if the POI comes out at the bottom).
+turns it over if the POI comes out at the bottom.
 """
 import os
 import re
@@ -1253,7 +1296,7 @@ import psspy
 
 SCALE = 1.0
 FLIP_Y = False
-MOVE_BUSES = True           # True = put every bus where the layout wants it (sliderPy)
+MOVE_BUSES = True           # False = growbus only (PSS/E's own placement)
 SKIP_EXISTING = True        # True = a package that already has <name>.sld is not drawn again
 LEAVE_LAST_OPEN = True      # True = the last diagram stays open on the screen
 ROOT = @ROOT@
@@ -1263,7 +1306,6 @@ PACKAGES = [
 
 LINES = []
 _BUS_MS = re.compile(r"^\s*BU[A-Z]*\s+(\d+)\s*$", re.I)
-SETTERS = ("SetPosition", "SetLocation", "SetPos", "MoveTo", "Move")
 
 
 def say(msg):
@@ -1304,15 +1346,58 @@ def _out_dir():
     return ROOT if os.path.isdir(ROOT) else _here()
 
 
-def _try(obj, name, *args):
-    """(result, "") from obj.name(*args), or (None, why)."""
-    f = getattr(obj, name, None)
-    if f is None:
-        return None, "no %s" % name
+class Trace(object):
+    """One line per step, on disk before the step is made."""
+
+    def __init__(self, path):
+        self.path = path
+        self.fh = open(path, "w")
+
+    def __call__(self, msg):
+        try:
+            self.fh.write(msg + "\n")
+            self.fh.flush()
+            os.fsync(self.fh.fileno())
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.fh.close()
+        except Exception:
+            pass
+
+
+def _doc(obj):
+    d = getattr(obj, "__doc__", None)
+    return (d or "").strip()
+
+
+def api_dump():
+    """The help text of psspy's diagram calls and of sliderPy (modules and
+       classes only -- no diagram object is touched)."""
+    p = _free(os.path.join(_out_dir(), "slider_api.txt"))
+    out = []
+    for n in sorted(n for n in dir(psspy) if re.search(r"diag|grow|slid|sld", n, re.I)):
+        out.append("==== psspy.%s\n%s\n" % (n, _doc(getattr(psspy, n, None))))
     try:
-        return f(*args), ""
+        import sliderPy
+        out.append("==== sliderPy module\n%s\n" % _doc(sliderPy))
+        for n in sorted(x for x in dir(sliderPy) if not x.startswith("_")):
+            obj = getattr(sliderPy, n, None)
+            out.append("---- sliderPy.%s (%s)\n%s" % (n, type(obj).__name__, _doc(obj)))
+            if isinstance(obj, type):
+                for m in sorted(x for x in dir(obj) if not x.startswith("_")):
+                    out.append("      .%s: %s" % (m, " ".join(_doc(getattr(obj, m, None)).split())[:300]))
+            out.append("")
     except Exception as e:
-        return None, "%s: %s" % (type(e).__name__, e)
+        out.append("no sliderPy here (%s)" % e)
+    try:
+        with open(p, "w") as fh:
+            fh.write("\n".join(out) + "\n")
+        say("help text of the diagram calls: %s" % p)
+    except Exception:
+        pass
 
 
 def _xy(p):
@@ -1330,16 +1415,7 @@ def _xy(p):
                 return float(getattr(p, a)), float(getattr(p, b))
             except Exception:
                 pass
-    if hasattr(p, "GetX") and hasattr(p, "GetY"):
-        try:
-            return float(p.GetX()), float(p.GetY())
-        except Exception:
-            pass
     return None
-
-
-def _methods(obj):
-    return ", ".join(n for n in dir(obj) if not n.startswith("_"))
 
 
 def _nn(pts):
@@ -1354,110 +1430,90 @@ def _nn(pts):
     return ds[len(ds) // 2] if ds else 0.0
 
 
-def _move(c, x, y):
-    """Put component c at (x, y); the setter that did it (read back), or None."""
-    for name in SETTERS:
-        f = getattr(c, name, None)
-        if f is None:
-            continue
-        p0, _e = _try(c, "GetPosition")
-        trials = [(x, y), ((x, y),)]
-        if p0 is not None and not isinstance(p0, (list, tuple)):
-            for a, b in (("x", "y"), ("X", "Y")):
-                if hasattr(p0, a) and hasattr(p0, b):
-                    try:
-                        setattr(p0, a, x)
-                        setattr(p0, b, y)
-                        trials.append((p0,))
-                    except Exception:
-                        pass
-        for args in trials:
-            try:
-                f(*args)
-            except Exception:
-                continue
-            got = _xy(_try(c, "GetPosition")[0])
-            if got and abs(got[0] - x) <= 1e-3 * max(1.0, abs(x)) and abs(got[1] - y) <= 1e-3 * max(1.0, abs(y)):
-                return name
-    return None
-
-
-def tidy(pkg, ins):
-    """Every bus of the active diagram moved to its place in the layout."""
+def tidy(pkg, tr):
+    """Every bus of the active diagram moved to its place in the layout.
+       "" when done, else what stopped it."""
+    tr("import sliderPy")
     try:
         import sliderPy
     except Exception as e:
-        ins.append("no sliderPy in this PSS/E (%s) -- the buses stay where growbus put them" % e)
-        return "no sliderPy"
-    ins.append("sliderPy: " + _methods(sliderPy))
-    doc, e1 = _try(sliderPy, "GetActiveDocument")
-    diag, e2 = _try(doc, "GetDiagram") if doc is not None else (None, e1)
-    comps, e3 = _try(diag, "GetComponents") if diag is not None else (None, e2)
-    if doc is not None:
-        ins.append("document: " + _methods(doc))
-    if diag is not None:
-        ins.append("diagram: " + _methods(diag))
-    if comps is None:
-        ins.append("no components: %s" % (e3 or e2 or e1))
-        return "sliderPy gave no components (%s)" % (e3 or e2 or e1)
-    buses, seen = {}, set()
-    ins.append("components (%d):" % len(comps))
-    for c in comps:
-        ms, _e = _try(c, "GetMapString")
-        pos, _e = _try(c, "GetPosition")
-        t = type(c).__name__
-        ct, _e = _try(c, "GetType")
-        ins.append("  %-14s %-10s %-26r %r" % (t, ct, ms, _xy(pos) if _xy(pos) else pos))
-        if t not in seen:
-            seen.add(t)
-            ins.append("    methods of %s: %s" % (t, _methods(c)))
+        tr("  no sliderPy: %s" % e)
+        return "no sliderPy in this PSS/E"
+    tr("sliderPy.GetActiveDocument()")
+    doc = sliderPy.GetActiveDocument()
+    tr("  -> %s" % type(doc).__name__)
+    tr("document.GetDiagram()")
+    diag = doc.GetDiagram()
+    tr("  -> %s" % type(diag).__name__)
+    tr("diagram.GetComponents()")
+    comps = list(diag.GetComponents() or [])
+    tr("  -> %d component(s); classes: %s" % (len(comps), ", ".join(sorted(set(type(c).__name__ for c in comps)))))
+    buses = {}
+    for i, c in enumerate(comps):
+        if not hasattr(type(c), "GetMapString") and not hasattr(c, "GetMapString"):
+            continue
+        tr("component %d (%s).GetMapString()" % (i, type(c).__name__))
+        ms = c.GetMapString()
+        tr("  -> %r" % (ms,))
         m = _BUS_MS.match(str(ms or ""))
         if m:
             buses.setdefault(int(m.group(1)), c)
     want = dict((b, (x, y)) for b, x, y in pkg["buses"])
     found = [b for b in want if b in buses]
-    ins.append("buses found on the diagram: %d of %d" % (len(found), len(want)))
+    tr("buses found by map string: %d of %d" % (len(found), len(want)))
     if not found:
         return "no bus found on the diagram by its map string"
-    now = dict((b, _xy(_try(buses[b], "GetPosition")[0])) for b in found)
-    now = dict((b, p) for b, p in now.items() if p)
+    now = {}
+    for b in found:
+        tr("bus %d .GetPosition()" % b)
+        p = buses[b].GetPosition()
+        tr("  -> %r" % (p,))
+        if _xy(p):
+            now[b] = _xy(p)
     poi = pkg["buses"][0][0]
     if poi not in now:
         return "the POI %d has no position on the diagram" % poi
     s_auto = _nn(list(now.values()))
     s_ours = _nn([want[b] for b in now])
     k = (s_auto / s_ours if s_auto > 0 and s_ours > 0 else 1.0) * SCALE
-    ins.append("spacing: PSS/E's %.4g, the layout's %.4g -> scale %.4g" % (s_auto, s_ours, k))
+    tr("spacing: PSS/E's %.4g, the layout's %.4g -> scale %.4g" % (s_auto, s_ours, k))
     x0, y0 = now[poi]
     px, py = want[poi]
     sgn = -1.0 if FLIP_Y else 1.0
-    goal = dict((b, (x0 + k * (want[b][0] - px), y0 + sgn * k * (want[b][1] - py))) for b in found)
+    goal = dict((b, (x0 + k * (want[b][0] - px), y0 + sgn * k * (want[b][1] - py))) for b in now)
     tol = 1e-3 * max(1.0, s_auto)
-    if all(b in now and abs(now[b][0] - goal[b][0]) <= tol and abs(now[b][1] - goal[b][1]) <= tol
-           for b in found):
-        ins.append("every bus is already where the layout wants it")
+    if all(abs(now[b][0] - goal[b][0]) <= tol and abs(now[b][1] - goal[b][1]) <= tol for b in now):
+        tr("every bus is already where the layout wants it")
         return ""
-    moved, how, left = 0, set(), []
-    for b in found:
+    sample = buses[found[0]]
+    if not hasattr(type(sample), "SetPosition") and not hasattr(sample, "SetPosition"):
+        tr("no SetPosition on %s -- buses cannot be moved from Python here" % type(sample).__name__)
+        return "sliderPy offers no SetPosition (see slider_api.txt)"
+    moved, left = 0, []
+    for b in [x for x in found if x in goal]:
         tx, ty = goal[b]
-        name = _move(buses[b], tx, ty)
-        if name:
+        tr("bus %d .SetPosition(%.4f, %.4f)" % (b, tx, ty))
+        try:
+            buses[b].SetPosition(tx, ty)
+        except TypeError as e:
+            tr("  TypeError: %s -- stopping (the signature is not (x, y))" % e)
+            return "SetPosition takes other arguments (see the trace)"
+        tr("bus %d .GetPosition() to check" % b)
+        got = _xy(buses[b].GetPosition())
+        tr("  -> %r" % (got,))
+        if got and abs(got[0] - tx) <= tol and abs(got[1] - ty) <= tol:
             moved += 1
-            how.add(name)
         else:
             left.append(b)
-        if not name and moved == 0 and len(left) >= 3:
-            break                       # no setter works here: stop trying
-    ins.append("moved %d bus(es)%s%s" % (moved, (" with " + "/".join(sorted(how))) if how else "",
-                                        ("; not moved: %s" % ", ".join(str(b) for b in left[:12])) if left else ""))
-    if moved:
-        for obj, nm in ((psspy, "refreshdiagfile"), (diag, "Refresh"), (doc, "Refresh")):
-            r, e = _try(obj, nm)
-            if not e:
-                ins.append("%s() done" % nm)
+            if moved == 0 and len(left) >= 2:
+                tr("SetPosition did not move the first buses -- stopping")
                 break
-    return "" if moved and not left else ("%d of %d moved" % (moved, len(found)) if moved
-                                          else "no move took (see the inspect file)")
+    if moved and hasattr(psspy, "refreshdiagfile"):
+        tr("psspy.refreshdiagfile()")
+        psspy.refreshdiagfile()
+    tr("moved %d of %d" % (moved, len(found)))
+    return "" if moved == len(found) else ("%d of %d moved" % (moved, len(found)) if moved
+                                           else "no move took (see the trace)")
 
 
 def draw(pkg, last):
@@ -1470,76 +1526,70 @@ def draw(pkg, last):
     if SKIP_EXISTING and os.path.isfile(sld):
         say("%-22s %s.sld is already there -- left as it is" % (name, name))
         return True
-    ie = _ie(psspy.case(os.path.join(d, name + ".sav")))
-    if ie not in (0, None):
-        say("%-22s *** could not open %s.sav (ierr %s)" % (name, name, ie))
-        return False
-    ie = _ie(psspy.newdiagfile())
-    if ie not in (0, None):
-        say("%-22s *** newdiagfile ierr %s" % (name, ie))
-        return False
-    bad = []
-    for b, x, y in pkg["buses"]:
+    tr = Trace(_free(os.path.join(_out_dir(), "slider_trace_%s.txt" % name)))
+    tr("%s -- %s" % (name, time.strftime("%Y-%m-%d %H:%M:%S")))
+    try:
+        tr("psspy.case(%s.sav)" % name)
+        ie = _ie(psspy.case(os.path.join(d, name + ".sav")))
+        if ie not in (0, None):
+            say("%-22s *** could not open %s.sav (ierr %s)" % (name, name, ie))
+            return False
+        tr("psspy.newdiagfile()")
+        ie = _ie(psspy.newdiagfile())
+        if ie not in (0, None):
+            say("%-22s *** newdiagfile ierr %s" % (name, ie))
+            return False
+        bad = []
+        for b, x, y in pkg["buses"]:
+            tr("psspy.growbus(%d, %.4f, %.4f)" % (b, x * SCALE, y * SCALE))
+            try:
+                ie = _ie(psspy.growbus(b, x * SCALE, y * SCALE * (-1.0 if FLIP_Y else 1.0)))
+            except Exception as e:
+                ie = e
+            if ie not in (0, None):
+                bad.append("%d (%s)" % (b, ie))
+        if MOVE_BUSES:
+            try:
+                note = tidy(pkg, tr)
+            except Exception as e:
+                note = "%s: %s" % (type(e).__name__, e)
+                tr("  %s" % note)
+        else:
+            note = "MOVE_BUSES = False"
+        out = _free(sld)
+        tr("psspy.savediagfile(%s)" % os.path.basename(out))
         try:
-            ie = _ie(psspy.growbus(b, x * SCALE, y * SCALE * (-1.0 if FLIP_Y else 1.0)))
+            ie = _ie(psspy.savediagfile(out))
         except Exception as e:
             ie = e
-        if ie not in (0, None):
-            bad.append("%d (%s)" % (b, ie))
-    ins = ["%s -- %s" % (name, time.strftime("%Y-%m-%d %H:%M"))]
-    note = tidy(pkg, ins) if MOVE_BUSES else "MOVE_BUSES = False"
-    try:
-        p = _free(os.path.join(_out_dir(), "slider_inspect_%s.txt" % name))
-        with open(p, "w") as fh:
-            fh.write("\n".join(str(x) for x in ins) + "\n")
-    except Exception:
-        p = None
-    out = _free(sld)
-    try:
-        ie = _ie(psspy.savediagfile(out))
-    except Exception as e:
-        ie = e
-    ok = os.path.isfile(out) and os.path.getsize(out) > 0
-    if ok:
-        say("%-22s written %s -- %d of %d buses drawn%s" % (name, out, len(pkg["buses"]) - len(bad),
-                                                           len(pkg["buses"]),
-                                                           ("; tidied" if not note else "; NOT tidied: " + note)))
-    else:
-        say("%-22s *** %s not written (savediagfile gave %s)" % (name, os.path.basename(out), ie))
-    if bad:
-        say("    %d bus(es) not drawn: %s" % (len(bad), ", ".join(bad[:10])))
-    if not (last and LEAVE_LAST_OPEN and ok):
-        try:
-            psspy.closediagfile()
-        except Exception:
-            pass
-    return ok and not bad
-
-
-def _api_help():
-    """The help text of the diagram calls, kept when one of them failed."""
-    p = _free(os.path.join(_out_dir(), "slider_api_help.txt"))
-    try:
-        with open(p, "w") as fh:
-            for n in ("newdiagfile", "growbus", "growbuslevels", "savediagfile", "closediagfile",
-                      "opendiagfile", "refreshdiagfile"):
-                f = getattr(psspy, n, None)
-                fh.write("==== psspy.%s: %s\n%s\n\n" % (n, "present" if f else "NOT in this PSS/E",
-                                                         (getattr(f, "__doc__", "") or "") if f else ""))
-            fh.write("==== psspy names about diagrams: %s\n" % ", ".join(
-                n for n in dir(psspy) if re.search(r"diag|grow|slid|draw|sld", n, re.I)))
-        say("help text of the diagram calls: %s" % p)
-    except Exception:
-        pass
+        ok = os.path.isfile(out) and os.path.getsize(out) > 0
+        if ok:
+            say("%-22s written %s -- %d of %d buses drawn%s"
+                % (name, out, len(pkg["buses"]) - len(bad), len(pkg["buses"]),
+                   "; tidied" if not note else "; NOT tidied: " + note))
+        else:
+            say("%-22s *** %s not written (savediagfile gave %s)" % (name, os.path.basename(out), ie))
+        if bad:
+            say("    %d bus(es) not drawn: %s" % (len(bad), ", ".join(bad[:10])))
+        if not (last and LEAVE_LAST_OPEN and ok):
+            tr("psspy.closediagfile()")
+            try:
+                psspy.closediagfile()
+            except Exception:
+                pass
+        tr("done")
+        return ok and not bad
+    finally:
+        tr.close()
 
 
 def main():
     say("One-line diagrams of the plant packages -- %s" % time.strftime("%Y-%m-%d %H:%M"))
+    api_dump()
     n = 0
     for k, pkg in enumerate(PACKAGES):
         n += 1 if draw(pkg, k == len(PACKAGES) - 1) else 0
     say("%d of %d diagram(s) in place" % (n, len(PACKAGES)))
-    _api_help()
     try:
         p = _free(os.path.join(_out_dir(), "DRAW_SLD_IN_PSSE_GUI_log.txt"))
         with open(p, "w") as fh:
@@ -1768,7 +1818,7 @@ def one_project(proj, cfg, out_root, log):
         unit_buses = set(k[0] for k, m in units)
         tri = [set((a, b, c)) for kind, a, b, c, _ck, st in branches
                if kind == "3W" and a in allb and b in allb and c in allb]
-        pos, _par, kids, order = tree_layout(adj, poi, keep, unit_buses, SLD_DX, SLD_DY, tri)
+        pos, _par, kids, order = tree_layout(adj, poi, keep, unit_buses, SLD_DX, SLD_DY, tri, SLD_UNITS_BOTTOM)
         if not SLD_POI_ON_TOP:
             pos = dict((b, (x, -y)) for b, (x, y) in pos.items())
         kind_of = {}
@@ -1803,7 +1853,7 @@ def one_project(proj, cfg, out_root, log):
         sld = None
     return {"proj": proj, "name": name, "poi": poi, "stem": stem, "tags": tags, "work": work, "pkg": pkg,
             "sav_o": sav_o, "buses": buses, "keep": keep, "units": units, "mach_full": mach_full,
-            "loads_full": loads_full, "sld": sld}
+            "loads_full": loads_full, "sld": sld, "sgf": sorted(set(k[0] for k, m in sgf_u))}
 
 
 def _read_dyr(path):
@@ -1819,6 +1869,43 @@ def _read_dyr(path):
 
 def _st_txt(st):
     return "[%s]" % ", ".join("default" if v == _i else str(v) for v in st)
+
+
+def _lib_name(model):
+    """The library name PSS/E writes a 'U' model out under: REGCAU1 -> REGCA1
+       (seen on the user's PSS/E: dyda gives the SGF's REGCAU1 / REPCAU1 and
+       East Fork's REECAU1 ... WTTQAU1 as REGCA1, REPCA1, REECA1 ... WTTQA1)."""
+    return model[:-2] + "1" if len(model) > 3 and model.endswith("U1") else None
+
+
+def _rkey(r):
+    """(model, anchor bus, id) of a record -- id only for one keyed by its bus."""
+    return (r.model, r.anchor, _rid(r.toks[1]) if r.first_bus and len(r.toks) > 1 else None)
+
+
+def u_pairs(as_run, deck):
+    """(records, notes): every as-run record written under a library name where
+       the deck has the 'U' model on the same unit (REGCA1 for REGCAU1) is
+       replaced by the deck's record -- the one the study loaded -- so the
+       package does not carry both."""
+    u_at = collections.defaultdict(list)
+    for d in deck:
+        ln = _lib_name(d.model)
+        if ln and d.first_bus:
+            u_at[(ln,) + _rkey(d)[1:]].append(d)
+    have = set(_rkey(r) for r in as_run)
+    out, swapped = [], []
+    for r in as_run:
+        ds = u_at.get(_rkey(r)) if r.first_bus else None
+        if ds and (ds[0].model,) + _rkey(r)[1:] not in have:
+            d = ds.pop(0)
+            out.append(d)
+            swapped.append("%s at %s '%s'" % (d.model, r.anchor, _rkey(r)[2]))
+        else:
+            out.append(r)
+    notes = (["'U' models PSS/E writes out under the library name (REGCA1 for REGCAU1 ...): the deck's record "
+              "is kept for %s" % ", ".join(swapped)] if swapped else [])
+    return out, notes
 
 
 _DYDA_FOUND = {}        # the option set the first plant's search settled on, for the others
@@ -1984,7 +2071,12 @@ def plant_dynamics(ctx, log):
     def judge(text):
         mine = plant_records(text, keep, poi, allbus, True, ids_at)[0]
         have = set(r.model for r in mine)
-        return len(mine), [m for m in need if m not in have]
+        return len(mine), [m for m in need if m not in have and _lib_name(m) not in have]
+    sgf = set(ctx.get("sgf") or [])
+
+    def egf_rec(r):
+        """A record of the existing plant (not on, nor naming, an SGF unit)."""
+        return EGF_FROM_DECK and r.anchor not in sgf and not (set(r.refs) & sgf)
     have_snp = os.path.isfile(cnv) and os.path.isfile(snp)
     if have_snp:
         log("dynamics       : snapshot %s (%s) with %s" % (snp, _when(snp), os.path.basename(cnv)))
@@ -2006,13 +2098,16 @@ def plant_dynamics(ctx, log):
     if as_run_txt is not None:
         recs, dnotes = plant_records(as_run_txt, keep, poi, allbus, True, ids_at)
         if deck_txt is not None:
+            recs, unotes = u_pairs(recs, drecs)
+            dnotes += unotes
             if dyda_lacks:                       # models the dump has none of: the deck's records stand in
-                extra = [r for r in drecs if r.model in dyda_lacks]
+                have = set(_rkey(r) for r in recs)
+                extra = [d for d in drecs if d.model in dyda_lacks and _rkey(d) not in have]
                 recs += extra
                 if extra:
                     log("WARNING: %d plant record(s) from the deck text (%s): the dump has none of these models"
                         % (len(extra), ", ".join(sorted(set(r.model for r in extra)))))
-            texts, mnotes, n_deck = merge_records(recs, drecs)
+            texts, mnotes, n_deck = merge_records(recs, drecs, egf_rec)
             log("records        : %d as run -- %d keep the deck's own text, %d are written as PSS/E holds them"
                 % (len(recs), n_deck, len(recs) - n_deck))
             dnotes += mnotes
