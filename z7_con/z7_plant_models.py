@@ -54,6 +54,11 @@
      converted, the .dyr read (dyre_new), initialised (strt) and run with no
      disturbance for FLAT_RUN_S seconds; the largest drift of every unit's
      P, Q and terminal voltage is reported.
+     It runs in a PSS/E of its own (VALIDATE_OWN_PROCESS): a fresh PSS/E, the
+     package loaded as the client loads it. If PSS/E crashes there, the check
+     file names the step it died in, with PSS/E's last messages, and the other
+     plants go on. When it dies reading the .dyr, a few more such runs read
+     the records model by model and name the model that takes PSS/E down.
 
    ONE-LINE DIAGRAM (SLD = True)
      <name>.sld, drawn by PSS/E itself (newdiagfile / growbus / savediagfile)
@@ -85,6 +90,8 @@ import sys
 import re
 import time
 import glob
+import json
+import subprocess
 import collections
 import traceback
 
@@ -119,6 +126,10 @@ TOL_MW = 0.5                      # unit P / Q / bus V against the full case: la
 TOL_MVAR = 1.0
 TOL_V_PU = 0.001
 VALIDATE = True                   # load each package back, initialise it and run it flat
+VALIDATE_OWN_PROCESS = True       # True = that check runs in a PSS/E of its own: if PSS/E crashes there, the
+                                  # step it died in is named (and the model, when it is the .dyr) and the
+                                  # other plants go on | False = in this process, as before
+VALIDATE_TIMEOUT_S = 1800         # a check run still going after this long is stopped and reported
 FLAT_RUN_S = 10.0
 FLAT_TOL = (0.5, 0.5, 0.001)      # MW, MVAr, pu: a larger drift in the flat run is listed for review
 ADDLIB_IDV = ""                   # "" = the study's own (ADDLIB_IDV of z7_spp_p_f.py, in the case folder)
@@ -674,9 +685,9 @@ def idv_dlls(path):
         t = ln.strip()
         if not t or t.startswith("@!") or t.startswith("!") or t.startswith("/"):
             continue
-        m = re.search(r"ADDMODELLIBRARY\s*[, ]\s*['\"]?([^'\";]+?)['\"]?\s*;?\s*$", t, re.I)
-        if m:
-            dlls.append(os.path.normpath(_abs(m.group(1).strip(), base)))
+        m = re.search(r"ADDMODELLIBRARY\s*[, ]\s*(?:'([^']+)'|\"([^\"]+)\"|([^\s,;'\"]+))", t, re.I)
+        if m:                                       # (whatever follows the path -- a comment -- is not part of it)
+            dlls.append(os.path.normpath(_abs((m.group(1) or m.group(2) or m.group(3)).strip(), base)))
         elif not re.match(r"^(BAT_)?(END|ECHO)\b", t, re.I):
             other = True
     return dlls, other
@@ -2154,26 +2165,66 @@ def plant_dynamics(ctx, log):
 def validate(name, sav_o, dyr_o, work, units, log):
     log("")
     log("VALIDATION -- the package loaded back from its own files, in %s" % work)
+    if VALIDATE_OWN_PROCESS and _python_exe():
+        _validate_apart(name, sav_o, dyr_o, work, units, log)
+    else:
+        if VALIDATE_OWN_PROCESS:
+            log("  (in this process: %r is not a Python to start a PSS/E of its own with)" % sys.executable)
+        _validate_here(name, sav_o, dyr_o, work, units, log)
+
+
+_PROBLEM = r"error|not found|no model|not modeled|invalid|ignored"
+
+
+def _load_back(sav_o, log, step):
+    """The package's .sav opened, solved and converted, the user-model DLLs
+       loaded -- everything before its .dyr is read. True when it solved."""
+    step("case %s" % sav_o)
+    if not _ok(psspy.case(sav_o)):
+        log("  *** the .sav does not open")
+        return False
+    step("solve (fnsl)")
+    if not solve():
+        log("  *** the .sav does not solve")
+        return False
+    step("cong / conl / ordr / fact / tysl")
+    psspy.cong(0)
+    for opt in (1, 2, 3):
+        psspy.conl(0, 1, opt, [0, 0], [100.0, 0.0, 0.0, 100.0])
+    psspy.ordr(0)
+    psspy.fact()
+    psspy.tysl(0)
+    step("user-model DLLs (each DLL line in the log was loaded before the next)")
+    load_libraries(log, whole_idv=False)
+    return True
+
+
+def _dyre(dyr, work, tag, log, step):
+    """dyre_new on `dyr` (its CONEC / CONET files named after `tag`); its ierr."""
+    step("dyre_new %s" % dyr)
+    ie = _ie(psspy.dyre_new([1, 1, 1, 1], dyr, os.path.join(work, tag + "_conec.flx"),
+                            os.path.join(work, tag + "_conet.flx"), os.path.join(work, tag + "_compile.bat")))
+    log("  dyre_new            : %s" % ("ok" if ie in (0, None) else "*** ierr %s" % ie))
+    return ie
+
+
+def _validate_here(name, sav_o, dyr_o, work, units, log, step=None, tag=None):
+    """The check run in this process. step(what) is called before each PSS/E
+       call: in a check run of its own it is on disk first, so a crash names
+       the step."""
+    step = step or (lambda what: None)
+    tag = tag or (name + "_validate")
     cwd = os.getcwd()
-    prefix = os.path.join(work, name + "_validate")
+    prefix = os.path.join(work, tag)
     out = os.path.join(work, name + "_flat.out")
     ran = False
     try:
         os.chdir(work)
         outputs_to(prefix)
-        if not (_ok(psspy.case(sav_o)) and solve()):
-            log("  *** the .sav does not open and solve")
+        if not _load_back(sav_o, log, step):
             return
-        psspy.cong(0)
-        for opt in (1, 2, 3):
-            psspy.conl(0, 1, opt, [0, 0], [100.0, 0.0, 0.0, 100.0])
-        psspy.ordr(0)
-        psspy.fact()
-        psspy.tysl(0)
-        load_libraries(log, whole_idv=False)
-        ie = _ie(psspy.dyre_new([1, 1, 1, 1], dyr_o, os.path.join(work, "conec.flx"),
-                                os.path.join(work, "conet.flx"), os.path.join(work, "compile.bat")))
-        log("  dyre_new            : %s" % ("ok" if ie in (0, None) else "*** ierr %s" % ie))
+        ie = _dyre(dyr_o, work, tag, log, step)
+        step("dynamics_solution_param_2 / channels")
         n, a, t, d, ff = DYN_PARAMS
         psspy.dynamics_solution_param_2([n, _i, _i, _i, _i, _i, _i, _i], [a, t, d, ff, _f, _f, _f, _f])
         try:
@@ -2184,10 +2235,12 @@ def validate(name, sav_o, dyr_o, work, units, log):
             if m["st"] == 1:
                 for code, q in ((2, "P"), (3, "Q"), (4, "V")):
                     psspy.machine_array_channel([-1, code, k[0]], k[1], "%s %d %s" % (q, k[0], k[1]))
+        step("strt_2 (initialisation)")
         ie = _ie(psspy.strt_2([0, 1], out))
         log("  strt_2              : %s" % ("ok" if ie in (0, None) else "*** ierr %s" % ie))
         if ie not in (0, None):
             return
+        step("run to %.1f s" % FLAT_RUN_S)
         ie = _ie(psspy.run(0, FLAT_RUN_S, 0, 1, 0))
         log("  run to %.1f s        : %s" % (FLAT_RUN_S, "ok" if ie in (0, None) else "*** ierr %s" % ie))
         ran = ie in (0, None)
@@ -2201,11 +2254,237 @@ def validate(name, sav_o, dyr_o, work, units, log):
             log("  initial conditions  : SUSPECT -- see %s_progress.txt" % prefix)
         elif re.search(r"INITIAL CONDITIONS CHECK O\.?K", txt, re.I):
             log("  initial conditions  : check o.k.")
-        for ln in [x.strip() for x in txt.splitlines()
-                   if re.search(r"error|not found|no model|not modeled|invalid|ignored", x, re.I)][:15]:
+        for ln in [x.strip() for x in txt.splitlines() if re.search(_PROBLEM, x, re.I)][:15]:
             log("    | " + ln[:150])
     if ran:
+        step("flat-run report (dyntools)")
         flat_report(out, log)
+
+
+# ============================================================================
+# THE CHECK RUN IN A PSS/E OF ITS OWN (VALIDATE_OWN_PROCESS)
+# ============================================================================
+# This script, started again with --validate <job> (or --dyreprobe <job>),
+# in the package's work folder: a fresh PSS/E -- nothing of the study's
+# snapshot or add-library file in it, the package loaded as the client loads
+# it -- and a PSS/E crash there takes down only that process. Before each
+# PSS/E call it writes the step to <tag>_steps.txt (flushed to disk), and its
+# log lines go to <tag>_log.txt the same way; what PSS/E and Python printed
+# is in <tag>_console.txt.
+_CRASH = {0xC0000005: "an access violation", 0xC00000FD: "a stack overflow",
+          0xC0000409: "a fatal error (stack buffer overrun)", 0xC0000374: "heap corruption",
+          0xC000001D: "an illegal instruction", 0xC0000094: "an integer divide by zero"}
+PROBE_RUNS_MAX = 8                # check runs at most to find the model PSS/E dies on
+
+
+def _python_exe():
+    """sys.executable when it is a Python that can run this script (not
+       PSS/E's own program, as inside the GUI), else ''."""
+    exe = sys.executable or ""
+    return exe if (os.path.isfile(exe) and "python" in os.path.basename(exe).lower()) else ""
+
+
+def _disk(fh, text):
+    fh.write(text)
+    fh.flush()
+    try:
+        os.fsync(fh.fileno())
+    except Exception:
+        pass
+
+
+class _Steps(object):
+    def __init__(self, path):
+        self.fh = open(_new(path), "w", encoding="utf-8")
+
+    def __call__(self, what):
+        _disk(self.fh, "%s  %s\n" % (time.strftime("%H:%M:%S"), what))
+
+
+class _FileLog(Log):
+    """Log lines straight to disk (not the screen: the run that started this
+       one shows them)."""
+    def __init__(self, path):
+        Log.__init__(self)
+        self.fh = open(_new(path), "w", encoding="utf-8")
+
+    def __call__(self, msg=""):
+        self.lines.extend(str(msg).split("\n"))
+        _disk(self.fh, str(msg) + "\n")
+
+
+def _lines(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return [ln.rstrip("\n") for ln in fh]
+    except Exception:
+        return []
+
+
+def _how(rc):
+    if rc is None:
+        return "still running after %d s, so it was stopped" % VALIDATE_TIMEOUT_S
+    u = rc & 0xFFFFFFFF
+    if u in _CRASH:
+        return "PSS/E crashed: %s (exit code 0x%08X)" % (_CRASH[u], u)
+    if rc < 0:
+        return "PSS/E crashed (signal %d)" % -rc
+    return "it ended with exit code %d" % rc
+
+
+def _child(mode, job, work, tag):
+    """This script in a PSS/E of its own on `job`, in `work`:
+       (exit code -- None when it timed out --, its log lines, its last step)."""
+    job = dict(job, work=work, tag=tag)
+    jpath = _new(os.path.join(work, tag + "_job.json"))
+    with open(jpath, "w", encoding="utf-8") as fh:
+        json.dump(job, fh, indent=1)
+    with open(_new(os.path.join(work, tag + "_console.txt")), "w") as con:
+        try:
+            rc = subprocess.call([_python_exe(), os.path.abspath(__file__), mode, jpath], cwd=work,
+                                 stdout=con, stderr=subprocess.STDOUT, timeout=VALIDATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            rc = None
+    steps = _lines(os.path.join(work, tag + "_steps.txt"))
+    return rc, _lines(os.path.join(work, tag + "_log.txt")), (steps[-1] if steps else "")
+
+
+def _done(rc, last):
+    return rc == 0 and last.endswith("  DONE")
+
+
+def _validate_apart(name, sav_o, dyr_o, work, units, log):
+    tag = name + "_validate"
+    log("  (in a PSS/E of its own: %s_steps.txt / _log.txt / _console.txt)" % tag)
+    rc, lines, last = _child("--validate", {"name": name, "sav": sav_o, "dyr": dyr_o,
+                                            "units": [[k[0], k[1], m["st"]] for k, m in units]}, work, tag)
+    for ln in lines:
+        log(ln)
+    if _done(rc, last):
+        return
+    log("  *** the check run did not finish: %s -- in the step: %s"
+        % (_how(rc), last.split("  ", 1)[-1] if last else "starting Python / PSS/E"))
+    txt = read_outputs(os.path.join(work, tag))
+    bad = [x.strip() for x in txt.splitlines() if re.search(_PROBLEM, x, re.I)][:15]
+    tail = [x.rstrip() for x in txt.splitlines() if x.strip()][-12:]
+    if bad or tail:
+        log("    PSS/E's last messages (%s_progress.txt / _alerts.txt):" % tag)
+        for ln in bad + [x for x in tail if x.strip() not in bad]:
+            log("    | " + ln[:150])
+    con = [x for x in _lines(os.path.join(work, tag + "_console.txt")) if x.strip()]
+    if any("Traceback" in x or "Error" in x for x in con):
+        log("    its console (%s_console.txt):" % tag)
+        for ln in con[-12:]:
+            log("    | " + ln[:150])
+    if "dyre_new" in last:
+        _dyre_probe(name, sav_o, dyr_o, work, log)
+    log("  the package files are written -- it is this check run that did not finish")
+
+
+def _model_of(rec):
+    toks = _TOK.findall(_data(rec))
+    if len(toks) < 2:
+        return "?"
+    m = toks[1].strip("'\"").strip().upper()
+    at = _USR_NAME_AT.get(m)
+    return toks[at].strip("'\"").strip().upper() if at and len(toks) > at else m
+
+
+def _dyre_probe(name, sav_o, dyr_o, work, log):
+    """PSS/E died reading the package's .dyr: which model takes it down? Each
+       probe reads the records of the first k models (in the .dyr's order) in
+       a PSS/E of its own; the fewest models that take it down end with the one
+       to blame (a halving search), then that model is read on its own."""
+    with open(dyr_o, encoding="utf-8", errors="replace") as fh:
+        recs = dyr_records(fh.read())
+    order = []
+    for r in recs:
+        m = _model_of(r)
+        if m not in order:
+            order.append(m)
+    runs = []
+
+    def dies(models):
+        """True: PSS/E died reading these records; False: they read; None: it
+           died somewhere else (then no model can be blamed)."""
+        k = len(runs) + 1
+        tag = "%s_probe%d" % (name, k)
+        part = [r for r in recs if _model_of(r) in models]
+        p = _new(os.path.join(work, tag + ".dyr"))
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(part) + "\n")
+        rc, _l, last = _child("--dyreprobe", {"name": name, "sav": sav_o, "dyr": p}, work, tag)
+        step = last.split("  ", 1)[-1] if last else "starting Python / PSS/E"
+        died = None if not _done(rc, last) and "dyre_new" not in step else not _done(rc, last)
+        what = "+".join(models) if len(models) <= 3 else "the first %d models (to %s)" % (len(models), models[-1])
+        runs.append("%s (%s.dyr): %s" % (what, tag, "read without a crash" if died is False else
+                                         "PSS/E died reading them -- %s" % _how(rc) if died else
+                                         "PSS/E died before the .dyr, in: %s -- %s" % (step, _how(rc))))
+        return died
+    log("  the .dyr's %d models, in its order: %s" % (len(order), ", ".join(order)))
+    lo, hi, why = 0, len(order), None   # the first lo models read; all hi took PSS/E down in the check run
+    while hi - lo > 1 and len(runs) < PROBE_RUNS_MAX - 1:
+        mid = (lo + hi) // 2
+        d = dies(order[:mid])
+        if d is None:
+            why = "a probe died before it read the .dyr, so no model can be blamed"
+            break
+        if d:
+            hi = mid
+        else:
+            lo = mid
+    if why is None and hi - lo > 1:
+        why = "it stopped after %d check runs: PSS/E dies once one of %s is read" % (len(runs), ", ".join(order[lo:hi]))
+    if why:
+        log("  *** the model search did not settle: %s" % why)
+    else:
+        culprit = order[hi - 1]
+        alone = dies([culprit])
+        at = ["%s" % " ".join(_TOK.findall(_data(r))[:3]) for r in recs if _model_of(r) == culprit]
+        log("  *** PSS/E dies reading the %s records (%d: %s%s)%s" % (
+            culprit, len(at), ", ".join(at[:6]), " ..." if len(at) > 6 else "",
+            "" if hi == 1 else "; the %d model(s) before it read without a crash" % (hi - 1)))
+        log("      %s" % ("read on its own, it takes PSS/E down too" if alone else
+                          "read on its own it does not -- only together with the models before it"
+                          if alone is False else "read on its own: PSS/E died before the .dyr (see below)"))
+    for ln in runs:
+        log("      probe -- " + ln)
+
+
+def _probe_here(job, log, step):
+    work, tag = job["work"], job["tag"]
+    prefix = os.path.join(work, tag)
+    outputs_to(prefix)
+    try:
+        if _load_back(job["sav"], log, step):
+            _dyre(job["dyr"], work, tag, log, step)
+    finally:
+        outputs_back()
+
+
+def _child_main(mode, jpath):
+    """--validate / --dyreprobe: one check run (see above). 0 when it ran to
+       the end (whatever it found)."""
+    with open(jpath, encoding="utf-8") as fh:
+        job = json.load(fh)
+    work, tag = job["work"], job["tag"]
+    step = _Steps(os.path.join(work, tag + "_steps.txt"))
+    log = _FileLog(os.path.join(work, tag + "_log.txt"))
+    try:
+        os.chdir(work)
+        step("PSS/E start (psseinit)")
+        psse_start()
+        if mode == "--validate":
+            units = [((int(b), str(i)), {"st": int(st)}) for b, i, st in job["units"]]
+            _validate_here(job["name"], job["sav"], job["dyr"], work, units, log, step, tag)
+        else:
+            _probe_here(job, log, step)
+        step("DONE")
+        return 0
+    except Exception:
+        log("  *** " + traceback.format_exc().strip().replace("\n", "\n      "))
+        step("stopped by a Python error (in its log)")
+        return 3
 
 
 def flat_report(out, log):
@@ -2295,4 +2574,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] in ("--validate", "--dyreprobe"):
+        sys.exit(_child_main(sys.argv[1], sys.argv[2]))
     main()
