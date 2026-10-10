@@ -51,8 +51,17 @@
      disturbance for FLAT_RUN_S seconds; the largest drift of every unit's
      P, Q and terminal voltage is reported.
 
+   ONE-LINE DIAGRAM (SLD = True)
+     <name>.sld, drawn by PSS/E itself (newdiagfile / growbus / savediagfile)
+     with every bus placed by this script as a tidy tree: the POI and its
+     infinite bus on top, each gen-tie straight down to its main transformer,
+     the collector bus below, every feeder's GSU and unit straight below that
+     -- EGF feeders on the left, SGF on the right, one column per unit, one row
+     per level, so every connection runs straight. The same layout is written
+     as _check\\<name>_layout.svg, to compare with what PSS/E drew.
+
    OUTPUT -- nothing that exists is ever overwritten or deleted
-     {OUT_DIR}\\<date_time>\\<name>\\<name>.sav / .raw / .dyr   the package
+     {OUT_DIR}\\<date_time>\\<name>\\<name>.sav / .raw / .dyr / .sld   the package
      {OUT_DIR}\\<date_time>\\_check\\<name>_CHECK.txt, SUMMARY.txt
      {OUT_DIR}\\<date_time>\\_work\\<name>\\                     dumps, validation run
 
@@ -103,6 +112,10 @@ FLAT_TOL = (0.5, 0.5, 0.001)      # MW, MVAr, pu: a larger drift in the flat run
 ADDLIB_IDV = ""                   # "" = the study's own (ADDLIB_IDV of z7_spp_p_f.py, in the case folder)
 DLLS = []                         # extra user-model DLLs (full paths), if any
 DYN_PARAMS = (60, 0.60, 0.0000095, 1.0 / 240.0, 0.033333)   # NITER, ACCEL, TOL, DELT, FREQFILT (the study's)
+SLD = True                        # also <name>.sld: the plant drawn as a tidy tree (POI on top, units at the bottom)
+SLD_DX = 2.0                      # diagram column spacing (PSS/E diagram units -- inches)
+SLD_DY = 1.6                      # diagram row spacing: one row per level below the POI
+SLD_POI_ON_TOP = True             # True = POI and infinite bus on top, units at the bottom | False = upside down
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _BATCH = 4000                     # buses per extr call
@@ -942,6 +955,216 @@ def merge_records(as_run, deck):
 
 
 # ============================================================================
+# ONE-LINE DIAGRAM -- a tidy tree hanging from the POI
+# ============================================================================
+def tree_layout(adj, poi, keep, unit_buses, dx, dy, tri=()):
+    """(positions {bus: (x, y)}, parent {bus: bus}, children {bus: [bus]}, order).
+
+       The plant as a tree hanging from the POI: the POI at (0, 0), every bus
+       one row (dy) below the bus that feeds it (first reached from the POI),
+       its children side by side under it. Each leaf takes its own column (dx);
+       a bus sits centred over its children, so every connection runs straight
+       down. Children are ordered by the lowest unit number below them: the EGF
+       feeders (their own numbers) come left of the SGF ones (999001..). The
+       other windings of a three-winding transformer (tri: its three buses) stay
+       side by side under the winding that feeds them, so PSS/E draws the
+       transformer in one place."""
+    nodes = set(keep) | set([poi])
+    parent, depth, order, front = {poi: None}, {poi: 0}, [poi], [poi]
+    while front:
+        nxt = []
+        for u in front:
+            for w in sorted(adj.get(u, ())):
+                if w in nodes and w not in depth:
+                    depth[w] = depth[u] + 1
+                    parent[w] = u
+                    order.append(w)
+                    nxt.append(w)
+        front = nxt
+    kids = collections.defaultdict(list)
+    for b in order[1:]:
+        kids[parent[b]].append(b)
+    low = {}
+    for b in reversed(order):                       # deepest first: the lowest unit number below b
+        cand = [b] if b in unit_buses else []
+        cand += [low[c] for c in kids[b] if low[c] is not None]
+        low[b] = min(cand) if cand else None
+    big = 10 ** 9
+
+    def lo(c):
+        return low[c] if low[c] is not None else big
+    for b in list(kids):
+        groups = collections.OrderedDict()
+        for c in kids[b]:
+            t = next((k for k, w in enumerate(tri) if b in w and c in w), None)
+            groups.setdefault(("t", t) if t is not None else ("b", c), []).append(c)
+        ordered = []
+        for _g, members in sorted(groups.items(), key=lambda gm: (min(lo(m) for m in gm[1]), min(gm[1]))):
+            ordered += sorted(members, key=lambda m: (lo(m), m))
+        kids[b] = ordered
+    col, slot = {}, [0]
+
+    def place(b):
+        if not kids[b]:
+            col[b] = float(slot[0])
+            slot[0] += 1
+            return
+        for c in kids[b]:
+            place(c)
+        col[b] = (col[kids[b][0]] + col[kids[b][-1]]) / 2.0
+    place(poi)
+    x0 = col[poi]
+    pos = dict((b, (round((col[b] - x0) * dx, 4), round(-depth[b] * dy, 4))) for b in order)
+    return pos, parent, kids, order
+
+
+def layout_svg(path, pos, kids, kind_of, info, units, poi, title, dx, dy, tri=()):
+    """The intended layout as an SVG drawing (bus bars, straight connections,
+       transformer and machine symbols, labels) -- to compare with the .sld.
+       Works either way up: symbols are drawn away from the bus that feeds them."""
+    px = 64.0                                       # pixels per diagram inch
+    xs = [p[0] for p in pos.values()]
+    ys = [p[1] for p in pos.values()]
+    left, right = min(xs) - 0.9 * dx, max(xs) + 1.9 * dx
+    top, bottom = max(ys) + 1.3 * dy, min(ys) - 1.3 * dy
+
+    def X(x):
+        return (x - left) * px
+
+    def Y(y):
+        return (top - y) * px
+
+    w, h = (right - left) * px, (top - bottom) * px
+    out = ['<svg xmlns="http://www.w3.org/2000/svg" width="%.0f" height="%.0f" viewBox="0 0 %.0f %.0f" '
+           'font-family="Arial" font-size="10">' % (w, h, w, h),
+           '<rect width="100%" height="100%" fill="white"/>',
+           '<text x="12" y="20" font-size="13" font-weight="bold">%s</text>' % _esc(title)]
+
+    def pline(x1, y1, x2, y2):                      # pixel coordinates
+        out.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#555" stroke-width="1.4"/>'
+                   % (x1, y1, x2, y2))
+
+    def circ(cx, cy, r, stroke="#333", fill="none", sw=1.2):
+        out.append('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s" stroke="%s" stroke-width="%.1f"/>'
+                   % (cx, cy, r, fill, stroke, sw))
+    par = {}
+    for b, cs in kids.items():
+        for c in cs:
+            par[c] = b
+    half = {}
+    for b, (x, y) in pos.items():
+        span = [pos[c][0] for c in kids.get(b, [])]
+        half[b] = max(0.32 * dx, (max(span) - min(span)) / 2.0 + 0.18 * dx if span else 0.0)
+    r = 0.11 * px
+    for b, cs in kids.items():                      # three-winding transformers: one symbol each
+        for wd in tri:
+            if b not in wd:
+                continue
+            ms = sorted((c for c in cs if c in wd), key=lambda c: pos[c][0])
+            if not ms:
+                continue
+            xm = X(sum(pos[c][0] for c in ms) / float(len(ms)))
+            pb, pc = Y(pos[b][1]), Y(pos[ms[0]][1])
+            d = 1.0 if pc > pb else -1.0           # +1: children drawn below their feeder
+            ps, pj = pb + (pc - pb) * 0.32, pc - (pc - pb) * 0.14
+            pline(xm, pb, xm, ps - d * r * 1.5)
+            for ox, oy in ((0, -0.75), (-0.65, 0.45), (0.65, 0.45)):
+                circ(xm + ox * r, ps + d * oy * r, r)
+            pline(xm, ps + d * r * 1.2, xm, pj)
+            pline(X(pos[ms[0]][0]), pj, X(pos[ms[-1]][0]), pj)
+            for c in ms:
+                pline(X(pos[c][0]), pj, X(pos[c][0]), Y(pos[c][1]))
+    for b, cs in kids.items():                      # other connections, straight down
+        for c in cs:
+            if any(b in wd and c in wd for wd in tri):
+                continue
+            x, p1, p2 = X(pos[c][0]), Y(pos[b][1]), Y(pos[c][1])
+            pline(x, p1, x, p2)
+            if kind_of.get(frozenset((b, c)), "LINE") in ("2W", "3W"):
+                pm = (p1 + p2) / 2.0
+                circ(x, pm - r * 0.7, r)
+                circ(x, pm + r * 0.7, r)
+    for b, (x, y) in pos.items():                   # bus bars and labels on top
+        kv = info.get(b, ("", 0.0))[1]
+        colr = "#1F3864" if kv >= 100 else ("#2E75B6" if kv >= 10 else "#7F7F7F")
+        out.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="4"/>'
+                   % (X(x - half[b]), Y(y), X(x + half[b]), Y(y), colr))
+        out.append('<text x="%.1f" y="%.1f">%d %s</text>' % (X(x + half[b]) + 4, Y(y) - 3, b,
+                                                             _esc(info.get(b, ("", 0))[0])))
+        out.append('<text x="%.1f" y="%.1f" fill="#555">%.1f kV</text>' % (X(x + half[b]) + 4, Y(y) + 10, kv))
+
+    def away(b):                                    # +1: draw below the bus, -1: above
+        if b in par:
+            return 1.0 if Y(pos[b][1]) > Y(pos[par[b]][1]) else -1.0
+        cs = kids.get(b, [])
+        return -1.0 if cs and Y(pos[cs[0]][1]) > Y(pos[b][1]) else 1.0
+    for b, mid in units:                            # machines on the free side of their bus
+        if b not in pos:
+            continue
+        d, x, y = away(b), X(pos[b][0]), Y(pos[b][1])
+        pline(x, y, x, y + d * 0.32 * dy * px)
+        cy = y + d * (0.32 * dy * px + 0.15 * px)
+        circ(x, cy, 0.15 * px, stroke="#C00000", fill="white", sw=1.5)
+        out.append('<text x="%.1f" y="%.1f" text-anchor="middle" fill="#C00000">%s</text>' % (x, cy + 3.5, _esc(mid)))
+    d, x, y = away(poi), X(pos[poi][0]), Y(pos[poi][1])  # the infinite bus on the free side of the POI
+    pline(x, y, x, y + d * 0.45 * dy * px)
+    cy = y + d * (0.45 * dy * px + 0.17 * px)
+    circ(x, cy, 0.17 * px, stroke="#1F3864", fill="white", sw=1.8)
+    out.append('<text x="%.1f" y="%.1f" font-weight="bold" fill="#1F3864">%s -- infinite bus</text>'
+               % (x + 0.25 * px, cy + 3.5, _esc(IB_ID)))
+    out.append("</svg>")
+    with open(_new(path), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+
+def _esc(t):
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def write_sld(sld_path, pos, order, work, log):
+    """<name>.sld drawn by PSS/E: a new diagram, every bus placed with growbus
+       at its layout position, saved. The help text of the diagram calls this
+       PSS/E has is kept in the work folder. True when the file was written."""
+    names = ("newdiagfile", "growbus", "growbuslevels", "savediagfile", "closediagfile", "opendiagfile")
+    try:
+        with open(_new(os.path.join(work, "diagram_api_help.txt")), "w", encoding="utf-8") as fh:
+            for n in names:
+                f = getattr(psspy, n, None)
+                fh.write("==== psspy.%s: %s\n%s\n\n" % (n, "present" if f else "NOT in this PSS/E",
+                                                         (getattr(f, "__doc__", "") or "") if f else ""))
+    except Exception:
+        pass
+    if not all(getattr(psspy, n, None) for n in ("newdiagfile", "growbus", "savediagfile")):
+        log("REVIEW: slider diagram not written -- this PSS/E has no newdiagfile / growbus / savediagfile")
+        return False
+    bad, ok = [], False
+    try:
+        ie = _ie(psspy.newdiagfile())
+        if ie not in (0, None):
+            log("REVIEW: slider diagram not written -- newdiagfile ierr %s" % ie)
+            return False
+        for b in order:
+            x, y = pos[b]
+            ie = _ie(psspy.growbus(b, x, y))
+            if ie not in (0, None):
+                bad.append("%d (ierr %s)" % (b, ie))
+        ie = _ie(psspy.savediagfile(_new(sld_path)))
+        ok = ie in (0, None) and os.path.isfile(sld_path) and os.path.getsize(sld_path) > 0
+        if not ok:
+            log("REVIEW: slider diagram not written -- savediagfile ierr %s" % ie)
+    except Exception as e:
+        log("REVIEW: slider diagram not written -- %s" % e)
+    finally:
+        try:
+            psspy.closediagfile()
+        except Exception:
+            pass
+    if bad:
+        log("REVIEW: slider diagram: %d bus(es) not placed: %s" % (len(bad), ", ".join(bad[:10])))
+    return ok
+
+
+# ============================================================================
 # ONE PROJECT
 # ============================================================================
 def one_project(proj, cfg, out_root, log):
@@ -1153,6 +1376,35 @@ def one_project(proj, cfg, out_root, log):
         return False
     log("written        : %s" % sav_o)
     log("written        : %s" % raw_o)
+    if SLD:
+        unit_buses = set(k[0] for k, m in units)
+        tri = [set((a, b, c)) for kind, a, b, c, _ck, st in branches
+               if kind == "3W" and a in allb and b in allb and c in allb]
+        pos, _par, kids, order = tree_layout(adj, poi, keep, unit_buses, SLD_DX, SLD_DY, tri)
+        if not SLD_POI_ON_TOP:
+            pos = dict((b, (x, -y)) for b, (x, y) in pos.items())
+        kind_of = {}
+        for kind, a, b, c, _ck, st in branches:
+            ends = [x for x in (a, b, c) if x]
+            if all(x in allb for x in ends):
+                for x in ends:
+                    for y in ends:
+                        if x != y:
+                            kind_of[frozenset((x, y))] = kind
+        try:
+            layout_svg(os.path.join(out_root, "_check", name + "_layout.svg"), pos, kids, kind_of,
+                       dict((b, (buses[b]["name"], buses[b]["kv"])) for b in allb),
+                       sorted(set((k[0], k[1]) for k, m in units)), poi,
+                       "%s -- one-line diagram layout (as placed in %s.sld)" % (name, name), SLD_DX, SLD_DY,
+                       tri)
+        except Exception as e:
+            log("  (layout preview not written: %s)" % e)
+        rows = max(abs(p[1]) for p in pos.values()) / SLD_DY + 1
+        cols = max(p[0] for p in pos.values()) - min(p[0] for p in pos.values())
+        if _ok(psspy.case(sav_o)) and write_sld(os.path.join(pkg, name + ".sld"), pos, order, work, log):
+            log("written        : %s (%d buses placed: %d rows, %.0f wide, POI at the %s)"
+                % (os.path.join(pkg, name + ".sld"), len(order), rows, cols,
+                   "top" if SLD_POI_ON_TOP else "bottom"))
     return {"proj": proj, "name": name, "poi": poi, "stem": stem, "tags": tags, "work": work, "pkg": pkg,
             "sav_o": sav_o, "buses": buses, "keep": keep, "units": units, "mach_full": mach_full,
             "loads_full": loads_full}
