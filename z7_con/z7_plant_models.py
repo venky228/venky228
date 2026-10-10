@@ -68,6 +68,8 @@
      -- EGF feeders on the left, SGF on the right, one column per unit, one row
      per level, so every connection runs straight. The same layout is written
      as _check\\<name>_layout.svg, to compare with what PSS/E drew.
+     The diagram needs only the network: DYNAMICS = False makes the packages'
+     .sav / .raw and the diagram file without reading any snapshot or deck.
      PSS/E draws slider diagrams only in its GUI: run from a command prompt,
      this script writes DRAW_SLD_IN_PSSE_GUI.py into the run folder instead.
      Open PSS/E, File > Run Automation File > that file: it draws every
@@ -125,6 +127,8 @@ SOLVE_OPTS = [0, 0, 0, 1, 0, 0, 0, 0]   # FNSL: taps, interchange, phase shift, 
 TOL_MW = 0.5                      # unit P / Q / bus V against the full case: larger is listed for review
 TOL_MVAR = 1.0
 TOL_V_PU = 0.001
+DYNAMICS = True                   # False = network and one-line diagram only (.sav, .raw, layout, GUI file):
+                                  # no snapshot, no add-library file or DLLs, no .dyr, no check run
 VALIDATE = True                   # load each package back, initialise it and run it flat
 VALIDATE_OWN_PROCESS = True       # True = that check runs in a PSS/E of its own: if PSS/E crashes there, the
                                   # step it died in is named (and the model, when it is the .dyr) and the
@@ -2545,16 +2549,22 @@ def main():
                 print("[plant-models] *** %s not written: %s" % (GUI_SLD, e))
         for proj, log in logs.items():                   # pass 2: .dyr, then loaded back and run flat
             cfg, done = PLANTS[proj], False
-            if ctxs.get(proj):
+            if ctxs.get(proj) and DYNAMICS:
                 print("")
                 print("[plant-models] %s: dynamics" % cfg["name"])
                 try:
                     done = plant_dynamics(ctxs[proj], log)
                 except Exception:
                     log("*** stopped: " + traceback.format_exc())
+            elif ctxs.get(proj):
+                log("")
+                log("dynamics       : not built (DYNAMICS = False) -- network and one-line diagram only")
             rv = log.review()
-            state = "written" if done else ("NOT complete: .sav and .raw written, no .dyr" if ctxs.get(proj)
-                                            else "NOT written")
+            if ctxs.get(proj) and not DYNAMICS:
+                state = "written: .sav and .raw (DYNAMICS = False, so no .dyr)"
+            else:
+                state = "written" if done else ("NOT complete: .sav and .raw written, no .dyr" if ctxs.get(proj)
+                                                else "NOT written")
             summary.append("%-22s %s" % (cfg["name"], state + (" -- %d line(s) to review in _check\\%s_CHECK.txt"
                                                                % (len(rv), cfg["name"]) if rv else "")))
             log.write(os.path.join(out_root, "_check", cfg["name"] + "_CHECK.txt"))
