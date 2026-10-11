@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """z7_overlay_v2.py -- BASE, SCENARIO 1 and SCENARIO 2 per fault:
-VOLTAGES and ROTOR ANGLES overlaid, P and Q side by side.
+VOLTAGES and ROTOR ANGLES overlaid, P and Q one case under another.
 
     Base case                 the system without the surplus facility
     Scenario 1 (GIA)          SGF + EGF, POI held at the GIA amount
     Scenario 2                SGF on, EGF off
 
 For every fault found in the case folders it reads the three .out files and
-writes ONE PDF, in three parts:
+writes ONE PDF, three plots to a page, in three parts:
 
     VOLTAGES       one panel per bus or unit, the three cases on the same axes:
                    faulted bus, POI, the plant's own buses, each SGF / EGF
@@ -15,8 +15,9 @@ writes ONE PDF, in three parts:
                    fault.
     ROTOR ANGLES   the same way: swing machine, SGF / EGF units, the machines
                    nearest the fault.
-    P AND Q        THREE PANELS SIDE BY SIDE -- Base case | Scenario 1 |
-                   Scenario 2 -- one row for P and one for Q, for:
+    P AND Q        ONE PAGE PER QUANTITY -- the P of a unit, say -- with the
+                   Base case, Scenario 1 and Scenario 2 one under another, full
+                   width, on one y scale; then the same unit's Q. For:
                      the POI (sum of the plant ties),
                      each SGF and EGF unit,
                      every machine the study FLAGGED for this fault (tripped
@@ -27,15 +28,19 @@ writes ONE PDF, in three parts:
 The flagged machines come from each case's own violations list, the
 02_VIOLATIONS_*.csv the study writes beside its results, so the pages follow
 the study's verdicts. A flagged machine's rotor angle and terminal voltage are
-added to the overlays too (ANGLES_OF_VIOLATED), and its rows say which case
+added to the overlays too (ANGLES_OF_VIOLATED), and its pages say which case
 flagged it and for what.
 
-The three cases are told apart by colour AND line style AND width, so the plot
-still reads printed in black and white or by a colour-blind reader:
+On the overlays the three cases are told apart by colour AND line style AND
+width, so the plot still reads printed in black and white or by a colour-blind
+reader:
 
     Base         black       solid
     Scenario 1   blue        dashed
     Scenario 2   vermilion   dash-dot
+
+A P or Q panel holds one case only, so it is drawn solid in that case's colour
+(PQ_SOLID_LINES) -- dashes break up a fast transient.
 
 RUN (PSS/E Python 3.4, needs dyntools and matplotlib):
     python z7_overlay_v2.py
@@ -80,20 +85,26 @@ PDF_NAME = "{project}_{fault}.pdf"       # file name per fault, e.g. SantaFe_F01
 OUT_DIR = r"overlay_v2_plots"            # under ROOT unless absolute (apart from z7_overlay.py's overlay_plots)
 ALIGN_TO_FAULT = False                   # False = simulation time, as the study plots | True = time from the fault (0 s = fault)
 T_MIN, T_MAX = 0.0, 20.0                 # seconds shown; None = the whole record
-MAX_POINTS = 800                         # points per trace; above this each block keeps its min AND max,
-                                         #   so spikes survive (smaller PDFs; 4000 = finer, bigger files)
+MAX_POINTS = 6000                        # points per trace: 20 s recorded every 1/4 cycle is 4800, so every point
+                                         #   is drawn (matplotlib's path simplification keeps the PDFs small).
+                                         #   Above this each block keeps its min AND max -- a fast oscillation then
+                                         #   turns into a solid band, so do not set it low (800 did exactly that)
 
 # ---- HOW EACH QUANTITY IS DRAWN ----------------------------------------------
 OVERLAY_QUANTITIES = ["V", "A"]          # ONE panel, the three cases on the same axes:
                                          #   "V" voltage (bus and unit terminal, pu), "A" rotor angle (deg)
-SIDE_BY_SIDE_QUANTITIES = ["P", "Q"]     # THREE panels in a row -- Base | Scenario 1 | Scenario 2:
+SEPARATE_QUANTITIES = ["P", "Q"]         # ONE PANEL PER CASE -- Base case, Scenario 1, Scenario 2:
                                          #   "P" active power (MW), "Q" reactive power (MVAr)
 PLOT_GROUPS = ["FAULT", "POI", "PLANT", "SGF", "EGF", "GEN"]   # faulted bus, POI, the plant's own buses,
                                          #   SGF units, EGF units, other machines
-PANELS_PER_PAGE = 4                      # overlay panels per page
-PQ_ROWS_PER_PAGE = 4                     # side-by-side rows per page (a machine's P and Q stay on one page)
-PQ_SAME_SCALE = True                     # the three panels of a row share one y scale, so they compare at a glance
-PQ_MIN_SPAN = 2.0                        # smallest y range of a P / Q row (MW / MVAr): a flat trace is not blown up
+PANELS_PER_PAGE = 3                      # overlay panels per page
+PQ_LAYOUT = "stacked"                    # "stacked": one page per P or Q, the three cases one under another, full
+                                         #   width (a unit's P page, then its Q page) | "rows": three small panels
+                                         #   side by side, PQ_ROWS_PER_PAGE rows to a page
+PQ_ROWS_PER_PAGE = 4                     # rows per page with PQ_LAYOUT = "rows"
+PQ_SOLID_LINES = True                    # a P / Q panel holds one case, so it is drawn solid in that case's colour
+PQ_SAME_SCALE = True                     # the three panels of a quantity share one y scale, so they compare at a glance
+PQ_MIN_SPAN = 2.0                        # smallest y range of a P / Q panel (MW / MVAr): a flat trace is not blown up
 
 # ---- WHICH MACHINES ------------------------------------------------------------
 PQ_POI_HOPS = 8                          # P / Q of other machines: only those within this many buses of the POI ...
@@ -1058,7 +1069,7 @@ def _choose(traces, viol, bmap):
                     dist_p[b] = n
     groups = set(str(x).upper() for x in (PLOT_GROUPS or []))
     ovq = set(str(x).upper() for x in (OVERLAY_QUANTITIES or []))
-    sbq = set(str(x).upper() for x in (SIDE_BY_SIDE_QUANTITIES or []))
+    sbq = set(str(x).upper() for x in (SEPARATE_QUANTITIES or []))
 
     def flagged(meta):
         return bool(_flags_of(meta, viol))
@@ -1207,21 +1218,33 @@ def _page_legend(fig, legend):
         pass
 
 
-def _legend_handles():
-    """Proxy lines for the page legend (a page of side-by-side rows has every
-       case even when one row lacks one)."""
+def _legend_handles(solid=False):
+    """Proxy lines for the page legend of a P / Q page (it shows every case even
+       when one panel lacks one), drawn as the panels are."""
     from matplotlib.lines import Line2D
     out = {}
     for ci in range(len(CASES)):
         lab, col, ls, lw, al, kw = _style(ci)
+        if solid:
+            ls, kw = "-", {}
         out[ci] = Line2D([0, 1], [0, 0], color=col, linestyle=ls, linewidth=lw, alpha=al, **kw)
     return out
 
 
 def _draw_overlay_page(plt, page, traces, fault_t, ctx, viol, bmap):
-    fig, axes = plt.subplots(len(page), 1, figsize=(11.0, 8.5), squeeze=False)
+    """PANELS_PER_PAGE panels, the three cases overlaid on each. The page is
+       always divided into PANELS_PER_PAGE rows, so a section's last page, with
+       fewer panels, keeps the same panel height instead of stretching them."""
+    from matplotlib.gridspec import GridSpec
+    fig = plt.figure(figsize=(11.0, 8.5))
+    nrow = max(1, int(PANELS_PER_PAGE or 1), len(page))
+    top, bot, gap = 0.835, 0.075, 0.85       # gap in inches: the time axis above + this panel's two title lines
+    h = ((top - bot) * 8.5 - (nrow - 1) * gap) / float(nrow)
+    gs = GridSpec(nrow, 1, left=0.08, right=0.97, top=top, bottom=bot,
+                  hspace=(gap / h) if nrow > 1 else 0.2)
+    axes = [fig.add_subplot(gs[i, 0]) for i in range(len(page))]
     legend = {}
-    for ax, name in zip(axes[:, 0], page):
+    for ax, name in zip(axes, page):
         ends = []
         for ci, t, sig in traces:
             v = sig.get(name)
@@ -1256,7 +1279,6 @@ def _draw_overlay_page(plt, page, traces, fault_t, ctx, viol, bmap):
         ax.margins(y=0.08)
         if FAULT_LINE and fault_t is not None:
             ax.axvline(fault_t, color="#C92A2A", linewidth=0.9, linestyle=":", zorder=1)
-    fig.subplots_adjust(left=0.08, right=0.97, top=0.835, bottom=0.075, hspace=0.95)
     return fig, legend
 
 
@@ -1298,6 +1320,8 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, viol, bmap, present):
             ax = fig.add_subplot(gs[r, ci], sharey=(axs[0] if (axs and PQ_SAME_SCALE) else None))
             axs.append(ax)
             lab, col, ls, lw, al, kw = _style(ci)
+            if PQ_SOLID_LINES:
+                ls, kw = "-", {}
             got = by_ci.get(ci)
             v = got[1].get(name) if got else None
             if v:
@@ -1340,15 +1364,78 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, viol, bmap, present):
     return fig
 
 
+def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, viol, bmap, present):
+    """One P or Q quantity on a page: Base case, Scenario 1 and Scenario 2 one
+       under another, full width, on one y scale (PQ_SAME_SCALE)."""
+    from matplotlib.gridspec import GridSpec
+    fig = plt.figure(figsize=(11.0, 8.5))
+    n = len(CASES)
+    gs = GridSpec(n, 1, left=0.08, right=0.97, top=0.80, bottom=0.075, hspace=0.42)
+    by_ci = dict((ci, (t, sig)) for ci, t, sig in traces)
+    meta = _meta(name)
+    fl = _flags_of(meta, viol)
+    fl_kind = dict((ci, k) for ci, k, _v, _u, _n in fl)
+    axs, series = [], []
+    for ci in range(n):
+        ax = fig.add_subplot(gs[ci, 0], sharey=(axs[0] if (axs and PQ_SAME_SCALE) else None))
+        axs.append(ax)
+        lab, col, ls, lw, al, kw = _style(ci)
+        if PQ_SOLID_LINES:
+            ls, kw = "-", {}
+        got = by_ci.get(ci)
+        v = got[1].get(name) if got else None
+        if v:
+            t = got[0]
+            tt, vv = _thin(t, v)
+            ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw, alpha=al, zorder=2, **kw)
+            series.append((t, v))
+            if SHOW_END_VALUES:
+                _above(ax, 1.0, "at %g s: %s" % (T_MAX if T_MAX is not None else t[-1], _fmt_end(_value_at_end(t, v))),
+                       fontsize=8, color=col, ha="right")
+        else:
+            ax.text(0.5, 0.5, _missing_text(ci, name, ci in present), transform=ax.transAxes,
+                    fontsize=9, color="#999999", ha="center", va="center")
+        _above(ax, 0.0, _cap(lab), fontsize=9, color=col if col != "#000000" else "#1A1A1A", ha="left",
+               fontweight="bold")
+        if ci in fl_kind and not SHOW_END_VALUES:
+            _above(ax, 1.0, fl_kind[ci].upper(), fontsize=8, color="#C92A2A", ha="right", fontweight="bold")
+        _dress(ax, xlabel=(ci == n - 1))
+        ax.set_ylabel(_ylabel(name), fontsize=8.5, color="#333333")
+        if FAULT_LINE and fault_t is not None:
+            ax.axvline(fault_t, color="#C92A2A", linewidth=0.9, linestyle=":", zorder=1)
+    lim = _ylim(series) if PQ_SAME_SCALE else None
+    if lim:
+        axs[0].set_ylim(lim[0], lim[1])
+    elif not PQ_SAME_SCALE:
+        for ax in axs:
+            ax.margins(y=0.08)
+    # ---- what it is in bold, where it is in grey, the study's flag in red
+    fig.text(0.08, 0.872, _cap(name), fontsize=11, color="#1A1A1A", ha="left", va="bottom", fontweight="bold")
+    w = _where(meta, ctx["fbus"], ctx["pois"], bmap, ctx["dist_f"], ctx["dist_p"]) if SHOW_NODES else ""
+    if w:
+        fig.text(0.08, 0.851, _cap(w), fontsize=8, color="#666666", ha="left", va="bottom")
+    if fl:
+        fig.text(0.97, 0.851, "Study flag: " + _flag_text(fl), fontsize=8, color="#C92A2A", ha="right", va="bottom")
+    return fig
+
+
 def _paginate(sections, elems):
     """[(kind, section title, panels)] -- overlay pages of PANELS_PER_PAGE panels,
-       then side-by-side pages of PQ_ROWS_PER_PAGE rows; a machine's P and Q rows
-       are never split across two pages."""
+       then the P / Q pages: with PQ_LAYOUT "stacked" one page per quantity (a
+       unit's P page, then its Q page); with "rows" PQ_ROWS_PER_PAGE rows to a
+       page, a machine's P and Q rows never split across two pages."""
     pages = []
     per = max(1, int(PANELS_PER_PAGE or 1))
     for title, names in sections:
         for i in range(0, len(names), per):
             pages.append(("overlay", title, names[i:i + per]))
+    if str(PQ_LAYOUT).strip().lower().startswith("stack"):
+        for rows in elems:
+            for name in rows:
+                q = _meta(name)[3]
+                pages.append(("pq1", "Active power" if q == "P" else "Reactive power" if q == "Q" else "P and Q",
+                              [name]))
+        return pages
     nrow = max(1, int(PQ_ROWS_PER_PAGE or 1))
     title = "P and Q, side by side"
     cur = []
@@ -1407,8 +1494,8 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     sections, elems, ctx = _choose(traces, viol, bmap)
     pages = _paginate(sections, elems)
     if not pages:
-        print("    %s: nothing left to draw with OVERLAY_QUANTITIES = %s, SIDE_BY_SIDE_QUANTITIES = %s, "
-              "PLOT_GROUPS = %s" % (fault, OVERLAY_QUANTITIES, SIDE_BY_SIDE_QUANTITIES, PLOT_GROUPS))
+        print("    %s: nothing left to draw with OVERLAY_QUANTITIES = %s, SEPARATE_QUANTITIES = %s, "
+              "PLOT_GROUPS = %s" % (fault, OVERLAY_QUANTITIES, SEPARATE_QUANTITIES, PLOT_GROUPS))
         return None, "nothing to draw"
     if ctx["flag_missing"]:
         print("    %s: flagged by the study but not in any .out (no channel to draw): %s"
@@ -1419,21 +1506,24 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     pdf_path = os.path.join(out_dir, PDF_NAME.format(project=proj, fault=fault, mode=MODE))
     stamp = time.strftime("%Y-%m-%d")
     n_ov = sum(len(p[2]) for p in pages if p[0] == "overlay")
-    n_pq = sum(len(p[2]) for p in pages if p[0] == "pq")
+    n_pq = sum(len(p[2]) for p in pages if p[0] in ("pq", "pq1"))
     with PdfPages(pdf_path) as pdf:
         for pg, (kind, title, page) in enumerate(pages, start=1):
             if kind == "overlay":
                 fig, legend = _draw_overlay_page(plt, page, traces, fault_t, ctx, viol, bmap)
+            elif kind == "pq1":
+                fig = _draw_pq_stacked_page(plt, page[0], traces, fault_t, ctx, viol, bmap, present)
+                legend = _legend_handles(solid=PQ_SOLID_LINES)
             else:
                 fig = _draw_pq_page(plt, page, traces, fault_t, ctx, viol, bmap, present)
-                legend = _legend_handles()
+                legend = _legend_handles(solid=PQ_SOLID_LINES)
             _page_head(fig, proj, fault, title, pg, len(pages), stamp)
             _page_legend(fig, legend)
             try:
                 pdf.savefig(fig)
             finally:
                 plt.close(fig)
-    note = "%d overlay panel(s), %d P/Q row(s), %d flagged machine(s), %d page(s)" % (
+    note = "%d overlay panel(s), %d P / Q quantities, %d flagged machine(s), %d page(s)" % (
         n_ov, n_pq, ctx["n_flagged"], len(pages))
     return pdf_path, note
 
