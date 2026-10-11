@@ -2,34 +2,36 @@
 """z7_overlay_v2.py -- BASE, SCENARIO 1 and SCENARIO 2 per fault:
 VOLTAGES and ROTOR ANGLES overlaid, P and Q one case under another.
 
-    Base case                 the system without the surplus facility
+    Base Case (DISIS 2201)    the system without the surplus facility
     Scenario 1 (GIA)          SGF + EGF, POI held at the GIA amount
     Scenario 2                SGF on, EGF off
 
 For every fault found in the case folders it reads the three .out files and
-writes ONE PDF, three plots to a page, in three parts:
+writes ONE PDF, three plots to a page, in this order (SECTIONS):
 
-    VOLTAGES       one panel per bus or unit, the three cases on the same axes:
-                   faulted bus, POI, the plant's own buses, each SGF / EGF
-                   unit's terminal voltage, and the other machines nearest the
-                   fault.
-    ROTOR ANGLES   the same way: swing machine, SGF / EGF units, the machines
-                   nearest the fault.
-    P AND Q        ONE PAGE PER QUANTITY -- the P of a unit, say -- with the
-                   Base case, Scenario 1 and Scenario 2 one under another, full
-                   width, on one y scale; then the same unit's Q. For:
-                     the POI (sum of the plant ties),
-                     each SGF and EGF unit,
-                     every machine the study FLAGGED for this fault (tripped
-                       or undamped, in any of the three cases), wherever it is,
-                     and the other machines within PQ_POI_HOPS (8) buses of
-                       the POI -- nothing further away.
+    1 FAULTED BUS  the faulted bus voltage.
+    2 EGF AND SGF  the plant: the POI P and Q (sum of the plant ties); the POI
+                   and the plant's own bus voltages; each EGF and SGF unit's
+                   terminal voltage and rotor angle; each unit's P and Q.
+    3 BUSES        the voltage of every bus within BUS_POI_HOPS (5) buses of
+                   the POI -- the buses the study FLAGGED for this fault
+                   (overshoot, recovery, steady state, in any of the three
+                   cases) first, wherever they are, each marked with its
+                   violation.
+    4 OTHER GENS   P and Q of the other machines within PQ_POI_HOPS (7) buses
+                   of the POI -- the machines the study flagged (tripped or
+                   undamped, in any case) first, wherever they are, with
+                   their rotor angle and terminal voltage (ANGLES_OF_VIOLATED).
 
-The flagged machines come from each case's own violations list, the
-02_VIOLATIONS_*.csv the study writes beside its results, so the pages follow
-the study's verdicts. A flagged machine's rotor angle and terminal voltage are
-added to the overlays too (ANGLES_OF_VIOLATED), and its pages say which case
-flagged it and for what.
+Voltages and rotor angles are overlaid: one panel per bus or unit, the three
+cases on the same axes. P and Q are drawn ONE PAGE PER QUANTITY -- the P of a
+unit, say -- with the Base case, Scenario 1 and Scenario 2 one under another,
+full width, on one y scale; then the same unit's Q.
+
+The flags come from each case's own violations list, the 02_VIOLATIONS_*.csv
+the study writes beside its results, so the pages follow the study's verdicts;
+each flagged panel says which case flagged it and for what. Every project's
+PDFs go to their own folder, <OUT_DIR>\<project>.
 
 On the overlays the three cases are told apart by colour AND line style AND
 width, so the plot still reads printed in black and white or by a colour-blind
@@ -46,7 +48,8 @@ RUN (PSS/E Python 3.4, needs dyntools and matplotlib):
     python z7_overlay_v2.py
 Edit the SETTINGS block first. Nothing is simulated; the .out files and the
 violations lists are only read, and nothing in the results folders is changed.
-The PDFs go to OUT_DIR (overlay_v2_plots), apart from z7_overlay.py's.
+The PDFs go to OUT_DIR (overlay_v2_plots), one folder per project, apart from
+z7_overlay.py's.
 """
 import os
 import re
@@ -72,17 +75,18 @@ FAULTS = []                              # [] = every fault with an .out in Scen
 # the gaps in the upper lines let the lower ones show, so all three stay visible.
 # (label, results root, folder suffix, colour, line style, width, opacity)
 CASES = [
-    ("Base case",                          r"Base\results_base_f",     "",           "#000000", "-",  1.3, 1.0),
+    ("Base Case (DISIS 2201)",             r"Base\results_base_f",     "",           "#000000", "-",  1.3, 1.0),
     ("Scenario 1: SGF + EGF (GIA)",        r"Projects\results_proj_f", "",           "#1F5AA6", "--", 1.3, 1.0),
     ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#E8590C", "-.", 1.3, 1.0),
 ]
 
-PAGE_SUBTITLE = "Base Case vs Scenario 1 vs Scenario 2"   # right of the page title
+PAGE_SUBTITLE = "Base Case (DISIS 2201) vs Scenario 1 vs Scenario 2"   # right of the page title
 FOOTER_TEXT = "SPP Dynamic Stability Study -- Surplus Interconnection"   # bottom left of every page
 FAULT_LINE = True                        # thin red dotted line at the fault instant (no label); False = none
 SHOW_END_VALUES = False                  # each panel's value at T_MAX per case, small, top right of the panel
 PDF_NAME = "{project}_{fault}.pdf"       # file name per fault, e.g. SantaFe_F01.pdf ({project}, {fault}, {mode})
 OUT_DIR = r"overlay_v2_plots"            # under ROOT unless absolute (apart from z7_overlay.py's overlay_plots)
+PROJECT_FOLDERS = True                   # each project's PDFs in their own folder: <OUT_DIR>\SantaFe\SantaFe_F01.pdf
 ALIGN_TO_FAULT = False                   # False = simulation time, as the study plots | True = time from the fault (0 s = fault)
 T_MIN, T_MAX = 0.0, 20.0                 # seconds shown; None = the whole record
 MAX_POINTS = 6000                        # points per trace: 20 s recorded every 1/4 cycle is 4800, so every point
@@ -90,13 +94,21 @@ MAX_POINTS = 6000                        # points per trace: 20 s recorded every
                                          #   Above this each block keeps its min AND max -- a fast oscillation then
                                          #   turns into a solid band, so do not set it low (800 did exactly that)
 
+# ---- WHAT EVERY PDF SHOWS, IN THIS ORDER -------------------------------------
+SECTIONS = ["FAULT", "EGF_SGF", "BUSES", "OTHER_GENS"]   # the parts of each PDF, in this order (remove any
+                                         #   you do not want):
+                                         #   FAULT       the faulted bus voltage
+                                         #   EGF_SGF     the plant: POI P and Q; POI and plant bus voltages; each
+                                         #               EGF and SGF unit's terminal voltage, rotor angle, P and Q
+                                         #   BUSES       the voltage of every bus within BUS_POI_HOPS of the POI,
+                                         #               the buses the study flagged first, with their violation
+                                         #   OTHER_GENS  P and Q of the other machines within PQ_POI_HOPS of the
+                                         #               POI, the machines the study flagged first
 # ---- HOW EACH QUANTITY IS DRAWN ----------------------------------------------
 OVERLAY_QUANTITIES = ["V", "A"]          # ONE panel, the three cases on the same axes:
                                          #   "V" voltage (bus and unit terminal, pu), "A" rotor angle (deg)
 SEPARATE_QUANTITIES = ["P", "Q"]         # ONE PANEL PER CASE -- Base case, Scenario 1, Scenario 2:
                                          #   "P" active power (MW), "Q" reactive power (MVAr)
-PLOT_GROUPS = ["FAULT", "POI", "PLANT", "SGF", "EGF", "GEN"]   # faulted bus, POI, the plant's own buses,
-                                         #   SGF units, EGF units, other machines
 PANELS_PER_PAGE = 3                      # overlay panels per page
 PQ_LAYOUT = "stacked"                    # "stacked": one page per P or Q, the three cases one under another, full
                                          #   width (a unit's P page, then its Q page) | "rows": three small panels
@@ -106,16 +118,21 @@ PQ_SOLID_LINES = True                    # a P / Q panel holds one case, so it i
 PQ_SAME_SCALE = True                     # the three panels of a quantity share one y scale, so they compare at a glance
 PQ_MIN_SPAN = 2.0                        # smallest y range of a P / Q panel (MW / MVAr): a flat trace is not blown up
 
-# ---- WHICH MACHINES ------------------------------------------------------------
-PQ_POI_HOPS = 8                          # P / Q of other machines: only those within this many buses of the POI ...
+# ---- WHICH BUSES AND MACHINES --------------------------------------------------
+BUS_POI_HOPS = 5                         # BUSES: the voltage of every bus within this many buses of the POI
+                                         #   (the study records the buses five away from the POI) ...
+BUS_MAX = 0                              # ... at most this many of them, nearest the POI first (0 = all)
+BUS_VIOLATION_KINDS = ["overshoot", "recovery", "steady"]   # ... plus EVERY bus the study flagged for these in
+                                         #   any of the three cases, wherever it is -- drawn first, never cut by
+                                         #   BUS_MAX (the 'violation' column of the study's 02_VIOLATIONS csv)
+PQ_POI_HOPS = 7                          # OTHER_GENS: P / Q of the other machines within this many buses of the POI ...
 PQ_GEN_MAX = 0                           # ... at most this many of them, nearest the POI first (0 = all)
 VIOLATED_ALWAYS = True                   # ... plus EVERY machine the study flagged for this fault (any of the
-                                         #   three cases), wherever it is -- never cut by PQ_GEN_MAX
-VIOLATION_KINDS = ["tripped", "undamped"]   # the flags that count: the 'violation' column of the study's
+                                         #   three cases), wherever it is -- drawn first, never cut by PQ_GEN_MAX
+VIOLATION_KINDS = ["tripped", "undamped"]   # the machine flags that count: the 'violation' column of the study's
                                          #   02_VIOLATIONS csv ("tripped", "undamped", "review", ...)
-ANGLES_OF_VIOLATED = True                # flagged machines' rotor angle and terminal voltage are overlaid too
-GEN_NEAR_HOPS = 3                        # voltage / rotor-angle panels of other machines: those within this many
-GEN_MAX = 8                              #   buses of the FAULT, at most this many, nearest first (0 = none)
+ANGLES_OF_VIOLATED = True                # a flagged machine's rotor angle and terminal voltage are overlaid too,
+                                         #   before the P / Q pages of the other machines
 INCLUDE_SGF_UNITS = True                 # per-unit SGF P / Q / terminal V / angle
 INCLUDE_EGF_UNITS = True                 # per-unit EGF P / Q / terminal V / angle
 BUS_ANGLES = False                       # bus voltage angles (POI, faulted bus, plant buses) -- not rotor angles
@@ -219,6 +236,8 @@ def _faults(dirs):
 #   POWR / VARS / ETRM / ANGL <bus>[NAME kV]<id>   PSS/E's own titles (chsb),
 #                        which is how the central-area machines' P and Q are
 #                        recorded
+# and the bus voltages the study records within five buses of the POI (and in
+# the study areas) under PSS/E's own title, VOLT <bus> [NAME kV].
 _RX_IDX = re.compile(r"^\s*\d+\s+(?=[A-Za-z])")
 _RX_DUP = re.compile(r"\s*#\d+$")
 _RX_FLT = re.compile(r"^FLT ?(\d+) (V|ANG)$", re.I)
@@ -233,6 +252,7 @@ _RX_NPG = re.compile(r"^NPGEN(\d+)(?:_(\w{1,2}))?_(PELEC|QELEC|ETERM|ANGL)$", re
 _RX_GEN = re.compile(r"^(A?GEN|SYNC)(\d+)(?:_(\w{1,2}))?_(PELEC|QELEC|ETERM|ANGL)$", re.I)
 _RX_PSSE = re.compile(r"^(ANGL|POWR|VARS|ETRM) *(\d+) *\[[^\[\]]*\] *([A-Za-z0-9]{1,2}) *$", re.I)
 _RX_SWING = re.compile(r"^SWING ?(\d+)_ANGL$", re.I)
+_RX_VOLT = re.compile(r"^VOLT *(\d+)(?: *\[[^\[\]]*\])? *$", re.I)
 _QTY = {"PELEC": "P", "POWR": "P", "QELEC": "Q", "VARS": "Q", "ETERM": "V", "ETRM": "V", "ANGL": "A"}
 _QTXT = {"P": "P (MW)", "Q": "Q (MVAr)", "V": "terminal V (pu)", "A": "angle (deg)"}
 # preference when one machine quantity comes under two titles: the study's own
@@ -267,13 +287,11 @@ def _machine_of(core):
 
 def _fixed(core):
     """True for the channels drawn whatever the fault: faulted bus, POI, ties,
-       plant buses, SGF / EGF / new-plant units, swing machine."""
+       plant buses, SGF / EGF / new-plant units."""
     m = _RX_FLT.match(core) or _RX_POIV.match(core) or _RX_PBUS.match(core)
     if m:
         return m.group(2).upper() == "V" or BUS_ANGLES
     if _RX_POIP.match(core) or _RX_POIQ.match(core) or _RX_POIG.match(core):
-        return True
-    if _RX_SWING.match(core):
         return True
     if INCLUDE_SGF_UNITS and (_RX_SGF.match(core) or _RX_NPG.match(core)):
         return True
@@ -282,44 +300,51 @@ def _fixed(core):
     return False
 
 
-def _make_want(titles, bmap, vbuses):
-    """The channels worth reading from one .out: the fixed ones, and of the other
-       machines only those that can reach a page -- flagged by the study, within
-       GEN_NEAR_HOPS of the fault bus or within PQ_POI_HOPS of the POI. The fault
-       and POI buses are taken from the file's own titles, so the choice is made
-       before any data is read (a .out can hold a thousand machine channels)."""
-    fb, pois = None, set()
+def _sections():
+    return [str(s).strip().upper() for s in (SECTIONS or [])]
+
+
+def _make_want(titles, bmap, vbuses, bbuses=()):
+    """The channels worth reading from one .out: the fixed ones; the bus
+       voltages within BUS_POI_HOPS of the POI and the buses the study flagged
+       (bbuses); the other machines within PQ_POI_HOPS of the POI and the
+       machines the study flagged (vbuses). The POI is taken from the file's
+       own titles, so the choice is made before any data is read (a .out can
+       hold a thousand machine channels and as many bus voltages). With no
+       network map only the flagged buses and machines are read."""
+    pois = set()
     for ttl in titles:
         c = _core(ttl)
-        m = _RX_FLT.match(c)
-        if m and fb is None:
-            fb = int(m.group(1))
         m = _RX_POIV.match(c) or _RX_POIP.match(c) or _RX_POIQ.match(c)
         if m:
             pois.add(int(m.group(1)))
         m = _RX_POIG.match(c)
         if m:
             pois.add(int(m.group(2)))
-    near = None
+    secs = _sections()
+    near_gen, near_bus = set(), set()
     if bmap is not None:
-        near = set()
-        if fb is not None:
-            near.update(_hops_memo(bmap, fb, GEN_NEAR_HOPS))
         for p in pois:
-            near.update(_hops_memo(bmap, p, PQ_POI_HOPS))
-    vb = set(vbuses or ())
+            near_gen.update(_hops_memo(bmap, p, PQ_POI_HOPS))
+            near_bus.update(_hops_memo(bmap, p, BUS_POI_HOPS))
+    vb = set(vbuses or ()) if VIOLATED_ALWAYS else set()
+    bb = set(bbuses or ())
     extra = [re.compile(x) for x in EXTRA_TITLE_REGEX]
 
     def want(title):
         c = _core(title)
         if _fixed(c) or any(rx.search(c) for rx in extra):
             return True
+        m = _RX_VOLT.match(c)
+        if m:
+            b = int(m.group(1))
+            return "BUSES" in secs and (b in bb or b in near_bus or b in pois)
         mm = _machine_of(c)
         if mm is None:
             return False
-        if mm[1] in vb or near is None:          # no network map: keep, GEN_MAX trims later
-            return True
-        return mm[1] in near
+        # the plant's own units recorded under PSS/E's titles sit next to the
+        # POI, so they are read whatever OTHER_GENS says
+        return mm[1] in vb or mm[1] in near_gen
     return want
 
 
@@ -477,9 +502,10 @@ def _extract(t, ids, data, want):
     """{panel name: values}. Panel names:
          Faulted bus <b> voltage (pu)          POI <b> voltage (pu)
          POI <b> active / reactive power (MW / MVAr)   (and per tie, when several)
-         Bus <b> voltage (pu)                  the plant's own buses (PBUS)
+         Plant bus <b> voltage (pu)            the plant's own buses (PBUS)
+         Bus <b> voltage (pu)                  the buses near the POI (VOLT)
          SGF unit <n> P (MW) / Q (MVAr) / terminal V (pu) / angle (deg)
-         EGF <bus>['id'] ...,  Gen <bus>['id'] ...,  Swing <b> rotor angle (deg)"""
+         EGF <bus>['id'] ...,  Gen <bus>['id'] ..."""
     out, poip, poiq, grid = {}, [], [], {}
     gen_src = {}                  # Gen panel -> priority of the title it came from
     npg = {}                      # NPGEN panels, used only where PROJ<n> gave none
@@ -526,13 +552,13 @@ def _extract(t, ids, data, want):
         m = _RX_PBUS.match(c)
         if m:
             if m.group(2).upper() == "V":
-                out["Bus %s voltage (pu)" % m.group(1)] = list(v)
+                out["Plant bus %s voltage (pu)" % m.group(1)] = list(v)
             elif BUS_ANGLES:
-                out["Bus %s angle (deg)" % m.group(1)] = list(v)
+                out["Plant bus %s angle (deg)" % m.group(1)] = list(v)
             continue
-        m = _RX_SWING.match(c)
+        m = _RX_VOLT.match(c)
         if m:
-            out["Swing %s rotor angle (deg)" % m.group(1)] = list(v)
+            out.setdefault("Bus %s voltage (pu)" % m.group(1), list(v))
             continue
         m = _RX_SGF.match(c)
         if m:
@@ -594,7 +620,7 @@ def _extract(t, ids, data, want):
                         tot[i] += v[i]
             out["POI %s %s (%s)" % (poi, word, u)] = tot
             # every tie, even a lone one: another case may have two, and then
-            # this one's single tie belongs on that tie's row (_choose drops the
+            # this one's single tie belongs on that tie's row (_plan drops the
             # tie rows when no case has more than one)
             for _b, d, _pl, v in ties:
                 sg = -1.0 if d == "P" else 1.0
@@ -609,7 +635,7 @@ def _read_cached(dyntools, path, mk_want, sel_key):
         return _read(dyntools, path, mk_want)
     import pickle
     st = os.stat(path)
-    key = "ov2-1|%s|%d|%d|%s|%s|%s|%s|%s|%s|%s" % (
+    key = "ov2-2|%s|%d|%d|%s|%s|%s|%s|%s|%s|%s" % (
         os.path.abspath(path), st.st_size, int(st.st_mtime), INCLUDE_SGF_UNITS,
         INCLUDE_EGF_UNITS, BUS_ANGLES, SBASE_MVA, SGF_UNIT_BUS_START,
         "|".join(EXTRA_TITLE_REGEX), sel_key)
@@ -750,8 +776,13 @@ def _fnorm(f):
 
 def _elem_machine(el):
     """(bus, id) of a violations-list element: '584713', '531461-4',
-       "PROJ 587313 'B'", 'SYNC 542963-2', 'NEW 999001' ..."""
+       "PROJ 587313 'B'", 'SYNC 542963-2', 'NEW 999001', a bus '765930' or
+       'POI 765911', a named bus 'GEN-2021-070 [765930]' (the number in
+       brackets is the bus) ..."""
     s = str(el or "").strip()
+    m = re.search(r"\[\s*(\d{4,})\s*\]", s)
+    if m:
+        return int(m.group(1)), ""
     m = re.search(r"(\d{4,})", s)
     if not m:
         return None
@@ -773,11 +804,17 @@ def _viol_file(d):
     return max(pool, key=lambda p: os.path.getmtime(p))
 
 
+def _kinds(lst):
+    return set(str(k).strip().lower() for k in (lst or []))
+
+
 def _viol_table(d):
-    """(csv path, {fault: [(bus, id, kind, value, unit, note)]}) for one case folder."""
+    """(csv path, {fault: [(bus, id, kind, value, unit, note)]}) for one case
+       folder -- the machine kinds (VIOLATION_KINDS) and the bus kinds
+       (BUS_VIOLATION_KINDS)."""
     if d in _VIOL:
         return _VIOL[d]
-    kinds = set(str(k).strip().lower() for k in (VIOLATION_KINDS or []))
+    kinds = _kinds(VIOLATION_KINDS) | _kinds(BUS_VIOLATION_KINDS)
     p = _viol_file(d) if d else None
     tab = {}
     if p:
@@ -800,43 +837,69 @@ def _viol_table(d):
     return _VIOL[d]
 
 
-def _violations(dirs, fault):
-    """{(bus, id): [(case index, kind, value, unit, note)]} for one fault, all cases."""
+def _violations(dirs, fault, kinds):
+    """{(bus, id): [(case index, kind, value, unit, note)]} for one fault, all
+       cases, only the given kinds. Bus flags carry id '' (a bus has none)."""
+    want = _kinds(kinds)
     got = {}
     for ci, d in enumerate(dirs):
         if not d:
             continue
         _p, tab = _viol_table(d)
         for bus, mid, kind, val, unit, note in tab.get(_fnorm(fault), []):
-            got.setdefault((bus, mid), []).append((ci, kind, val, unit, note))
+            if kind in want:
+                got.setdefault((bus, mid), []).append((ci, kind, val, unit, note))
     return got
 
 
-def _flags_of(meta, viol):
-    """The study's flags for the machine behind a panel, or []. An SGF unit
-       panel matches on its bus alone (PROJ<n> carries no machine id)."""
+def _flags_of(meta, flags):
+    """The study's flags for what a panel shows, or []. flags = {"mach": machine
+       flags, "bus": bus flags}. A machine panel takes the machine flags (an SGF
+       unit matches on its bus alone: PROJ<n> carries no machine id); a bus
+       panel -- faulted bus, POI, plant bus, bus near the POI -- the bus flags."""
     g, bus, mid, _q = meta
-    if bus is None or g not in ("SGF", "EGF", "GEN"):
+    if bus is None:
         return []
     out = []
-    for (vb, vm), rows in viol.items():
-        if vb == bus and (g == "SGF" or vm == mid):
-            out.extend(rows)
+    if g in ("SGF", "EGF", "GEN"):
+        for (vb, vm), rows in flags.get("mach", {}).items():
+            if vb == bus and (g == "SGF" or vm == mid):
+                out.extend(rows)
+    elif g in ("FAULT", "POI", "PLANT", "BUS") and _q in ("V", "B"):
+        for (vb, _vm), rows in flags.get("bus", {}).items():
+            if vb == bus:
+                out.extend(rows)
     return out
 
 
 def _flag_text(rows):
-    """'tripped in Scenario 1 (4.27 MW, ended 0.00 MW); undamped 34.9 deg in Scenario 2'."""
+    """'tripped in Scenario 1 (4.27 MW, ended 0.00 MW); undamped 34.9 deg in Scenario 2;
+       overshoot (1.581 pu, above limit for 3.3 cycles) in Scenario 1'."""
     by = {}
     for ci, kind, val, unit, note in rows:
         by.setdefault(kind, []).append((ci, val, unit, note))
     parts = []
     for kind in sorted(by):
         cs = sorted(set(ci for ci, _v, _u, _n in by[kind]))
-        ci0, val, unit, note = sorted(by[kind])[0]
+        # the worst value of the kind: highest for an overshoot, lowest for a recovery
+        recs = sorted(by[kind])
+        if kind in ("overshoot", "recovery"):
+            def _num(r):
+                try:
+                    return float(r[1])
+                except (TypeError, ValueError):
+                    return None
+            nums = [r for r in recs if _num(r) is not None]
+            if nums:
+                recs = sorted(nums, key=_num, reverse=(kind == "overshoot"))
+        ci0, val, unit, note = recs[0]
         det = ""
         if kind == "tripped" and val:
             det = " (%s MW before%s)" % (val, (", " + note) if note else "")
+        elif kind in ("overshoot", "recovery", "steady") and val:
+            gen = ("above the limit after clearing", kind, "")
+            det = " (%s%s%s)" % (val, (" " + unit) if unit else "",
+                                 (", " + note) if note and note not in gen else "")
         elif val and unit:
             det = " (%s %s)" % (val, unit)
         parts.append("%s%s in %s" % (kind, det, ", ".join(_short(CASES[c][0]) for c in cs)))
@@ -858,12 +921,12 @@ def _meta(name):
     if m:
         return ("POI", int(m.group(1)), "", {"voltage": "V", "angle": "B", "active power": "P",
                                              "reactive power": "Q"}[m.group(2)])
-    m = re.match(r"^Bus (\d+) (voltage|angle)", name)
+    m = re.match(r"^Plant bus (\d+) (voltage|angle)", name)
     if m:
         return ("PLANT", int(m.group(1)), "", "V" if m.group(2) == "voltage" else "B")
-    m = re.match(r"^Swing (\d+) rotor angle", name)
+    m = re.match(r"^Bus (\d+) voltage", name)
     if m:
-        return ("GEN", int(m.group(1)), "", "A")
+        return ("BUS", int(m.group(1)), "", "V")
     m = re.match(r"^SGF unit (\d+) (P|Q|terminal V|angle) ", name)
     if m:
         n = int(m.group(1))
@@ -1050,12 +1113,22 @@ def _ylim(series):
 
 
 # ---- choosing and ordering the panels ------------------------------------------
-def _choose(traces, viol, bmap):
-    """(overlay sections, side-by-side element groups, context) for one fault."""
+_TITLES = {"FAULT": "Faulted bus voltage",
+           "EGF_SGF": "EGF and SGF",
+           "BUSES": "Bus voltages within %d buses of the POI",
+           "OTHER_GENS": "Other machines within %d buses of the POI"}
+
+
+def _plan(traces, flags, bmap):
+    """([(kind, section title, panels)], context) for one fault: the pages in
+       SECTIONS order. kind "overlay": up to PANELS_PER_PAGE panels, the three
+       cases on the same axes; "pq1": one P or Q quantity, the cases one under
+       another (PQ_LAYOUT "stacked"); "pq": rows of P / Q, the cases side by
+       side (PQ_LAYOUT "rows"), a machine's P and Q never split over two pages."""
     allk = set(k for _c, _t, sg in traces for k in sg)
+    meta = dict((k, _meta(k)) for k in allk)
     fbus, pois = None, set()
-    for k in allk:
-        g, b, mid, q = _meta(k)
+    for k, (g, b, mid, q) in meta.items():
         if g == "FAULT":
             fbus = b
         if g == "POI":
@@ -1067,45 +1140,22 @@ def _choose(traces, viol, bmap):
             for b, n in _hops_memo(bmap, p, 40).items():
                 if b not in dist_p or n < dist_p[b]:
                     dist_p[b] = n
-    groups = set(str(x).upper() for x in (PLOT_GROUPS or []))
+    far = 10 ** 6
     ovq = set(str(x).upper() for x in (OVERLAY_QUANTITIES or []))
     sbq = set(str(x).upper() for x in (SEPARATE_QUANTITIES or []))
+    stacked = str(PQ_LAYOUT).strip().lower().startswith("stack")
+    per = max(1, int(PANELS_PER_PAGE or 1))
+    nrow = max(1, int(PQ_ROWS_PER_PAGE or 1))
 
-    def flagged(meta):
-        return bool(_flags_of(meta, viol))
+    def flagged(k):
+        return bool(_flags_of(meta[k], flags))
 
-    # OTHER MACHINES. For the overlays: the GEN_MAX nearest the fault within
-    # GEN_NEAR_HOPS (as the study PDFs show them) plus the flagged ones. For P / Q:
-    # every one within PQ_POI_HOPS of the POI plus the flagged ones.
-    gens = sorted(set((_meta(k)[1], _meta(k)[2]) for k in allk
-                      if _meta(k)[0] == "GEN" and not k.startswith("Swing")))
-    far = 10 ** 6
-    vio = set(gm for gm in gens if flagged(("GEN", gm[0], gm[1], "P")))
-    if dist_f:
-        near = sorted((dist_f[b], b, m) for b, m in gens if b in dist_f and dist_f[b] <= GEN_NEAR_HOPS)
-        keep_va = set((b, m) for _d, b, m in near[:max(0, int(GEN_MAX or 0))])
-    else:
-        keep_va = set(gens[:max(0, int(GEN_MAX or 0))])
-    if ANGLES_OF_VIOLATED:
-        keep_va |= vio
-    if dist_p:
-        near = sorted((dist_p[b], b, m) for b, m in gens if b in dist_p and dist_p[b] <= PQ_POI_HOPS)
-        near = [(b, m) for _d, b, m in near if (b, m) not in vio]
-        if PQ_GEN_MAX:
-            near = near[:int(PQ_GEN_MAX)]
-        keep_pq = set(near)
-    else:
-        keep_pq = set()
-    if VIOLATED_ALWAYS:
-        keep_pq |= vio
+    def dp(b):
+        return dist_p.get(b, far) if b is not None else far
 
-    def on(k, meta):
-        g = meta[0]
-        if g == "GEN" and "GEN" not in groups:
-            return False
-        if g in ("FAULT", "POI", "PLANT", "SGF", "EGF") and g not in groups:
-            return False
-        return True
+    def is_ov(k):
+        q = meta[k][3]
+        return q in ovq or q in ("B", "X")
 
     # POI TIE ROWS only where some case has two or more ties into that POI --
     # with one tie the row would repeat the POI total
@@ -1118,73 +1168,130 @@ def _choose(traces, viol, bmap):
                 nties[m.group(1)] = nties.get(m.group(1), 0) + 1
         multi |= set(int(p) for p, cnt in nties.items() if cnt > 1)
 
-    ov = {"V": [], "A": [], "B": [], "X": []}
-    sb = {}
-    for k in allk:
-        meta = _meta(k)
-        g, b, mid, q = meta
-        if not on(k, meta):
-            continue
-        if g == "POI" and mid != "" and b not in multi:
-            continue
-        if g == "GEN" and not k.startswith("Swing"):
-            if q in sbq and (b, mid) not in keep_pq:
-                continue
-            if q not in sbq and (b, mid) not in keep_va:
-                continue
-        if q in sbq:
-            sb.setdefault((g, b, mid), []).append(k)
-        elif q == "B":
-            if BUS_ANGLES:
-                ov["B"].append(k)
-        elif q in ovq or q == "X":
-            ov.setdefault(q, []).append(k)
+    pages = []
 
-    def ord_ov(k):
-        meta = _meta(k)
-        g, b, mid, q = meta
-        f = 0 if flagged(meta) else 1
-        d = dist_f.get(b, far) if b is not None else far
-        if k.startswith("Swing"):
-            return (0, 0, 0, 0, k)
-        rank = {"FAULT": 1, "POI": 2, "PLANT": 3, "SGF": 5, "EGF": 6, "GEN": 7}.get(g, 9)
-        if g == "GEN" and f == 0:
-            rank = 4                                   # flagged machines lead the other machines
-        return (rank, d if g == "GEN" else 0, b if b is not None else 0, str(mid), k)
+    def emit(title, groups):
+        """groups: [[panel names]] in order -- one bus, unit, machine or tie each.
+           Overlay quantities fill overlay pages; P / Q get their own pages."""
+        buf, sep = [], []
 
-    def ord_sb(key):
-        g, b, mid = key
-        meta = (g, b, mid, "P")
-        f = flagged(meta)
-        if g == "POI":
-            return (0, 0 if mid == "" else 1, mid if mid != "" else 0, b)
-        if f:
-            return (1, dist_p.get(b, far), b, str(mid))
-        rank = {"SGF": 2, "EGF": 3}.get(g, 4)
-        return (rank, dist_p.get(b, far) if g == "GEN" else 0, b, str(mid))
+        def flush_ov():
+            for i in range(0, len(buf), per):
+                pages.append(("overlay", title, buf[i:i + per]))
+            del buf[:]
 
-    sections = []
-    for q, title in (("V", "Voltages"), ("A", "Rotor angles"), ("P", "Active power"), ("Q", "Reactive power"),
-                     ("B", "Bus angles"), ("X", "Other channels")):
-        if ov.get(q):
-            sections.append((title, sorted(ov[q], key=ord_ov)))
-    elems = []
-    for key in sorted(sb, key=ord_sb):
-        rows = sorted(sb[key], key=lambda k: (0 if _meta(k)[3] == "P" else 1, k))
-        elems.append(rows)
-    # how many flagged machines have a panel, and which have none in any .out
-    # (only their verdict is known -- nothing to draw)
-    drawn = set()
-    for k in allk:
-        meta = _meta(k)
-        if meta[0] in ("SGF", "EGF", "GEN") and not k.startswith("Swing"):
-            for vb, vm in viol:
-                if vb == meta[1] and (meta[0] == "SGF" or vm == meta[2]):
-                    drawn.add((vb, vm))
+        def flush_sep():
+            if stacked:
+                for grp in sep:
+                    for n in grp:
+                        pages.append(("pq1", title, [n]))
+            else:
+                cur = []
+                for grp in sep:
+                    if cur and len(cur) + len(grp) > nrow:
+                        pages.append(("pq", title, cur))
+                        cur = []
+                    while len(grp) > nrow:           # only when PQ_ROWS_PER_PAGE is 1
+                        pages.append(("pq", title, grp[:nrow]))
+                        grp = grp[nrow:]
+                    cur = cur + list(grp)
+                if cur:
+                    pages.append(("pq", title, cur))
+            del sep[:]
+        for grp in groups:
+            ov = [n for n in grp if is_ov(n)]
+            sp = sorted((n for n in grp if meta[n][3] in sbq and not is_ov(n)),
+                        key=lambda n: (0 if meta[n][3] == "P" else 1, n))
+            if ov:
+                if sep:
+                    flush_sep()
+                buf.extend(ov)
+            if sp:
+                if buf:
+                    flush_ov()
+                sep.append(sp)
+        flush_ov()
+        flush_sep()
+
+    def units(group):
+        """[((bus, id), [panel names])] of one group, in unit order."""
+        out = {}
+        for k, (g, b, mid, q) in meta.items():
+            if g == group:
+                out.setdefault((b, mid), []).append(k)
+        if group == "SGF":
+            order = sorted(out, key=lambda u: (u[1] if isinstance(u[1], int) else 0, u[0]))
+        else:
+            order = sorted(out, key=lambda u: (u[0], str(u[1])))
+        return [(u, sorted(out[u])) for u in order]
+
+    def qof(ks, qs):
+        return [k for k in ks if meta[k][3] in qs]
+
+    shown_buses = set()
+    for sec in _sections():
+        if sec == "FAULT":
+            names = sorted((k for k in allk if meta[k][0] == "FAULT"),
+                           key=lambda k: {"V": 0, "B": 1}.get(meta[k][3], 2))
+            shown_buses |= set(meta[k][1] for k in names)
+            emit(_TITLES["FAULT"], [[k] for k in names])
+        elif sec == "EGF_SGF":
+            t = _TITLES["EGF_SGF"]
+            # the plant's total at the POI, and each tie where some case has several
+            ties = {}
+            for k, (g, b, mid, q) in meta.items():
+                if g == "POI" and q in ("P", "Q") and (mid == "" or b in multi):
+                    ties.setdefault((b, mid), []).append(k)
+            tk = sorted(ties, key=lambda x: (x[0], 0 if x[1] == "" else 1, x[1] if x[1] != "" else 0))
+            emit(t + ": POI power", [ties[x] for x in tk])
+            # voltages: the POI, the plant's own buses, then each EGF and SGF unit
+            v = sorted((k for k in allk if meta[k][0] in ("POI", "PLANT") and meta[k][3] in ("V", "B")),
+                       key=lambda k: (0 if meta[k][0] == "POI" else 1, meta[k][1], meta[k][3]))
+            shown_buses |= set(meta[k][1] for k in v)
+            us = units("EGF") + units("SGF")
+            emit(t + ": voltages", [[k] for k in v] + [[k] for _u, ks in us for k in qof(ks, ("V",))])
+            emit(t + ": rotor angles", [[k] for _u, ks in us for k in qof(ks, ("A",))])
+            emit(t + ": unit P and Q", [qof(ks, ("P", "Q")) for _u, ks in us])
+        elif sec == "BUSES":
+            t = _TITLES["BUSES"] % BUS_POI_HOPS
+            cand = [k for k in allk if meta[k][0] == "BUS" and meta[k][1] not in shown_buses]
+            fl = sorted((k for k in cand if flagged(k)), key=lambda k: (dp(meta[k][1]), meta[k][1]))
+            near = sorted((k for k in cand if not flagged(k) and dp(meta[k][1]) <= BUS_POI_HOPS),
+                          key=lambda k: (dp(meta[k][1]), meta[k][1]))
+            if BUS_MAX:
+                near = near[:int(BUS_MAX)]
+            emit(t, [[k] for k in fl + near])
+        elif sec == "OTHER_GENS":
+            t = _TITLES["OTHER_GENS"] % PQ_POI_HOPS
+            gens = dict(units("GEN"))
+            vio = [u for u in gens if any(flagged(k) for k in gens[u])] if VIOLATED_ALWAYS else []
+            vio.sort(key=lambda u: (dp(u[0]), u[0], str(u[1])))
+            near = sorted((u for u in gens if u not in vio and dp(u[0]) <= PQ_POI_HOPS),
+                          key=lambda u: (dp(u[0]), u[0], str(u[1])))
+            if PQ_GEN_MAX:
+                near = near[:int(PQ_GEN_MAX)]
+            if ANGLES_OF_VIOLATED and vio:
+                emit("Flagged machines: rotor angle and terminal voltage",
+                     [[k] for u in vio for k in qof(gens[u], ("A",)) + qof(gens[u], ("V",))])
+            emit(t, [qof(gens[u], ("P", "Q")) for u in vio + near])
+    extra = sorted(k for k in allk if meta[k][0] == "OTHER")
+    if extra:
+        emit("Other channels", [[k] for k in extra])
+    # flagged machines and buses with no channel in any .out: only the verdict is known
+    drawn_m, drawn_b = set(), set()
+    for k, (g, b, mid, q) in meta.items():
+        if g in ("SGF", "EGF", "GEN"):
+            for vb, vm in flags.get("mach", {}):
+                if vb == b and (g == "SGF" or vm == mid):
+                    drawn_m.add((vb, vm))
+        elif g in ("FAULT", "POI", "PLANT", "BUS"):
+            drawn_b.add(b)
+    fbuses = set(vb for vb, _vm in flags.get("bus", {}))
     ctx = {"fbus": fbus, "pois": pois, "dist_f": dist_f, "dist_p": dist_p,
-           "n_flagged": len(drawn),
-           "flag_missing": [_unit(vb, vm) for (vb, vm) in viol if (vb, vm) not in drawn]}
-    return sections, elems, ctx
+           "n_flagged": len(drawn_m) + len(fbuses & drawn_b),
+           "flag_missing": [_unit(vb, vm) for (vb, vm) in flags.get("mach", {}) if (vb, vm) not in drawn_m],
+           "bus_flag_missing": sorted(fbuses - drawn_b)}
+    return pages, ctx
 
 
 # ---- drawing ---------------------------------------------------------------------
@@ -1231,7 +1338,7 @@ def _legend_handles(solid=False):
     return out
 
 
-def _draw_overlay_page(plt, page, traces, fault_t, ctx, viol, bmap):
+def _draw_overlay_page(plt, page, traces, fault_t, ctx, flags, bmap):
     """PANELS_PER_PAGE panels, the three cases overlaid on each. The page is
        always divided into PANELS_PER_PAGE rows, so a section's last page, with
        fewer panels, keeps the same panel height instead of stretching them."""
@@ -1264,7 +1371,7 @@ def _draw_overlay_page(plt, page, traces, fault_t, ctx, viol, bmap):
         if w:
             ax.text(0.0, 1.015, _cap(w), transform=ax.transAxes, fontsize=7.5,
                     color="#666666", ha="left", va="bottom")
-        fl = _flags_of(meta, viol)
+        fl = _flags_of(meta, flags)
         if SHOW_END_VALUES and ends:
             x = 1.0
             for col, txt in reversed(ends):
@@ -1299,7 +1406,7 @@ def _missing_text(ci, name, have_case):
     return "not recorded in this case"
 
 
-def _draw_pq_page(plt, rows, traces, fault_t, ctx, viol, bmap, present):
+def _draw_pq_page(plt, rows, traces, fault_t, ctx, flags, bmap, present):
     """Rows of three panels -- one per case, in CASES order -- sharing one y scale."""
     from matplotlib.gridspec import GridSpec
     fig = plt.figure(figsize=(11.0, 8.5))
@@ -1311,7 +1418,7 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, viol, bmap, present):
     by_ci = dict((ci, (t, sig)) for ci, t, sig in traces)
     for r, name in enumerate(rows):
         meta = _meta(name)
-        fl = _flags_of(meta, viol)
+        fl = _flags_of(meta, flags)
         fl_cases = set(ci for ci, _k, _v, _u, _n in fl)
         fl_kind = dict((ci, k) for ci, k, _v, _u, _n in fl)
         series = []
@@ -1364,7 +1471,7 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, viol, bmap, present):
     return fig
 
 
-def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, viol, bmap, present):
+def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, flags, bmap, present):
     """One P or Q quantity on a page: Base case, Scenario 1 and Scenario 2 one
        under another, full width, on one y scale (PQ_SAME_SCALE)."""
     from matplotlib.gridspec import GridSpec
@@ -1373,7 +1480,7 @@ def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, viol, bmap, present):
     gs = GridSpec(n, 1, left=0.08, right=0.97, top=0.80, bottom=0.075, hspace=0.42)
     by_ci = dict((ci, (t, sig)) for ci, t, sig in traces)
     meta = _meta(name)
-    fl = _flags_of(meta, viol)
+    fl = _flags_of(meta, flags)
     fl_kind = dict((ci, k) for ci, k, _v, _u, _n in fl)
     axs, series = [], []
     for ci in range(n):
@@ -1419,49 +1526,20 @@ def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, viol, bmap, present):
     return fig
 
 
-def _paginate(sections, elems):
-    """[(kind, section title, panels)] -- overlay pages of PANELS_PER_PAGE panels,
-       then the P / Q pages: with PQ_LAYOUT "stacked" one page per quantity (a
-       unit's P page, then its Q page); with "rows" PQ_ROWS_PER_PAGE rows to a
-       page, a machine's P and Q rows never split across two pages."""
-    pages = []
-    per = max(1, int(PANELS_PER_PAGE or 1))
-    for title, names in sections:
-        for i in range(0, len(names), per):
-            pages.append(("overlay", title, names[i:i + per]))
-    if str(PQ_LAYOUT).strip().lower().startswith("stack"):
-        for rows in elems:
-            for name in rows:
-                q = _meta(name)[3]
-                pages.append(("pq1", "Active power" if q == "P" else "Reactive power" if q == "Q" else "P and Q",
-                              [name]))
-        return pages
-    nrow = max(1, int(PQ_ROWS_PER_PAGE or 1))
-    title = "P and Q, side by side"
-    cur = []
-    for rows in elems:
-        if cur and len(cur) + len(rows) > nrow:
-            pages.append(("pq", title, cur))
-            cur = []
-        while len(rows) > nrow:                      # only when PQ_ROWS_PER_PAGE is 1
-            pages.append(("pq", title, rows[:nrow]))
-            rows = rows[nrow:]
-        cur = cur + list(rows)
-    if cur:
-        pages.append(("pq", title, cur))
-    return pages
-
-
 def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     """One fault's PDF. Returns (pdf path or None, note)."""
     bmap = _bus_map(dirs)
-    viol = _violations(dirs, fault)
-    vbuses = sorted(set(b for (b, _m) in viol))
+    flags = {"mach": _violations(dirs, fault, VIOLATION_KINDS),       # tripped / undamped machines
+             "bus": _violations(dirs, fault, BUS_VIOLATION_KINDS)}    # overshoot / recovery / steady buses
+    vbuses = sorted(set(b for (b, _m) in flags["mach"]))
+    bbuses = sorted(set(b for (b, _m) in flags["bus"]))
     stamp_map = ("%s@%d" % (bmap[3], int(os.path.getmtime(bmap[3])))) if bmap else "nomap"
-    sel_key = "%s|%s|%s|%s" % (GEN_NEAR_HOPS, PQ_POI_HOPS, ",".join(str(b) for b in vbuses), stamp_map)
+    sel_key = "%s|%s|%s|%s|%s|%s|%s" % (PQ_POI_HOPS, BUS_POI_HOPS, ",".join(_sections()), VIOLATED_ALWAYS,
+                                         ",".join(str(b) for b in vbuses), ",".join(str(b) for b in bbuses),
+                                         stamp_map)
 
     def mk_want(titles):
-        return _make_want(titles, bmap, vbuses)
+        return _make_want(titles, bmap, vbuses, bbuses)
     traces = []                   # (case index, t, {panel: values})
     fault_t = None                # fault instant on the plotted time axis
     present = set()
@@ -1491,16 +1569,20 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
         print("    %s: no case has a readable .out -- skipped" % fault)
         return None, ("no readable .out" if unreadable else "no .out")
     traces = _normalise(traces)
-    sections, elems, ctx = _choose(traces, viol, bmap)
-    pages = _paginate(sections, elems)
+    pages, ctx = _plan(traces, flags, bmap)
     if not pages:
-        print("    %s: nothing left to draw with OVERLAY_QUANTITIES = %s, SEPARATE_QUANTITIES = %s, "
-              "PLOT_GROUPS = %s" % (fault, OVERLAY_QUANTITIES, SEPARATE_QUANTITIES, PLOT_GROUPS))
+        print("    %s: nothing left to draw with SECTIONS = %s, OVERLAY_QUANTITIES = %s, SEPARATE_QUANTITIES = %s"
+              % (fault, SECTIONS, OVERLAY_QUANTITIES, SEPARATE_QUANTITIES))
         return None, "nothing to draw"
     if ctx["flag_missing"]:
-        print("    %s: flagged by the study but not in any .out (no channel to draw): %s"
+        print("    %s: machine(s) flagged by the study but not in any .out (no channel to draw): %s"
               % (fault, ", ".join(sorted(set(ctx["flag_missing"])))))
+    if ctx["bus_flag_missing"] and "BUSES" in _sections():
+        print("    %s: bus(es) flagged by the study with no voltage channel in any .out: %s"
+              % (fault, ", ".join(str(b) for b in ctx["bus_flag_missing"])))
     out_dir = _abs(OUT_DIR)
+    if PROJECT_FOLDERS:
+        out_dir = os.path.join(out_dir, proj)
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
     pdf_path = os.path.join(out_dir, PDF_NAME.format(project=proj, fault=fault, mode=MODE))
@@ -1510,12 +1592,12 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     with PdfPages(pdf_path) as pdf:
         for pg, (kind, title, page) in enumerate(pages, start=1):
             if kind == "overlay":
-                fig, legend = _draw_overlay_page(plt, page, traces, fault_t, ctx, viol, bmap)
+                fig, legend = _draw_overlay_page(plt, page, traces, fault_t, ctx, flags, bmap)
             elif kind == "pq1":
-                fig = _draw_pq_stacked_page(plt, page[0], traces, fault_t, ctx, viol, bmap, present)
+                fig = _draw_pq_stacked_page(plt, page[0], traces, fault_t, ctx, flags, bmap, present)
                 legend = _legend_handles(solid=PQ_SOLID_LINES)
             else:
-                fig = _draw_pq_page(plt, page, traces, fault_t, ctx, viol, bmap, present)
+                fig = _draw_pq_page(plt, page, traces, fault_t, ctx, flags, bmap, present)
                 legend = _legend_handles(solid=PQ_SOLID_LINES)
             _page_head(fig, proj, fault, title, pg, len(pages), stamp)
             _page_legend(fig, legend)
@@ -1523,7 +1605,7 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                 pdf.savefig(fig)
             finally:
                 plt.close(fig)
-    note = "%d overlay panel(s), %d P / Q quantities, %d flagged machine(s), %d page(s)" % (
+    note = "%d overlay panel(s), %d P / Q quantities, %d flagged bus(es) / machine(s), %d page(s)" % (
         n_ov, n_pq, ctx["n_flagged"], len(pages))
     return pdf_path, note
 
@@ -1608,11 +1690,12 @@ def main():
                 continue
             p, tab = _viol_table(d)
             print("    %-30s flags: %s" % (_short(c[0]), ("%s (%d fault(s) with %s)"
-                  % (os.path.basename(p), len(tab), "/".join(VIOLATION_KINDS))) if p else
-                  "*** no violations list found -- flagged machines cannot be added ***"))
+                  % (os.path.basename(p), len(tab), "/".join(list(VIOLATION_KINDS) + list(BUS_VIOLATION_KINDS))))
+                  if p else "*** no violations list found -- flagged buses and machines cannot be added ***"))
         bm = _bus_map(dirs)
         if bm is None:
-            print("    *** no flags\\BUS_MAP.csv: other machines' P / Q are limited to the flagged ones ***")
+            print("    *** no flags\\BUS_MAP.csv: bus voltages and other machines' P / Q are limited to "
+                  "the flagged ones ***")
         faults = _faults(dirs)
         print("    %d fault(s)" % len(faults))
         jobs.extend((proj, f, dirs) for f in faults)
@@ -1658,7 +1741,8 @@ def main():
             pool.close()
             pool.join()
     print("")
-    print("%s %d PDF(s) in %s  (%s)" % (TAG, ok, _abs(OUT_DIR), _hms(time.time() - t0)))
+    print("%s %d PDF(s) in %s%s  (%s)" % (TAG, ok, _abs(OUT_DIR), ("\\<project>" if PROJECT_FOLDERS else ""),
+                                         _hms(time.time() - t0)))
     for f in fails:
         print("%s   not drawn: %s" % (TAG, f))
 
