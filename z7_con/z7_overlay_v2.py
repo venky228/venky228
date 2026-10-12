@@ -12,13 +12,14 @@ writes ONE PDF, three plots to a page, in this order (SECTIONS):
     1 FAULTED BUS  the faulted bus voltage.
     2 EGF AND SGF  the plant: the POI P and Q (sum of the plant ties); the POI
                    and the plant's own bus voltages; each EGF and SGF unit's
-                   terminal voltage and rotor angle; each unit's P and Q.
+                   terminal voltage and rotor angle; each unit's P and Q. The
+                   SGF units' buses (999001, 999002, ...) are drawn as SGF
+                   unit 1, SGF unit 2, ...
     3 BUSES        the voltage of every bus within BUS_POI_HOPS (5) buses of
                    the POI -- the buses the study FLAGGED for this fault
                    (overshoot, recovery, steady state, in any of the three
-                   cases) first, wherever they are, each marked with its
-                   violation.
-    4 OTHER GENS   P and Q of the other machines within PQ_POI_HOPS (7) buses
+                   cases) first, wherever they are.
+    4 OTHER GENS   P and Q of every other machine within PQ_POI_HOPS (10) buses
                    of the POI -- the machines the study flagged (tripped or
                    undamped, in any case) first, wherever they are, with
                    their rotor angle and terminal voltage (ANGLES_OF_VIOLATED).
@@ -29,9 +30,10 @@ unit, say -- with the Base case, Scenario 1 and Scenario 2 one under another,
 full width, on one y scale; then the same unit's Q.
 
 The flags come from each case's own violations list, the 02_VIOLATIONS_*.csv
-the study writes beside its results, so the pages follow the study's verdicts;
-each flagged panel says which case flagged it and for what. Every project's
-PDFs go to their own folder, <OUT_DIR>\<project>.
+the study writes beside its results, so the pages follow the study's verdicts
+(the flag text itself is printed only with SHOW_STUDY_FLAGS = True). Each page
+is headed "<project>  |  <fault>". Every project's PDFs go to their own folder,
+<OUT_DIR>\<project>.
 
 On the overlays the three cases are told apart by colour AND line style AND
 width, so the plot still reads printed in black and white or by a colour-blind
@@ -65,6 +67,8 @@ ROOT = r"C:\KV\ENGIE\CQ_MIT_f"          # the study folder holding Base\ and Pro
 PROJECTS = ["SantaFe", "IronStar", "EmpirePrairie", "EastFork"]   # all 4 (remove any you do not want)
 MODE = "spp"
 FAULTS = []                              # [] = every fault with an .out in Scenario 1 | e.g. ["F134", "F01"]
+PLOT_FLAT_RUN = True                     # the flat run (no fault; FLAT_RUN.out) is drawn too, first -- with
+                                         #   FAULTS = [] (name it in FAULTS, e.g. ["FLAT_RUN", "F01"], otherwise)
 
 # The three runs: label, results root (under ROOT), folder suffix, colour, style, width.
 # Folder = <results root>\<project>\<project>_<mode><suffix>  (or without the
@@ -80,7 +84,13 @@ CASES = [
     ("Scenario 2: SGF on, EGF off",        r"Projects\results_proj_f", "_s1_egfoff", "#E8590C", "-.", 1.3, 1.0),
 ]
 
-PAGE_SUBTITLE = "Base Case (DISIS 2201) vs Scenario 1 vs Scenario 2"   # right of the page title
+PAGE_SUBTITLE = ""                       # right of the page title, e.g. "Base Case (DISIS 2201) vs Scenario 1
+                                         #   vs Scenario 2" ("" = none)
+SHOW_SECTION_TITLE = False               # True = the page title also names the section ("EastFork | F01 | Bus
+                                         #   voltages within 5 buses of the POI") | False = "EastFork | F01" only
+SHOW_STUDY_FLAGS = False                 # True = the study's flag ("Study flag: overshoot (1.249 pu ...) in Base Case
+                                         #   ...") in red on each flagged panel | False = no flag text on the plots
+                                         #   (flagged buses and machines are still drawn, first)
 FOOTER_TEXT = "SPP Dynamic Stability Study -- Surplus Interconnection"   # bottom left of every page
 FAULT_LINE = True                        # thin red dotted line at the fault instant (no label); False = none
 SHOW_END_VALUES = False                  # each panel's value at T_MAX per case, small, top right of the panel
@@ -125,7 +135,7 @@ BUS_MAX = 0                              # ... at most this many of them, neares
 BUS_VIOLATION_KINDS = ["overshoot", "recovery", "steady"]   # ... plus EVERY bus the study flagged for these in
                                          #   any of the three cases, wherever it is -- drawn first, never cut by
                                          #   BUS_MAX (the 'violation' column of the study's 02_VIOLATIONS csv)
-PQ_POI_HOPS = 7                          # OTHER_GENS: P / Q of the other machines within this many buses of the POI ...
+PQ_POI_HOPS = 10                         # OTHER_GENS: P / Q of EVERY other machine within this many buses of the POI ...
 PQ_GEN_MAX = 0                           # ... at most this many of them, nearest the POI first (0 = all)
 VIOLATED_ALWAYS = True                   # ... plus EVERY machine the study flagged for this fault (any of the
                                          #   three cases), wherever it is -- drawn first, never cut by PQ_GEN_MAX
@@ -203,16 +213,18 @@ def _case_dir(res_root, proj, suffix):
 
 
 def _faults(dirs):
-    """Faults to draw: FAULTS, else every .out in Scenario 1 (or the first case found)."""
+    """Faults to draw: FAULTS, else every .out in Scenario 1 (or the first case
+       found) -- the flat run first when PLOT_FLAT_RUN."""
     if FAULTS:
         return list(FAULTS)
     for d in dirs[1:] + dirs[:1]:
         if d:
             got = sorted(os.path.splitext(os.path.basename(p))[0]
                          for p in glob.glob(os.path.join(d, "outs", "*.out")))
+            flat = [f for f in got if f.upper().startswith("FLAT")] if PLOT_FLAT_RUN else []
             got = [f for f in got if not f.upper().startswith("FLAT")]
-            if got:
-                return got
+            if got or flat:
+                return flat + got
     return []
 
 
@@ -983,6 +995,26 @@ def _normalise(traces):
             if nm not in new:
                 new[nm] = v
         traces[j] = (ci, t, new)
+    # The SGF units' own buses (SGF_UNIT_BUS_START, +1, ...) are drawn as the
+    # units: a unit's bus voltage IS its terminal voltage, so "Plant bus 999001
+    # voltage" becomes "SGF unit 1 terminal V" -- one panel, the unit's own
+    # channel kept where both were recorded. Only the buses of SGF units that
+    # some case records are renamed (other plant buses keep their name).
+    sgf_n = set()
+    for ci, t, sg in traces:
+        if "base" not in str(CASES[ci][1]).lower():
+            for k in sg:
+                m = re.match(r"^SGF unit (\d+) ", k)
+                if m:
+                    sgf_n.add(int(m.group(1)))
+    for j, (ci, t, sg) in enumerate(traces):
+        if "base" in str(CASES[ci][1]).lower():
+            continue
+        for k in list(sg):
+            m = re.match(r"^Plant bus (\d+) voltage \(pu\)$", k)
+            if m and int(m.group(1)) - SGF_UNIT_BUS_START + 1 in sgf_n:
+                v = sg.pop(k)
+                sg.setdefault("SGF unit %d %s" % (int(m.group(1)) - SGF_UNIT_BUS_START + 1, _QTXT["V"]), v)
     return traces
 
 
@@ -992,7 +1024,7 @@ def _where(meta, fbus, pois, bmap, dist_f, dist_p):
     if b is None or bmap is None:
         return ""
     _adj, bus, area, _p = bmap
-    parts = []
+    parts = ["bus %d" % b] if g == "SGF" else []      # an SGF unit's title gives n, not its bus
     if pois:
         if b in pois:
             parts.append("at the POI")
@@ -1296,9 +1328,10 @@ def _plan(traces, flags, bmap):
 
 # ---- drawing ---------------------------------------------------------------------
 def _page_head(fig, proj, fault, section, pg, n_pages, stamp):
-    fig.text(0.06, 0.965, "%s  |  %s  |  %s" % (proj, fault, section), fontsize=14,
-             color="#1A1A1A", ha="left", va="center")
-    fig.text(0.94, 0.965, PAGE_SUBTITLE, fontsize=9, color="#555555", ha="right", va="center")
+    head = ("%s  |  %s  |  %s" % (proj, fault, section)) if SHOW_SECTION_TITLE else ("%s  |  %s" % (proj, fault))
+    fig.text(0.06, 0.965, head, fontsize=14, color="#1A1A1A", ha="left", va="center")
+    if PAGE_SUBTITLE:
+        fig.text(0.94, 0.965, PAGE_SUBTITLE, fontsize=9, color="#555555", ha="right", va="center")
     # the rule under the title -- fig.lines works on every matplotlib
     # (fig.add_artist only exists from 3.0; Python 3.4 has older ones)
     from matplotlib.lines import Line2D as _L2D
@@ -1378,7 +1411,7 @@ def _draw_overlay_page(plt, page, traces, fault_t, ctx, flags, bmap):
                 ax.text(x, 1.015, txt, transform=ax.transAxes, fontsize=7.5,
                         color=col, ha="right", va="bottom")
                 x -= 0.008 + 0.0068 * len(txt)
-        elif fl:
+        elif fl and SHOW_STUDY_FLAGS:
             ax.text(1.0, 1.015, "Study flag: " + _flag_text(fl), transform=ax.transAxes,
                     fontsize=7.5, color="#C92A2A", ha="right", va="bottom")
         _dress(ax)
@@ -1442,7 +1475,7 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, flags, bmap, present):
                 ax.text(0.5, 0.5, _missing_text(ci, name, ci in present), transform=ax.transAxes,
                         fontsize=8, color="#999999", ha="center", va="center")
             _above(ax, 0.0, _short(lab), fontsize=8.5, color=col if col != "#000000" else "#1A1A1A", ha="left")
-            if ci in fl_cases and not SHOW_END_VALUES:
+            if ci in fl_cases and SHOW_STUDY_FLAGS and not SHOW_END_VALUES:
                 _above(ax, 1.0, fl_kind[ci].upper(), fontsize=7.5, color="#C92A2A", ha="right",
                        fontweight="bold")
             _dress(ax, xlabel=(r == len(rows) - 1))
@@ -1464,7 +1497,7 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, flags, bmap, present):
         if w:
             fig.text(pos.x0, pos.y1 + 0.029, _cap(w), fontsize=7.5, color="#666666",
                      ha="left", va="bottom")
-        if fl:
+        if fl and SHOW_STUDY_FLAGS:
             pr = axs[-1].get_position()
             fig.text(pr.x1, pos.y1 + 0.029, "Study flag: " + _flag_text(fl), fontsize=7.5,
                      color="#C92A2A", ha="right", va="bottom")
@@ -1504,7 +1537,7 @@ def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, flags, bmap, present)
                     fontsize=9, color="#999999", ha="center", va="center")
         _above(ax, 0.0, _cap(lab), fontsize=9, color=col if col != "#000000" else "#1A1A1A", ha="left",
                fontweight="bold")
-        if ci in fl_kind and not SHOW_END_VALUES:
+        if ci in fl_kind and SHOW_STUDY_FLAGS and not SHOW_END_VALUES:
             _above(ax, 1.0, fl_kind[ci].upper(), fontsize=8, color="#C92A2A", ha="right", fontweight="bold")
         _dress(ax, xlabel=(ci == n - 1))
         ax.set_ylabel(_ylabel(name), fontsize=8.5, color="#333333")
@@ -1521,7 +1554,7 @@ def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, flags, bmap, present)
     w = _where(meta, ctx["fbus"], ctx["pois"], bmap, ctx["dist_f"], ctx["dist_p"]) if SHOW_NODES else ""
     if w:
         fig.text(0.08, 0.851, _cap(w), fontsize=8, color="#666666", ha="left", va="bottom")
-    if fl:
+    if fl and SHOW_STUDY_FLAGS:
         fig.text(0.97, 0.851, "Study flag: " + _flag_text(fl), fontsize=8, color="#C92A2A", ha="right", va="bottom")
     return fig
 
