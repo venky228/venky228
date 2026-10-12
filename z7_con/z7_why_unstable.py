@@ -20,7 +20,25 @@ that went wrong and says why, as far as the study's own files can tell:
                    of the network lost its solution (a voltage off-scale, an
                    angle turning through more than 720 deg, or a divergence).
 
-and for those two it reads: which channels the study names (parts\\SCEN_<id>.csv),
+  NOT CONVERGED    the run FINISHED and was scored, but PSS/E's network solution
+                   was still failing NONCONV_AFTER_S or more after the last
+                   switching (SCAN_NONCONV): the values in that window are not a
+                   solution, so the verdict of that run cannot be trusted.
+
+For every one of them it then says WHERE IT STARTS and WHY, as a root cause:
+the bus where the voltage runs away worst (PSS/E's own "outside of band"
+lines, the study's off-scale list), how many buses that is from the faulted
+bus, whether its ONLY path to the system runs through the faulted bus (a plant
+radial on the faulted bus sees zero volts for the whole fault), which machines
+sit there and which dynamic models they use (from the .dyr files), whether a
+VSC / DC converter is involved, whether it starts at the reclose, which of the
+cases fail and which run (the base case failing too = not caused by the SGF;
+running with the EGF off = needs the SGF and the EGF together), and whether a
+model PSS/E could not load ("NOT ACCESSIBLE" in the init log) sits nearby --
+and WHAT TO TRY to confirm it (a smaller time step, the solver retry ladder,
+switching the plant off as a test, running without the reclose).
+
+For every run it also reads: which channels the study names (parts\\SCEN_<id>.csv),
 whether the fault's own trips cut those buses off from the system (the fault
 list + flags\\BUS_MAP.csv, the same test the study uses, and PSS/E's own
 "following buses are disconnected"), what PSS/E reported in the fault window
@@ -38,11 +56,16 @@ RUN (Python 3.4 or later, from the study folder that holds Base\\ and Projects\\
     python z7_why_unstable.py                 every crashed or unstable run it finds
     python z7_why_unstable.py F124 F148       only these faults (in every case)
     python z7_why_unstable.py --quick         logs and score files only, no .out read (seconds)
+    python z7_why_unstable.py --noscan        without the scan of the finished runs for non-convergence
 READ_OUT = True reads the .out files with PSS/E's dyntools (the PSS/E Python
 folders are looked for in the usual places, or set PSSE_DIRS) -- only the first
 part of each file, up to OUT_WINDOW_S after the last switching, which is where a
 blow-up shows; a crashed run's partial .out is never read. If the .out cannot be
 read the rest of the report is still written.
+
+The report opens with the MODELS PSS/E COULD NOT LOAD in each project (the
+"NOT ACCESSIBLE" lines of the init logs), with the buses each one belongs to --
+those models do not run in ANY fault.
 
 Output: <ROOT>\\unstable_reasons\\WHY_UNSTABLE.txt and WHY_UNSTABLE.csv
 """
@@ -68,6 +91,7 @@ CASES = [
     ("Base case",                    r"Base\results_base_f",     ""),
     ("Scenario 1 (SGF + EGF, GIA)",  r"Projects\results_proj_f", ""),
     ("Scenario 2 (SGF on, EGF off)", r"Projects\results_proj_f", "_s1_egfoff"),
+    ("Scenario 1 at 40/60 (SGF 40 %, EGF 60 %)", r"Projects\results_proj_f", "_s1_sgf40"),   # skipped if not there
 ]
 FAULTS = []                    # [] = every crashed / off-scale / solution-lost run found | e.g. ["F124", "F10-F20"]
 COMPARE_OTHER_CASES = True     # show each fault in the other cases too
@@ -91,6 +115,11 @@ DC_TERMINALS = {
 }
 EXIT_MATCH_MIN = 45            # a worker exit this many minutes after an attempt's last log line still belongs to it
 RUNNING_MIN = 10               # no result, but the .out / run log written this recently = STILL RUNNING, not crashed
+SCAN_NONCONV = True            # also every run that FINISHED but whose network solution was still failing ...
+NONCONV_AFTER_S = 1.0          # ... this long (s) or more after the last switching (clearing / reclose) -> NOT CONVERGED
+DYR_FILES = []                 # [] = every .dyr directly in Base\ and Projects\ | or paths (under ROOT or full)
+DYR_INCLUDE_LOADED = False     # True = also the LOADED_*.dyr dumps the builds leave beside them
+PLANT_HOPS = 3                 # the machines this close to where the voltage runs away are named, with their models
 OUT_DIR = "unstable_reasons"   # under ROOT unless a full path
 # ============================================================================
 
@@ -457,6 +486,212 @@ def near(bm, buses, hops=1):
         seen |= nx
         fr = nx
     return seen
+
+def hops_map(bm, src, limit=60):
+    """{bus: buses from src} over the bus map."""
+    dist, fr = {src: 0}, [src]
+    for k in range(1, limit + 1):
+        nx = []
+        for u in fr:
+            for w in bm["adj"].get(u, ()):
+                if w not in dist:
+                    dist[w] = k
+                    nx.append(w)
+        if not nx:
+            break
+        fr = nx
+    return dist
+
+
+def behind(bm, b, fbus, cut=()):
+    """The buses b reaches WITHOUT passing through fbus (nor the fault's opened branches),
+       when that is a small pocket (ISLAND_MAX_BUSES at most): b's only path to the system
+       then runs through fbus. None when b reaches the system some other way (or no map).
+       The bus map also lists branches that are out of service, so a radial connection can
+       be missed -- never invented."""
+    if not bm["ok"] or b is None or fbus is None or b == fbus or b not in bm["adj"]:
+        return None
+    seen, fr = set([b]), [b]
+    while fr:
+        nx = []
+        for u in fr:
+            for w in bm["adj"].get(u, ()):
+                if w == fbus or w in seen or (u, w) in cut:
+                    continue
+                seen.add(w)
+                nx.append(w)
+                if len(seen) > ISLAND_MAX_BUSES:
+                    return None
+        fr = nx
+    return seen
+
+
+# -------------------------------------------------------------------- .dyr --
+_TOK = re.compile(r"'[^']*'|\"[^\"]*\"|[^\s,'\"/]+")
+_USR_AT_BUS = ("USRMDL", "USRLOD", "USRBUS", "USRBRN", "USRSHT", "USRAUX")
+_DC_MODEL = re.compile(r"^(CDC|VSCDC|MTDC|CEEL|CHAAUT|CSTCNT|CSVGN|SVSMO)", re.I)
+_CONVERTER = re.compile(r"^(REGC|REEC|REPC|WT[1-4][A-Z]|PVGU|PVEU|PVD|GEWT|GEPV|W[34]G|SWTG|DER_A|DERA|PVGEN|WTARA|WTDTA|"
+                        r"WTPTA|WTTQA|IBR|GFM)", re.I)
+_DYR = {"done": False, "files": [], "at": collections.defaultdict(list), "by_name": collections.defaultdict(list)}
+
+
+def _cut_slash(line):
+    """(the text before the first / outside quotes, True when there was one)."""
+    if "/" not in line:
+        return line, False
+    if "'" not in line and '"' not in line:
+        return line[:line.index("/")], True
+    q = None
+    for i, ch in enumerate(line):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "'\"":
+            q = ch
+        elif ch == "/":
+            return line[:i], True
+    return line, False
+
+
+def _unq(t):
+    t = str(t)
+    if len(t) >= 2 and t[0] in "'\"" and t[-1] == t[0]:
+        return t[1:-1].strip()
+    return t.strip()
+
+
+def dyr_files():
+    if DYR_FILES:
+        return [_abs(p) for p in DYR_FILES if os.path.isfile(_abs(p))]
+    out = []
+    for sub in ("Base", "Projects"):
+        d = _abs(sub)
+        if not os.path.isdir(d):
+            continue
+        for nm in sorted(os.listdir(d)):
+            if nm.lower().endswith(".dyr") and (DYR_INCLUDE_LOADED or not nm.upper().startswith("LOADED_")):
+                if os.path.isfile(os.path.join(d, nm)):
+                    out.append(os.path.join(d, nm))
+    return out
+
+
+def _dyr_rec(toks, path):
+    if len(toks) < 3:
+        return
+    m1 = _unq(toks[1]).upper()
+    ints = []
+    for x in toks[3:60]:
+        u = _unq(x)
+        if re.match(r"^\d{4,7}$", u):
+            ints.append(int(u))
+    if m1 == "USRMSC":                       # 'id' 'USRMSC' 'NAME' ... -- a plant controller and the like
+        name, bus = _unq(toks[2]).upper(), None
+    elif m1 in _USR_AT_BUS and len(toks) >= 4:
+        name, bus = _unq(toks[3]).upper(), _unq(toks[0])
+    elif _DC_MODEL.match(m1):                # a DC line: named, not at a bus
+        name, bus = m1, None
+    else:
+        name, bus = m1, _unq(toks[0])
+    b = int(bus) if bus and bus.isdigit() else None
+    if b is not None:
+        _DYR["at"][b].append((name, _unq(toks[2]), path))
+    _DYR["by_name"][name].append((b, ints, path, _unq(toks[0])))
+
+
+def read_dyrs():
+    """Every .dyr record, once: the models at each bus, and every record by model name."""
+    if _DYR["done"]:
+        return _DYR
+    _DYR["done"] = True
+    for p in dyr_files():
+        t0, n = time.time(), 0
+        try:
+            cur = []
+            with open(p, "r", errors="replace") as fh:
+                for line in fh:
+                    s = line.lstrip()
+                    if not s or s.startswith("@!"):
+                        continue
+                    body, end = _cut_slash(line)
+                    cur.extend(_TOK.findall(body))
+                    if end:
+                        if cur:
+                            _dyr_rec(cur, p)
+                            n += 1
+                        cur = []
+            if cur:
+                _dyr_rec(cur, p)
+        except Exception as e:
+            print("[why] could not read %s (%s)" % (_rel(p), e))
+            continue
+        _DYR["files"].append(p)
+        print("[why] .dyr %s: %d record(s) (%.1f s)" % (_rel(p), n, time.time() - t0))
+    if not _DYR["files"]:
+        print("[why] no .dyr found in Base\\ or Projects\\ -- the models at the buses cannot be named (DYR_FILES)")
+    return _DYR
+
+
+def _dyr_for(proj, path):
+    """A .dyr whose name names another project is that project's own (its SGF buses 999001...)."""
+    nm = os.path.basename(path).lower()
+    hits = [p for p in (PROJECTS or []) if p.lower() in nm]
+    return not hits or proj in hits
+
+
+def models_at(proj, b):
+    """['REGCAU1', 'REECAU1', ...] of the machine(s) at bus b (the project's own .dyr files)."""
+    out = []
+    for name, _mid, path in read_dyrs()["at"].get(int(b), []):
+        if _dyr_for(proj, path) and name not in out:
+            out.append(name)
+    return out
+
+
+def _models_txt(ms, n=6):
+    return ", ".join(ms[:n]) + (" ..." if len(ms) > n else "")
+
+
+_MISSING = {}
+
+
+def missing_models(proj, rdirs):
+    """[(model name, [record text])] of the models PSS/E could not load ("NOT ACCESSIBLE" in an
+       init log of this project), with the buses their .dyr records name."""
+    if proj in _MISSING:
+        return _MISSING[proj]
+    names = set()
+    for rdir in rdirs:
+        for q in sorted(glob.glob(os.path.join(rdir, "logs", "FAULT_*_strt-prog.txt")))[:3] + \
+                glob.glob(os.path.join(rdir, "logs", "INIT*-prog.txt"))[:2]:
+            names |= set(x.upper() for x in re.findall(r'MODEL\s+"([^"]+)"\s+NOT ACCESSIBLE', _read(q) or "", re.I))
+        if names:
+            break
+    out = []
+    for nm in sorted(names):
+        recs = []
+        for b, ints, path, first in read_dyrs()["by_name"].get(nm, []):
+            if not _dyr_for(proj, path):
+                continue
+            recs.append((b, ints, path, first))
+        out.append((nm, recs))
+    _MISSING[proj] = out
+    return out
+
+
+def missing_lines(proj, rdirs, bm):
+    L = []
+    for nm, recs in missing_models(proj, rdirs):
+        if not recs:
+            L.append("   %-8s not in any .dyr read here" % nm)
+            continue
+        for b, ints, path, first in recs[:4]:
+            named = [x for x in ints if x in bm["bus"]] if bm["ok"] else ints
+            L.append("   %-8s %s%s in %s" % (
+                nm, ("at bus %s" % bus_name(bm, b)) if b is not None else "record %s" % first,
+                ("; names bus(es) %s" % ", ".join(bus_name(bm, x) for x in named[:4])) if named else "",
+                os.path.basename(path)))
+    return L
+
 
 
 # ------------------------------------------------------------- run logs --
@@ -994,6 +1229,13 @@ def _analyse_run(proj, case, rdir, fid):
     run1 = A["atts"][-1] if A["atts"] else None
     A["ev"] = event_times(frow, st, run1)
     A["psse"] = psse_log(rdir, fid)
+    A["late_nc"] = None
+    if A["kind"].startswith("ran") and A["psse"] and A["psse"]["nc"]:
+        ln = late_nc(A["psse"]["nc"], A["ev"])
+        if ln:
+            # it finished and was scored, but PSS/E was still failing to solve the network
+            # well after the last switching: the values the verdict judged are not a solution
+            A["kind"], A["late_nc"] = "NOT CONVERGED", ln
     bm = bus_map(rdir)
     A["bm"] = bm
     A["pocket"] = event_pocket(frow, bm)
@@ -1145,6 +1387,14 @@ def reason(A):
         if not parts:
             parts.append("no message survives: the process vanished without a log line -- see the attempts below")
         return "; ".join(parts) + "."
+    if A["kind"] == "NOT CONVERGED" and A.get("late_nc"):
+        n, tl, ls = A["late_nc"]
+        s, _bk = nc_text(P.get("nc") or [])
+        return ("Ran to the end and was scored (%s), but PSS/E's network solution kept failing: %s, %d of them more "
+                "than %.1f s after the last switching (t=%.3f s), the last at t=%.3f s. PSS/E does not stop on a "
+                "failed step -- it carries on from the unconverged values -- so the values in that window are not a "
+                "solution, and this run's verdict cannot be trusted."
+                % ((A["scen"] or {}).get("verdict") or "no verdict", s, n, NONCONV_AFTER_S, ls, tl))
     if A["kind"].startswith("ran"):
         return "Ran to the end: no off-scale voltage and no lost solution (%s)." % A["kind"][5:]
     # off-scale / solution lost
@@ -1228,6 +1478,288 @@ def reason(A):
     return ". ".join(out) + "."
 
 
+# ------------------------------------------------------------ root cause --
+_VERB = {"CRASHED": "crashes", "OFF-SCALE": "goes off-scale", "SOLUTION LOST": "loses its solution",
+         "NOT CONVERGED": "does not converge"}
+
+
+def _bad(X):
+    return X["kind"] in _VERB
+
+
+def _role(X):
+    """'base' | 'egfoff' | 'proj' -- from the case's results folder and suffix in CASES."""
+    for lab, res, suf in CASES:
+        if lab == X["case"]:
+            return "base" if "base" in res.lower() else "egfoff" if "egfoff" in suf.lower() else "proj"
+    return "proj"
+
+
+def _cases(xs):
+    return ", ".join(X["case"].split(" (")[0] for X in xs)
+
+
+def case_pattern(A, others):
+    """Which cases of this fault fail and which run -- and what that says."""
+    if not others:
+        return ""
+    allr = [A] + list(others)
+    base = [X for X in allr if _role(X) == "base"]
+    bad = [X for X in allr if _bad(X)]
+    ok = [X for X in allr if X["kind"].startswith("ran")]
+    okw = ""
+    if ok:
+        marg = [X for X in ok if X["psse"] and X["psse"]["nc"]]
+        okw = "; it runs in %s" % _cases(ok)
+        if marg:
+            n, a, b, _e, _bk = nc_window(marg[0]["psse"]["nc"])
+            okw += (" -- only just: PSS/E's network solution failed there too (%d time(s), to t=%.3f s)" % (n, b)
+                    if b is not None else "")
+    if base and _bad(base[0]):
+        return ("the base case (no SGF) %s too, so it is an existing base case problem, not caused by the SGF%s"
+                % (_VERB[base[0]["kind"]], okw))
+    if base and bad:
+        s = "it fails only with the SGF in service (%s); the base case runs" % _cases(bad)
+        eo = [X for X in allr if _role(X) == "egfoff"]
+        if eo and not _bad(eo[0]) and any(_role(X) == "proj" for X in bad):
+            s += "; with the EGF off (Scenario 2) it runs too, so it takes the SGF and the EGF in service together"
+        return s
+    return ""
+
+
+def last_switch(ev):
+    xs = [x for x in (ev.get("clear"), ev.get("reclose")) if x is not None]
+    return max(xs) if xs else ev.get("fault")
+
+
+def late_nc(nc, ev):
+    """(failed steps more than NONCONV_AFTER_S after the last switching, the last one, that switching) or None."""
+    ls = last_switch(ev or {})
+    if ls is None or not nc:
+        return None
+    after = [t for t in nc if t is not None and t > ls + NONCONV_AFTER_S]
+    return (len(after), max(after), ls) if after else None
+
+
+_RX_NCB = re.compile(br"Network not converged at TIME\s*=\s*(-?[\d.]+(?:[Ee][-+]?\d+)?)")
+
+
+def nc_scan(path):
+    """PSS/E's 'Network not converged' times in one fault log -- a fast pass, nothing else read."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except Exception:
+        return []
+    out = []
+    for x in _RX_NCB.findall(data):
+        v = _num(x.decode("ascii", "replace"))
+        if v is not None:
+            out.append(v)
+    return out
+
+
+def runaway(A):
+    """[(bus, peak pu -- 1e9 for PSS/E's '****' overflow --, first time above RUNAWAY_PU)], worst first:
+       PSS/E's own 'outside of band' lines, the study's off-scale list, and the .out when read."""
+    P = A["psse"] or {}
+    pk, t1 = {}, {}
+
+    def put(b, v, t):
+        if b is None:
+            return
+        v = 1e9 if v is None else v
+        if v > pk.get(b, -1.0):
+            pk[b] = v
+        if t is not None and (b not in t1 or t < t1[b]):
+            t1[b] = t
+    for t, b, v, _nm in P.get("band_hi", []):
+        put(b, v, t)
+    for lab, v in A.get("offscale") or []:
+        bs = _buses_in(lab)
+        if bs:
+            put(bs[0], v, None)
+    of = A.get("out_facts")
+    if of and of[0] == "series":
+        for v in of[1][:8]:
+            bs = _buses_in(v["title"])
+            if bs:
+                put(bs[0], v["peak"], v["t15"])
+    return sorted(((b, pk[b], t1.get(b)) for b in pk), key=lambda x: -x[1])
+
+
+def _pk(v):
+    return "overflow (****)" if v >= 1e8 else ("%.3g pu" % v)
+
+
+def _nb(n):
+    return "1 bus" if n == 1 else "%d buses" % n
+
+
+def _nc_from(ncw, ev):
+    if not ncw or ncw[1] is None:
+        return ""
+    a = ncw[1]
+    if ev.get("fault") is not None and a <= ev["fault"] + 0.01:
+        return "from the moment the fault is applied (t=%.3f s)" % a
+    if ev.get("clear") is not None and a < ev["clear"] - 1e-3:
+        return "during the fault (from t=%.3f s)" % a
+    if ev.get("reclose") is not None and a >= ev["reclose"] - 1e-3:
+        return "from the reclose (from t=%.3f s)" % a
+    return "from t=%.3f s" % a
+
+
+def explain(A, others):
+    """(root cause, [where it starts], [what to try]) -- the logs, the bus map and the .dyr read
+       together. ('', [], []) where nothing can be said beyond the evidence."""
+    if A.get("running") or not (_bad(A)):
+        return "", [], []
+    key = "_explained"
+    if key in A:
+        return A[key]
+    bm, ev, P = A["bm"], A["ev"], A["psse"] or {}
+    fr = A["frow"] or {}
+    try:
+        fb = int(str(fr.get("fault_bus") or "").split(".")[0])
+    except ValueError:
+        fb = None
+    cyc = (fr.get("clear_cycles") or "").strip()
+    cut = fault_cuts(A["frow"])
+    top = runaway(A)
+    nc = P.get("nc") or []
+    ncw = nc_window(nc) if nc else None
+    ncf = _nc_from(ncw, ev)
+    pat = case_pattern(A, others)
+    W, T, head = [], [], ""
+    mach, mods, vsc, pocket, h, src = [], [], [], None, None, None
+    on_map = [x for x in top if x[0] in bm["adj"]] if bm["ok"] else []
+    if on_map:
+        src = on_map[0][0]               # the worst bus the map knows (a bus off the map cannot be placed)
+        dist = hops_map(bm, fb, 40) if (fb is not None and fb in bm["adj"]) else {}
+        h = dist.get(src)
+        pocket = behind(bm, src, fb, cut)
+        if pocket:
+            area = sorted(pocket)
+        else:
+            nb = hops_map(bm, src, PLANT_HOPS)
+            area = sorted(x for x in nb if x == src or (bm["bus"].get(x, (999.0,))[0] or 999.0) <= 35.0)
+        mach = [(x, i) for x in area for i in bm["mach"].get(x, [])]
+        for x, _i in mach:
+            for m in models_at(A["project"], x):
+                if m not in mods:
+                    mods.append(m)
+        vsc = [b for b, _p, _t in top[:8] if "VSC" in str(bm["bus"].get(b, ("", "", ""))[2]).upper()]
+        W.append("worst: %s" % ", ".join("%s %s%s" % (bus_name(bm, b), _pk(p), (" (t=%.3f s)" % t) if t is not None else "")
+                                         for b, p, t in top[:3]))
+        W.append("%s is %s from the faulted bus %s" % (
+            bus_name(bm, src), _nb(h) if h is not None else "more than 40 buses (or not on the map)",
+            bus_name(bm, fb) if fb is not None else "?"))
+        if pocket:
+            W.append("RADIAL: its only path to the system runs through the faulted bus (%s behind it: %s)"
+                     % (_nb(len(pocket)), ", ".join(str(b) for b in sorted(pocket)[:10])))
+        if mach:
+            W.append("machine(s) there: %s" % ", ".join("%s-%s [%s]" % (b, i, _short(bm["bus"].get(b, ("", "", ""))[2], 14))
+                                                         for b, i in mach[:8]))
+            W.append("their models (.dyr): %s" % (_models_txt(mods, 10) if mods else
+                                                   "none found (no .dyr read, or not modelled there)"))
+        if vsc:
+            W.append("VSC HVDC converter bus(es) among them: %s" % ", ".join(bus_name(bm, b) for b in vsc[:4]))
+    elif top:
+        W.append("worst: %s (%s)" % (", ".join("%s %s" % (b, _pk(p)) for b, p, _t in top[:3]),
+                                     "not on the bus map" if bm["ok"] else "no flags\\BUS_MAP.csv to place them"))
+    dcl = [(t, ln) for t, ln in P.get("dc", []) if re.search(r"no longer controlling|block|commutat", ln, re.I)]
+    if dcl:
+        W.append("DC links reported (often a symptom of the collapse, not its start): %s" % "; ".join("t=%s %s" % (("%.3f" % t) if t is not None else "?", _short(ln, 70)) for t, ln in dcl[:2]))
+    if ncw and ncw[1] is not None:
+        W.append("network solution failed %s %s" % (nc_text(nc)[0], ("-- " + ncf) if ncf else ""))
+    # did it start at the reclose?
+    rec = ev.get("reclose")
+    first = sorted([t for t, _a, _b in P.get("oos", []) if t is not None] +
+                   [t for t, _b, v, _n in P.get("band_hi", []) if t is not None and (v is None or v > RUNAWAY_PU)])
+    at_rec = bool(rec is not None and first and rec - 0.005 <= first[0] <= rec + 0.15)
+    if at_rec:
+        W.append("it starts at the reclose: first out-of-step / runaway at t=%.3f s, the reclose at t=%.3f s" % (first[0], rec))
+    # a model PSS/E could not load, at or near it
+    miss = []
+    if src is not None and bm["ok"]:
+        zone = set(hops_map(bm, src, PLANT_HOPS)) | set(pocket or ())
+        for nm, recs in missing_models(A["project"], [A["rdir"]]):
+            for b, ints, path, first_tok in recs:
+                if (b is not None and b in zone) or (set(ints) & zone):
+                    miss.append(nm)
+                    break
+        if miss:
+            W.append("NOT LOADED there: %s (\"NOT ACCESSIBLE\" in the init log) -- that plant runs without it"
+                     % ", ".join(miss))
+    plant = ""
+    if src is not None:
+        nm0 = bm["bus"].get(src, ("", "", ""))[2] if bm["ok"] else ""
+        plant = (("the %s plant (machine(s) %s; models %s)" % (
+            _short(nm0, 16) if nm0 else src, ", ".join("%s-%s" % (b, i) for b, i in mach[:4]), _models_txt(mods, 5) or "?"))
+            if mach else ("bus %s" % bus_name(bm, src)))
+    in_island = bool(src is not None and src in (A.get("pocket") or set()))
+    if src is None or in_island:
+        head = ""                        # nothing placed, or the fault's own island explains it (evidence)
+    elif at_rec:
+        oos = [x for x in P.get("oos", [])][:2]
+        head = ("it starts at the RECLOSE (t=%.3f s): %s, %s from the faulted bus, %s as the line recloses; "
+                "PSS/E's network solution then fails%s" % (
+                    rec, plant, _nb(h) if h is not None else "some buses",
+                    ("goes out of step (%s)" % ", ".join("%d-%d" % (a, b) for _t, a, b in oos)) if oos else "runs away",
+                    (" " + nc_text(nc)[0]) if nc else ""))
+    elif vsc:
+        head = ("the voltage runs away at the VSC HVDC converter buses (%s), %s from the faulted bus: the VSC "
+                "converter model next to the fault does not hold its voltage after the fault and PSS/E's network "
+                "solution fails around it %s -- a DC converter model problem, not a real overvoltage" % (
+                    ", ".join(str(b) for b in vsc[:3]), _nb(h) if h is not None else "near", ncf))
+    elif pocket:
+        conv = any(_CONVERTER.match(m) for m in mods)
+        head = ("%s is RADIAL on the faulted bus %s: its only path to the system runs through it. For the %s-cycle "
+                "fault its terminal voltage is held near zero%s; PSS/E's network solution fails %s, and at clearing "
+                "the unconverged solution runs away at the plant's buses (%s %s) -- a numerical failure of the "
+                "plant's %smodel at a bolted fault on its only connection, not a real overvoltage" % (
+                    plant[0].upper() + plant[1:], fb, cyc or "?",
+                    (" and its converter controls go to their low-voltage limits" if conv else ""),
+                    ncf or "around it", src, _pk(on_map[0][1]), "converter " if conv else ""))
+    elif h == 0:
+        head = ("the voltage runs away first at the faulted bus %s itself%s; PSS/E's network solution fails %s" % (
+            bus_name(bm, src), (" -- next to %s" % plant) if mach else "", ncf or "around it"))
+    else:
+        head = ("the voltage runs away first at %s, %s from the faulted bus%s; PSS/E's network solution fails %s" % (
+            bus_name(bm, src), _nb(h) if h is not None else "more than 40 buses",
+            (": " + plant) if mach else "", ncf or "around it"))
+    if head and miss:
+        head += "; the plant's %s model is NOT loaded (NOT ACCESSIBLE) in this run" % ", ".join(miss)
+    if pat:
+        if head:
+            head = head + ". " + pat[0].upper() + pat[1:]
+        else:
+            # nothing placed on the map (or the fault's own island explains it -- see the evidence):
+            # the case pattern is still worth having, beside the evidence
+            W.insert(0, "cases: " + pat)
+    if head:
+        head = "ROOT CAUSE: " + head
+    # what to try
+    if nc or A["crashed"]:
+        T.append("rerun %s with DELT_CYCLES = 8 (1/8 cycle) in z7_main_f.py, or with SOLVER_RETRY_ON_NONCONV = True "
+                 "(up to 600 iterations, acceleration down to 0.1): if it then finishes, the failure is numerical, "
+                 "not a real instability" % A["fault"])
+    if mach and not vsc:
+        T.append("as a test, switch off machine(s) %s (or trip them at the fault): if the run then finishes, this "
+                 "plant's model is the cause" % ", ".join("%s-%s" % (b, i) for b, i in mach[:6]))
+    if vsc:
+        T.append("check the VSC HVDC model's data and limits near bus %s; as a test, block the DC line at the fault" % vsc[0])
+    if at_rec:
+        T.append("as a check, run %s without the reclose" % A["fault"])
+    if miss:
+        T.append("get the %s model (DLL) loaded -- PSS/E prints NOT ACCESSIBLE when the model library is not "
+                 "loaded with the case -- and rerun" % ", ".join(miss))
+    if pat.startswith("the base case"):
+        T.append("in the report: an existing base case issue -- the base case without the SGF fails the same way")
+    A[key] = (head, W, T)
+    return A[key]
+
+
 # ---------------------------------------------------------------- report --
 def block(A, others):
     L = []
@@ -1237,7 +1769,25 @@ def block(A, others):
     L.append("   %s" % fault_text(A["frow"]))
     L.append("   folder: %s" % _rel(A["rdir"]))
     L.append(SUB)
-    L.append(" MOST LIKELY REASON")
+    head, where, tries = explain(A, others)
+    if head:
+        L.append(" ROOT CAUSE")
+        for ln in _wrap(head[len("ROOT CAUSE: "):], 74):
+            L.append("   " + ln)
+        L.append("")
+    if where:
+        L.append(" WHERE IT STARTS")
+        for w in where:
+            for i, ln in enumerate(_wrap(w, 72)):
+                L.append(("   - " if i == 0 else "     ") + ln)
+        L.append("")
+    if tries:
+        L.append(" WHAT TO TRY")
+        for w in tries:
+            for i, ln in enumerate(_wrap(w, 72)):
+                L.append(("   - " if i == 0 else "     ") + ln)
+        L.append("")
+    L.append(" EVIDENCE FROM THE LOGS" if head else " MOST LIKELY REASON")
     for ln in _wrap(reason(A), 74):
         L.append("   " + ln)
     L.append("")
@@ -1370,7 +1920,7 @@ def block(A, others):
         for O in others:
             of = O.get("out_facts")
             extra = []
-            if O["kind"].startswith("ran"):
+            if O["kind"].startswith("ran") or O["kind"] == "NOT CONVERGED":
                 if O["pocket"]:
                     extra.append("island %d bus(es)" % len(O["pocket"]))
                 if O["psse"] and O["psse"]["islands"]:
@@ -1409,9 +1959,13 @@ def _wrap(s, n):
 
 # ------------------------------------------------------------------ main --
 def find_targets(folders, want):
-    """{(project, fault): {case: kind}} for every crashed / off-scale / solution-lost run."""
+    """{(project, fault): {case: kind}} for every crashed / off-scale / solution-lost run -- and, with
+       SCAN_NONCONV, every finished run whose network solution was still failing NONCONV_AFTER_S after
+       the last switching (its PSS/E fault log, read fast)."""
     hits = collections.defaultdict(dict)
     for proj, case, rdir in folders:
+        n_scan = n_nc = 0
+        t_scan = time.time()
         od = os.path.join(rdir, "outs")
         ids = set()
         for p in glob.glob(os.path.join(od, "*.out")) + glob.glob(os.path.join(od, "*.attempts")):
@@ -1431,12 +1985,26 @@ def find_targets(folders, want):
             stab = _crit(scen, "System stability")
             if crashed or (off and off[0] == "FAIL") or (stab and stab[0] == "FAIL"):
                 hits[(proj, fid)][case] = rdir
+            elif SCAN_NONCONV and st["done"]:
+                lp = os.path.join(rdir, "logs", "psse", fid + ".txt")
+                if os.path.isfile(lp):
+                    n_scan += 1
+                    nc = nc_scan(lp)
+                    if nc and late_nc(nc, event_times(fault_list(proj, rdir).get(fid.upper()), st, None)):
+                        hits[(proj, fid)][case] = rdir
+                        n_nc += 1
+        if SCAN_NONCONV and n_scan:
+            print("[why] %s %s: %d finished run(s) scanned for non-convergence, %d still failing %.1f s after the "
+                  "last switching (%.0f s)" % (proj, case.split(" (")[0], n_scan, n_nc, NONCONV_AFTER_S,
+                                              time.time() - t_scan))
     return hits
 
 
 def main():
-    global READ_OUT
+    global READ_OUT, SCAN_NONCONV
     t0 = time.time()
+    if "--noscan" in sys.argv:
+        SCAN_NONCONV = False
     if "--quick" in sys.argv:
         READ_OUT = False
         print("[why] --quick: logs and score files only, no .out read")
@@ -1448,7 +2016,8 @@ def main():
     print("[why] %d run folder(s): %s" % (len(folders), ", ".join("%s %s" % (p, c.split(" (")[0]) for p, c, _d in folders)))
     hits = find_targets(folders, want)
     if not hits:
-        print("[why] nothing to explain: no crashed run, no off-scale voltage and no 'System stability' FAIL%s"
+        print("[why] nothing to explain: no crashed run, no off-scale voltage, no 'System stability' FAIL and no "
+              "run still failing to converge%s"
               % (" among %s" % ", ".join(sorted(want)) if want else ""))
         return 0
     by_proj = collections.defaultdict(list)
@@ -1461,6 +2030,17 @@ def main():
     lines, rows = [], []
     head = [BAR, " WHY DID THESE RUNS CRASH OR LOSE THEIR SOLUTION?   %s" % time.strftime("%Y-%m-%d %H:%M"),
             " study folder %s" % _root(), BAR, ""]
+    # the models PSS/E could not load -- they do not run in ANY fault of these cases
+    mm = []
+    for proj in sorted(set(p for p, _c, _d in folders)):
+        rd = [d for p, _c, d in folders if p == proj]
+        ml = missing_lines(proj, rd, bus_map(rd[0]))
+        if ml:
+            mm.append("  %s" % proj)
+            mm += ml
+    if mm:
+        head += [" MODELS PSS/E COULD NOT LOAD (\"NOT ACCESSIBLE\" in the init logs) -- they do not run in ANY fault:"]
+        head += mm + [""]
     summary = []
     plan = []
     for proj in sorted(by_proj):
@@ -1495,8 +2075,11 @@ def main():
         proj, fid, case = A["project"], A["fault"], A["case"]
         lines += block(A, others)
         rsn = reason(A)
-        summary.append("  %-14s %-6s %-30s %-14s %s" % (proj, fid, case, A["kind"], _short(rsn, 120)))
-        rows.append([proj, fid, case, A["kind"], rsn])
+        hd, wh, tr = explain(A, others)
+        summary.append("  %-14s %-6s %-30s %-14s %s" % (proj, fid, case.split(" (")[0], A["kind"],
+                                                       _short(hd[len("ROOT CAUSE: "):] if hd else rsn, 150)))
+        rows.append([proj, fid, case, A["kind"], hd[len("ROOT CAUSE: "):] if hd else "", " | ".join(wh),
+                     " | ".join(tr), rsn])
     od = _abs(OUT_DIR)
     try:
         os.makedirs(od)
@@ -1509,7 +2092,8 @@ def main():
         fh.write(txt)
     with open(p2, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["project", "fault", "case", "what", "most likely reason"])
+        w.writerow(["project", "fault", "case", "what", "root cause", "where it starts", "what to try",
+                    "evidence from the logs"])
         w.writerows(rows)
     print("")
     print("\n".join([" SUMMARY"] + summary))

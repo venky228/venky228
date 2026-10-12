@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """z7_trip_why.py -- WHY DID THIS GENERATOR TRIP?
 
-You give it one or more generator bus numbers. For every fault of the base
-case, Scenario 1 and Scenario 2 it finds out whether that unit tripped and WHY,
-from three sources:
+With GEN_BUSES = "ALL" (the default) it finds EVERY unit that trips in any
+fault of any case by itself -- the units the study's own verdict calls tripped
+(02_VIOLATIONS_*.csv, and the "No generator tripping" lines of
+SPP_CRITERIA_REPORT_*.csv) -- and explains each one. Or give it one or more
+generator bus numbers. For every fault of the base case, Scenario 1 and
+Scenario 2 it finds out whether that unit tripped and WHY, from three sources:
 
     the .dyr files     the protection relays that act on the unit and their
                        settings (VTGTPAT / VTGDCAT / FRQTPAT / FRQDCAT, and the
@@ -22,7 +25,9 @@ from three sources:
                        voltage before / after)
 
 and writes ONE TEXT FILE PER UNIT:  <ROOT>\\trip_reasons\\TRIP_REASON_<bus>.txt
-(plus TRIP_REASONS.csv with every fault of every unit, for Excel). Every trip is
+plus TRIP_REASONS_SUMMARY.txt -- every trip of every unit, fault by fault, with
+its reason, on a few pages -- and TRIP_REASONS.csv with every fault of every
+unit, for Excel. Every trip is
 given a CAUSE: UNDER-VOLTAGE, OVER-VOLTAGE, UNDER-FREQUENCY, OVER-FREQUENCY, or
 ISOLATED (its bus lost its connection -- not a voltage or frequency trip).
 
@@ -30,10 +35,12 @@ Nothing is simulated and nothing in the results folders is changed: the logs,
 .dyr files and CSVs are only read.
 
 RUN (any Python 3.4 or later -- PSS/E is not needed):
-    1. Type the generator bus numbers into GEN_BUSES at the top of SETTINGS below
-       and run:   python z7_trip_why.py
-    2. Or give them on the command line (they then replace GEN_BUSES for that run):
+    1. GEN_BUSES = "ALL" (as set): every tripped unit, found by itself:
+                  python z7_trip_why.py
+    2. Or type the generator bus numbers into GEN_BUSES, or give them on the
+       command line (they then replace GEN_BUSES for that run):
                   python z7_trip_why.py 584713 539114
+                  python z7_trip_why.py ALL
     3. With GEN_BUSES = [] and nothing on the command line, it asks for them.
     "bus:id" picks one machine only, e.g. "999001:B".
 Put the file in the study folder (the one holding Base\\ and Projects\\), or set
@@ -50,13 +57,15 @@ import collections
 #   SETTINGS
 # ============================================================================
 # >>> ENTER THE GENERATOR BUS NUMBERS HERE <<< -------------------------------
-# One or more bus numbers, separated by commas. "bus:id" = that machine only.
+# "ALL" = every unit the study calls tripped in any fault of any case (found by itself).
+# Or one or more bus numbers, separated by commas. "bus:id" = that machine only.
+#   GEN_BUSES = "ALL"
 #   GEN_BUSES = [584713]
 #   GEN_BUSES = [584713, 539114, 764984, 531601]
 #   GEN_BUSES = [584713, "999001:B"]
 #   GEN_BUSES = []        -> asked when the script runs
 # Numbers given on the command line replace this list for that run.
-GEN_BUSES = [584713, 539114, 764984, 531601]
+GEN_BUSES = "ALL"
 # ----------------------------------------------------------------------------
 ROOT = ""                      # the study folder holding Base\ and Projects\ ("" = this file's folder)
 PROJECTS = ["SantaFe", "IronStar", "EmpirePrairie", "EastFork"]   # [] = every project found
@@ -189,11 +198,84 @@ def _units_from(args):
     return out
 
 
+def _is_all(x):
+    if isinstance(x, (list, tuple)):
+        return len(x) == 1 and _is_all(x[0])
+    return str(x).strip().upper() in ("ALL", "*", "AUTO")
+
+
+R_ELEM_BR = re.compile(r"\[\s*(\d{4,})\s*\]")
+
+
+def _elem_bus(el):
+    """The bus of a violations-list element: '584713', '531461-4', "PROJ 587313 'B'",
+       'SYNC 542963-2', 'GEN-2021-070 [765930]' (the number in brackets is the bus)."""
+    s = str(el or "").strip()
+    m = R_ELEM_BR.search(s)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{4,})", s)
+    return m.group(1) if m else None
+
+
+def find_tripped_units():
+    """[(bus, None)] of every unit the study calls tripped in any fault of any case:
+       02_VIOLATIONS_*.csv rows 'tripped' and the "No generator tripping" lines of
+       SPP_CRITERIA_REPORT_*.csv (not the units the EVENT removes -- those are not trips)."""
+    want = _want_faults()
+    found = collections.OrderedDict()
+    for proj in find_projects():
+        for (lbl, d, _b) in find_runs(proj):
+            n0 = len(found)
+            for p in _csvs(d, "02_VIOLATIONS"):
+                try:
+                    rows = _read_csv(p)
+                except Exception as e:
+                    print("[trip-why] could not read %s (%s)" % (p, e))
+                    continue
+                for r in rows:
+                    if (r.get("violation") or "").strip().lower() != "tripped":
+                        continue
+                    f = (r.get("fault_id") or "").strip().upper()
+                    if not _fault_wanted(f, want):
+                        continue
+                    b = _elem_bus(r.get("element"))
+                    if b:
+                        found.setdefault(b, set()).add((proj, lbl, f))
+            for p in _csvs(d, "SPP_CRITERIA_REPORT"):
+                try:
+                    rows = _read_csv(p)
+                except Exception as e:
+                    print("[trip-why] could not read %s (%s)" % (p, e))
+                    continue
+                for r in rows:
+                    if not (r.get("Criterion") or "").strip().startswith("No generator tripping"):
+                        continue
+                    if (r.get("Result") or "FAIL").strip().upper() != "FAIL":
+                        continue
+                    f = (r.get("Case") or "").strip().upper()
+                    if not _fault_wanted(f, want):
+                        continue
+                    for m in R_LABEL.finditer(r.get("Detail") or ""):
+                        found.setdefault(m.group(2), set()).add((proj, lbl, f))
+            print("[trip-why] %s -- %s: %d tripped unit(s) so far (+%d)" % (proj, lbl, len(found), len(found) - n0))
+    order = sorted(found, key=lambda b: (-len(found[b]), int(b) if b.isdigit() else 0))
+    for b in order:
+        print("[trip-why]   unit %-8s trips in %d fault run(s)" % (b, len(found[b])))
+    return [(b, None) for b in order]
+
+
 def get_units():
-    """The command line first, then GEN_BUSES in SETTINGS, else ask."""
+    """The command line first, then GEN_BUSES in SETTINGS, else ask. "ALL" = every tripped unit."""
     if len(sys.argv) > 1:
+        if _is_all(sys.argv[1:]):
+            print("[trip-why] ALL from the command line: looking for every tripped unit ...")
+            return find_tripped_units()
         print("[trip-why] bus numbers from the command line (GEN_BUSES not used this run)")
         return _units_from(sys.argv[1:])
+    if GEN_BUSES and _is_all(GEN_BUSES):
+        print("[trip-why] GEN_BUSES = ALL: looking for every tripped unit ...")
+        return find_tripped_units()
     if GEN_BUSES:
         print("[trip-why] bus numbers from GEN_BUSES in the script")
         return _units_from([str(b) for b in GEN_BUSES])
@@ -1453,8 +1535,20 @@ def run_study(folder, units, near=None):
                     _ats = [i for i, h in enumerate(hdr) if h == "at (s)"]
                     if _ats:
                         ix["at (s)"] = _ats[0]
+                    bi = ix.get("Bus")
                     for ln in fh:
-                        if not any(k in ln for k in keys):
+                        # the Bus column read straight off the line (one set lookup, however many
+                        # units -- with GEN_BUSES = "ALL" there can be hundreds of buses to find);
+                        # a line quoted before that column falls back to the substring test
+                        cand = None
+                        if bi is not None:
+                            parts = ln.split(",", bi + 1)
+                            if len(parts) > bi:
+                                cand = parts[bi].strip().strip('"').split(".")[0]
+                        if cand is not None and cand.isdigit():
+                            if cand not in allb:
+                                continue
+                        elif not any(k in ln for k in keys):
                             continue
                         r = next(csv.reader([ln]))
                         if len(r) < len(hdr) - 2:
@@ -2562,6 +2656,68 @@ def write_unit(unit, gid, dinfo, dyr_files, results, nlogs, out_dir, csv_rows, p
 
 
 # -------------------------------------------------------------------- main --
+def write_summary(rows, out_dir, units):
+    """TRIP_REASONS_SUMMARY.txt: every trip of every unit -- first per unit (how often, and why),
+       then fault by fault, case by case -- from the same rows as TRIP_REASONS.csv."""
+    # row: 0 bus, 1 id, 2 project, 3 run, 4 fault, 5 fault bus, 6 kV, 7 type, 8 event, 9 clear (cy),
+    #      10 buses from unit, 16 study, 17 cause, 18 time, 19 short, 21 study MW, 22 P before,
+    #      27 probable reason, 28 why
+    trips = [r for r in rows if r[16] in ("TRIPPED", "tripped in PSS/E, not counted")]
+    path = os.path.join(out_dir, "TRIP_REASONS_SUMMARY.txt")
+    L = [BAR, " TRIPPED UNITS AND WHY   %s" % time.strftime("%Y-%m-%d %H:%M"),
+         " study folder %s" % _root(),
+         " %d unit(s) looked at; %d trip(s) found (TRIPPED = the study counts it; 'not counted' = PSS/E"
+         % (len(units), len(trips)),
+         " tripped it, but the study's verdict does not count it as a generator trip)", BAR, ""]
+    if not trips:
+        L.append(" No unit trips in any fault of any case.")
+    else:
+        L.append(" PER UNIT -- how often it trips, and the reasons")
+        by_u = collections.OrderedDict()
+        for r in sorted(trips, key=lambda r: (r[0], r[2], r[3], _fkey(r[4]))):
+            by_u.setdefault((r[0], r[1]), []).append(r)
+        for (b, g), rs in sorted(by_u.items(), key=lambda x: -len(x[1])):
+            cnt = collections.Counter((r[27] or r[17] or "NOT IDENTIFIED") for r in rs if r[16] == "TRIPPED")
+            nc = sum(1 for r in rs if r[16] != "TRIPPED")
+            L.append("  %-10s %3d trip(s)%s: %s" % (b + ((":" + g) if g else ""), len(rs) - nc,
+                                                    (" (+%d not counted)" % nc) if nc else "",
+                                                    "; ".join("%s %d" % (k, v) for k, v in cnt.most_common()) or "-"))
+            runs = collections.OrderedDict()
+            for r in rs:
+                runs.setdefault((r[2], r[3]), []).append(r[4])
+            for (pj, rn), fs in runs.items():
+                L.append("  %-10s   %s, %s: %s" % ("", pj, rn, _flist(sorted(set(fs), key=_fkey), 14)))
+        L.append("")
+        L.append(" FAULT BY FAULT")
+        cur = None
+        for r in sorted(trips, key=lambda r: (r[2], _fkey(r[4]), r[3], r[0])):
+            if (r[2], r[4]) != cur:
+                cur = (r[2], r[4])
+                L.append("")
+                fw = ("bus %s%s%s%s" % (r[5], (" (%s kV)" % r[6]) if r[6] else "", (" %s" % r[7]) if r[7] else "",
+                                        (", cleared in %s cy" % r[9]) if r[9] != "" else "")) if r[5] else \
+                    "(not in the fault list)"
+                L.append("  %s %s -- %s" % (r[2], r[4], fw))
+            mw = r[21] or (("%.1f" % r[22]) if isinstance(r[22], float) else str(r[22] or ""))
+            L.append("    %-28s %-9s %7s MW  %s%s" % (_short_run(r[3]), r[0] + ((":" + r[1]) if r[1] else ""),
+                                                   mw or "?", r[27] or r[17] or "NOT IDENTIFIED",
+                                                   ("" if r[16] == "TRIPPED" else "  [not counted]")))
+            why = r[28] or r[19] or ""
+            if why:
+                L.append("        " + _wrap(why, 92, "        "))
+    try:
+        with open(path, "w") as fh:
+            fh.write("\n".join(L) + "\n")
+        return path
+    except Exception as e:
+        print("[trip-why] could not write %s (%s)" % (path, e))
+        return None
+
+
+def _short_run(lbl):
+    return str(lbl).split(" (")[0] if len(str(lbl)) > 28 else str(lbl)
+
+
 def main():
     units = get_units()
     if not units:
@@ -2662,6 +2818,9 @@ def main():
     written = []
     for (b, gid) in units:
         written.append(write_unit(b, gid, dinfo[b], dyr_files, results[(b, gid)], nlogs, out_dir, csv_rows, pinfo))
+    sp = write_summary(csv_rows, out_dir, units)
+    if sp:
+        written.insert(0, sp)
     cp = os.path.join(out_dir, "TRIP_REASONS.csv")
     try:
         with open(cp, "w", newline="") as fh:
