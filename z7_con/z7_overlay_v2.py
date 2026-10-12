@@ -22,7 +22,9 @@ writes ONE PDF, three plots to a page, in this order (SECTIONS):
     4 OTHER GENS   P and Q of every other machine within PQ_POI_HOPS (10) buses
                    of the POI -- the machines the study flagged (tripped or
                    undamped, in any case) first, wherever they are, with
-                   their rotor angle and terminal voltage (ANGLES_OF_VIOLATED).
+                   their rotor angle and terminal voltage (ANGLES_OF_VIOLATED)
+                   -- and before them the rotor angle of every synchronous
+                   machine within those 10 buses (SYNC_ANGLES).
 
 Voltages and rotor angles are overlaid: one panel per bus or unit, the three
 cases on the same axes. P and Q are drawn ONE PAGE PER QUANTITY -- the P of a
@@ -143,6 +145,9 @@ VIOLATION_KINDS = ["tripped", "undamped"]   # the machine flags that count: the 
                                          #   02_VIOLATIONS csv ("tripped", "undamped", "review", ...)
 ANGLES_OF_VIOLATED = True                # a flagged machine's rotor angle and terminal voltage are overlaid too,
                                          #   before the P / Q pages of the other machines
+SYNC_ANGLES = True                       # the rotor angle of every SYNCHRONOUS machine within PQ_POI_HOPS of the
+                                         #   POI, overlaid, before the P / Q pages (the study records a rotor angle
+                                         #   only for synchronous machines -- wind, solar and BESS have none)
 INCLUDE_SGF_UNITS = True                 # per-unit SGF P / Q / terminal V / angle
 INCLUDE_EGF_UNITS = True                 # per-unit EGF P / Q / terminal V / angle
 BUS_ANGLES = False                       # bus voltage angles (POI, faulted bus, plant buses) -- not rotor angles
@@ -1305,6 +1310,11 @@ def _plan(traces, flags, bmap):
             if ANGLES_OF_VIOLATED and vio:
                 emit("Flagged machines: rotor angle and terminal voltage",
                      [[k] for u in vio for k in qof(gens[u], ("A",)) + qof(gens[u], ("V",))])
+            if SYNC_ANGLES:
+                # a machine with a rotor angle recorded is synchronous; the
+                # flagged ones already have theirs above
+                emit("Synchronous machines within %d buses of the POI: rotor angles" % PQ_POI_HOPS,
+                     [[k] for u in (near if ANGLES_OF_VIOLATED else vio + near) for k in qof(gens[u], ("A",))])
             emit(t, [qof(gens[u], ("P", "Q")) for u in vio + near])
     extra = sorted(k for k in allk if meta[k][0] == "OTHER")
     if extra:
