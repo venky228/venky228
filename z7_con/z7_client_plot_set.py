@@ -336,8 +336,20 @@ def side_files(dst_case, live, backup, src_of):
     fields = list(lf) + [f for f in bf if f not in lf]
     if not fields:
         return 0
-    rows = [r for r in lr if src_of.get(_fnorm(r.get("fault_id"))) == "LIVE"]
-    rows += [r for r in br if src_of.get(_fnorm(r.get("fault_id"))) == "BACKUP"]
+    by_l, by_b = {}, {}
+    for r in lr:
+        by_l.setdefault(_fnorm(r.get("fault_id")), []).append(r)
+    for r in br:
+        by_b.setdefault(_fnorm(r.get("fault_id")), []).append(r)
+    rows = []
+    for f in sorted(src_of, key=_fkey):
+        s = src_of[f]
+        if s == "LIVE":                      # rerun with reclosure: the live list only
+            rows += by_l.get(f, [])
+        elif s == "BACKUP":                  # crashed with reclosure: the backup's list
+            rows += by_b.get(f, [])
+        else:                                # not rerun: same run in both -- the live list,
+            rows += by_l.get(f) or by_b.get(f, [])   # or the backup's if the live one lacks it
     if not DRY_RUN:
         buf = io.StringIO()
         w = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
@@ -421,6 +433,7 @@ def main():
             else:
                 src, what = "LIVE", "not in the reclosure rerun"
                 n["notrerun"] += 1
+            choice[("rerun", fid)] = bool(states)
             per = []
             for lab, lrel, brel, suf in CASES:
                 want = src
@@ -447,7 +460,8 @@ def main():
                 want, folder = choice[(lab, fid)]
                 if want == "MISSING":
                     continue
-                src_of[_fnorm(fid)] = want
+                src_of[_fnorm(fid)] = (want if want == "BACKUP" or choice[("rerun", fid)]
+                                       else "LIVE_NOT_RERUN")
                 place(os.path.join(folder, "outs", fid + ".out"), os.path.join(dst_case, "outs", fid + ".out"))
                 done = os.path.join(folder, "outs", fid + ".done")
                 if os.path.isfile(done):
