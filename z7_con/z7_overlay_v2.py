@@ -129,6 +129,17 @@ PQ_ROWS_PER_PAGE = 4                     # rows per page with PQ_LAYOUT = "rows"
 PQ_SOLID_LINES = True                    # a P / Q panel holds one case, so it is drawn solid in that case's colour
 PQ_SAME_SCALE = True                     # the three panels of a quantity share one y scale, so they compare at a glance
 PQ_MIN_SPAN = 2.0                        # smallest y range of a P / Q panel (MW / MVAr): a flat trace is not blown up
+# ---- THE Y AXIS OF EVERY PANEL -------------------------------------------------
+# The y axis follows the traces themselves, never a stray sample: a unit flat at
+# 200 MW in the flat run is drawn on 160 to 240 MW, not on 0 to 1000 because of
+# one start-up spike.
+Y_PAD_FRAC = 0.20                        # the axis reaches 20 % of the traces' range beyond them, top and bottom
+Y_FLAT_FRAC = 0.20                       # a flat trace is shown +/-20 % of its value (200 MW -> 160 to 240 MW)
+Y_SPIKE_SAMPLES = 2                      # a jump this many samples long or shorter (a start-up or switching spike)
+                                         #   does not set the scale; it is still drawn and simply runs off the
+                                         #   panel (0 = every sample sets the scale)
+V_MIN_SPAN = 0.05                        # smallest y range of a voltage panel (pu)
+ANGLE_MIN_SPAN = 2.0                     # smallest y range of an angle panel (deg)
 
 # ---- WHICH BUSES AND MACHINES --------------------------------------------------
 BUS_POI_HOPS = 5                         # BUSES: the voltage of every bus within this many buses of the POI
@@ -157,8 +168,12 @@ VIOLATION_FILES = ["02_VIOLATIONS*.csv", r"reports\SPP_VIOLATIONS*.csv"]   # eac
 
 SBASE_MVA = 100.0                        # machine PELEC / QELEC are pu on the system base
 FAST_READ = True                         # True = the study's fast packed reader where its verified layout fits (seconds, not minutes)
-WORKERS = 1                              # faults drawn at once, each in its own process (1 = one at a time)
+WORKERS = 4                              # faults drawn at once, each in its own process (1 = one at a time) --
+                                         #   raise it on a PC with more cores (each one needs ~0.5 GB of memory)
 USE_CACHE = True                         # keep each .out's traces in <OUT_DIR>\cache: a re-run only reads new / changed .out files
+SKIP_UP_TO_DATE = True                   # a fault whose PDF was drawn from the same three .out files with the same
+                                         #   settings is not drawn again (a re-run only draws the faults that changed)
+PDF_COMPRESSION = 1                      # 0-9: 1 writes fastest (files a little larger), 9 the smallest and slowest
 STATUS_FILE = "OVERLAY_STATUS.txt"       # live progress, in OUT_DIR ("" = off)
 SHOW_NODES = True                        # "N nodes from POI / fault bus, area" on each panel (from flags\BUS_MAP.csv)
 SGF_UNIT_BUS_START = 999001              # SGF unit n is bus SGF_UNIT_BUS_START + n - 1 (NEW_PLANT "bus_start")
@@ -1119,6 +1134,12 @@ def _dress(ax, xlabel=True):
     ax.grid(True, color="#E5E5E5", linewidth=0.6, zorder=0)
     ax.set_axisbelow(True)
     ax.tick_params(labelsize=8, colors="#333333", length=3)
+    try:                                    # five ticks a side: fewer artists per page, drawn faster
+        from matplotlib.ticker import MaxNLocator
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    except Exception:
+        pass
     if xlabel:
         ax.set_xlabel("Time from fault (s)" if ALIGN_TO_FAULT else "Time (s)",
                       fontsize=8.5, color="#333333")
@@ -1126,27 +1147,55 @@ def _dress(ax, xlabel=True):
         ax.set_xlim(left=T_MIN, right=T_MAX)
 
 
-def _ylim(series):
-    """Shared y limits of a side-by-side row over the time shown, with a minimum span."""
-    lo = hi = None
-    for t, v in series:
-        for x, y in zip(t, v):
-            if (T_MIN is not None and x < T_MIN) or (T_MAX is not None and x > T_MAX):
-                continue
-            if y != y or abs(y) > 1e30:
-                continue
-            if lo is None or y < lo:
-                lo = y
-            if hi is None or y > hi:
-                hi = y
-    if lo is None:
+def _robust_lohi(t, v):
+    """(lowest, highest) of one trace over the time shown, NaN left out, and an
+       excursion of Y_SPIKE_SAMPLES samples or fewer not counted: the highest
+       value the trace HOLDS for Y_SPIKE_SAMPLES + 1 samples in a row, and the
+       lowest likewise. A fault dip lasts dozens of samples and is kept whole; a
+       one-sample start-up spike is not. None when nothing is shown."""
+    xs = [y for x, y in zip(t, v)
+          if not ((T_MIN is not None and x < T_MIN) or (T_MAX is not None and x > T_MAX))
+          and y == y and abs(y) < 1e30]
+    if not xs:
         return None
-    need = max(float(PQ_MIN_SPAN or 0.0), 0.02 * max(abs(lo), abs(hi)))
-    if hi - lo < need:
-        mid = 0.5 * (lo + hi)
-        lo, hi = mid - 0.5 * need, mid + 0.5 * need
-    pad = 0.08 * (hi - lo)
-    return lo - pad, hi + pad
+    m = int(Y_SPIKE_SAMPLES or 0) + 1
+    if m > 1 and len(xs) > 2 * m:
+        cols = [xs[j:] for j in range(m)]
+        hi = max(map(min, *cols))
+        lo = min(map(max, *cols))
+        if lo <= hi:
+            return lo, hi
+    return min(xs), max(xs)                 # too short, or chatter faster than the window
+
+
+def _yrange(series, q=None):
+    """y limits for the traces of one panel (or of a row that shares one scale):
+       their range, padded by Y_PAD_FRAC of it -- the padding never takes an
+       all-positive (all-negative) trace across zero -- and at least
+       +/-Y_FLAT_FRAC of the level (or the quantity's minimum span), so a flat
+       trace is shown flat rather than its noise blown up. None = no data."""
+    got = [r for r in (_robust_lohi(t, v) for t, v in series) if r]
+    if not got:
+        return None
+    lo = min(a for a, _b in got)
+    hi = max(b for _a, b in got)
+    span = hi - lo
+    lo2, hi2 = lo - Y_PAD_FRAC * span, hi + Y_PAD_FRAC * span
+    if lo >= 0.0 and lo2 < 0.0:
+        lo2 = 0.0
+    if hi <= 0.0 and hi2 > 0.0:
+        hi2 = 0.0
+    q = str(q or "").upper()
+    min_span = (float(V_MIN_SPAN or 0.0) if q == "V" else
+                float(ANGLE_MIN_SPAN or 0.0) if q in ("A", "B") else
+                float(PQ_MIN_SPAN or 0.0) if q in ("P", "Q") else 0.0)
+    c = 0.5 * (lo + hi)
+    half = max(float(Y_FLAT_FRAC or 0.0) * abs(c), 0.5 * min_span)
+    if hi2 - lo2 < 2.0 * half:
+        lo2, hi2 = c - half, c + half
+    if hi2 <= lo2:                           # all zero, no minimum span set
+        lo2, hi2 = lo2 - 1.0, hi2 + 1.0
+    return lo2, hi2
 
 
 # ---- choosing and ordering the panels ------------------------------------------
@@ -1396,10 +1445,12 @@ def _draw_overlay_page(plt, page, traces, fault_t, ctx, flags, bmap):
     legend = {}
     for ax, name in zip(axes, page):
         ends = []
+        ser = []
         for ci, t, sig in traces:
             v = sig.get(name)
             if not v:
                 continue
+            ser.append((t, v))
             lab, col, ls, lw, al, kw = _style(ci)
             tt, vv = _thin(t, v)
             ln, = ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw, alpha=al, zorder=2 + ci, **kw)
@@ -1426,7 +1477,11 @@ def _draw_overlay_page(plt, page, traces, fault_t, ctx, flags, bmap):
                     fontsize=7.5, color="#C92A2A", ha="right", va="bottom")
         _dress(ax)
         ax.set_ylabel(_ylabel(name), fontsize=8.5, color="#333333")
-        ax.margins(y=0.08)
+        lim = _yrange(ser, meta[3])
+        if lim:
+            ax.set_ylim(lim[0], lim[1])
+        else:
+            ax.margins(y=0.08)
         if FAULT_LINE and fault_t is not None:
             ax.axvline(fault_t, color="#C92A2A", linewidth=0.9, linestyle=":", zorder=1)
     return fig, legend
@@ -1465,6 +1520,7 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, flags, bmap, present):
         fl_cases = set(ci for ci, _k, _v, _u, _n in fl)
         fl_kind = dict((ci, k) for ci, k, _v, _u, _n in fl)
         series = []
+        own = {}                            # axis index -> its own trace (PQ_SAME_SCALE = False)
         axs = []
         for ci in range(len(CASES)):
             ax = fig.add_subplot(gs[r, ci], sharey=(axs[0] if (axs and PQ_SAME_SCALE) else None))
@@ -1479,6 +1535,7 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, flags, bmap, present):
                 tt, vv = _thin(t, v)
                 ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw, alpha=al, zorder=2, **kw)
                 series.append((t, v))
+                own[len(axs) - 1] = [(t, v)]
                 if SHOW_END_VALUES:
                     _above(ax, 1.0, _fmt_end(_value_at_end(t, v)), fontsize=7.5, color=col, ha="right")
             else:
@@ -1493,12 +1550,17 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, flags, bmap, present):
                 ax.set_ylabel(_ylabel(name), fontsize=8.5, color="#333333")
             if FAULT_LINE and fault_t is not None:
                 ax.axvline(fault_t, color="#C92A2A", linewidth=0.9, linestyle=":", zorder=1)
-        lim = _ylim(series) if PQ_SAME_SCALE else None
-        if lim:
-            axs[0].set_ylim(lim[0], lim[1])
-        elif not PQ_SAME_SCALE:
-            for ax in axs:
-                ax.margins(y=0.08)
+        if PQ_SAME_SCALE:
+            lim = _yrange(series, meta[3])
+            if lim:
+                axs[0].set_ylim(lim[0], lim[1])
+        else:
+            for k, ax in enumerate(axs):
+                lim = _yrange(own.get(k, []), meta[3])
+                if lim:
+                    ax.set_ylim(lim[0], lim[1])
+                else:
+                    ax.margins(y=0.08)
         # ---- the row's title: what it is in bold, where it is in grey, the flag in red
         pos = axs[0].get_position()
         fig.text(pos.x0, pos.y1 + 0.047, _cap(name), fontsize=9.5, color="#1A1A1A",
@@ -1526,6 +1588,7 @@ def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, flags, bmap, present)
     fl = _flags_of(meta, flags)
     fl_kind = dict((ci, k) for ci, k, _v, _u, _n in fl)
     axs, series = [], []
+    own = {}                                # axis index -> its own trace (PQ_SAME_SCALE = False)
     for ci in range(n):
         ax = fig.add_subplot(gs[ci, 0], sharey=(axs[0] if (axs and PQ_SAME_SCALE) else None))
         axs.append(ax)
@@ -1539,6 +1602,7 @@ def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, flags, bmap, present)
             tt, vv = _thin(t, v)
             ax.plot(tt, vv, color=col, linestyle=ls, linewidth=lw, alpha=al, zorder=2, **kw)
             series.append((t, v))
+            own[len(axs) - 1] = [(t, v)]
             if SHOW_END_VALUES:
                 _above(ax, 1.0, "at %g s: %s" % (T_MAX if T_MAX is not None else t[-1], _fmt_end(_value_at_end(t, v))),
                        fontsize=8, color=col, ha="right")
@@ -1553,12 +1617,17 @@ def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, flags, bmap, present)
         ax.set_ylabel(_ylabel(name), fontsize=8.5, color="#333333")
         if FAULT_LINE and fault_t is not None:
             ax.axvline(fault_t, color="#C92A2A", linewidth=0.9, linestyle=":", zorder=1)
-    lim = _ylim(series) if PQ_SAME_SCALE else None
-    if lim:
-        axs[0].set_ylim(lim[0], lim[1])
-    elif not PQ_SAME_SCALE:
-        for ax in axs:
-            ax.margins(y=0.08)
+    if PQ_SAME_SCALE:
+        lim = _yrange(series, meta[3])
+        if lim:
+            axs[0].set_ylim(lim[0], lim[1])
+    else:
+        for k, ax in enumerate(axs):
+            lim = _yrange(own.get(k, []), meta[3])
+            if lim:
+                ax.set_ylim(lim[0], lim[1])
+            else:
+                ax.margins(y=0.08)
     # ---- what it is in bold, where it is in grey, the study's flag in red
     fig.text(0.08, 0.872, _cap(name), fontsize=11, color="#1A1A1A", ha="left", va="bottom", fontweight="bold")
     w = _where(meta, ctx["fbus"], ctx["pois"], bmap, ctx["dist_f"], ctx["dist_p"]) if SHOW_NODES else ""
@@ -1567,6 +1636,52 @@ def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, flags, bmap, present)
     if fl and SHOW_STUDY_FLAGS:
         fig.text(0.97, 0.851, "Study flag: " + _flag_text(fl), fontsize=8, color="#C92A2A", ha="right", va="bottom")
     return fig
+
+
+_DRAW_VERSION = "ov2-3"         # bump when the drawing changes: every PDF is then drawn again
+
+
+def _settings_sig():
+    """Every setting that changes what a PDF looks like, as one string."""
+    keys = ("SECTIONS", "OVERLAY_QUANTITIES", "SEPARATE_QUANTITIES", "PANELS_PER_PAGE", "PQ_LAYOUT",
+            "PQ_ROWS_PER_PAGE", "PQ_SOLID_LINES", "PQ_SAME_SCALE", "PQ_MIN_SPAN", "BUS_POI_HOPS", "BUS_MAX",
+            "BUS_VIOLATION_KINDS", "PQ_POI_HOPS", "PQ_GEN_MAX", "VIOLATED_ALWAYS", "VIOLATION_KINDS",
+            "ANGLES_OF_VIOLATED", "SYNC_ANGLES", "INCLUDE_SGF_UNITS", "INCLUDE_EGF_UNITS", "BUS_ANGLES",
+            "EXTRA_TITLE_REGEX", "CASES", "PAGE_SUBTITLE", "SHOW_SECTION_TITLE", "SHOW_STUDY_FLAGS",
+            "FOOTER_TEXT", "FAULT_LINE", "SHOW_END_VALUES", "ALIGN_TO_FAULT", "T_MIN", "T_MAX", "MAX_POINTS",
+            "SHOW_NODES", "SGF_UNIT_BUS_START", "SBASE_MVA", "Y_PAD_FRAC", "Y_FLAT_FRAC", "Y_SPIKE_SAMPLES",
+            "V_MIN_SPAN", "ANGLE_MIN_SPAN", "PDF_NAME", "MODE", "VIOLATION_FILES")
+    g = globals()
+    return _DRAW_VERSION + "|" + "|".join("%s=%r" % (k, g.get(k)) for k in keys)
+
+
+def _pdf_sig(fault, dirs, bmap):
+    """Fingerprint of one fault's PDF: the settings, each case's .out (size and
+       time), the violations list it was flagged from and the bus map."""
+    import hashlib
+    parts = [_settings_sig()]
+    for d in dirs:
+        if not d:
+            parts.append("-")
+            continue
+        q = os.path.join(d, "outs", "%s.out" % fault)
+        try:
+            st = os.stat(q)
+            parts.append("%s:%d:%d" % (q, st.st_size, int(st.st_mtime)))
+        except OSError:
+            parts.append("%s:none" % q)
+        vf = _viol_table(d)[0]
+        if vf:
+            try:
+                parts.append("%s@%d" % (vf, int(os.path.getmtime(vf))))
+            except OSError:
+                pass
+    if bmap:
+        try:
+            parts.append("%s@%d" % (bmap[3], int(os.path.getmtime(bmap[3]))))
+        except OSError:
+            pass
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
 
 
 def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
@@ -1580,6 +1695,22 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     sel_key = "%s|%s|%s|%s|%s|%s|%s" % (PQ_POI_HOPS, BUS_POI_HOPS, ",".join(_sections()), VIOLATED_ALWAYS,
                                          ",".join(str(b) for b in vbuses), ",".join(str(b) for b in bbuses),
                                          stamp_map)
+
+    # NOTHING CHANGED, NOTHING DRAWN: the PDF on disk was made from these very
+    # .out files with these settings (SKIP_UP_TO_DATE)
+    out_dir = _abs(OUT_DIR)
+    if PROJECT_FOLDERS:
+        out_dir = os.path.join(out_dir, proj)
+    pdf_path = os.path.join(out_dir, PDF_NAME.format(project=proj, fault=fault, mode=MODE))
+    sig_path = os.path.join(_abs(OUT_DIR), "cache", "pdfsig", "%s_%s.sig" % (proj, fault))
+    psig = _pdf_sig(fault, dirs, bmap) if SKIP_UP_TO_DATE else None
+    if psig and os.path.isfile(pdf_path) and os.path.isfile(sig_path):
+        try:
+            with open(sig_path) as fh:
+                if fh.read().strip() == psig:
+                    return pdf_path, "up to date (same .out files and settings) -- not drawn again"
+        except Exception:
+            pass
 
     def mk_want(titles):
         return _make_want(titles, bmap, vbuses, bbuses)
@@ -1623,12 +1754,8 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
     if ctx["bus_flag_missing"] and "BUSES" in _sections():
         print("    %s: bus(es) flagged by the study with no voltage channel in any .out: %s"
               % (fault, ", ".join(str(b) for b in ctx["bus_flag_missing"])))
-    out_dir = _abs(OUT_DIR)
-    if PROJECT_FOLDERS:
-        out_dir = os.path.join(out_dir, proj)
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
-    pdf_path = os.path.join(out_dir, PDF_NAME.format(project=proj, fault=fault, mode=MODE))
     stamp = time.strftime("%Y-%m-%d")
     n_ov = sum(len(p[2]) for p in pages if p[0] == "overlay")
     n_pq = sum(len(p[2]) for p in pages if p[0] in ("pq", "pq1"))
@@ -1648,6 +1775,14 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
                 pdf.savefig(fig)
             finally:
                 plt.close(fig)
+    if psig:
+        try:
+            if not os.path.isdir(os.path.dirname(sig_path)):
+                os.makedirs(os.path.dirname(sig_path))
+            with open(sig_path, "w") as fh:
+                fh.write(psig + "\n")
+        except Exception:
+            pass
     note = "%d overlay panel(s), %d P / Q quantities, %d flagged bus(es) / machine(s), %d page(s)" % (
         n_ov, n_pq, ctx["n_flagged"], len(pages))
     return pdf_path, note
@@ -1660,7 +1795,7 @@ def _worker_init():
     import matplotlib
     matplotlib.use("Agg")
     try:                                    # smaller PDFs, same look
-        matplotlib.rcParams["pdf.compression"] = 9
+        matplotlib.rcParams["pdf.compression"] = max(0, min(9, int(PDF_COMPRESSION)))
         matplotlib.rcParams["path.simplify"] = True
         matplotlib.rcParams["path.simplify_threshold"] = 0.5
     except Exception:
