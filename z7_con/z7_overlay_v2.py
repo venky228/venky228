@@ -29,7 +29,7 @@ writes ONE PDF, three plots to a page, in this order (SECTIONS):
 Voltages and rotor angles are overlaid: one panel per bus or unit, the three
 cases on the same axes. P and Q are drawn ONE PAGE PER QUANTITY -- the P of a
 unit, say -- with the Base case, Scenario 1 and Scenario 2 one under another,
-full width, on one y scale; then the same unit's Q.
+full width, each on its own y scale (PQ_SAME_SCALE); then the same unit's Q.
 
 The flags come from each case's own violations list, the 02_VIOLATIONS_*.csv
 the study writes beside its results, so the pages follow the study's verdicts
@@ -127,7 +127,8 @@ PQ_LAYOUT = "stacked"                    # "stacked": one page per P or Q, the t
                                          #   side by side, PQ_ROWS_PER_PAGE rows to a page
 PQ_ROWS_PER_PAGE = 4                     # rows per page with PQ_LAYOUT = "rows"
 PQ_SOLID_LINES = True                    # a P / Q panel holds one case, so it is drawn solid in that case's colour
-PQ_SAME_SCALE = True                     # the three panels of a quantity share one y scale, so they compare at a glance
+PQ_SAME_SCALE = False                    # False = each case's P / Q panel on its OWN y scale: its trace, 20 % beyond its
+                                         #   highest and lowest values (Y_PAD_FRAC) | True = the three panels share one scale
 PQ_MIN_SPAN = 2.0                        # smallest y range of a P / Q panel (MW / MVAr): a flat trace is not blown up
 # ---- THE Y AXIS OF EVERY PANEL -------------------------------------------------
 # The y axis follows the traces themselves, never a stray sample: a unit flat at
@@ -1578,7 +1579,8 @@ def _draw_pq_page(plt, rows, traces, fault_t, ctx, flags, bmap, present):
 
 def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, flags, bmap, present):
     """One P or Q quantity on a page: Base case, Scenario 1 and Scenario 2 one
-       under another, full width, on one y scale (PQ_SAME_SCALE)."""
+       under another, full width -- each on its own y scale, or one shared scale
+       with PQ_SAME_SCALE = True."""
     from matplotlib.gridspec import GridSpec
     fig = plt.figure(figsize=(11.0, 8.5))
     n = len(CASES)
