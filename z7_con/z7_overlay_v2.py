@@ -94,14 +94,17 @@ SHOW_SECTION_TITLE = False               # True = the page title also names the 
 SHOW_STUDY_FLAGS = False                 # True = the study's flag ("Study flag: overshoot (1.249 pu ...) in Base Case
                                          #   ...") in red on each flagged panel | False = no flag text on the plots
                                          #   (flagged buses and machines are still drawn, first)
-FOOTER_TEXT = "SPP Dynamic Stability Study -- Surplus Interconnection"   # bottom left of every page
+FOOTER_TEXT = "SPP Stability Study -- Surplus Interconnection"   # bottom left of every page
 FAULT_LINE = True                        # thin red dotted line at the fault instant (no label); False = none
 SHOW_END_VALUES = False                  # each panel's value at T_MAX per case, small, top right of the panel
 PDF_NAME = "{project}_{fault}.pdf"       # file name per fault, e.g. SantaFe_F01.pdf ({project}, {fault}, {mode})
 OUT_DIR = r"overlay_v2_plots"            # under ROOT unless absolute (apart from z7_overlay.py's overlay_plots)
 PROJECT_FOLDERS = True                   # each project's PDFs in their own folder: <OUT_DIR>\SantaFe\SantaFe_F01.pdf
 ALIGN_TO_FAULT = False                   # False = simulation time, as the study plots | True = time from the fault (0 s = fault)
-T_MIN, T_MAX = 0.0, 20.0                 # seconds shown; None = the whole record
+T_MIN, T_MAX = 0.0, 23.2                 # seconds shown; None = the whole record
+PANEL_BORDER = True                      # every panel framed on all four sides | False = left and bottom only
+SHOW_END_TIME = True                     # the time axis stops exactly at the last time shown (T_MAX, or the end of
+                                         #   the record with T_MAX = None) and that time is labelled, e.g. 23.2
 MAX_POINTS = 6000                        # points per trace: 20 s recorded every 1/4 cycle is 4800, so every point
                                          #   is drawn (matplotlib's path simplification keeps the PDFs small).
                                          #   Above this each block keeps its min AND max -- a fast oscillation then
@@ -1163,9 +1166,8 @@ def _style(ci):
 
 
 def _dress(ax, xlabel=True):
-    for sp in ("top", "right"):
-        ax.spines[sp].set_visible(False)
-    for sp in ("left", "bottom"):
+    for sp in ("top", "right", "left", "bottom"):
+        ax.spines[sp].set_visible(bool(PANEL_BORDER) or sp in ("left", "bottom"))
         ax.spines[sp].set_color("#888888")
         ax.spines[sp].set_linewidth(0.8)
     ax.grid(True, color="#E5E5E5", linewidth=0.6, zorder=0)
@@ -1182,6 +1184,33 @@ def _dress(ax, xlabel=True):
                       fontsize=8.5, color="#333333")
     if T_MIN is not None or T_MAX is not None:
         ax.set_xlim(left=T_MIN, right=T_MAX)
+
+
+def _tick_txt(x):
+    if abs(x) < 0.005:
+        return "0"
+    return ("%.2f" % x).rstrip("0").rstrip(".")
+
+
+def _time_axis(fig, t0, t1):
+    """Every panel of the page on the same span, t0 to t1, its frame ending at
+       t1. With SHOW_END_TIME the end time is labelled on the time axis; a
+       regular tick closer to it than 6 % of the span is dropped so the two
+       labels do not run together."""
+    if t0 is None or t1 is None or not t1 > t0:
+        return
+    span = float(t1 - t0)
+    for ax in fig.axes:
+        ax.set_xlim(t0, t1)
+        if not SHOW_END_TIME:
+            continue
+        try:
+            ticks = list(ax.xaxis.get_major_locator().tick_values(t0, t1))
+        except Exception:
+            ticks = list(ax.get_xticks())
+        ticks = [x for x in ticks if t0 - 1e-9 <= x <= t1 + 1e-9 and t1 - x > 0.06 * span] + [t1]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([_tick_txt(x) for x in ticks])
 
 
 def _robust_lohi(t, v):
@@ -1676,7 +1705,7 @@ def _draw_pq_stacked_page(plt, name, traces, fault_t, ctx, flags, bmap, present)
     return fig
 
 
-_DRAW_VERSION = "ov2-3"         # bump when the drawing changes: every PDF is then drawn again
+_DRAW_VERSION = "ov2-4"         # bump when the drawing changes: every PDF is then drawn again
 
 
 def _settings_sig():
@@ -1687,6 +1716,7 @@ def _settings_sig():
             "ANGLES_OF_VIOLATED", "SYNC_ANGLES", "INCLUDE_SGF_UNITS", "INCLUDE_EGF_UNITS", "BUS_ANGLES",
             "EXTRA_TITLE_REGEX", "CASES", "PAGE_SUBTITLE", "SHOW_SECTION_TITLE", "SHOW_STUDY_FLAGS",
             "FOOTER_TEXT", "FAULT_LINE", "SHOW_END_VALUES", "ALIGN_TO_FAULT", "T_MIN", "T_MAX", "MAX_POINTS",
+            "PANEL_BORDER", "SHOW_END_TIME",
             "SHOW_NODES", "SGF_UNIT_BUS_START", "SBASE_MVA", "Y_PAD_FRAC", "Y_FLAT_FRAC", "Y_SPIKE_SAMPLES",
             "V_MIN_SPAN", "ANGLE_MIN_SPAN", "PDF_NAME", "MODE", "VIOLATION_FILES")
     g = globals()
@@ -1781,6 +1811,9 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
         print("    %s: no case has a readable .out -- skipped" % fault)
         return None, ("no readable .out" if unreadable else "no .out")
     traces = _normalise(traces)
+    ends = [(t[0], t[-1]) for _c, t, _s in traces if t]       # the time span every panel is drawn on
+    t_lo = T_MIN if T_MIN is not None else (min(a for a, _b in ends) if ends else None)
+    t_hi = T_MAX if T_MAX is not None else (max(b for _a, b in ends) if ends else None)
     pages, ctx = _plan(traces, flags, bmap)
     if not pages:
         print("    %s: nothing left to draw with SECTIONS = %s, OVERLAY_QUANTITIES = %s, SEPARATE_QUANTITIES = %s"
@@ -1807,6 +1840,7 @@ def draw_fault(proj, fault, dirs, dyntools, plt, PdfPages):
             else:
                 fig = _draw_pq_page(plt, page, traces, fault_t, ctx, flags, bmap, present)
                 legend = _legend_handles(solid=PQ_SOLID_LINES)
+            _time_axis(fig, t_lo, t_hi)
             _page_head(fig, proj, fault, title, pg, len(pages), stamp)
             _page_legend(fig, legend)
             try:
