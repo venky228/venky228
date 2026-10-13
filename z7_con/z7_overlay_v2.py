@@ -69,6 +69,7 @@ ROOT = r"C:\KV\ENGIE\CQ_MIT_f"          # the study folder holding Base\ and Pro
 PROJECTS = ["SantaFe", "IronStar", "EmpirePrairie", "EastFork"]   # all 4 (remove any you do not want)
 MODE = "spp"
 FAULTS = []                              # [] = every fault with an .out in Scenario 1 | e.g. ["F134", "F01"]
+                                         #   or a range, e.g. ["F01-F03"] = F01, F02, F03 (mix freely: ["F01-F03", "F134"])
 PLOT_FLAT_RUN = True                     # the flat run (no fault; FLAT_RUN.out) is drawn too, first -- with
                                          #   FAULTS = [] (name it in FAULTS, e.g. ["FLAT_RUN", "F01"], otherwise)
 
@@ -233,11 +234,46 @@ def _case_dir(res_root, proj, suffix):
     return None
 
 
+_RX_RANGE = re.compile(r"^\s*([A-Za-z_]*)(\d+)\s*(?:-|\u2013|to)\s*([A-Za-z_]*)(\d+)\s*$", re.I)
+
+
+def _expand(entries, dirs):
+    """FAULTS as written: a name ("F134", "FLAT_RUN") or a range ("F01-F03",
+       "F98-F102"): every fault numbered from the first to the last that has an
+       .out in any case (written F01, F02 ... when none has)."""
+    cache, out = {}, []
+    for e in entries:
+        m = _RX_RANGE.match(str(e))
+        if not m:
+            out.append(str(e).strip())
+            continue
+        pre = m.group(1) or m.group(3) or "F"
+        a, b = sorted((int(m.group(2)), int(m.group(4))))
+        if pre.upper() not in cache:
+            cache[pre.upper()] = {}
+            for d in dirs:
+                if d:
+                    for p in glob.glob(os.path.join(d, "outs", "*.out")):
+                        f = os.path.splitext(os.path.basename(p))[0]
+                        n = re.match(r"^%s(\d+)$" % re.escape(pre), f, re.I)
+                        if n:
+                            cache[pre.upper()][f] = int(n.group(1))
+        have = cache[pre.upper()]
+        hit = sorted((f for f, n in have.items() if a <= n <= b), key=lambda f: have[f])
+        out.extend(hit or ["%s%0*d" % (pre, len(m.group(2)), n) for n in range(a, b + 1)])
+    seen, res = set(), []
+    for f in out:
+        if f.upper() not in seen:
+            seen.add(f.upper())
+            res.append(f)
+    return res
+
+
 def _faults(dirs):
-    """Faults to draw: FAULTS, else every .out in Scenario 1 (or the first case
-       found) -- the flat run first when PLOT_FLAT_RUN."""
+    """Faults to draw: FAULTS (ranges such as "F01-F03" expanded), else every .out
+       in Scenario 1 (or the first case found) -- the flat run first when PLOT_FLAT_RUN."""
     if FAULTS:
-        return list(FAULTS)
+        return _expand(FAULTS, dirs)
     for d in dirs[1:] + dirs[:1]:
         if d:
             got = sorted(os.path.splitext(os.path.basename(p))[0]
