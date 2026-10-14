@@ -105,10 +105,14 @@
                              source at the solved terminal voltage and angle
                              (the transformers' phase shifts included) -- a
                              check that PSCAD's network matches PSS/E's; delete
-                             it and connect a UDM to its node. A UDM with its
-                             GSU inside: PSCAD inverter at MV. Every parameter
-                             it set, and any it could not, is listed in its
-                             log, <name>_build_pscad_<date_time>.txt.
+                             it and connect a UDM to its node (a model of one
+                             unit through PSCAD's current scaler, as in its
+                             vendor's test case). A UDM with its GSU inside:
+                             PSCAD inverter at MV. A timed fault on the grid side
+                             of the POI (Plant: PSCAD fault ...). One wired
+                             single-line diagram, its page sized to fit. Every
+                             parameter it set, and any it could not, is listed
+                             in its log, <name>_build_pscad_<date_time>.txt.
      <name>_PSCAD_DATA.txt   every PSCAD value: ohm, H, uF, kV, MVA, pu on the
                              equipment's own base, vector groups, initial values
 
@@ -182,6 +186,7 @@ REEC_OK = {"PV": ("REEC_A", "REEC_D"), "WT4": ("REEC_A", "REEC_D"), "WT3": ("REE
            "BESS": ("REEC_C", "REEC_D")}
 
 # Plant sheet (Item | Value | Unit | Notes): (key, item, unit, note, choices)
+FAULT_TYPES = ["ABCG", "ABC", "AG", "BG", "CG", "ABG", "BCG", "ACG", "AB", "BC", "AC"]
 PLANT_FIELDS = [
     ("name", "Name", "", "model name: file names and the PSCAD case (letters, digits, _)", None),
     ("sbase_mva", "System base", "MVA", "PSS/E system base (blank = 100)", None),
@@ -224,6 +229,12 @@ PLANT_FIELDS = [
     ("pscad_duration_s", "PSCAD duration", "s", "blank = 5", None),
     ("pscad_plot_step_us", "PSCAD plot step", "us", "blank = 100", None),
     ("pscad_meter", "PSCAD meter at POI", "", "YES = a multimeter between the grid and the POI", ["YES", "NO"]),
+    ("pscad_fault", "PSCAD fault at POI", "", "YES = a fault on the grid side of the POI with its timed fault logic, "
+     "as vendors' test cases have", ["YES", "NO"]),
+    ("pscad_fault_s", "PSCAD fault time", "s", "when the fault starts (blank = 100: none in the run)", None),
+    ("pscad_fault_dur_s", "PSCAD fault duration", "s", "blank = 0.15", None),
+    ("pscad_fault_type", "PSCAD fault type", "", "the phases faulted, G = to ground (blank = ABCG)", FAULT_TYPES),
+    ("pscad_fault_ohm", "PSCAD fault resistance", "ohm", "blank = 0.01", None),
     ("pscad_libraries", "PSCAD libraries", "", "user-model libraries (.pslx) to load, separated by ;", None),
 ]
 
@@ -399,6 +410,7 @@ EXAMPLE = {
         "control_mode": "Q", "v_poi_pu": 1.0, "q_poi_mvar": 0.0, "pf_poi": 1.0, "v_grid_pu": 1.0,
         "plant_ctrl": "REPC_B", "regc_repc": "standard",
         "pscad_time_step_us": 10.0, "pscad_duration_s": 5.0, "pscad_plot_step_us": 100.0, "pscad_meter": "YES",
+        "pscad_fault": "YES", "pscad_fault_dur_s": 0.15, "pscad_fault_type": "ABCG", "pscad_fault_ohm": 0.01,
     },
     "mpt": [
         {"name": "MPT1", "hv_kv": 230.0, "lv_kv": 34.5, "mva": 225.0, "z_hl_pct": 10.0, "x_r": 45.0,
@@ -1655,7 +1667,15 @@ def control(net, pl):
                   "duration_s": _num(pl, "pscad_duration_s", W, 5.0, positive=True),
                   "plot_step_us": _num(pl, "pscad_plot_step_us", W, 100.0, positive=True),
                   "meter": _choice(pl, "pscad_meter", W, ["YES", "NO"], "YES") == "YES",
+                  "fault": None if _choice(pl, "pscad_fault", W, ["YES", "NO"], "YES") == "NO" else {
+                      "t": _num(pl, "pscad_fault_s", W, None), "type": _choice(pl, "pscad_fault_type", W, FAULT_TYPES,
+                                                                                "ABCG"),
+                      "dur": _num(pl, "pscad_fault_dur_s", W, 0.15, positive=True),
+                      "ohm": _num(pl, "pscad_fault_ohm", W, 0.01, positive=True)},
                   "libraries": [x.strip() for x in (_txt(pl.get("pscad_libraries")) or "").split(";") if x.strip()]}
+    flt = c["pscad"]["fault"]
+    if flt and flt["t"] is not None and flt["t"] < 0:
+        raise InputError("Plant: %s must be 0 or more (it is %s)" % (_label("pscad_fault_s"), _g(flt["t"])))
     net.ctl = c
 
 
@@ -2510,6 +2530,12 @@ def pscad_model(net, inp):
         x[0] += step
         return x[0]
 
+    for t in net.tx3:
+        if pscad_shifts(t["vg"]) != t["vg"]["shift"]:
+            net.notes.append("NOTE: PSCAD: %s %s drawn with one lead / lag for both its delta windings (PSCAD's "
+                             "3-winding transformer has one): its TV side's angles are %+.0f deg from the vector "
+                             "group's; the power flows are the same" % (t["name"], t["vg"]["text"],
+                                                                        pscad_shifts(t["vg"])[2] - t["vg"]["shift"][2]))
     th = net.thev
     comps.append(_source("IB_SRC", "IB", net.kv("IB"), net.bus["IB"]["vm"], 0.0, f, x[0], y0, "IB"))
     nxt = "IB"
@@ -2528,6 +2554,22 @@ def pscad_model(net, inp):
                                  _pp("base kV", ["BaseV"], "%s [kV]" % _g(net.kv("POI")))],
                       "ports": [{"node": "POI_M", "pick": ["@left", "@first"]},
                                 {"node": "POI", "pick": ["@right", "@second"]}]})
+
+    flt = c["fault"]
+    if flt:
+        t = flt["t"] if flt["t"] is not None else max(100.0, 10.0 * c["duration_s"])
+        when = ("at %s s for %s s" % (_g(t), _g(flt["dur"]))) if flt["t"] is not None else (
+            "none in the run (from %s s: set Plant: %s to apply one)" % (_g(t), _label("pscad_fault_s")))
+        comps.append({"tag": "POI_FAULT", "kind": "FAULT", "defn": ["master:tpflt"], "x": 0, "y": 0, "room": 2,
+                      "note": "%s fault at the POI%s through %s ohm, %s" % (
+                          flt["type"], " (grid side of its meter)" if c["meter"] else "", _g(flt["ohm"]), when),
+                      "params": [_pp("phase %s" % ph, [ph], None, ["YES"] if ph in flt["type"] else ["NO"])
+                                 for ph in "ABCG"] + [_pp("fault resistance", ["RON"], "%s [ohm]" % _g(flt["ohm"]))],
+                      "ports": [{"node": poi_m, "pick": ["@dim3", "@first"]}]})
+        comps.append({"tag": "POI_FAULT_TIMER", "kind": "TIMER", "defn": ["master:tfaultn"], "x": 0, "y": 0,
+                      "beside": "POI_FAULT", "drives": "POI_FAULT", "note": "the fault's timing: %s" % when,
+                      "params": [_pp("fault time", ["TF"], "%s [s]" % _g(t)),
+                                 _pp("fault duration", ["DF"], "%s [s]" % _g(flt["dur"]))], "ports": []})
 
     def line(ln, xx, yy):
         n = ln["count"]
@@ -2611,17 +2653,22 @@ def pscad_model(net, inp):
         if cm["tag"] in seen:
             raise InputError("PSCAD: two components are named %s -- rename a load / shunt" % cm["tag"])
         seen.add(cm["tag"])
+    for c3 in pscad_layout(comps, cw=PSCAD_W3, ch=PSCAD_H3, pad=0)[0]:
+        c3["x3"], c3["y3"] = c3["x"], c3["y"]          # where R, L and C are three-phase in this PSCAD
     comps, net.pscad_groups = pscad_layout(comps)
+    net.pscad_comps = comps
     return comps
 
 
-PSCAD_W = 14          # a component's room along its row (grid units)
+PSCAD_W = 10          # a component's room along its row (grid units)
 PSCAD_H = 14          # from a row to what hangs below it, and between those
 PSCAD_GAP = 4         # from a node to the things hanging off it
 PSCAD_PAD = 6         # each side of a run of R, L, C: room for its breakouts where PSCAD's R, L, C are single-phase
+PSCAD_W3 = 8          # the same where PSCAD's R, L, C take the wire's three phases: no breakouts, closer together
+PSCAD_H3 = 10
 
 
-def pscad_layout(comps, root="IB"):
+def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PSCAD_PAD):
     """A single-line drawing, left to right from the infinite source: at each node its main branch carries on
        along the row, what hangs off it (shunts, loads, a GSU with its inverter) goes below it, its other branches
        below those. Sets every component's x, y (grid units) and its upstream node ("in"); returns the components
@@ -2670,16 +2717,16 @@ def pscad_layout(comps, root="IB"):
 
     def chain(c, frm, x, y):
         """c hanging off node frm (at x) on row y, then what lies beyond it -> (bottom, right)"""
-        x0 = x + (PSCAD_PAD if rlc(c) and frm and not mid(frm) else 0)
-        put(c, x0 + PSCAD_W // 2, y, frm)
-        right, bottom = x0 + PSCAD_W, y
+        x0 = x + (pad if rlc(c) and frm and not mid(frm) else 0)
+        put(c, x0 + cw // 2, y, frm)
+        right, bottom = x0 + cw * c.get("room", 1), y
         far = [n for n in nodes[id(c)] if n != frm]
         if far:
-            x1 = right + (PSCAD_PAD if rlc(c) and not mid(far[0]) else 0)
+            x1 = right + (pad if rlc(c) and not mid(far[0]) else 0)
             b, r = node(far[0], x1, y)
             bottom, right = max(bottom, b), max(right, r)
             for n2 in far[1:]:                   # a three-winding transformer's tertiary: below
-                b, r = node(n2, x1, bottom + PSCAD_H)
+                b, r = node(n2, x1, bottom + ch)
                 bottom, right = max(bottom, b), max(right, r)
         return bottom, right
 
@@ -2695,28 +2742,32 @@ def pscad_layout(comps, root="IB"):
         others = [c for c in kids if c is not main and all(c is not d for d in drops)]
         bottom, right, yd, wide = y, x, y, 0
         for c in drops:
-            yd += PSCAD_H
-            b, r = chain(c, n, x + PSCAD_GAP, yd)
+            yd += ch
+            b, r = chain(c, n, x + gap, yd)
             bottom, right, wide = max(bottom, b, yd), max(right, r), max(wide, r - x)
         if main is not None:                     # its trunks clear of what hangs below this node
-            b, r = chain(main, n, x + max(0, wide + 2 - PSCAD_W // 2), y)
+            b, r = chain(main, n, x + max(0, wide + 2 - cw // 2), y)
             bottom, right = max(bottom, b), max(right, r)
         for c in others:
-            yo = bottom + PSCAD_H
-            b, r = chain(c, n, x + PSCAD_GAP, yo)
+            yo = bottom + ch
+            b, r = chain(c, n, x + gap, yo)
             bottom, right = max(bottom, b, yo), max(right, r)
         return bottom, right
 
     x0, y0 = 20, 10
     for c in [c for c in at[root] if len(nodes[id(c)]) == 1]:
         if not any(p["node"] == "GND" for p in c["ports"]):
-            put(c, x0 - PSCAD_W // 2, y0, None)          # the infinite source, left of its bus
+            put(c, x0 - cw // 2, y0, None)          # the infinite source, left of its bus
     bottom, _r = node(root, x0, y0)
+    for c in comps:                                     # in the room left beside the one it goes with (a timer)
+        t = next((t for t in comps if t["tag"] == c.get("beside") and id(t) in placed), None)
+        if t is not None and id(c) not in placed:
+            put(c, t["x"] + cw, t["y"] + 2, None)
     xl = 20
     for c in comps:                                     # anything not reached from the source: a row of its own
         if id(c) not in placed:
-            put(c, xl, bottom + 2 * PSCAD_H, None)
-            xl += PSCAD_W
+            put(c, xl, bottom + 2 * ch, None)
+            xl += cw
     groups, done = [], set()
     for c in order:
         if not rlc(c) or id(c) in done:
@@ -2988,6 +3039,15 @@ def _detailed_comps(net, d, x0, y0):
     return comps, y
 
 
+def pscad_shifts(vg):
+    """The angle of each winding against winding 1 in PSCAD's classical transformer (deg): 0 for the same
+       connection, +-30 by its one 'delta lags / leads Y' -- for a 3-winding one, set by winding 2 (or 3 when
+       winding 2 is like winding 1). The vector group's own angles where it can follow them."""
+    lead = _lead(vg, 1) or (_lead(vg, 2) if len(vg["w"]) > 2 else None)
+    d = -30.0 if lead == ["LAG"] else 30.0
+    return [0.0] + [0.0 if w == vg["w"][0] else (d if w == "D" else -d) for w in vg["w"][1:]]
+
+
 def phase_shifts(net):
     """The angle PSCAD's transformers add on the way from the infinite bus to every bus (deg); PSS/E has none."""
     out = {"IB": 0.0}
@@ -2996,11 +3056,11 @@ def phase_shifts(net):
         edges[ln["fr"]].append((ln["to"], 0.0))
         edges[ln["to"]].append((ln["fr"], 0.0))
     for t in net.tx2:
-        s = t["vg"]["shift"][1]
+        s = pscad_shifts(t["vg"])[1]
         edges[t["hv"]].append((t["lv"], s))
         edges[t["lv"]].append((t["hv"], -s))
     for t in net.tx3:
-        s = t["vg"]["shift"]
+        s = pscad_shifts(t["vg"])
         for a, b, d in ((t["hv"], t["lv"], s[1]), (t["hv"], t["tv"], s[2]), (t["lv"], t["tv"], s[2] - s[1])):
             edges[a].append((b, d))
             edges[b].append((a, -d))
@@ -3076,7 +3136,7 @@ _BUILD_PSCAD = r'''# -*- coding: utf-8 -*-
    It uses the PSCAD that is running (or starts one), loads the user-model libraries, creates the
    case in this folder under a free name (nothing is overwritten), places every component, sets its
    parameters, draws the single-line diagram with wires (R, L and C three times over, between breakouts,
-   where they are single-phase in this PSCAD), names each node and saves
+   where they are single-phase in this PSCAD), names each node, sizes the page to the drawing and saves
    the case. Its log, @NAME@_build_pscad_<date_time>.txt, lists every parameter set (as PSCAD reads
    it back), everything it could not do (CHECK:) and each component type's own parameter names, so
    anything left can be set by hand. The values themselves are in @NAME@_PSCAD_DATA.txt.
@@ -3131,6 +3191,38 @@ def eports(cmp):
         except Exception:
             pass
     return out
+
+
+def sports(cmp, kind):
+    """[(name, x, y)] of the component's signal ports: kind 1 its inputs, 2 its outputs."""
+    try:
+        ports = cmp.ports()
+    except Exception:
+        return []
+    out = []
+    for name, p in ports.items():
+        try:
+            if int(p[4]) == kind:
+                out.append((str(name), int(p[0]), int(p[1])))
+        except Exception:
+            pass
+    return out
+
+
+def link(canvas, src, dst, what, log):
+    """A wire from src's output to dst's nearest input (a timer to what it drives)."""
+    outs, ins = sports(src, 2), sports(dst, 1)
+    if not outs or not ins:
+        log("CHECK: %s: no %s found -- join them by hand" % (what, "output" if not outs else "input"))
+        return
+    o = outs[0]
+    i = min(ins, key=lambda p: abs(p[1] - o[1]) + abs(p[2] - o[2]))
+    mx = (o[1] + i[1]) // 2
+    try:
+        wire(canvas, (o[1], o[2]), (mx, o[2]), (mx, i[2]), (i[1], i[2]))
+        log("%s: %s (%d, %d) -> %s (%d, %d)" % (what, o[0], o[1], o[2], i[0], i[1], i[2]))
+    except Exception as e:
+        log("CHECK: %s: no wire (%s) -- join them by hand" % (what, e))
 
 
 def pick(ports, picks, taken):
@@ -3228,12 +3320,71 @@ def _range(cmp, name):
 DY = 4                     # single-phase R, L, C: the phases' rows, top to bottom (grid units)
 TRACE = []                 # SMIB_PSCAD_TRACE=<file>: what was drawn, for smib_build's own tests
 NO_BREAKOUT = []           # why this PSCAD has no breakout, once found
+PAGES = (("85X11", 88, 68), ("11X17", 136, 88), ("17X22", 176, 136), ("22X34", 272, 176), ("34X44", 352, 272),
+         ("100X100", 800, 800))  # PSCAD's page sizes, landscape: (size, width, height) in grid units
+DRAWN = []                 # every component placed
+REACH = [0, 0]             # how far right and down the drawing goes (grid units)
+PAGE = [0, 0]              # the page set: width, height (grid units)
+NEED = [0, 0]              # the drawing's size it was set for
 
 
 def _trace(kind, **kw):
     if os.environ.get("SMIB_PSCAD_TRACE"):
         kw["kind"] = kind
         TRACE.append(kw)
+
+
+def _made(cmp, x, y):
+    """A component placed at (x, y): counted in the drawing's reach (its symbol's own size added at the end)."""
+    DRAWN.append(cmp)
+    REACH[0], REACH[1] = max(REACH[0], int(x) + 4), max(REACH[1], int(y) + 4)
+    return cmp
+
+
+def page(canvas, w, h, log):
+    """The smallest page -- landscape, else portrait -- that holds a drawing w x h grid units: PSCAD shows
+       nothing past the page's edge (a new case starts on the smallest, 88 x 68)."""
+    fits = [(s, o, a, b) for s, pw, ph in PAGES for o, a, b in (("LANDSCAPE", pw, ph), ("PORTRAIT", ph, pw))
+            if a >= w and b >= h]
+    fits += [(s, "LANDSCAPE", pw, ph) for s, pw, ph in reversed(PAGES) if (s, "LANDSCAPE", pw, ph) not in fits]
+    err = None
+    NEED[0], NEED[1] = w, h
+    for size, orient, a, b in fits:
+        try:
+            canvas.parameters(size=size, orient=orient)
+        except Exception as e:
+            err = e
+            continue
+        PAGE[0], PAGE[1] = a, b
+        try:
+            got = canvas.parameters() or {}
+            got = "%s %s" % (got.get("size", "?"), got.get("orient", "?"))
+        except Exception:
+            got = "?"
+        log("page: %s %s, %d x %d grid units (read back: %s), for a drawing %d x %d" % (size, orient, a, b, got, w, h))
+        if a < w or b < h:
+            log("CHECK: the drawing (%d x %d grid units) is larger than the largest page this PSCAD takes: what lies "
+                "past %d, %d is not shown -- move it onto the page by hand" % (w, h, a, b))
+        return True
+    log("CHECK: the page size cannot be set here (%s) -- set the canvas's size to %s, %s by hand (right-click an "
+        "empty spot of the canvas): the drawing is %d x %d grid units and PSCAD shows nothing past the page's edge"
+        % (err, fits[0][0], fits[0][1], w, h))
+    return False
+
+
+def reach(canvas):
+    """How far right and down what was drawn goes (grid units): the symbols' own bounds where PSCAD gives them."""
+    w, h = REACH
+    try:
+        rects = list(canvas.bounds(DRAWN))
+    except Exception:
+        rects = []
+    for r in rects:
+        try:
+            w, h = max(w, int(r[2])), max(h, int(r[3]))
+        except Exception:
+            pass
+    return w + 2, h + 2
 
 
 def _move(cmp, dx, dy):
@@ -3259,7 +3410,22 @@ def _delete(canvas, cmp):
         try:
             canvas.delete(cmp)
         except Exception:
-            pass
+            return False
+    return True
+
+
+def rlc_single(canvas, log):
+    """Whether PSCAD's R, L and C are single-phase here (ports of dimension 1), from one resistor placed and
+       removed; True (the roomy layout, right either way) when that cannot be told."""
+    try:
+        r = canvas.create_component("master:resistor", 2, 2)
+    except Exception as e:
+        log("(no resistor to look at: %s)" % e)
+        return True
+    dims = [p[3] for p in eports(r)]
+    if not _delete(canvas, r):
+        log("CHECK: a resistor placed to see its ports is left at (2, 2): delete it")
+    return not dims or all(d == 1 for d in dims)
 
 
 def wire(canvas, *pts):
@@ -3272,12 +3438,13 @@ def wire(canvas, *pts):
     if len(v) > 1:
         canvas.create_wire(*v)
         _trace("wire", pts=v)
+        REACH[0], REACH[1] = max([REACH[0]] + [p[0] for p in v]), max([REACH[1]] + [p[1] for p in v])
 
 
 def ground(canvas, x, y, log):
     """A ground on the port at (x, y): below it, joined by a wire where its own port is not right there."""
     try:
-        g = canvas.create_component("master:ground", x, y + 2)
+        g = _made(canvas.create_component("master:ground", x, y + 2), x, y + 2)
         gp = eports(g)
         if gp and (gp[0][1], gp[0][2]) != (x, y):
             wire(canvas, (x, y), (x, gp[0][2]), (gp[0][1], gp[0][2]))
@@ -3289,7 +3456,7 @@ def ground(canvas, x, y, log):
 def label(canvas, x, y, name):
     """The node's name (a node label) on the port at (x, y)."""
     try:
-        lb = canvas.create_component("master:nodelabel", x, y, Name=name)
+        lb = _made(canvas.create_component("master:nodelabel", x, y, Name=name), x, y)
         _trace("comp", role="label", name=name, ports=eports(lb))
         return True
     except Exception:
@@ -3325,6 +3492,7 @@ def breakout_for(canvas, targets, right, names, log):
             return None
         if ok:
             ps = eports(b)
+            _made(b, tx, ty + 2 * DY)
             return b, [p for p in ps if p[3] == 3][0], sorted([p for p in ps if p[3] == 1], key=lambda p: p[2])
         _delete(canvas, b)
     log("CHECK: no orientation of the breakout faces the phases")
@@ -3364,7 +3532,7 @@ def phase_group(canvas, g, made, spec_of, points, log):
             cmp, used, _picked = made[tag]
             if k:
                 c = spec_of[tag]
-                cmp = canvas.create_component(used, c["x"], c["y"] + DY * k)
+                cmp = _made(canvas.create_component(used, c["x"], c["y"] + DY * k), c["x"], c["y"] + DY * k)
                 set_params(cmp, c["params"], log, quiet=True)
                 added += 1
             ports = sorted([p for p in eports(cmp) if p[3] == 1], key=lambda p: (p[1], p[2]))
@@ -3484,6 +3652,11 @@ def main():
     except Exception as e:
         log("CHECK: run settings not set (%s): %s" % (e, SPEC["settings"]))
     canvas = prj.canvas("Main") if hasattr(prj, "canvas") else prj.user_canvas("Main")
+    if not rlc_single(canvas, log):
+        for c in SPEC["components"]:
+            c["x"], c["y"] = c.get("x3", c["x"]), c.get("y3", c["y"])
+        log("R, L and C take the wire's three phases here: drawn once each, closer together")
+    page(canvas, max(c["x"] for c in SPEC["components"]) + 12, max(c["y"] for c in SPEC["components"]) + 16, log)
     seen_defn = {}
     made = {}                                         # tag -> (component, definition, [(node, port)])
     spec_of = dict((c["tag"], c) for c in SPEC["components"])
@@ -3501,6 +3674,7 @@ def main():
                 cmp = canvas.create_component(d, c["x"], c["y"])
                 used = d
                 if cmp is not None:
+                    _made(cmp, c["x"], c["y"])
                     break
             except Exception as e:
                 log("    (%s: %s)" % (d, e))
@@ -3569,10 +3743,16 @@ def main():
         if c["tag"] in made and c["tag"] not in grouped:
             for node, q in made[c["tag"]][2]:
                 points.setdefault(node, []).append((q[1], q[2], c["tag"], q[0]))
+    for c in SPEC["components"]:
+        if c.get("drives") and c["tag"] in made and c["drives"] in made:
+            link(canvas, made[c["tag"]][0], made[c["drives"]][0], "%s -> %s" % (c["tag"], c["drives"]), log)
     log("")
     join(canvas, points, log)
     made = len(made)
     log("nodes joined by wires: %d" % len([n for n in points if n != "GND"]))
+    w, h = reach(canvas)
+    if PAGE[0] and (w > PAGE[0] or h > PAGE[1]) and (w > NEED[0] or h > NEED[1]):    # past what the layout said
+        page(canvas, w, h, log)
     log("")
     log("inverters -- a vendor model (UDM) goes on these nodes; a stand-in source holds the load flow until then:")
     for s in SPEC.get("slots", []):
@@ -3624,6 +3804,11 @@ def pscad_slot_lines(net, ind):
         L.append(ind + "  %-24s %-24s %6s %10.3f %10.3f %9.5f %10.4f  %s%s" % (
             sl["tag"], _node(sl["node"]), _g(sl["units"]), sl["p"], sl["q"], sl["vm"], sl["ang"], sl["model"],
             "  (GSU inside: on its HV side)" if sl["at"] == "MV" else ""))
+    L.append(ind + "  A vendor model of one unit: wire it as in its vendor's test case -- the model, PSCAD's current "
+                   "scaler (master:current_scaler, its scale = the units above), then the node.")
+    flt = next((c for c in getattr(net, "pscad_comps", []) if c["kind"] == "FAULT"), None)
+    if flt:
+        L.append(ind + "POI_FAULT: %s (its timing: POI_FAULT_TIMER)" % flt["note"])
     for d in net.pscad_det:
         nsec = sum(len(row) for _fd, row in d["rows"])
         L.append(ind + "Collector %s DETAILED: %d feeder row(s) (identical copies lumped), %d sections, %d inverters; "
@@ -3643,7 +3828,7 @@ def pscad_data_text(net, comps, spec):
          "voltages (V1 is the tapped HV voltage). Lines and collector equivalents: pi sections (C/2 at each end);",
          "detailed collectors: each section's R and L, its charging as C/2 at each end (one capacitor per node).",
          "The drawing: a single-line diagram with wires (R, L, C three times over, between breakouts, where PSCAD's",
-         "are single-phase); the node names below are the labels on the wires.",
+         "are single-phase), on a page sized to fit it; the node names below are the labels on the wires.",
          "Sources: kV line-to-line rms and degrees, the angle relative to the infinite source, the PSCAD",
          "transformers' phase shifts included (PSS/E has none). A node joins the components that name it.",
          "",
