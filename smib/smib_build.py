@@ -115,6 +115,9 @@
        python smib_build.py --template SMIB_INPUT.xlsx   an input workbook to fill in
        python smib_build.py SMIB_INPUT.xlsx              the models
        python smib_build.py SMIB_INPUT.xlsx --no-psse    the models, no PSS/E check
+       python smib_build.py                              (the Run button) the workbook
+           in INPUT_XLSX, else the one beside this script; several or none: a
+           file dialog -- none chosen: a new SMIB_INPUT.xlsx beside it to fill in
 """
 from __future__ import print_function, division
 
@@ -137,7 +140,7 @@ from xml.sax.saxutils import escape as _xml_escape
 # ============================================================================
 # SETTINGS
 # ============================================================================
-INPUT_XLSX = ""                   # "" = the workbook on the command line | r"C:\...\SMIB_INPUT.xlsx"
+INPUT_XLSX = ""                   # "" = the command line's, else the one beside this script | r"C:\...\SMIB.xlsx"
 OUT_DIR = ""                      # "" = SMIB_MODELS beside the workbook; a new <name>_<date_time> folder inside
 PSSE_CHECK = True                 # PSS/E found: the .raw read back and solved, the .sav saved, the .dyr run flat
 FLAT_RUN_S = 10.0                 # flat run length (s)
@@ -3781,6 +3784,77 @@ def build(src, out_dir=None, check=True):
     return net, files
 
 
+def find_inputs(dirs):
+    """The SMIB input workbooks in `dirs` (a Plant and a Generators sheet), the newest first."""
+    out, seen = [], set()
+    for d in dirs:
+        for p in glob.glob(os.path.join(d, "*.xls[xm]")):
+            key = os.path.normcase(os.path.abspath(p))
+            if key in seen or os.path.basename(p).startswith("~$"):
+                continue
+            seen.add(key)
+            try:
+                with zipfile.ZipFile(p) as z:
+                    wb = z.read("xl/workbook.xml").decode("utf-8", "replace")
+            except Exception:
+                continue
+            names = set(n.lower() for n in re.findall(r'<sheet\b[^>]*\bname="([^"]*)"', wb))
+            if "plant" in names and "generators" in names:
+                out.append(os.path.abspath(p))
+    return sorted(out, key=os.path.getmtime, reverse=True)
+
+
+def _ask_workbook(here, found):
+    """A file dialog for the input workbook; None: no dialog here, or cancelled."""
+    try:
+        import tkinter
+        import tkinter.filedialog
+    except ImportError:
+        return None
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = tkinter.filedialog.askopenfilename(
+            parent=root, initialdir=here, filetypes=[("Excel workbook", "*.xlsx *.xlsm"), ("All files", "*.*")],
+            title="SMIB input workbook -- Cancel: %s" % ("list them" if found else "a new one to fill in"))
+        root.destroy()
+    except Exception:
+        return None
+    return os.path.abspath(path) if path else None
+
+
+def pick_input():
+    """No workbook given: the one beside this script (or in the working folder); several or none: a file dialog;
+       none chosen and none there: a new SMIB_INPUT.xlsx beside the script to fill in. None: nothing to run."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    found = find_inputs([here, os.getcwd()])
+    if len(found) == 1:
+        print("[smib] input: %s (the SMIB workbook beside the script)" % found[0])
+        return found[0]
+    print("[smib] %s -- choose one in the file dialog" % ("%d SMIB workbooks beside the script" % len(found) if found
+                                                         else "no input workbook given"))
+    path = _ask_workbook(here, found)
+    if path:
+        return path
+    if found:
+        print("[smib] give one:  python %s <workbook>   (or set INPUT_XLSX at the top of the script)"
+              % os.path.basename(__file__))
+        for p in found:
+            print("         %s" % p)
+        return None
+    path = os.path.join(here, "SMIB_INPUT.xlsx")
+    try:
+        roles = example_roles()
+    except Exception:
+        roles = None
+    write_template(path, EXAMPLE, roles)
+    print("[smib] no input workbook -- a new one to fill in: %s" % path)
+    print("       it holds an example (100 MW PV + 100 MW BESS) and a README sheet; fill it in, save it and run "
+          "this again (or: python %s --help)" % os.path.basename(__file__))
+    return None
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--template" in argv:
@@ -3799,13 +3873,15 @@ def main(argv=None):
         print("[smib] input workbook written: %s" % path)
         print("       fill it in, then: python %s \"%s\"" % (os.path.basename(__file__), path))
         return 0
-    files = [a for a in argv if not a.startswith("--")]
+    if "--help" in argv or "-h" in argv:
+        print(__doc__)
+        return 0
+    files = [a for a in argv if not a.startswith("-")]
     src = files[0] if files else INPUT_XLSX
     if not src:
-        print(__doc__)
-        print("[smib] no input: python smib_build.py --template SMIB_INPUT.xlsx, fill it in, then "
-              "python smib_build.py SMIB_INPUT.xlsx")
-        return 2
+        src = pick_input()
+        if not src:
+            return 2
     if not os.path.isfile(src):
         print("[smib] *** no file %s" % src)
         return 2
