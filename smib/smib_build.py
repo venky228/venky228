@@ -80,9 +80,13 @@
                   WECC user-model DLL must be loaded (ADDLIB_IDV / DLLS).
                   Limits from the unit data, any parameter from Dyr_Params --
                   and your own records (Dyr_Records) with {BUS}, {ID}, {POI} ...
-     With PSS/E found (PSSE_CHECK): the .raw read back and solved against this
-     script's load flow, <name>.sav saved, the .dyr read, initialised and run
-     flat for FLAT_RUN_S seconds.
+     With PSS/E found (PSSE_CHECK; PSSE_VERSION = 35: PSS/E 35): the .raw read
+     back and solved against this script's load flow, <name>.sav and
+     <name>_psse35.raw (PSS/E 35's own format) saved, the .dyr read
+     (<name>.snp saved), initialised and run flat for FLAT_RUN_S seconds.
+     PSS/E 35's psspy is for set Pythons (its PSSPY39, PSSPY310 ... folders):
+     run from another (3.13 ...), the script runs the check in one of those,
+     found by itself (the py launcher, PythonXY folders) or PSSE_PYTHON.
 
    PSCAD
      <name>_build_pscad.py   run it with a Python that has PSCAD's automation
@@ -131,6 +135,7 @@ import math
 import cmath
 import time
 import shutil
+import subprocess
 import zipfile
 import posixpath
 import collections
@@ -143,11 +148,14 @@ from xml.sax.saxutils import escape as _xml_escape
 INPUT_XLSX = ""                   # "" = the command line's, else the one beside this script | r"C:\...\SMIB.xlsx"
 OUT_DIR = ""                      # "" = SMIB_MODELS beside the workbook; a new <name>_<date_time> folder inside
 PSSE_CHECK = True                 # PSS/E found: the .raw read back and solved, the .sav saved, the .dyr run flat
+PSSE_VERSION = 35                 # the PSS/E that checks the models: 35 | 34 | 36 ... | None = the newest installed
+PSSE_PYTHON = ""                  # a Python PSS/E has a psspy for (its PSSPYxy folders), used when this one has none
+                                  # (3.13 ...): "" = found (the py launcher, PythonXY folders) | r"C:\...\python.exe"
 FLAT_RUN_S = 10.0                 # flat run length (s)
 FLAT_TOL = (0.5, 0.5, 0.001)      # MW, MVAr, pu: a larger drift in the flat run is listed for review
 DYN_PARAMS = (60, 0.60, 0.0000095, 1.0 / 240.0, 0.033333)   # NITER, ACCEL, TOL, DELT, FREQFILT
-ADDLIB_IDV = ""                   # an .idv that loads the user-model libraries (the study's add_library.idv), run
-                                  # before the .dyr is read -- BESS (REGCAU1 / REECCU1 / REPCAU1) and vendor models
+ADDLIB_IDV = ""                   # an .idv that loads user-model libraries (the study's add_library.idv), run before
+                                  # the .dyr is read: vendor models, and WECC models your PSS/E's own library lacks
 DLLS = []                         # user-model DLLs (full paths), loaded before the .dyr -- instead of / with ADDLIB_IDV
 SOLVE_OPTS = [0, 0, 0, 1, 0, 0, 0, 0]   # FNSL: taps, interchange, phase shift, switched shunts locked
 TOL_MW = 0.5                      # PSS/E's solution against this script's: a larger difference is listed for review
@@ -502,11 +510,13 @@ REVIEW_MARKS = ("CHECK:", "WARNING", "***", "NOT FLAT", "SUSPECT")
 
 
 class Log(object):
-    def __init__(self):
+    def __init__(self, echo=True):
         self.lines = []
+        self.echo = echo
 
     def __call__(self, msg=""):
-        print(msg)
+        if self.echo:
+            print(msg)
         self.lines.extend(str(msg).split("\n"))
 
     def review(self):
@@ -3455,17 +3465,30 @@ _i, _f, _s = -100000000, -1.0e20, "1"
 _PSSE_DLL_HANDLES = []
 
 
+def _vkey(path):
+    """A sort key that puts 35.10 after 35.9."""
+    return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", os.path.basename(path.rstrip("\\/")))]
+
+
 def _psse_install_roots():
-    """PSS/E install folders, the ones matching this interpreter first (PSSE_ROOT always first)."""
-    import struct
-    bases = [r"C:\Program Files (x86)\PTI", r"C:\Program Files\PTI"]
-    if struct.calcsize("P") == 8:
-        bases.reverse()
+    """PSS/E install folders -- PSSE_VERSION's only, when set -- the newest first (PSSE_ROOT always first)."""
+    bases = [r"C:\Program Files\PTI", r"C:\Program Files (x86)\PTI"]
+    ver = "%d" % PSSE_VERSION if PSSE_VERSION else "3"
     out = [os.environ.get("PSSE_ROOT", "")]
     for b in bases:
-        for d in sorted(glob.glob(os.path.join(b, "PSSE3*")), reverse=True):
-            out += sorted(glob.glob(os.path.join(d, "3[0-9].*")), reverse=True) + [d]
+        for d in sorted(glob.glob(os.path.join(b, "PSSE%s*" % ver)), key=_vkey, reverse=True):
+            out += sorted(glob.glob(os.path.join(d, "%s*.*" % ver)), key=_vkey, reverse=True) + [d]
     return [r for r in out if r and os.path.isdir(r)]
+
+
+def _psspy_versions(root):
+    """[(3, 11), (3, 9) ...]: the Pythons a PSS/E install has a psspy for (its PSSPYxy folders), the newest first."""
+    out = []
+    for d in glob.glob(os.path.join(root, "PSSPY*")):
+        m = re.match(r"^PSSPY(\d)(\d+)$", os.path.basename(d), re.I)
+        if m and os.path.isdir(d):
+            out.append((int(m.group(1)), int(m.group(2))))
+    return sorted(set(out), reverse=True)
 
 
 def _add_path(d):
@@ -3481,16 +3504,20 @@ def _add_path(d):
             pass
 
 
+PSSE_RUNNING = None                 # (major, minor) of the PSS/E psspy came from
+
+
 def psse_start(log):
-    """psspy, for this Python's PSSPY## folder; False when there is no PSS/E."""
-    global psspy, _i, _f, _s
+    """psspy of PSSE_VERSION for this Python (its PSSPYxy folder); False when there is none."""
+    global psspy, _i, _f, _s, PSSE_RUNNING
     if psspy is not None:
         return True
     try:
         import psspy as _p
     except ImportError:
         prefer = "PSSPY%d%d" % sys.version_info[:2]
-        for root in _psse_install_roots():
+        roots = _psse_install_roots()
+        for root in roots:
             if os.path.isdir(os.path.join(root, prefer)):
                 _add_path(os.path.join(root, "PSSBIN"))
                 _add_path(os.path.join(root, prefer))
@@ -3501,7 +3528,7 @@ def psse_start(log):
                 _add_path(pbin)
                 log("PSS/E: %s" % pbin)
                 break
-        for m in ("psse35", "psse34"):
+        for m in (["psse%d" % PSSE_VERSION] if PSSE_VERSION else ["psse36", "psse35", "psse34"]):
             try:
                 __import__(m)
                 break
@@ -3510,8 +3537,11 @@ def psse_start(log):
         try:
             import psspy as _p
         except Exception as e:
-            log("no PSS/E for Python %d.%d (%s) -- the check is skipped; the models are written"
-                % (sys.version_info[0], sys.version_info[1], e))
+            have = sorted(set(v for r in roots for v in _psspy_versions(r)))
+            log("no PSS/E %sfor Python %d.%d (%s)%s" % (
+                ("%s " % PSSE_VERSION) if PSSE_VERSION else "", sys.version_info[0], sys.version_info[1], e,
+                ("; it has psspy for Python %s" % ", ".join("%d.%d" % v for v in have)) if have else
+                ("; no PSS/E %s found under C:\\Program Files\\PTI (PSSE_ROOT: its folder)" % (PSSE_VERSION or ""))))
             return False
     psspy = _p
     try:
@@ -3524,7 +3554,72 @@ def psse_start(log):
         _i, _f, _s = psspy.getdefaultint(), psspy.getdefaultreal(), psspy.getdefaultchar()
     except Exception:
         pass
+    try:
+        v = psspy.psseversion()
+        PSSE_RUNNING = (int(v[1]), int(v[2]))
+        log("PSS/E %d.%d, Python %d.%d" % (PSSE_RUNNING + sys.version_info[:2]))
+        if PSSE_VERSION and PSSE_RUNNING[0] != PSSE_VERSION:
+            log("CHECK: this is PSS/E %d, PSSE_VERSION says %d" % (PSSE_RUNNING[0], PSSE_VERSION))
+    except Exception:
+        pass
     return True
+
+
+def _probe_python(cmd):
+    """(major, minor, bits, executable) of the Python that `cmd` runs, or None."""
+    code = ("import sys, struct; print('%d %d %d %s' % (sys.version_info[0], sys.version_info[1], "
+            "struct.calcsize('P') * 8, sys.executable))")
+    try:
+        got = subprocess.check_output(cmd + ["-c", code], stderr=subprocess.STDOUT)
+    except Exception:
+        return None
+    parts = got.decode("utf-8", "replace").strip().splitlines()[-1].split(" ", 3)
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2]), parts[3]
+    except (IndexError, ValueError):
+        return None
+
+
+def psse_python(log):
+    """A Python the PSS/E of PSSE_VERSION has a psspy for: PSSE_PYTHON, else one found (the py launcher, then the
+       usual PythonXY folders) -- 64-bit for PSS/E 35 on, 32-bit before. None: none."""
+    wanted = []
+    for root in _psse_install_roots():
+        for v in _psspy_versions(root):
+            if v not in wanted:
+                wanted.append(v)
+    if not wanted:
+        return None
+    bits = 64 if (PSSE_RUNNING or (PSSE_VERSION or 35, 0))[0] >= 35 else 32
+    names = ", ".join("%d.%d" % v for v in wanted)
+    if PSSE_PYTHON:
+        got = _probe_python([PSSE_PYTHON])
+        if got and got[:2] in wanted:
+            return got[3]
+        log("CHECK: PSSE_PYTHON %s is %s -- PSS/E %s has psspy for Python %s" % (
+            PSSE_PYTHON, ("Python %d.%d" % got[:2]) if got else "no Python", PSSE_VERSION or "", names))
+        return None
+    here = os.environ.get("LOCALAPPDATA", "")
+    tried = set()
+    for v in wanted:
+        tag = "%d%d" % v
+        cands = [["py", "-%d.%d-%d" % (v[0], v[1], bits)]]
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                     os.path.join(here, "Programs", "Python") if here else "", "C:\\"):
+            for name in ("Python%s" % tag, "Python%s-%d" % (tag, bits)):
+                exe = os.path.join(base, name, "python.exe") if base else ""
+                if exe and os.path.isfile(exe) and exe.lower() not in tried:
+                    tried.add(exe.lower())
+                    cands.append([exe])
+        for cmd in cands:
+            got = _probe_python(cmd)
+            if got and got[:2] == v and got[2] == bits:
+                return got[3]
+    log("no %d-bit Python %s here for PSS/E %s's psspy -- install one (python.org), or set PSSE_PYTHON in the "
+        "script; the check is skipped, the models are written" % (bits, " / ".join(names.split(", ")),
+                                                                   PSSE_VERSION or ""))
+    return None
 
 
 class FileLog(Log):
@@ -3547,10 +3642,31 @@ def _ie(rc):
     return rc[0] if isinstance(rc, (list, tuple)) else rc
 
 
-def psse_check(net, recs, inp, files, out):
-    log = FileLog(os.path.join(out, net.name + "_PSSE_CHECK.txt"))
+def psse_check(net, recs, inp, files, out, here_only=False):
+    """PSS/E's check of the models in `out`: in this Python when it has PSS/E's psspy (PSSE_VERSION), else -- not
+       here_only -- in a Python that has one: this script again, with --psse-check <out>."""
+    pre = Log(echo=False)
+    path = os.path.join(out, net.name + "_PSSE_CHECK.txt")
+    if not psse_start(pre) and not here_only:
+        py = psse_python(pre)
+        if py:
+            print("[psse] %s -- the check runs in %s" % (pre.lines[-1] if pre.lines else "", py))
+            rc = subprocess.call([py, os.path.abspath(__file__), "--psse-check", out])
+            log = Log(echo=False)
+            try:
+                with io.open(path, encoding="utf-8", errors="replace") as fh:
+                    log.lines = fh.read().splitlines()
+            except (IOError, OSError):
+                log("*** the PSS/E check in %s left no %s (exit %s)" % (py, os.path.basename(path), rc))
+            for k, ext in (("sav", ".sav"), ("raw_psse", "_psse%d.raw" % (PSSE_VERSION or 0)), ("snp", ".snp")):
+                if os.path.isfile(os.path.join(out, net.name + ext)):
+                    files[k] = os.path.join(out, net.name + ext)
+            return log
+    log = FileLog(path)
     log("PSS/E CHECK -- SMIB %s   %s" % (net.name, time.strftime("%Y-%m-%d %H:%M")))
-    if not psse_start(log):
+    for ln in pre.lines:
+        log(ln)
+    if psspy is None:
         return log
     work = os.path.join(out, "_psse")
     os.makedirs(work)
@@ -3583,9 +3699,13 @@ def psse_check(net, recs, inp, files, out):
             log("*** initial conditions SUSPECT -- see _psse\\progress.txt")
         elif re.search(r"INITIAL CONDITIONS CHECK O\.?K", txt, re.I):
             log("initial conditions check o.k.")
-        for ln in [x.strip() for x in txt.splitlines()
-                   if re.search(r"error|not found|no model|not modeled|invalid|ignored", x, re.I)][:20]:
+        bad = [x.strip() for x in txt.splitlines()
+               if re.search(r"error|not found|no model|not modeled|invalid|ignored", x, re.I)]
+        for ln in bad[:20]:
             log("    | " + ln[:150])
+        if any(re.search(r"not found|no model|not modeled|unknown", x, re.I) for x in bad):
+            log("CHECK: PSS/E did not find a model of the .dyr (the lines above) -- set ADDLIB_IDV or DLLS in the "
+                "script to the user-model library that has it")
     return log
 
 
@@ -3640,15 +3760,24 @@ def _psse_steps(net, recs, inp, files, out, work, log):
     log("saved %s: %s" % (os.path.basename(sav), "ok" if ie in (0, None) else "*** ierr %s" % ie))
     if ie in (0, None):
         files["sav"] = sav
+    ver = (PSSE_RUNNING or (PSSE_VERSION or 0, 0))[0]
+    raw2 = os.path.join(out, "%s_psse%d.raw" % (net.name, ver))
+    try:                                         # the case in this PSS/E's own .raw format
+        ie = _ie(psspy.rawd_2(0, 1, [1, 1, 1, 0, 0, 0, 0], 0, _new(raw2)))
+        log("wrote %s (PSS/E %d's own .raw): %s" % (os.path.basename(raw2), ver, "ok" if ie in (0, None)
+                                                    else "*** ierr %s" % ie))
+        if ie in (0, None):
+            files["raw_psse"] = raw2
+    except Exception as e:
+        log("CHECK: PSS/E's own .raw not written: %s" % e)
     if not ok:
         return
     usr = sorted(set(m for _g_, m, _v in recs if DYR_LIB[m][0]))
     if any(re.search(r"'?USR(MDL|BUS)'?", (_txt(r.get("record")) or "").upper()) for r in inp["dyr_records"]):
         usr.append("your own")
     if usr and not (ADDLIB_IDV or DLLS):
-        log("CHECK: the .dyr has user models (%s) -- set ADDLIB_IDV or DLLS in the script to the user-model "
-            "libraries, or PSS/E cannot read them: the dynamic check is skipped" % ", ".join(usr))
-        return
+        log("user models in the .dyr: %s -- read from PSS/E %d's own model library (one it lacks: set ADDLIB_IDV "
+            "or DLLS in the script to the library that has it)" % (", ".join(usr), ver))
     psspy.cong(0)
     for opt in (1, 2, 3):
         psspy.conl(0, 1, opt, [0, 0], [100.0, 0.0, 0.0, 100.0])
@@ -3669,6 +3798,14 @@ def _psse_steps(net, recs, inp, files, out, work, log):
     log("dyre_new: %s" % ("ok" if ie in (0, None) else "*** ierr %s" % ie))
     if ie not in (0, None):
         return
+    snp = os.path.join(out, net.name + ".snp")
+    try:                                         # the dynamics snapshot, with the .sav: the case to study from
+        ie = _ie(psspy.snap([-1, -1, -1, -1, -1], _new(snp)))
+        log("saved %s: %s" % (os.path.basename(snp), "ok" if ie in (0, None) else "*** ierr %s" % ie))
+        if ie in (0, None):
+            files["snp"] = snp
+    except Exception as e:
+        log("CHECK: snapshot not saved: %s" % e)
     n, a, t, d, ff = DYN_PARAMS
     psspy.dynamics_solution_param_2([n, _i, _i, _i, _i, _i, _i, _i], [a, t, d, ff, _f, _f, _f, _f])
     for g in net.gens:
@@ -3781,7 +3918,27 @@ def build(src, out_dir=None, check=True):
         clog = psse_check(net, recs, inp, files, out)
         for ln in clog.review():
             log("[psse] " + ln)
+        made = [os.path.basename(files[k]) for k in ("sav", "raw_psse", "snp") if files.get(k)]
+        if made:
+            log("[psse] PSS/E wrote %s" % ", ".join(made))
     return net, files
+
+
+def psse_check_only(out):
+    """--psse-check <folder>: PSS/E's check of the models in <folder>, rebuilt from its _inputs.json -- how the
+       check runs in a Python that PSS/E has a psspy for, when the one that wrote the models has none."""
+    found = glob.glob(os.path.join(out, "*_inputs.json"))
+    if len(found) != 1:
+        print("[psse] *** %s: %s _inputs.json" % (out, "more than one" if found else "no"))
+        return 2
+    inp = read_input(found[0])
+    quiet = Log(echo=False)
+    net = build_network(inp, quiet)
+    operating_point(net, quiet)
+    recs = dyr_models(net, inp)
+    files = {"raw": os.path.join(out, net.name + ".raw"), "dyr": os.path.join(out, net.name + ".dyr")}
+    psse_check(net, recs, inp, files, out, here_only=True)
+    return 0 if psspy is not None else 3
 
 
 def find_inputs(dirs):
@@ -3857,6 +4014,9 @@ def pick_input():
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if "--psse-check" in argv:
+        k = argv.index("--psse-check")
+        return psse_check_only(os.path.abspath(argv[k + 1])) if k + 1 < len(argv) else 2
     if "--template" in argv:
         k = argv.index("--template")
         path = os.path.abspath(argv[k + 1] if k + 1 < len(argv) else "SMIB_INPUT.xlsx")
