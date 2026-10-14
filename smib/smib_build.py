@@ -89,15 +89,19 @@
                              library (mhi.pscad, PSCAD 5). It builds <name>.pscx
                              from master-library parts: the infinite source at
                              the solved voltage, the grid impedance, gen-tie,
-                             MPTs, collector equivalents, GSUs and, per
-                             generator, your vendor model (PSCAD library /
-                             definition in Generators, its parameters in
-                             PSCAD_Params) or a source at the solved terminal
-                             voltage and angle (the transformers' phase shifts
-                             included) -- a check that PSCAD's network matches
-                             PSS/E's. Every parameter it set, and any it could
-                             not, is listed in its log,
-                             <name>_build_pscad_<date_time>.txt.
+                             MPTs, the collectors (the WECC equivalent, or
+                             DETAILED: every feeder section), the GSUs and, on
+                             each GSU's LV side, the inverter: your vendor model
+                             (UDM: PSCAD library / definition / AC port in
+                             Generators, its parameters in PSCAD_Params with
+                             {UNITS} {P_PU} {V_PU} ... filled in) or a stand-in
+                             source at the solved terminal voltage and angle
+                             (the transformers' phase shifts included) -- a
+                             check that PSCAD's network matches PSS/E's; delete
+                             it and connect a UDM to its node. A UDM with its
+                             GSU inside: PSCAD inverter at MV. Every parameter
+                             it set, and any it could not, is listed in its
+                             log, <name>_build_pscad_<date_time>.txt.
      <name>_PSCAD_DATA.txt   every PSCAD value: ohm, H, uF, kV, MVA, pu on the
                              equipment's own base, vector groups, initial values
 
@@ -278,6 +282,10 @@ GEN_COLS = [
     ("pscad_library", "PSCAD library", "vendor library .pslx (blank = none)", None, 18),
     ("pscad_definition", "PSCAD definition", "vendor model, library:name (blank = a source: network check)", None, 16),
     ("pscad_ac_port", "PSCAD AC port", "its AC port (blank = its 3-phase port)", None, 9),
+    ("pscad_inv_at", "PSCAD inverter at", "LV: the inverter (your UDM or the stand-in source) on the GSU's LV side, "
+     "the GSU built | MV: on its HV side, for a UDM with its GSU inside (blank = LV)", ["LV", "MV"], 8),
+    ("pscad_collector", "PSCAD collector", "EQUIVALENT: one pi section, as PSS/E | DETAILED: every Feeders section, "
+     "a GSU and an inverter at every node with units (blank = EQUIVALENT)", ["EQUIVALENT", "DETAILED"], 11),
 ]
 
 FEEDER_COLS = [
@@ -307,6 +315,8 @@ CABLE_COLS = [
 COLLECTOR_COLS = [
     ("name", "Name", "# shared collector: its far-end bus has this name", None, 11),
     ("connect", "Connect to", "the bus it starts from (MPT1, MPT1:TV ...)", None, 11),
+    ("pscad_collector", "PSCAD collector", "EQUIVALENT | DETAILED: every section, a GSU and an inverter per "
+     "generator at every node (blank = EQUIVALENT)", ["EQUIVALENT", "DETAILED"], 11),
 ]
 
 LOAD_COLS = [
@@ -340,7 +350,7 @@ DYRR_COLS = [
 PSCADP_COLS = [
     ("generator", "Generator", "#", None, 11),
     ("parameter", "Parameter", "the vendor model's parameter name", None, 16),
-    ("value", "Value", "as PSCAD takes it (0.63 [kV], 40, ...)", None, 16),
+    ("value", "Value", "as PSCAD takes it (0.63 [kV], 40, {UNITS}, {P_PU} ...)", None, 16),
 ]
 
 TABLES = [  # (sheet, input key, columns)
@@ -362,7 +372,8 @@ _BESS_FEEDER = [("1000AL", 0.80, 0), ("500AL", 0.15, 1), ("500AL", 0.15, 1), ("4
                 ("4/0AL", 0.15, 1), ("1/0AL", 0.15, 1)]
 
 # the example: a hybrid plant -- 100 MW PV (25 x 4.0 MW) and 100 MW BESS (25 x 4.0 MW) on one 230/34.5 kV MPT,
-# five identical feeders each, one plant controller (REPC_B: PLNTBU1 + REAX4BU1)
+# five identical feeders each, one plant controller (REPC_B: PLNTBU1 + REAX4BU1); PSCAD: the collectors section
+# by section, a GSU and an inverter slot at every node
 EXAMPLE = {
     "plant": {
         "name": "Hybrid_PV100_BESS100", "sbase_mva": 100.0, "freq_hz": 60.0, "first_bus": 1000,
@@ -381,11 +392,13 @@ EXAMPLE = {
         {"name": "PV", "type": "PV", "id": "1", "connect": "MPT1", "units": 25, "unit_mva": 4.2,
          "unit_pmax_mw": 4.0, "unit_pmin_mw": 0.0, "unit_qmax_mvar": 1.28, "unit_qmin_mvar": -1.28, "kv": 0.63,
          "q_mode": "share", "gsu_mva": 4.2, "gsu_hv_kv": 34.5, "gsu_lv_kv": 0.63, "gsu_z_pct": 6.5,
-         "gsu_x_r": 8.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_A"},
+         "gsu_x_r": 8.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_A", "pscad_inv_at": "LV",
+         "pscad_collector": "DETAILED"},
         {"name": "BESS", "type": "BESS", "id": "1", "connect": "MPT1", "units": 25, "unit_mva": 4.4,
          "unit_pmax_mw": 4.0, "unit_pmin_mw": -4.0, "unit_qmax_mvar": 1.83, "unit_qmin_mvar": -1.83, "kv": 0.69,
          "q_mode": "share", "gsu_mva": 4.4, "gsu_hv_kv": 34.5, "gsu_lv_kv": 0.69, "gsu_z_pct": 6.0,
-         "gsu_x_r": 7.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_C"},
+         "gsu_x_r": 7.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_C", "pscad_inv_at": "LV",
+         "pscad_collector": "DETAILED"},
     ],
     "feeders": [{"collector": gen, "feeder": "F", "copies": 5, "section": k + 1, "cable": c, "length": ln,
                  "unit": "km", "units": u}
@@ -404,7 +417,8 @@ EXAMPLE = {
     "dyr_records": [{"generator": "#PV",
                      "record": "{BUS} 'USRMDL' {ID} 'MYMODEL' 101 0 1 3 2 1  1  0.02 0.5 1.0 /   <- a row "
                                "starting with # is skipped"}],
-    "pscad_params": [{"generator": "#PV", "parameter": "Ninv", "value": "25"}],
+    "pscad_params": [{"generator": "#PV", "parameter": "Ninv", "value": "{UNITS}"},
+                     {"generator": "#PV", "parameter": "Vt0", "value": "{V_PU} [pu]"}],
 }
 
 README = [
@@ -435,7 +449,8 @@ README = [
                    "shares the POI's Q, its electrical control model in the .dyr (REEC_A: REECA1, PV and wind; "
                    "REEC_C: REECCU1, BESS; REEC_D: REECDU1, PV, BESS and WT4) and its PSCAD model (vendor library "
                    "and definition, or blank for a voltage source at the solved terminal voltage: a network check "
-                   "against PSS/E)."),
+                   "against PSS/E), where the inverter connects (LV or MV side of the GSU) and how the collector "
+                   "is drawn in PSCAD (EQUIVALENT or DETAILED)."),
     ("Feeders", "The collector feeders section by section from the collector bus out: cable, length and the units "
                 "tapped at the section's far end. A daisy chain needs no From section; a lateral names the section "
                 "it leaves from (its far end); 0 = straight from the collector bus. Copies: identical feeders. "
@@ -458,7 +473,18 @@ README = [
     ("Dyr_Records", "Records of your own (vendor or user models), one per row, ending in /. {BUS} {ID} {MBASE} "
                     "{POI} {IB} {HV} {MV} and {<bus role>} are filled in. Type USER generators have only these. "
                     "Models in user DLLs: list the DLLs in DLLS in the script for the PSS/E check."),
-    ("PSCAD_Params", "Parameters of each generator's vendor PSCAD model, as PSCAD takes them."),
+    ("PSCAD_Params", "Parameters of each generator's vendor PSCAD model (UDM), as PSCAD takes them. Filled in "
+                     "for each inverter it stands for (DETAILED: each node): {UNITS} units, {MVA} their MVA, "
+                     "{P_MW} {Q_MVAR} their P and Q where it connects, {P_PU} {Q_PU} on {MVA}, {UNIT_MVA} "
+                     "{UNIT_P_MW} {UNIT_Q_MVAR} one unit's, {V_PU} {V_KV} {KV} {ANGLE} the voltage there, its base "
+                     "and PSCAD angle, {P_INV_MW} {Q_INV_MVAR} {V_INV_PU} at the inverters' own terminals (a UDM on "
+                     "the MV side), {FREQ} -- e.g. Ninv = {UNITS}, Vt0 = {V_PU}."),
+    ("PSCAD", "The case holds the grid (source and Thevenin impedance), the gen-tie, the MPTs, each collector (the "
+              "WECC equivalent as a pi section, or DETAILED: every feeder section, identical feeder copies lumped), "
+              "the GSUs and, on each GSU's LV side, the inverter: your UDM (PSCAD library, definition and AC port "
+              "in Generators) or a stand-in source at the solved voltage -- delete it and connect your UDM to its "
+              "node label (the report and the build log list every inverter node). PSCAD inverter at MV: for a "
+              "UDM with its GSU inside, the inverter on the GSU's HV side and no GSU drawn."),
 ]
 
 
@@ -905,6 +931,7 @@ class Net(object):
         self.ctl = {}
         self.op = {}                             # the operating point
         self.plant_ctrl = None                   # REPC_B: {model, gens, mbase} (the .dyr)
+        self.pscad_slots, self.pscad_det = [], []  # PSCAD: the inverters' slots, the detailed collectors
         self.notes = []
 
     def add_bus(self, role, kv, where, aliases=()):
@@ -1324,6 +1351,8 @@ def build_network(inp, log):
             raise InputError("%s: collector %s has no rows in Feeders" % (w, cname))
         used.add(cname.upper())
         res = wecc_collector(cname, rows, cables, net.kv(at), sb, f, unit_mw, None, log)
+        res.update({"root": at, "own": None,
+                    "pscad": _choice(r, "pscad_collector", w, ["EQUIVALENT", "DETAILED"], "EQUIVALENT")})
         net.colls[cname] = res
         net.add_bus("C:" + cname, net.kv(at), w, aliases=(cname,))
         add_line(net, at, "C:" + cname, {"r": res["r"], "x": res["x"], "b": res["b"], "R": res["R"],
@@ -1445,7 +1474,8 @@ def gen_data(r):
          "q_mode": _choice(r, "q_mode", w, ["share", "fixed"], "share"),
          "zsorce_x": _num(r, "zsorce_x", w), "wmod": _int(r, "wmod", w, None),
          "pscad": {"library": _txt(r.get("pscad_library")), "definition": _txt(r.get("pscad_definition")),
-                   "ac_port": _txt(r.get("pscad_ac_port"))}}
+                   "ac_port": _txt(r.get("pscad_ac_port")), "at": _choice(r, "pscad_inv_at", w, ["LV", "MV"], "LV"),
+                   "collector": _choice(r, "pscad_collector", w, ["EQUIVALENT", "DETAILED"], "EQUIVALENT")}}
     d = _num(r, "dispatch_mw", w)
     g["dispatch"] = g["pmax"] if d is None else d
     if g["dispatch"] > g["pmax"] + 1e-6 or g["dispatch"] < g["pmin"] - 1e-6:
@@ -1479,6 +1509,7 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
             raise InputError("%s: Collector FEEDERS but Feeders has no rows for %s" % (w, name))
         used.add(name.upper())
         res = wecc_collector(name, rows, cables, kv, net.sb, net.f, unit_mw, name, log)
+        res.update({"root": at, "own": name, "pscad": g["pscad"]["collector"]})
         net.colls[name] = res
         n = res["N"].get(name.upper(), 0)
         if n != g["n"]:
@@ -1503,6 +1534,9 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
         if rows:
             raise InputError("%s: Collector NONE, but Feeders has rows for %s" % (w, name))
         line = None
+    if g["pscad"]["collector"] == "DETAILED" and mode != "FEEDERS":
+        net.notes.append("NOTE: %s: PSCAD collector DETAILED needs Collector FEEDERS -- PSCAD draws the %s"
+                         % (w, "equivalent" if line else "units on %s" % at))
     if line:
         net.add_bus(mv, kv, w)
         add_line(net, at, mv, line, name + "-COLL", "COLLECTOR", w)
@@ -2500,20 +2534,33 @@ def pscad_model(net, inp):
     for t in net.tx3:
         comps.append(_tx3_comp(t, net, nx(16), y0))
     yy = y0 + 22
+    dets = detailed_collectors(net, shift)
+    drawn = set(d["name"] for d in dets)
+    covered = set(gn for d in dets for gn in d["gens"])
     for ln in net.lines:
-        if ln["kind"] == "COLLECTOR" and ln["to"].startswith("C:"):
+        if ln["kind"] == "COLLECTOR" and ln["to"].startswith("C:") and ln["name"] not in drawn:
             comps.extend(line(ln, 20, yy))
             yy += 20
+    slots = []
     for g in net.gens:
+        if g["name"] in covered:
+            continue
         xx = 20
         ln = next((l for l in net.lines if l["kind"] == "COLLECTOR" and l["to"] == g["mv"] and l["name"] ==
                    g["name"] + "-COLL"), None)
         if ln:
             comps.extend(line(ln, xx, yy))
-        if g["gsu"]:
+        sl = _gen_slot(net, g, shift)
+        if g["gsu"] and sl["at"] == "LV":
             comps.append(_tx2_comp(g["gsu"], net, xx + 26, yy))
-        comps.append(_gen_comp(g, net, shift, xx + 42, yy))
+        comps.append(_inverter_comp(g, sl, net, xx + 42, yy))
+        slots.append(sl)
         yy += 20
+    for d in dets:
+        got, yy = _detailed_comps(net, d, 20, yy)
+        comps.extend(got)
+        slots.extend(d["slots"])
+    net.pscad_slots, net.pscad_det = slots, dets
     xx = 20
     for ld in net.loads:
         v = net.kv(ld["bus"])
@@ -2609,21 +2656,185 @@ def _tx3_comp(t, net, x, y):
                       {"node": _node(t["tv"]), "pick": ["N3", "W3", "@rest"]}]}
 
 
-def _gen_comp(g, net, shift, x, y):
-    b = net.bus[g["bus"]]
-    ang = b["va"] + shift.get(g["bus"], 0.0)
+def _gen_slot(net, g, shift):
+    """Where generator g's inverter connects in PSCAD (its collector drawn as the equivalent): its terminal (LV),
+       or its GSU's HV side (MV: a UDM with its GSU inside -- no GSU drawn), with the load flow there."""
+    at = g["pscad"]["at"] if g["gsu"] else "LV"
+    node = g["bus"] if at == "LV" else g["mv"]
+    b = net.bus[node]
+    s = complex(g["p"], g["q"])
+    if at == "MV":
+        s = -next(f["s1"] for f in net.op["flows"] if f["name"] == g["gsu"]["name"])
+    return {"name": g["name"], "gen": g["name"], "node": node, "kv": b["kv"], "vm": b["vm"],
+            "ang": b["va"] + shift.get(node, 0.0), "units": g["n"], "mva": g["n"] * g["unit"]["mva"],
+            "p": s.real, "q": s.imag, "at": at, "s_inv": complex(g["p"], g["q"]), "v_inv": net.bus[g["bus"]]["vm"]}
+
+
+def _inverter_comp(g, sl, net, x, y):
+    """The inverter in its slot: the generator's vendor model (UDM), or a stand-in source holding the load flow."""
     ps = g["pscad"]
+    what = "%s units, P %.3f MW, Q %.3f MVAr, V %.5f pu at %.4f deg (PSCAD angle)" % (
+        _g(sl["units"]), sl["p"], sl["q"], sl["vm"], sl["ang"])
     if ps["definition"]:
-        prm = [_pp(p, [p], v) for p, v in g.get("pscad_params", [])]
-        return {"tag": g["name"] + "_GEN", "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
-                "x": x, "y": y, "params": prm,
-                "note": "vendor model %s: P %.3f MW, Q %.3f MVAr, V %.5f pu at %.4f deg (PSCAD angle)"
-                        % (ps["definition"], g["p"], g["q"], b["vm"], ang),
-                "ports": [{"node": _node(g["bus"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
+        sl["tag"], sl["model"] = sl["name"] + "_INV", ps["definition"]
+        return {"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
+                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [],
+                "note": "inverter: vendor model %s -- %s" % (ps["definition"], what),
+                "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
                            ["@dim3", "@first"]}]}
-    c = _source(g["name"] + "_SRC", g["name"], net.kv(g["bus"]), b["vm"], ang, net.f, x, y, g["bus"])
-    c["note"] += " -- holds the load-flow P %.3f MW, Q %.3f MVAr (a network check)" % (g["p"], g["q"])
+    sl["tag"], sl["model"] = sl["name"] + "_SRC", "stand-in source"
+    c = _source(sl["tag"], sl["name"], sl["kv"], sl["vm"], sl["ang"], net.f, x, y, sl["node"])
+    c["note"] += (" -- stand-in for the inverter (%s): holds the load flow; your UDM goes on node %s"
+                  % (what, _node(sl["node"])))
+    c["gen"], c["slot"] = g["name"], sl
     return c
+
+
+def detailed_collectors(net, shift):
+    """The collectors PSCAD draws section by section (PSCAD collector DETAILED), each one solved."""
+    out = []
+    for cname, res in net.colls.items():
+        if res.get("pscad") != "DETAILED":
+            continue
+        gens = [g for g in net.gens if g["name"].upper() in res["N"]]
+        gone = set()
+        for g in gens:
+            gone.update((g["mv"], g["bus"]))
+        if res["own"] is None:
+            gone.add("C:" + cname)
+            bad = ["%s (no units on its feeders)" % g["name"] for g in net.gens
+                   if g["connect"] == "C:" + cname and g not in gens]
+            bad += ["%s (not straight on it: a collector of its own)" % g["name"] for g in gens
+                    if g["mv"] != "C:" + cname]
+            if bad:
+                net.notes.append("NOTE: PSCAD collector %s DETAILED: %s -- PSCAD draws its equivalent"
+                                 % (cname, ", ".join(bad)))
+                continue
+        on = sorted(set(x["bus"] for x in net.loads + net.shunts if x["bus"] in gone))
+        if on:
+            net.notes.append("NOTE: PSCAD collector %s DETAILED: a load or shunt on %s, which the detailed feeders "
+                             "replace -- PSCAD draws the equivalent" % (cname, ", ".join(on)))
+            continue
+        out.append(detailed_collector(net, cname, res, gens, shift))
+    return out
+
+
+def detailed_collector(net, cname, res, gens, shift):
+    """Collector `cname` section by section -- identical feeder copies lumped (R and X over the copies, B times
+       them) -- with the units at each node behind a GSU of their own (their generator's, scaled to them), solved
+       with its root at the load-flow voltage and every unit at its generator's P and Q."""
+    w = "PSCAD collector %s" % cname
+    sb = net.sb
+    sub = Net(net.name, sb, net.f)
+    root = res["root"]
+    sub.add_bus(root, net.kv(root), w)
+    gby = dict((g["name"].upper(), g) for g in gens)
+    rows, slots, nodes = [], [], {}
+    for k, fd in enumerate(res["feeders"]):
+        for sc in fd["sections"]:
+            nodes[(k, sc["num"])] = sub.add_bus("%s_%s_S%d" % (_node(cname), _node(fd["name"]), sc["num"]),
+                                                res["kv"], w)
+    for k, fd in enumerate(res["feeders"]):
+        n = fd["copies"]
+        row = []
+        for sc in fd["sections"]:
+            a = root if sc["from"] == 0 else nodes[(k, sc["from"])]
+            b = nodes[(k, sc["num"])]
+            ln = add_line(sub, a, b, {"r": sc["z"].real / n, "x": sc["z"].imag / n, "b": sc["b"] * n,
+                                      "R": sc["R"] / n, "X": sc["X"] / n, "B": sc["B"] * n, "count": 1, "rate": 0.0,
+                                      "kv": res["kv"], "km": 0.0}, b, "SECTION", w)
+            here = []
+            for G, cnt in sc["units"].items():
+                g = gby[G]
+                share = float(cnt * n) / res["N"][G]
+                sl = {"name": "%s_%s_S%d" % (_node(g["name"]), _node(fd["name"]), sc["num"]), "gen": g["name"],
+                      "units": cnt * n, "mva": cnt * n * g["unit"]["mva"], "mv": b, "copies": n,
+                      "s": complex(g["p"], g["q"]) * share, "at": g["pscad"]["at"] if g["gsu"] else "LV"}
+                if g["gsu"]:
+                    lv = sub.add_bus(sl["name"] + "_LV", net.kv(g["bus"]), w)
+                    d = dict((key, g["gsu"].get(key)) for key in ("kind", "z_pct", "x_r", "load_loss_kw", "kv1", "kv2",
+                                                                  "tap", "vector", "nll_pct", "im_pct", "unit_mva"))
+                    d.update({"name": sl["name"] + "_GSU", "hv": b, "lv": lv, "mva": g["gsu"]["mva"] * share,
+                              "units": g["gsu"]["units"] * share, "rate": g["gsu"]["mva"] * share, "count": 1,
+                              "where": w})
+                    sl["gsu"], sl["lv"] = add_tx2(sub, d), lv
+                else:
+                    sl["gsu"], sl["lv"] = None, b
+                here.append(sl)
+            row.append((ln, here))
+            slots.extend(here)
+        rows.append((fd, row))
+    roles = list(sub.bus)
+    idx, Y, N = ybus(sub, roles)
+    bs = net.bus[root]
+    v0 = cmath.rect(bs["vm"], math.radians(bs["va"]))
+    sinj = [0j] * N
+    for sl in slots:
+        sinj[idx[sl["lv"]]] += sl["s"] / sb
+    V, ok, _it = newton(Y, idx[root], v0, sinj, [v0] * N)
+    flows(sub, idx, V, Y)
+    fl = dict((f["name"], f) for f in sub.op["flows"])
+    for sl in slots:
+        g = gby[sl["gen"].upper()]
+        if sl["at"] == "MV" and sl["gsu"]:
+            node, s_at = sl["mv"], -fl[sl["gsu"]["name"]]["s1"]
+        else:
+            node, s_at = sl["lv"], sl["s"]
+        v = V[idx[node]]
+        sl.update({"node": node, "kv": sub.kv(node), "vm": abs(v), "p": s_at.real, "q": s_at.imag,
+                   "s_inv": sl["s"], "v_inv": abs(V[idx[sl["lv"]]]),
+                   "ang": math.degrees(cmath.phase(v)) + shift.get(g["bus"] if node == sl["lv"] and sl["gsu"]
+                                                                   else root, 0.0)})
+    s_root = sum((f["s1"] for f in sub.op["flows"] if f["kind"] == "SECTION" and f["a"] == root), 0j)
+    eq = next((f for f in net.op["flows"] if f["kind"] == "COLLECTOR" and f["a"] == root and
+               f["name"] == (cname if res["own"] is None else cname + "-COLL")), None)
+    if not ok:
+        net.notes.append("CHECK: PSCAD collector %s DETAILED: its load flow did not converge -- the stand-in "
+                         "sources' voltages are approximate" % cname)
+    return {"name": cname, "root": root, "sub": sub, "rows": rows, "slots": slots, "gens": [g["name"] for g in gens],
+            "s_root": s_root, "s_eq": eq["s1"] if eq else None, "ok": ok}
+
+
+def _detailed_comps(net, d, x0, y0):
+    """PSCAD components of a detailed collector: per feeder a row of sections (R, L; the charging as one
+       capacitor per node), and at each node with units a GSU and the inverter per generator."""
+    w = 2.0 * math.pi * net.f
+    comps = []
+    cap = collections.OrderedDict()
+    for _fd, row in d["rows"]:
+        for ln, _here in row:
+            for nd in (ln["fr"], ln["to"]):
+                cap[nd] = cap.get(nd, 0.0) + ln["B"] / w / 2.0          # uS / (rad/s) = uF; half at each end
+    gby = dict((g["name"], g) for g in net.gens)
+    if cap.get(d["root"], 0.0) > 0:
+        comps.append(_rlc("%s_ROOT_C" % _node(d["name"]), "C", cap[d["root"]], d["root"], "GND", x0, y0 + 8,
+                          "%s: the first sections' C/2 at %s" % (d["name"], d["root"])))
+    y = y0
+    for fd, row in d["rows"]:
+        x = x0 + 8
+        tall = 1
+        for ln, here in row:
+            a, b = ln["fr"], ln["to"]
+            mid = b + "_RL"
+            note = "feeder %s%s section %s" % (fd["name"], (" (x %d lumped)" % fd["copies"]) if fd["copies"] > 1
+                                               else "", b.rsplit("_S", 1)[-1])
+            if ln["R"] > 1e-9:
+                comps.append(_rlc(b + "_R", "R", ln["R"], a, mid, x, y, note + " R"))
+            else:
+                mid = a
+            comps.append(_rlc(b + "_L", "L", ln["X"] / w, mid, b, x + 10, y, note + " L"))
+            if cap.get(b, 0.0) > 0:
+                comps.append(_rlc(b + "_C", "C", cap[b], b, "GND", x + 20, y + 8, "C/2 of the sections at " + b))
+            for j, sl in enumerate(here):
+                g = gby[sl["gen"]]
+                yj = y + 18 + 14 * j
+                if sl["gsu"] and sl["at"] == "LV":
+                    comps.append(_tx2_comp(sl["gsu"], net, x + 20, yj))
+                comps.append(_inverter_comp(g, sl, net, x + 36, yj))
+            tall = max(tall, len(here))
+            x += 48
+        y += 18 + 14 * tall + 8
+    return comps, y
 
 
 def phase_shifts(net):
@@ -2652,6 +2863,30 @@ def phase_shifts(net):
     return out
 
 
+PSCAD_KEYS = ("UNITS", "MVA", "P_MW", "Q_MVAR", "P_PU", "Q_PU", "UNIT_MVA", "UNIT_P_MW", "UNIT_Q_MVAR", "V_PU",
+              "V_KV", "KV", "ANGLE", "FREQ", "P_INV_MW", "Q_INV_MVAR", "V_INV_PU")
+
+
+def slot_values(sl, net):
+    """The values PSCAD_Params can take for one inverter slot ({UNITS}, {P_PU} ...)."""
+    u, mva = sl["units"], sl["mva"]
+    return {"UNITS": u, "MVA": mva, "P_MW": sl["p"], "Q_MVAR": sl["q"], "P_PU": sl["p"] / mva if mva else 0.0,
+            "Q_PU": sl["q"] / mva if mva else 0.0, "UNIT_MVA": mva / u if u else 0.0,
+            "UNIT_P_MW": sl["p"] / u if u else 0.0, "UNIT_Q_MVAR": sl["q"] / u if u else 0.0, "V_PU": sl["vm"],
+            "V_KV": sl["vm"] * sl["kv"], "KV": sl["kv"], "ANGLE": sl["ang"], "FREQ": net.f,
+            "P_INV_MW": sl["s_inv"].real, "Q_INV_MVAR": sl["s_inv"].imag, "V_INV_PU": sl["v_inv"]}
+
+
+def _fill_pscad(text, vals, where):
+    def rep(m):
+        key = m.group(1).upper()
+        if key not in vals:
+            raise InputError("%s: {%s} -- one of %s" % (where, m.group(1), " ".join("{%s}" % k for k in PSCAD_KEYS)))
+        v = vals[key]
+        return "%d" % v if key == "UNITS" and float(v) == int(v) else _g(float(v), 7)
+    return re.sub(r"\{([A-Za-z_]+)\}", rep, text)
+
+
 def pscad_spec(net, inp, comps):
     params = collections.defaultdict(list)
     for r in inp["pscad_params"]:
@@ -2662,18 +2897,21 @@ def pscad_spec(net, inp, comps):
         if not g["pscad"]["definition"]:
             net.notes.append("NOTE: %s: PSCAD_Params for %s, which has no PSCAD definition -- not used"
                              % (r["_where"], g["name"]))
-        params[g["name"]].append((_txt(r.get("parameter")), _txt(r.get("value")) or ""))
+        params[g["name"]].append((_txt(r.get("parameter")), _txt(r.get("value")) or "", r["_where"]))
     for cm in comps:
         if cm["kind"] == "VENDOR":
-            gname = cm["tag"][:-4]
-            cm["params"] = [_pp(p, [p], v) for p, v in params.get(gname, [])]
+            vals = slot_values(cm["slot"], net)
+            cm["params"] = [_pp(p, [p], _fill_pscad(v, vals, w)) for p, v, w in params.get(cm["gen"], [])]
     c = net.ctl["pscad"]
     libs = list(c["libraries"]) + [cm["library"] for cm in comps if cm.get("library")]
     return {"case": _safe_name(net.name, 30), "written": time.strftime("%Y-%m-%d %H:%M"),
             "settings": {"time_duration": c["duration_s"], "time_step": c["time_step_us"],
                          "sample_step": c["plot_step_us"], "description": ("SMIB %s" % net.name)[:60]},
             "libraries": [l for k, l in enumerate(libs) if l and l not in libs[:k]],
-            "components": [dict((k, v) for k, v in cm.items() if k not in ("value", "unit")) for cm in comps]}
+            "slots": [{"tag": sl["tag"], "node": _node(sl["node"]), "units": sl["units"], "p": sl["p"], "q": sl["q"],
+                       "vm": sl["vm"], "ang": sl["ang"], "model": sl["model"]} for sl in net.pscad_slots],
+            "components": [dict((k, v) for k, v in cm.items() if k not in ("value", "unit", "slot", "gen"))
+                           for cm in comps]}
 
 
 _BUILD_PSCAD = r'''# -*- coding: utf-8 -*-
@@ -2960,6 +3198,11 @@ def main():
                 log("CHECK: %s: no wire to %s %s: %s" % (node, tag, port, e))
     log("nodes joined by %s: %s" % ("node labels" if labels else "wires",
                                      ", ".join("%s (%d)" % (n, len(p)) for n, p in sorted(joins.items()))))
+    log("")
+    log("inverters -- a vendor model (UDM) goes on these nodes; a stand-in source holds the load flow until then:")
+    for s in SPEC.get("slots", []):
+        log("    %-24s node %-24s %5s units  P %9.3f MW  Q %8.3f MVAr  V %.5f pu at %9.4f deg  %s"
+            % (s["tag"], s["node"], s["units"], s["p"], s["q"], s["vm"], s["ang"], s["model"]))
     prj.save()
     log("")
     log("saved %s: %d of %d components, %d CHECK line(s) above"
@@ -2992,17 +3235,42 @@ def write_pscad(net, inp, out, log):
     return comps, spec, path
 
 
+def pscad_slot_lines(net, ind):
+    """The inverters' slots (where a UDM goes) and the detailed collectors against their equivalents."""
+    L = [ind + "Inverters -- a vendor model (UDM) goes on each node (Generators: PSCAD library / definition / AC "
+               "port); until then a stand-in source holds the load flow there:",
+         ind + "  %-24s %-24s %6s %10s %10s %9s %10s  %s" % ("component", "node", "units", "P MW", "Q MVAr", "V pu",
+                                                              "angle", "model")]
+    for sl in net.pscad_slots:
+        L.append(ind + "  %-24s %-24s %6s %10.3f %10.3f %9.5f %10.4f  %s%s" % (
+            sl["tag"], _node(sl["node"]), _g(sl["units"]), sl["p"], sl["q"], sl["vm"], sl["ang"], sl["model"],
+            "  (GSU inside: on its HV side)" if sl["at"] == "MV" else ""))
+    for d in net.pscad_det:
+        nsec = sum(len(row) for _fd, row in d["rows"])
+        L.append(ind + "Collector %s DETAILED: %d feeder row(s) (identical copies lumped), %d sections, %d inverters; "
+                       "at %s the feeders take %s" % (d["name"], len(d["rows"]), nsec, len(d["slots"]), d["root"],
+                                                      _c(d["s_root"])))
+        if d["s_eq"] is not None:
+            ds = d["s_root"] - d["s_eq"]
+            L.append(ind + "  the WECC equivalent takes %s there in the load flow (PSS/E): %+.4f MW, %+.4f MVAr apart"
+                           % (_c(d["s_eq"]), ds.real, ds.imag))
+    return L
+
+
 def pscad_data_text(net, comps, spec):
     L = ["PSCAD DATA -- SMIB %s   (written by smib_build.py on %s)" % (net.name, spec["written"]),
          "=" * 100,
          "Every value the build script sets, in PSCAD's units. Transformers: pu on their own MVA and winding",
-         "voltages (V1 is the tapped HV voltage). Lines and collector equivalents: pi sections (C/2 at each end).",
+         "voltages (V1 is the tapped HV voltage). Lines and collector equivalents: pi sections (C/2 at each end);",
+         "detailed collectors: each section's R and L, its charging as C/2 at each end (one capacitor per node).",
          "Sources: kV line-to-line rms and degrees, the angle relative to the infinite source, the PSCAD",
          "transformers' phase shifts included (PSS/E has none). Nodes join components of the same name.",
          "",
          "Run settings: duration %(time_duration)s s, time step %(time_step)s us, plot step %(sample_step)s us"
          % spec["settings"],
          "Libraries: %s" % (", ".join(spec["libraries"]) or "(none)"), ""]
+    L += pscad_slot_lines(net, "")
+    L.append("")
     for cm in comps:
         L.append("%-16s %-7s %s" % (cm["tag"], cm["kind"], " / ".join(cm["defn"])))
         if cm.get("note"):
@@ -3164,6 +3432,7 @@ def report_text(net, inp, recs, comps, files, src):
                                                                        if _txt(r.get("record"))]))
     L += ["", "8. PSCAD: %d components -- the values are in %s; build the case with %s" % (
         len(comps), os.path.basename(files["pscad_data"]), os.path.basename(files["pscad_build"]))]
+    L += pscad_slot_lines(net, "   ")
     L += ["", "9. FILES"]
     for k in ("raw", "dyr", "pscad_build", "pscad_data", "json", "xlsx"):
         if files.get(k):
