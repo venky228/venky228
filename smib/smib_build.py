@@ -9,13 +9,15 @@
 
    THE INPUT: an Excel workbook (.xlsx)
        python smib_build.py --template SMIB_INPUT.xlsx
-   writes one, filled in with an example (160 MW PV and 90 MW BESS on one
-   MPT) and a README sheet that explains every column. Sheets:
+   writes one, filled in with an example (a hybrid plant: 100 MW PV and
+   100 MW BESS on one MPT, one plant controller) and a README sheet that
+   explains every column. Sheets:
      Plant          name, bases, POI, grid (SCR and X/R), gen-tie, the
-                    operating point (CONTROL), PSCAD run settings
+                    operating point (CONTROL), the plant controller, PSCAD
+                    run settings
      MPT            the main power transformers, 2 or 3 windings
      Generators     one row per generator: units, GSU, collector, Q control,
-                    the PSCAD model
+                    the electrical control model, the PSCAD model
      Feeders        the collector systems section by section (WECC)
      Cables         cable data per length
      Collectors     collector systems shared by more than one generator
@@ -61,13 +63,22 @@
      <name>.raw   rev 33 (PSS/E 33, 34 and 35 read it) -- network and solution
      <name>.dyr   GENCLS (the infinite bus) and, per generator, WECC-approved
                   generic models only:
-                    PV, WT4  REGCA1 + REECA1 + REPCA1     (REGC_A, REEC_A, REPC_A)
-                    BESS     REGCAU1 + REECCU1 + REPCAU1  (REGC_A, REEC_C, REPC_A;
-                             USRMDL records, PSS/E 34's layout -- the WECC
-                             user-model DLL must be loaded: ADDLIB_IDV / DLLS)
+                    REGC_A   REGCA1 (REGCAU1: Plant, REGC_A / REPC_A records)
+                    REEC     Generators, Electrical control:
+                               REEC_A  REECA1    PV, WT4, WT3 (blank: these)
+                               REEC_C  REECCU1   BESS (blank: BESS)
+                               REEC_D  REECDU1   PV, BESS, WT4
+                    REPC     Plant, Plant controller:
+                               REPC_A  REPCA1 (REPCAU1) on each generator
+                               REPC_B  one for the plant -- PLNTBU1 at the
+                                       POI and REAX4BU1 on each generator
+                                       (hybrid plants: PV + BESS)
                     WT3      + WTDTA1, WTARA1, WTPTA1, WTTQA1
                     SYNC     GENROU + SEXS + TGOV1
-                  limits from the unit data, any parameter from Dyr_Params --
+                  REECCU1, REECDU1, PLNTBU1, REAX4BU1, REGCAU1 and REPCAU1
+                  are USRMDL / USRBUS records (PSS/E 34 / 35 layouts): the
+                  WECC user-model DLL must be loaded (ADDLIB_IDV / DLLS).
+                  Limits from the unit data, any parameter from Dyr_Params --
                   and your own records (Dyr_Records) with {BUS}, {ID}, {POI} ...
      With PSS/E found (PSSE_CHECK): the .raw read back and solved against this
      script's load flow, <name>.sav saved, the .dyr read, initialised and run
@@ -146,6 +157,9 @@ IBR_ZSORCE_X = 9999.0             # inverter-based units: source reactance (pu o
 LEN_UNITS = ["km", "mi", "kft", "m", "ft"]
 LEN_KM = {"km": 1.0, "mi": 1.609344, "kft": 0.3048, "m": 0.001, "ft": 0.0003048}
 GEN_TYPES = ["PV", "BESS", "WT4", "WT3", "SYNC", "USER"]
+# the electrical control models (REEC) each inverter type takes; the first is its default
+REEC_OK = {"PV": ("REEC_A", "REEC_D"), "WT4": ("REEC_A", "REEC_D"), "WT3": ("REEC_A",),
+           "BESS": ("REEC_C", "REEC_D")}
 
 # Plant sheet (Item | Value | Unit | Notes): (key, item, unit, note, choices)
 PLANT_FIELDS = [
@@ -181,6 +195,11 @@ PLANT_FIELDS = [
     ("v_grid_pu", "Grid voltage", "pu", "mode V: the infinite bus (blank = 1.0)", None),
     ("p_poi_mw", "P at POI", "MW", "blank = each generator at its dispatch | a value = the dispatches scaled to "
      "deliver it", None),
+    ("plant_ctrl", "Plant controller", "", "PSS/E .dyr -- REPC_A: a REPCA1 on each generator | REPC_B: one for the "
+     "plant, PLNTBU1 at the POI and a REAX4BU1 on each generator (hybrid plants) (blank = REPC_A)",
+     ["REPC_A", "REPC_B"]),
+    ("regc_repc", "REGC_A / REPC_A records", "", "standard: REGCA1 / REPCA1 (PSS/E library) | USRMDL: REGCAU1 / "
+     "REPCAU1 (the WECC user-model DLL) (blank = standard)", ["standard", "USRMDL"]),
     ("pscad_time_step_us", "PSCAD time step", "us", "blank = 10 (the vendor model's own requirement wins)", None),
     ("pscad_duration_s", "PSCAD duration", "s", "blank = 5", None),
     ("pscad_plot_step_us", "PSCAD plot step", "us", "blank = 100", None),
@@ -254,6 +273,8 @@ GEN_COLS = [
     ("coll_units", "Collector units", "pu: system base at collector kV | ohm: R X in ohm, B in uS", ["pu", "ohm"], 8),
     ("zsorce_x", "ZSORCE X pu", "on MBASE (blank: inverters 9999, SYNC X''d)", None, 8),
     ("wmod", "WMOD", "blank: inverters 1, SYNC 0", None, 6),
+    ("reec", "Electrical control", "PSS/E .dyr -- REEC_A: PV, WT | REEC_C: BESS | REEC_D: PV, BESS, WT4 (blank = "
+     "REEC_A, BESS REEC_C)", ["REEC_A", "REEC_C", "REEC_D"], 9),
     ("pscad_library", "PSCAD library", "vendor library .pslx (blank = none)", None, 18),
     ("pscad_definition", "PSCAD definition", "vendor model, library:name (blank = a source: network check)", None, 16),
     ("pscad_ac_port", "PSCAD AC port", "its AC port (blank = its 3-phase port)", None, 9),
@@ -303,10 +324,10 @@ BUS_COLS = [
 ]
 
 DYRP_COLS = [
-    ("generator", "Generator", "# IB for the infinite bus", None, 11),
-    ("model", "Model", "PV/WT4: REGCA1 REECA1 REPCA1 | BESS: REGCAU1 REECCU1 REPCAU1 | WT3: + WTDTA1 WTARA1 WTPTA1 "
-     "WTTQA1 | SYNC: GENROU SEXS TGOV1 | IB: GENCLS", None, 9),
-    ("parameter", "Parameter", "PSS/E name (the report lists them all)", None, 10),
+    ("generator", "Generator", "# IB: the infinite bus | PLANT: the plant controller (REPC_B)", None, 11),
+    ("model", "Model", "REGCA1 (REGCAU1) | REECA1 REECCU1 REECDU1 | REPCA1 (REPCAU1) or REAX4BU1 | PLANT: PLNTBU1 | "
+     "WT3: + WTDTA1 WTARA1 WTPTA1 WTTQA1 | SYNC: GENROU SEXS TGOV1 | IB: GENCLS", None, 9),
+    ("parameter", "Parameter", "PSS/E name (the report lists them all) or position: ICON2, CON14", None, 10),
     ("value", "Value", "", None, 9),
 ]
 
@@ -335,35 +356,40 @@ TABLES = [  # (sheet, input key, columns)
     ("PSCAD_Params", "pscad_params", PSCADP_COLS),
 ]
 
-_PV_FEEDER = [("1000AL", 2.00, 0), ("500AL", 0.35, 2), ("500AL", 0.35, 2), ("4/0AL", 0.35, 2),
-              ("4/0AL", 0.35, 2), ("1/0AL", 0.35, 2)]
+_PV_FEEDER = [("1000AL", 1.60, 0), ("500AL", 0.40, 1), ("500AL", 0.40, 1), ("4/0AL", 0.40, 1),
+              ("4/0AL", 0.40, 1), ("1/0AL", 0.40, 1)]
+_BESS_FEEDER = [("1000AL", 0.80, 0), ("500AL", 0.15, 1), ("500AL", 0.15, 1), ("4/0AL", 0.15, 1),
+                ("4/0AL", 0.15, 1), ("1/0AL", 0.15, 1)]
 
+# the example: a hybrid plant -- 100 MW PV (25 x 4.0 MW) and 100 MW BESS (25 x 4.0 MW) on one 230/34.5 kV MPT,
+# five identical feeders each, one plant controller (REPC_B: PLNTBU1 + REAX4BU1)
 EXAMPLE = {
     "plant": {
-        "name": "Example_PV_BESS", "sbase_mva": 100.0, "freq_hz": 60.0, "first_bus": 1000,
-        "poi_kv": 345.0, "poi_name": "POI", "grid_scr": 3.0, "grid_x_r": 10.0,
-        "tie_length": 8.0, "tie_unit": "km", "tie_r_per": 0.0287, "tie_x_per": 0.3700, "tie_b_per": 4.40,
-        "tie_parallel": 1, "tie_rate_mva": 600.0,
+        "name": "Hybrid_PV100_BESS100", "sbase_mva": 100.0, "freq_hz": 60.0, "first_bus": 1000,
+        "poi_kv": 230.0, "poi_name": "POI", "grid_scr": 3.0, "grid_x_r": 10.0,
+        "tie_length": 5.0, "tie_unit": "km", "tie_r_per": 0.0720, "tie_x_per": 0.4950, "tie_b_per": 3.35,
+        "tie_parallel": 1, "tie_rate_mva": 400.0,
         "control_mode": "Q", "v_poi_pu": 1.0, "q_poi_mvar": 0.0, "pf_poi": 1.0, "v_grid_pu": 1.0,
+        "plant_ctrl": "REPC_B", "regc_repc": "standard",
         "pscad_time_step_us": 10.0, "pscad_duration_s": 5.0, "pscad_plot_step_us": 100.0, "pscad_meter": "YES",
     },
     "mpt": [
-        {"name": "MPT1", "hv_kv": 345.0, "lv_kv": 34.5, "mva": 280.0, "z_hl_pct": 12.0, "x_r": 50.0,
-         "vector": "YNd1", "tap": 1.0, "count": 1, "rate_mva": 280.0},
+        {"name": "MPT1", "hv_kv": 230.0, "lv_kv": 34.5, "mva": 225.0, "z_hl_pct": 10.0, "x_r": 45.0,
+         "vector": "YNd1", "tap": 1.0, "count": 1, "rate_mva": 225.0},
     ],
     "generators": [
-        {"name": "PV", "type": "PV", "id": "1", "connect": "MPT1", "units": 40, "unit_mva": 4.2,
+        {"name": "PV", "type": "PV", "id": "1", "connect": "MPT1", "units": 25, "unit_mva": 4.2,
          "unit_pmax_mw": 4.0, "unit_pmin_mw": 0.0, "unit_qmax_mvar": 1.28, "unit_qmin_mvar": -1.28, "kv": 0.63,
          "q_mode": "share", "gsu_mva": 4.2, "gsu_hv_kv": 34.5, "gsu_lv_kv": 0.63, "gsu_z_pct": 6.5,
-         "gsu_x_r": 8.0, "gsu_vector": "YNd1", "collector": "FEEDERS"},
-        {"name": "BESS", "type": "BESS", "id": "1", "connect": "MPT1", "units": 25, "unit_mva": 4.0,
-         "unit_pmax_mw": 3.6, "unit_pmin_mw": -3.6, "unit_qmax_mvar": 1.74, "unit_qmin_mvar": -1.74, "kv": 0.69,
-         "q_mode": "share", "gsu_mva": 4.0, "gsu_hv_kv": 34.5, "gsu_lv_kv": 0.69, "gsu_z_pct": 6.0,
-         "gsu_x_r": 7.0, "gsu_vector": "YNd1", "collector": "EQUIVALENT", "coll_r": 0.0040, "coll_x": 0.0030,
-         "coll_b": 0.0150, "coll_units": "pu"},
+         "gsu_x_r": 8.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_A"},
+        {"name": "BESS", "type": "BESS", "id": "1", "connect": "MPT1", "units": 25, "unit_mva": 4.4,
+         "unit_pmax_mw": 4.0, "unit_pmin_mw": -4.0, "unit_qmax_mvar": 1.83, "unit_qmin_mvar": -1.83, "kv": 0.69,
+         "q_mode": "share", "gsu_mva": 4.4, "gsu_hv_kv": 34.5, "gsu_lv_kv": 0.69, "gsu_z_pct": 6.0,
+         "gsu_x_r": 7.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_C"},
     ],
-    "feeders": [{"collector": "PV", "feeder": "F", "copies": 4, "section": k + 1, "cable": c, "length": ln,
-                 "unit": "km", "units": u} for k, (c, ln, u) in enumerate(_PV_FEEDER)],
+    "feeders": [{"collector": gen, "feeder": "F", "copies": 5, "section": k + 1, "cable": c, "length": ln,
+                 "unit": "km", "units": u}
+                for gen, secs in (("PV", _PV_FEEDER), ("BESS", _BESS_FEEDER)) for k, (c, ln, u) in enumerate(secs)],
     "cables": [
         {"cable": "1000AL", "unit": "km", "r_per": 0.0460, "x_per": 0.1050, "c_per": 0.390},
         {"cable": "500AL", "unit": "km", "r_per": 0.0900, "x_per": 0.1180, "c_per": 0.300},
@@ -371,13 +397,14 @@ EXAMPLE = {
         {"cable": "1/0AL", "unit": "km", "r_per": 0.4040, "x_per": 0.1480, "c_per": 0.170},
     ],
     "collectors": [],
-    "loads_shunts": [{"kind": "LOAD", "at": "MPT1", "mw": 0.5, "mvar": 0.2, "name": "AUX"}],
+    "loads_shunts": [{"kind": "LOAD", "at": "MPT1", "mw": 1.0, "mvar": 0.3, "name": "AUX"}],
     "bus_numbers": [],
-    "dyr_params": [{"generator": "PV", "model": "REPCA1", "parameter": "Kp", "value": 1.0}],
+    "dyr_params": [{"generator": "PLANT", "model": "PLNTBU1", "parameter": "Kp", "value": 1.0},
+                   {"generator": "BESS", "model": "REECCU1", "parameter": "SOCini", "value": 0.5}],
     "dyr_records": [{"generator": "#PV",
                      "record": "{BUS} 'USRMDL' {ID} 'MYMODEL' 101 0 1 3 2 1  1  0.02 0.5 1.0 /   <- a row "
                                "starting with # is skipped"}],
-    "pscad_params": [{"generator": "#PV", "parameter": "Ninv", "value": "40"}],
+    "pscad_params": [{"generator": "#PV", "parameter": "Ninv", "value": "25"}],
 }
 
 README = [
@@ -392,17 +419,23 @@ README = [
               "far end) | <generator>:MV (GSU HV side) | <generator> or <generator>:LV (terminal) | IB (infinite "
               "bus). Numbers are automatic from First bus number; Bus_Numbers sets any one."),
     ("Plant", "Bases, the POI, the grid (SCR and X/R, or short-circuit MVA, or R/X), the gen-tie, the operating "
-              "point and the PSCAD run settings."),
+              "point, the plant controller and the PSCAD run settings."),
     ("", "Control mode Q: the plant holds the POI voltage with Q at POI into the grid; PF: with that power factor; "
          "V: the plant holds the POI voltage with the infinite bus at Grid voltage. The infinite-bus voltage (and "
          "the generators' Q) come out of the load flow."),
+    ("", "Plant controller (PSS/E .dyr): REPC_A = a REPCA1 on each generator, each holding the POI; REPC_B = one "
+         "controller for the whole plant (hybrid PV + BESS): PLNTBU1 at the POI, and on each generator a REAX4BU1 "
+         "that takes its share of the plant's Q (Qmax / sum of Qmax) and P (Pmax / sum of Pmax). REGC_A / REPC_A "
+         "records: standard = REGCA1 / REPCA1 from the PSS/E library; USRMDL = REGCAU1 / REPCAU1."),
     ("MPT", "One row per main power transformer; HV winding first. Three windings: TV kV, the three impedances "
             "and their bases. Parallel units: identical units in parallel. Tie: a line of its own from HV to it."),
     ("Generators", "One row per generator (PV, BESS, wind, synchronous ...): the units (count and one unit's "
                    "data; the model is their aggregate), its GSU (one GSU's data and the count), its collector "
                    "(FEEDERS: the WECC equivalent of its rows in Feeders; EQUIVALENT: R X B given; NONE), how it "
-                   "shares the POI's Q, and its PSCAD model (vendor library and definition, or blank for a "
-                   "voltage source at the solved terminal voltage: a network check against PSS/E)."),
+                   "shares the POI's Q, its electrical control model in the .dyr (REEC_A: REECA1, PV and wind; "
+                   "REEC_C: REECCU1, BESS; REEC_D: REECDU1, PV, BESS and WT4) and its PSCAD model (vendor library "
+                   "and definition, or blank for a voltage source at the solved terminal voltage: a network check "
+                   "against PSS/E)."),
     ("Feeders", "The collector feeders section by section from the collector bus out: cable, length and the units "
                 "tapped at the section's far end. A daisy chain needs no From section; a lateral names the section "
                 "it leaves from (its far end); 0 = straight from the collector bus. Copies: identical feeders. "
@@ -415,11 +448,13 @@ README = [
     ("Loads_Shunts", "Auxiliary loads (constant impedance, MW and MVAr at 1 pu) and shunts (MVAr at 1 pu: + "
                      "capacitor, - reactor) on any bus."),
     ("Bus_Numbers", "Bus numbers or names of your own, by role (the report lists every role and its number)."),
-    ("Dyr_Params", "Any parameter of the WECC-approved generic models, by generator, model and PSS/E name (IB for "
-                   "the infinite bus). PV and WT4: REGCA1 + REECA1 + REPCA1 (REGC_A, REEC_A, REPC_A); BESS: REGCAU1 "
-                   "+ REECCU1 + REPCAU1 (REGC_A, REEC_C, REPC_A -- USRMDL records: the WECC user-model DLL must be "
-                   "loaded, ADDLIB_IDV / DLLS in the script); WT3: + WTDTA1 WTARA1 WTPTA1 WTTQA1; SYNC: GENROU SEXS "
-                   "TGOV1. The report lists every model's parameters with the values used."),
+    ("Dyr_Params", "Any parameter of the WECC-approved generic models, by generator, model and PSS/E name or "
+                   "position (ICON2, CON14) -- IB for the infinite bus, PLANT for the plant controller. Inverters: "
+                   "REGCA1 (REGC_A) + REECA1 / REECCU1 / REECDU1 (REEC_A / C / D) + REPCA1 (REPC_A) or REAX4BU1 "
+                   "(with PLNTBU1, REPC_B); WT3: + WTDTA1 WTARA1 WTPTA1 WTTQA1; SYNC: GENROU SEXS TGOV1. REECCU1, "
+                   "REECDU1, PLNTBU1, REAX4BU1 (and REGCAU1, REPCAU1) are user models: the WECC user-model DLL must "
+                   "be loaded for the PSS/E check (ADDLIB_IDV / DLLS in the script). The report lists every model's "
+                   "parameters with the values used."),
     ("Dyr_Records", "Records of your own (vendor or user models), one per row, ending in /. {BUS} {ID} {MBASE} "
                     "{POI} {IB} {HV} {MV} and {<bus role>} are filled in. Type USER generators have only these. "
                     "Models in user DLLs: list the DLLs in DLLS in the script for the PSS/E check."),
@@ -869,6 +904,7 @@ class Net(object):
         self.thev = {}
         self.ctl = {}
         self.op = {}                             # the operating point
+        self.plant_ctrl = None                   # REPC_B: {model, gens, mbase} (the .dyr)
         self.notes = []
 
     def add_bus(self, role, kv, where, aliases=()):
@@ -1374,10 +1410,20 @@ def gen_data(r):
         raise InputError("%s: Name is missing" % w)
     if not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", name):
         raise InputError("%s: generator name %r: letters, digits and _ only, starting with a letter" % (w, name))
+    if name.upper() in ("IB", "PLANT"):
+        raise InputError("%s: %s is a reserved name (IB: the infinite bus, PLANT: the plant controller)" % (w, name))
     w = "%s (%s)" % (w, name)
     typ = _choice(r, "type", w, GEN_TYPES, None)
     if typ is None:
         raise InputError("%s: Type is missing (%s)" % (w, ", ".join(GEN_TYPES)))
+    reec = _choice(r, "reec", w, ["REEC_A", "REEC_C", "REEC_D"], None)
+    if typ in REEC_OK:
+        reec = reec or REEC_OK[typ][0]
+        if reec not in REEC_OK[typ]:
+            raise InputError("%s: Electrical control %s -- a %s generator takes %s" % (w, reec, typ,
+                                                                                    " or ".join(REEC_OK[typ])))
+    elif reec:
+        raise InputError("%s: Electrical control %s -- only inverters take one (PV, BESS, WT4, WT3)" % (w, reec))
     n = _int(r, "units", w, required=True, minimum=1)
     pmax = _num(r, "unit_pmax_mw", w, required=True)
     pmin = _num(r, "unit_pmin_mw", w, 0.0)
@@ -1393,7 +1439,7 @@ def gen_data(r):
         raise InputError("%s: Unit Pmin is above Unit Pmax" % w)
     if qmin > qmax:
         raise InputError("%s: Unit Qmin is above Unit Qmax" % w)
-    g = {"name": name, "type": typ, "id": (_txt(r.get("id")) or "1")[:2], "row": r, "where": w, "n": n,
+    g = {"name": name, "type": typ, "reec": reec, "id": (_txt(r.get("id")) or "1")[:2], "row": r, "where": w, "n": n,
          "unit": {"mva": s, "pmax": pmax, "pmin": pmin, "qmax": qmax, "qmin": qmin, "pf": pf},
          "mbase": n * s, "pmax": n * pmax, "pmin": n * pmin, "qmax": n * qmax, "qmin": n * qmin,
          "q_mode": _choice(r, "q_mode", w, ["share", "fixed"], "share"),
@@ -1543,7 +1589,9 @@ def control(net, pl):
          "q_poi": _num(pl, "q_poi_mvar", W, 0.0),
          "pf_poi": _num(pl, "pf_poi", W, 1.0),
          "v_grid": _num(pl, "v_grid_pu", W, 1.0, positive=True),
-         "p_poi": _num(pl, "p_poi_mw", W, None)}
+         "p_poi": _num(pl, "p_poi_mw", W, None),
+         "plant_ctrl": _choice(pl, "plant_ctrl", W, ["REPC_A", "REPC_B"], "REPC_A"),
+         "regc_repc": _choice(pl, "regc_repc", W, ["standard", "USRMDL"], "standard")}
     if c["mode"] == "PF" and not 0.0 < abs(c["pf_poi"]) <= 1.0:
         raise InputError("Plant: PF at POI must be between 0 and 1 (+ lagging, - leading)")
     c["pscad"] = {"time_step_us": _num(pl, "pscad_time_step_us", W, 10.0, positive=True),
@@ -2035,27 +2083,43 @@ def write_raw(net, path):
 # ============================================================================
 # PSS/E -- the .dyr
 # ============================================================================
-# The models -- WECC-approved only (WECC Approved Dynamic Model List): REGC_A, REEC_A, REEC_C, REPC_A, the
-# type 3 wind models (WTGT_A, WTGAR_A, WTGPT_A, WTGTRQ_A), GENROU, SEXS, TGOV1, GENCLS.
-#   PV, WT4  REGCA1 + REECA1 + REPCA1         (REGC_A + REEC_A + REPC_A, PSS/E standard library)
-#   BESS     REGCAU1 + REECCU1 + REPCAU1      (REGC_A + REEC_C + REPC_A, USRMDL records -- the WECC user-model
-#                                              DLL must be loaded: ADDLIB_IDV / DLLS)
-# model: (USRMDL header IC IT NI NC NS NV, or None for a standard record; number of ICONs; names in record
-# order). ICONs are written as integers ('CKT' quoted). The USRMDL headers and layouts are PSS/E 34's, as in the
-# BESS template of the study engine (z7_spp_p.py).
+# The models -- WECC-approved only (WECC Approved Dynamic Model List): REGC_A, REEC_A, REEC_C, REEC_D, REPC_A,
+# REPC_B, the type 3 wind models (WTGT_A, WTGAR_A, WTGPT_A, WTGTRQ_A), GENROU, SEXS, TGOV1, GENCLS.
+#   inverters  REGCA1 (REGC_A) + the generator's REEC + its part of the plant controller:
+#                REEC_A  REECA1    PV, WT4, WT3     REPC_A  REPCA1 on the generator
+#                REEC_C  REECCU1   BESS             REPC_B  REAX4BU1 on the generator and one PLNTBU1 (a USRBUS
+#                REEC_D  REECDU1   PV, BESS, WT4            record) at the POI for the plant
+#              REGCAU1 / REPCAU1 for REGCA1 / REPCA1 with Plant 'REGC_A / REPC_A records' USRMDL
+#   WT3        + WTDTA1 WTARA1 WTPTA1 WTTQA1        SYNC  GENROU + SEXS + TGOV1
+# REECCU1, REECDU1, REAX4BU1, PLNTBU1, REGCAU1, REPCAU1 are user models (USRMDL / USRBUS): the WECC user-model DLL
+# must be loaded (ADDLIB_IDV / DLLS).
+# model: (USRMDL / USRBUS header IC IT NI NC NS NV, or None for a standard record; number of ICONs; names in record
+# order). ICONs are written as integers ('CKT' quoted). REGCAU1 / REECCU1 / REPCAU1: PSS/E 34's layouts, as in the
+# BESS template of the study engine (z7_spp_p.py). REECDU1, PLNTBU1 and REAX4BU1: the layouts of two PSS/E .dyr
+# files of real plants (a REGC + REECDU1 + REPCA1 plant; a hybrid PV + BESS plant with PLNTBU1 + REAX4BU1), read so:
+#   REECDU1   ICONs: the five REEC flags and VCMPFLAG. CONs 1-29 in REECA1's order (QMax QMin at 14-15 and PMAX PMIN
+#             at 26-27 are the plant's limits in those files), 30-69 the ten-point VDL tables (Vq1 Iq1 .. Vq10 Iq10,
+#             Vp1 Ip1 .. Vp10 Ip10), 70-77 REEC_D's own: Rc Xc Tr1 Kc Ke Vblkl Vblkh Tblk_delay (the files' BESS has
+#             Ke -1 there and blocks below 0.5 / above 1.1 pu)
+#   PLNTBU1   (REPC_B) ICONs and CONs 1-27 in REPCA1's order; CON 28 the MVA base of its limits: the sum of the
+#             MBASEs it commands (its Qmax = sum of Qmax / that base ...)
+#   REAX4BU1  ICON: the PLNTBU1 bus; CONs 2, 3: the generator's share of the plant's Q and P (its Qmax and Pmax over
+#             the sums), 4-7: its Qmax Qmin Pmax Pmin (pu on MBASE); CON 1 (0 in both files) by position
+# Names read from position -- check them against the PSS/E Model Library. Dyr_Params also takes ICONn / CONn.
 _REGCA = ["LVPLSW", "Tg", "Rrpwr", "Brkpt", "Zerox", "Lvpl1", "Volim", "Lvpnt1", "Lvpnt0", "Iolim", "Tfltr", "Khv",
           "Iqrmax", "Iqrmin", "Accel"]
 _REPCA = ["BUSR", "BUS1", "BUS2", "CKT", "VCFLAG", "REFFLAG", "FFLAG",
           "Tfltr", "Kp", "Ki", "Tft", "Tfv", "Vfrz", "Rc", "Xc", "Kc", "emax", "emin", "dbd1", "dbd2", "Qmax", "Qmin",
           "Kpg", "Kig", "Tp", "fdbd1", "fdbd2", "femax", "femin", "Pmax", "Pmin", "Tlag", "Ddn", "Dup"]
+_REECA = ["Vdip", "Vup", "Trv", "dbd1", "dbd2", "Kqv", "Iqh1", "Iql1", "Vref0", "Iqfrz", "Thld", "Thld2", "Tp", "QMax",
+          "QMin", "VMAX", "VMIN", "Kqp", "Kqi", "Kvp", "Kvi", "Vref1", "Tiq", "dPmax", "dPmin", "PMAX", "PMIN", "Imax",
+          "Tpord"]
 _VDL = ["Vq1", "Iq1", "Vq2", "Iq2", "Vq3", "Iq3", "Vq4", "Iq4", "Vp1", "Ip1", "Vp2", "Ip2", "Vp3", "Ip3", "Vp4", "Ip4"]
+_VDL10 = ["%s%d" % (n, k) for vi in (("Vq", "Iq"), ("Vp", "Ip")) for k in range(1, 11) for n in vi]
 DYR_LIB = collections.OrderedDict([
     ("GENCLS", (None, 0, ["H", "D"])),
     ("REGCA1", (None, 1, _REGCA)),
-    ("REECA1", (None, 6, ["BUSR", "PFFLAG", "VFLAG", "QFLAG", "PFLAG", "PQFLAG",
-                          "Vdip", "Vup", "Trv", "dbd1", "dbd2", "Kqv", "Iqh1", "Iql1", "Vref0", "Iqfrz", "Thld",
-                          "Thld2", "Tp", "QMax", "QMin", "VMAX", "VMIN", "Kqp", "Kqi", "Kvp", "Kvi", "Vref1", "Tiq",
-                          "dPmax", "dPmin", "PMAX", "PMIN", "Imax", "Tpord"] + _VDL)),
+    ("REECA1", (None, 6, ["BUSR", "PFFLAG", "VFLAG", "QFLAG", "PFLAG", "PQFLAG"] + _REECA + _VDL)),
     ("REPCA1", (None, 7, _REPCA)),
     ("REGCAU1", ((101, 1, 1, 14, 3, 4), 1, _REGCA)),
     ("REECCU1", ((102, 0, 5, 45, 7, 6), 5, ["BUSR", "PFFLAG", "VFLAG", "QFLAG", "PQFLAG",
@@ -2063,7 +2127,11 @@ DYR_LIB = collections.OrderedDict([
                                              "QMax", "QMin", "VMAX", "VMIN", "Kqp", "Kqi", "Kvp", "Kvi", "Tiq", "dPmax",
                                              "dPmin", "PMAX", "PMIN", "Imax", "Tpord"] + _VDL +
                                             ["T", "SOCini", "SOCmax", "SOCmin"])),
+    ("REECDU1", ((102, 0, 6, 77, 7, 20), 6, ["PFFLAG", "VFLAG", "QFLAG", "PFLAG", "PQFLAG", "VCMPFLAG"] + _REECA +
+                                             _VDL10 + ["Rc", "Xc", "Tr1", "Kc", "Ke", "Vblkl", "Vblkh", "Tblk_delay"])),
     ("REPCAU1", ((107, 0, 7, 27, 7, 9), 7, _REPCA)),
+    ("REAX4BU1", ((107, 0, 1, 7, 2, 4), 1, ["PCBUS", "CON1", "Kz", "Kw", "Qmax", "Qmin", "Pmax", "Pmin"])),
+    ("PLNTBU1", ((504, 0, 7, 28, 7, 15), 7, _REPCA + ["MVAbase"])),
     ("WTDTA1", (None, 0, ["H", "DAMP", "Htfrac", "Freq1", "Dshaft"])),
     ("WTARA1", (None, 0, ["Ka", "Theta0"])),
     ("WTPTA1", (None, 0, ["Kiw", "Kpw", "Kic", "Kpc", "Kcc", "Tp", "TetaMax", "TetaMin", "RTetaMax", "RTetaMin"])),
@@ -2074,6 +2142,7 @@ DYR_LIB = collections.OrderedDict([
     ("SEXS", (None, 0, ["TA_TB", "TB", "K", "TE", "EMIN", "EMAX"])),
     ("TGOV1", (None, 0, ["R", "T1", "VMAX", "VMIN", "T2", "T3", "Dt"])),
 ])
+DYR_USRBUS = ("PLNTBU1",)                  # bus-level user models: 'USRBUS' records, no machine
 DYR_ALIAS = {"TG": "Tlag", "VBIAS": "Vref1", "IQHL": "Iqh1", "IQLL": "Iql1", "TA/TB": "TA_TB", "TATB": "TA_TB"}
 
 # generic values -- placeholders until the vendor's (every one can be set in Dyr_Params). REPCA1 Kp 1 / Ki 5:
@@ -2104,6 +2173,7 @@ DYN_DEFAULTS = {
                 "Vq3": 0.8, "Iq3": 1.1, "Vq4": 1.2, "Iq4": 1.1, "Vp1": 0.2, "Ip1": 1.1, "Vp2": 0.5, "Ip2": 1.1,
                 "Vp3": 0.8, "Ip3": 1.1, "Vp4": 1.2, "Ip4": 1.1, "T": 14400.0, "SOCini": 0.5, "SOCmax": 1.0,
                 "SOCmin": 0.0},
+    "REAX4BU1": {"CON1": 0.0, "Kz": 1.0, "Kw": 1.0, "Qmax": 0.4, "Qmin": -0.4, "Pmax": 1.0, "Pmin": 0.0},
     "WTDTA1": {"H": 3.0, "DAMP": 0.0, "Htfrac": 0.92, "Freq1": 1.8, "Dshaft": 1.5},
     "WTARA1": {"Ka": 0.007, "Theta0": 0.0},
     "WTPTA1": {"Kiw": 25.0, "Kpw": 150.0, "Kic": 30.0, "Kpc": 3.0, "Kcc": 0.0, "Tp": 0.3, "TetaMax": 27.0,
@@ -2119,18 +2189,47 @@ DYN_DEFAULTS = {
 
 DYN_DEFAULTS["REGCAU1"] = dict(DYN_DEFAULTS["REGCA1"])
 DYN_DEFAULTS["REPCAU1"] = dict(DYN_DEFAULTS["REPCA1"])
+DYN_DEFAULTS["PLNTBU1"] = dict(DYN_DEFAULTS["REPCA1"], MVAbase=100.0)
+# REEC_D: REEC_A's generic values and flags (all 0: the same whether the first ICON is a flag or a bus), flat
+# ten-point VDL tables (the files' voltage points, Imax), no line-drop compensation and no blocking
+DYN_DEFAULTS["REECDU1"] = dict(DYN_DEFAULTS["REECA1"], VCMPFLAG=0, Rc=0.0, Xc=0.0, Tr1=0.0, Kc=0.0, Ke=0.0,
+                               Vblkl=0.0, Vblkh=1.5, Tblk_delay=0.0)
+for _k, (_vq, _vp) in enumerate(zip((0.0, 0.3, 0.4, 0.6, 0.8, 0.9, 1.0, 1.1, 1.2, 1.45),
+                                     (0.0, 0.3, 0.4, 0.6, 0.7, 0.9, 1.0, 1.1, 1.2, 1.45))):
+    DYN_DEFAULTS["REECDU1"].update({"Vq%d" % (_k + 1): _vq, "Iq%d" % (_k + 1): 1.1,
+                                    "Vp%d" % (_k + 1): _vp, "Ip%d" % (_k + 1): 1.1})
 
-CHAINS = {"PV": ["REGCA1", "REECA1", "REPCA1"], "BESS": ["REGCAU1", "REECCU1", "REPCAU1"],
-          "WT4": ["REGCA1", "REECA1", "REPCA1"],
-          "WT3": ["REGCA1", "REECA1", "REPCA1", "WTDTA1", "WTARA1", "WTPTA1", "WTTQA1"],
-          "SYNC": ["GENROU", "SEXS", "TGOV1"], "USER": []}
+REEC_MODEL = {"REEC_A": "REECA1", "REEC_C": "REECCU1", "REEC_D": "REECDU1"}
+PLANT_CTRL_TYPES = ("PV", "BESS", "WT4")   # REPC_B's REAX4BU1 is for type 4 machines (WT3 keeps a REPCA1)
+
+
+def on_plntbu1(g, ctl):
+    """True: generator g takes its P and Q from the plant's PLNTBU1 (REPC_B) through a REAX4BU1."""
+    return ctl.get("plant_ctrl") == "REPC_B" and g["type"] in PLANT_CTRL_TYPES and g["q_mode"] == "share"
+
+
+def gen_chain(g, ctl):
+    """Generator g's .dyr models: its type, Electrical control and the Plant's controller choices."""
+    if g["type"] == "SYNC":
+        return ["GENROU", "SEXS", "TGOV1"]
+    if g["type"] == "USER":
+        return []
+    usr = ctl.get("regc_repc") == "USRMDL"
+    chain = ["REGCAU1" if usr else "REGCA1", REEC_MODEL[g["reec"]]]
+    if g["q_mode"] == "share":                   # fixed Q: no plant controller, its REEC holds its own Q
+        chain.append("REAX4BU1" if on_plntbu1(g, ctl) else ("REPCAU1" if usr else "REPCA1"))
+    if g["type"] == "WT3":
+        chain += ["WTDTA1", "WTARA1", "WTPTA1", "WTTQA1"]
+    return chain
 
 
 def dyr_params(net, inp):
-    """{GENERATOR or IB: {MODEL: {param: value}}} from Dyr_Params; each name checked against the model."""
+    """{GENERATOR, IB or PLANT: {MODEL: {param: value}}} from Dyr_Params; each name (or ICONn / CONn) checked
+       against the model."""
     out = collections.defaultdict(lambda: collections.defaultdict(dict))
     gnames = dict((g["name"].upper(), g["name"]) for g in net.gens)
     gnames["IB"] = "IB"
+    gnames["PLANT"] = "PLANT"
     for r in inp["dyr_params"]:
         w = r["_where"]
         gen = (_txt(r.get("generator")) or "").upper()
@@ -2140,12 +2239,19 @@ def dyr_params(net, inp):
         if model not in DYR_LIB:
             raise InputError("%s: Model %r -- one of %s" % (w, r.get("model"), ", ".join(DYR_LIB)))
         pname = _txt(r.get("parameter")) or ""
-        names = dict((p.upper(), p) for p in DYR_LIB[model][2])
+        allp = DYR_LIB[model][2]
+        names = dict((p.upper(), p) for p in allp)
         if pname.upper() not in names and DYR_ALIAS.get(pname.upper(), "").upper() in names:
             pname = DYR_ALIAS[pname.upper()]
+        pos = re.match(r"^(I?CON)\s*\(?\s*(\d+)\s*\)?$", pname.upper())
+        if pname.upper() not in names and pos:
+            nic = DYR_LIB[model][1]
+            part = allp[:nic] if pos.group(1) == "ICON" else allp[nic:]
+            if 1 <= int(pos.group(2)) <= len(part):
+                pname = part[int(pos.group(2)) - 1]
         if pname.upper() not in names:
-            raise InputError("%s: %s has no parameter %r -- it has %s" % (w, model, pname,
-                                                                       ", ".join(DYR_LIB[model][2])))
+            raise InputError("%s: %s has no parameter %r -- it has %s (or ICON1..%d, CON1..%d)"
+                             % (w, model, pname, ", ".join(allp), DYR_LIB[model][1], len(allp) - DYR_LIB[model][1]))
         val = r.get("value")
         if names[pname.upper()] == "CKT":
             val = _txt(val) or "1"
@@ -2156,31 +2262,55 @@ def dyr_params(net, inp):
 
 
 def dyr_models(net, inp):
-    """[(generator name, model, ordered [(param, value)])] -- the generic models with the plant's own limits."""
+    """[(generator name | IB | PLANT, model, ordered [(param, value)])] -- the generic models with the plant's own
+       limits; PLANT: REPC_B's plant controller (PLNTBU1, at the POI)."""
     over = dyr_params(net, inp)
+    ctl = net.ctl
     poi, ib = _num_of(net, "POI"), _num_of(net, "IB")
     out = [("IB", "GENCLS", list(_merged("GENCLS", {}, over["IB"]["GENCLS"])))]
+    pc = [g for g in net.gens if on_plntbu1(g, ctl)]
+    smb = sum(g["mbase"] for g in pc)
+    sq, sp = sum(g["qmax"] for g in pc), sum(g["pmax"] for g in pc)
     for g in net.gens:
-        chain = [m for m in CHAINS[g["type"]] if not (m in ("REPCA1", "REPCAU1") and g["q_mode"] == "fixed")]
+        chain = gen_chain(g, ctl)
         mb = g["mbase"]
         qmax, qmin = g["qmax"] / mb, g["qmin"] / mb
         pmax, pmin = g["pmax"] / mb, g["pmin"] / mb
+        lim = {"QMax": qmax, "QMin": qmin, "PMAX": pmax, "PMIN": pmin}
+        g["pc_share"] = (g["qmax"] / sq if sq else 0.0, g["pmax"] / sp if sp else 0.0) if g in pc else (0.0, 0.0)
         auto = {
-            "REECA1": {"QMax": qmax, "QMin": qmin, "PMAX": pmax, "PMIN": pmin, "PFLAG": 1 if g["type"] == "WT3" else 0},
-            "REECCU1": {"QMax": qmax, "QMin": qmin, "PMAX": pmax, "PMIN": pmin},
+            "REECA1": dict(lim, PFLAG=1 if g["type"] == "WT3" else 0),
+            "REECCU1": lim,
+            "REECDU1": dict(lim, Ke=-1.0 if g["type"] == "BESS" else 0.0),
             "REPCA1": {"BUSR": poi, "BUS1": poi, "BUS2": ib, "CKT": "1", "Qmax": qmax, "Qmin": qmin, "Pmax": pmax,
                        "Pmin": pmin, "Dup": 20.0 if g["type"] == "BESS" else 0.0},
+            "REAX4BU1": {"PCBUS": poi, "Kz": g["pc_share"][0], "Kw": g["pc_share"][1], "Qmax": qmax, "Qmin": qmin,
+                         "Pmax": pmax, "Pmin": pmin},
             "WTTQA1": {"TRATE": g["pmax"]},
             "TGOV1": {"VMAX": max(1.05, g["p"] / mb + 0.05)},
         }
         auto["REPCAU1"] = auto["REPCA1"]
         for m in over.get(g["name"], {}):
-            if m not in chain and m != "GENCLS":
-                net.notes.append("NOTE: Dyr_Params for %s %s: %s is not in its model chain %s"
+            if m not in chain:
+                net.notes.append("NOTE: Dyr_Params for %s %s: %s is not in its model chain %s -- not used"
                                  % (g["name"], m, m, "+".join(chain) or "(none: type USER)"))
         for m in chain:
             out.append((g["name"], m, list(_merged(m, auto.get(m, {}), over[g["name"]][m]))))
         g["dyr"] = chain
+    net.plant_ctrl = None
+    if pc:
+        auto = {"BUSR": poi, "BUS1": poi, "BUS2": ib, "CKT": "1", "Qmax": sq / smb,
+                "Qmin": sum(g["qmin"] for g in pc) / smb, "Pmax": sp / smb, "Pmin": sum(g["pmin"] for g in pc) / smb,
+                "Dup": 20.0 if any(g["type"] == "BESS" for g in pc) else 0.0, "MVAbase": smb}
+        out.append(("PLANT", "PLNTBU1", list(_merged("PLNTBU1", auto, over["PLANT"]["PLNTBU1"]))))
+        net.plant_ctrl = {"model": "PLNTBU1", "gens": [g["name"] for g in pc], "mbase": smb}
+    elif ctl.get("plant_ctrl") == "REPC_B":
+        net.notes.append("CHECK: Plant controller REPC_B, but no generator for it (PV, BESS or WT4 with Q mode "
+                         "share) -- no PLNTBU1 written")
+    for who in ("IB", "PLANT"):
+        for m in over.get(who, {}):
+            if (who, m) not in [(n, mm) for n, mm, _v in out]:
+                net.notes.append("NOTE: Dyr_Params for %s %s: not in the .dyr -- not used" % (who, m))
     return out
 
 
@@ -2223,9 +2353,13 @@ def write_dyr(net, inp, path):
         hdr, nic, _names = DYR_LIB[model]
         if gname == "IB":
             bus, mid = _num_of(net, "IB"), IB_ID
+        elif gname == "PLANT":
+            bus, mid = _num_of(net, "POI"), None
         else:
             bus, mid = _num_of(net, gen_of[gname]["bus"]), gen_of[gname]["id"]
-        if hdr:
+        if model in DYR_USRBUS:
+            head = "%d 'USRBUS' '%s' %s" % (bus, model, " ".join(str(x) for x in hdr))
+        elif hdr:
             head = "%d 'USRMDL' '%s' '%s' %s" % (bus, mid, model, " ".join(str(x) for x in hdr))
         else:
             head = "%d '%s' '%s'" % (bus, model, mid)
@@ -2905,6 +3039,13 @@ def report_text(net, inp, recs, comps, files, src):
     L.append("   control: mode %s -- %s, %s; P: %s" % (
         c["mode"], ("the POI held at %.4f pu" % c["v_poi"]) if held else "no generator holds the POI (all fixed Q)",
         mode, ("%.3f MW at the POI" % c["p_poi"]) if c["p_poi"] is not None else "each generator at its dispatch"))
+    pcx = net.plant_ctrl
+    if pcx:
+        L.append("   plant controller (.dyr): REPC_B -- %s at the POI (bus %d) on %.3f MVA commands %s through a "
+                 "REAX4BU1 each" % (pcx["model"], net.bus["POI"]["num"], pcx["mbase"], ", ".join(pcx["gens"])))
+    else:
+        L.append("   plant controller (.dyr): REPC_A -- a %s on each generator that holds the POI" % (
+            "REPCAU1" if c.get("regc_repc") == "USRMDL" else "REPCA1"))
     s = op["s_grid"]
     L.append("   solved: P at POI %.3f MW, Q at POI %.3f MVAr (into the grid), POI %.6f pu at %.4f deg"
              % (s.real, s.imag, net.bus["POI"]["vm"], net.bus["POI"]["va"]))
@@ -2994,8 +3135,10 @@ def report_text(net, inp, recs, comps, files, src):
         L.append("       solved P %.3f MW, Q %.3f MVAr, V %.6f pu at %.4f deg (PSCAD %.4f deg)" % (
             g["p"], g["q"], b["vm"], b["va"], b["va"] + shift.get(g["bus"], 0.0)))
         if g["q_mode"] == "share":
-            L.append("       Q share %.1f %% (of Qmax); PSS/E: regulates the POI (%d) at %.4f pu, RMPCT %.1f" % (
-                100.0 * g["share"], net.bus["POI"]["num"], c["v_poi"], 100.0 * g["share"]))
+            L.append("       Q share %.1f %% (of Qmax); PSS/E: regulates the POI (%d) at %.4f pu, RMPCT %.1f%s" % (
+                100.0 * g["share"], net.bus["POI"]["num"], c["v_poi"], 100.0 * g["share"],
+                ("; REAX4BU1: %.4f of the plant's Q, %.4f of its P" % g["pc_share"]) if "REAX4BU1" in g.get("dyr", [])
+                else ""))
         else:
             L.append("       fixed Q (QT = QB = %.3f MVAr)" % g["q"])
         L.append("       PSS/E ZSORCE X %s pu, WMOD %d; .dyr: %s; PSCAD: %s" % (
@@ -3227,12 +3370,12 @@ def _psse_steps(net, recs, inp, files, out, work, log):
         files["sav"] = sav
     if not ok:
         return
-    usr = any(DYR_LIB[m][0] for _g_, m, _v in recs) or any("USRMDL" in (_txt(r.get("record")) or "").upper()
-                                                          for r in inp["dyr_records"])
+    usr = sorted(set(m for _g_, m, _v in recs if DYR_LIB[m][0]))
+    if any(re.search(r"'?USR(MDL|BUS)'?", (_txt(r.get("record")) or "").upper()) for r in inp["dyr_records"]):
+        usr.append("your own")
     if usr and not (ADDLIB_IDV or DLLS):
-        log("CHECK: the .dyr has USRMDL records (BESS: REGCAU1 / REECCU1 / REPCAU1, or your own) -- set ADDLIB_IDV "
-            "or DLLS in the script to the user-model libraries, or PSS/E cannot read them: the dynamic check is "
-            "skipped")
+        log("CHECK: the .dyr has user models (%s) -- set ADDLIB_IDV or DLLS in the script to the user-model "
+            "libraries, or PSS/E cannot read them: the dynamic check is skipped" % ", ".join(usr))
         return
     psspy.cong(0)
     for opt in (1, 2, 3):
@@ -3298,7 +3441,8 @@ def read_input(path):
             inp = json.load(fh)
         for key in ["plant"] + [t[1] for t in TABLES]:
             inp.setdefault(key, {} if key == "plant" else [])
-        for sheet, key, _cols in TABLES:
+        for sheet, key, cols in TABLES:             # a row whose first value starts with # is skipped, as in Excel
+            inp[key] = [r for r in inp[key] if not _skip([r.get(c[0]) for c in cols])]
             for k, r in enumerate(inp[key]):
                 r.setdefault("_where", "%s row %d" % (sheet, k + 1))
         inp["_source"], inp["_unknown"] = path, []
@@ -3335,8 +3479,12 @@ def build(src, out_dir=None, check=True):
     log("[smib] operating point: P at POI %.3f MW, Q %.3f MVAr, POI %.5f pu, infinite bus %.5f pu"
         % (s.real, s.imag, net.bus["POI"]["vm"], net.op["e"]))
     base = out_dir or OUT_DIR or os.path.join(os.path.dirname(os.path.abspath(src)), "SMIB_MODELS")
-    out = os.path.join(base, "%s_%s" % (net.name, time.strftime("%Y%m%d_%H%M%S")))
-    os.makedirs(_new(out))
+    out = stem = os.path.join(base, "%s_%s" % (net.name, time.strftime("%Y%m%d_%H%M%S")))
+    k = 2
+    while os.path.exists(out):                   # a second run within the same second: a folder of its own
+        out = "%s_%d" % (stem, k)
+        k += 1
+    os.makedirs(out)
     files = {"raw": os.path.join(out, net.name + ".raw"), "dyr": os.path.join(out, net.name + ".dyr"),
              "json": os.path.join(out, net.name + "_inputs.json")}
     write_raw(net, files["raw"])
@@ -3375,6 +3523,9 @@ def main(argv=None):
             roles = example_roles()
         except Exception:
             roles = None
+        if os.path.exists(path):
+            print("[smib] *** %s exists -- nothing is overwritten: give the template another name" % path)
+            return 2
         write_template(path, EXAMPLE, roles)
         print("[smib] input workbook written: %s" % path)
         print("       fill it in, then: python %s \"%s\"" % (os.path.basename(__file__), path))
