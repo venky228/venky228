@@ -500,9 +500,11 @@ README = [
               "The case holds the grid (source and Thevenin impedance), the gen-tie, the MPTs, each collector (the "
               "WECC equivalent as a pi section, or DETAILED: every feeder section, identical feeder copies lumped), "
               "the GSUs and, on each GSU's LV side, the inverter: your UDM (PSCAD library, definition and AC port "
-              "in Generators) or a stand-in source at the solved voltage -- delete it and connect your UDM to its "
-              "node label (the report and the build log list every inverter node). PSCAD inverter at MV: for a "
-              "UDM with its GSU inside, the inverter on the GSU's HV side and no GSU drawn."),
+              "in Generators) or a stand-in source at the solved voltage -- delete it and wire your UDM in its "
+              "place (the report and the build log list every inverter node). PSCAD inverter at MV: for a UDM "
+              "with its GSU inside, the inverter on the GSU's HV side and no GSU drawn. It is drawn as a "
+              "single-line diagram with wires, left to right from the grid; where PSCAD's R, L and C are "
+              "single-phase, each is drawn three times between breakouts."),
 ]
 
 
@@ -952,6 +954,7 @@ class Net(object):
         self.op = {}                             # the operating point
         self.plant_ctrl = None                   # REPC_B: {model, gens, mbase} (the .dyr)
         self.pscad_slots, self.pscad_det = [], []  # PSCAD: the inverters' slots, the detailed collectors
+        self.pscad_groups = []                   # PSCAD: the runs of R, L, C (single-phase R, L, C: drawn three times)
         self.notes = []
 
     def add_bus(self, role, kv, where, aliases=()):
@@ -2608,7 +2611,135 @@ def pscad_model(net, inp):
         if cm["tag"] in seen:
             raise InputError("PSCAD: two components are named %s -- rename a load / shunt" % cm["tag"])
         seen.add(cm["tag"])
+    comps, net.pscad_groups = pscad_layout(comps)
     return comps
+
+
+PSCAD_W = 14          # a component's room along its row (grid units)
+PSCAD_H = 14          # from a row to what hangs below it, and between those
+PSCAD_GAP = 4         # from a node to the things hanging off it
+PSCAD_PAD = 6         # each side of a run of R, L, C: room for its breakouts where PSCAD's R, L, C are single-phase
+
+
+def pscad_layout(comps, root="IB"):
+    """A single-line drawing, left to right from the infinite source: at each node its main branch carries on
+       along the row, what hangs off it (shunts, loads, a GSU with its inverter) goes below it, its other branches
+       below those. Sets every component's x, y (grid units) and its upstream node ("in"); returns the components
+       in drawing order and the runs of R, L, C -- [{kind series | shunt, members [(tag, in, out)], a, b}] -- that
+       the build script draws three times over, between breakouts, where PSCAD's R, L and C are single-phase."""
+    nodes = dict((id(c), [p["node"] for p in c["ports"] if p["node"] != "GND"]) for c in comps)
+    at = collections.defaultdict(list)
+    for c in comps:
+        for n in nodes[id(c)]:
+            at[n].append(c)
+
+    def rlc(c):
+        return c["kind"] in ("R", "L", "C")
+
+    def mid(n):                                  # a node between two R / L / C in series and nothing else
+        return len(at[n]) == 2 and all(rlc(c) and len(nodes[id(c)]) == 2 for c in at[n])
+
+    def beyond(c, frm):
+        out, seen_c, seen_n = [], set([id(c)]), set([frm])
+        todo = [n for n in nodes[id(c)] if n != frm]
+        while todo:
+            n = todo.pop()
+            if n in seen_n:
+                continue
+            seen_n.add(n)
+            for c2 in at[n]:
+                if id(c2) not in seen_c:
+                    seen_c.add(id(c2))
+                    out.append(c2)
+                    todo.extend(m for m in nodes[id(c2)] if m not in seen_n)
+        return out
+
+    def small(c, frm):                           # a shunt, a source, or one component then a source or a shunt
+        far = [n for n in nodes[id(c)] if n != frm]
+        if not far:
+            return True
+        rest = beyond(c, frm)
+        return len(far) == 1 and len(rest) <= 1 and all(len(nodes[id(x)]) == 1 for x in rest)
+
+    placed, order = set(), []
+
+    def put(c, x, y, frm):
+        c["x"], c["y"], c["in"] = int(x), int(y), frm
+        placed.add(id(c))
+        order.append(c)
+
+    def chain(c, frm, x, y):
+        """c hanging off node frm (at x) on row y, then what lies beyond it -> (bottom, right)"""
+        x0 = x + (PSCAD_PAD if rlc(c) and frm and not mid(frm) else 0)
+        put(c, x0 + PSCAD_W // 2, y, frm)
+        right, bottom = x0 + PSCAD_W, y
+        far = [n for n in nodes[id(c)] if n != frm]
+        if far:
+            x1 = right + (PSCAD_PAD if rlc(c) and not mid(far[0]) else 0)
+            b, r = node(far[0], x1, y)
+            bottom, right = max(bottom, b), max(right, r)
+            for n2 in far[1:]:                   # a three-winding transformer's tertiary: below
+                b, r = node(n2, x1, bottom + PSCAD_H)
+                bottom, right = max(bottom, b), max(right, r)
+        return bottom, right
+
+    def node(n, x, y):
+        kids = [c for c in at[n] if id(c) not in placed]
+        chains = [c for c in kids if len(nodes[id(c)]) >= 2]
+        big = [c for c in chains if not small(c, n)]
+        main = big[0] if big else (chains[0] if chains else None)
+        if main is None:
+            main = next((c for c in kids if len(nodes[id(c)]) == 1 and
+                         not any(p["node"] == "GND" for p in c["ports"])), None)
+        drops = [c for c in kids if c is not main and (len(nodes[id(c)]) == 1 or small(c, n))]
+        others = [c for c in kids if c is not main and all(c is not d for d in drops)]
+        bottom, right, yd, wide = y, x, y, 0
+        for c in drops:
+            yd += PSCAD_H
+            b, r = chain(c, n, x + PSCAD_GAP, yd)
+            bottom, right, wide = max(bottom, b, yd), max(right, r), max(wide, r - x)
+        if main is not None:                     # its trunks clear of what hangs below this node
+            b, r = chain(main, n, x + max(0, wide + 2 - PSCAD_W // 2), y)
+            bottom, right = max(bottom, b), max(right, r)
+        for c in others:
+            yo = bottom + PSCAD_H
+            b, r = chain(c, n, x + PSCAD_GAP, yo)
+            bottom, right = max(bottom, b, yo), max(right, r)
+        return bottom, right
+
+    x0, y0 = 20, 10
+    for c in [c for c in at[root] if len(nodes[id(c)]) == 1]:
+        if not any(p["node"] == "GND" for p in c["ports"]):
+            put(c, x0 - PSCAD_W // 2, y0, None)          # the infinite source, left of its bus
+    bottom, _r = node(root, x0, y0)
+    xl = 20
+    for c in comps:                                     # anything not reached from the source: a row of its own
+        if id(c) not in placed:
+            put(c, xl, bottom + 2 * PSCAD_H, None)
+            xl += PSCAD_W
+    groups, done = [], set()
+    for c in order:
+        if not rlc(c) or id(c) in done:
+            continue
+        ns = nodes[id(c)]
+        if len(ns) == 1:
+            groups.append({"kind": "shunt", "members": [[c["tag"], ns[0], "GND"]], "a": ns[0], "b": "GND"})
+            done.add(id(c))
+            continue
+        frm = c["in"] if c["in"] in ns else ns[0]
+        if mid(frm):
+            continue
+        run, n = [], frm
+        while True:
+            out = [m for m in nodes[id(c)] if m != n][0]
+            run.append([c["tag"], n, out])
+            done.add(id(c))
+            nxt = [x for x in at[out] if id(x) not in done] if mid(out) else []
+            if not nxt:
+                break
+            c, n = nxt[0], out
+        groups.append({"kind": "series", "members": run, "a": frm, "b": run[-1][2]})
+    return order, groups
 
 
 def _tx2_comp(t, net, x, y):
@@ -2930,6 +3061,8 @@ def pscad_spec(net, inp, comps):
             "libraries": [l for k, l in enumerate(libs) if l and l not in libs[:k]],
             "slots": [{"tag": sl["tag"], "node": _node(sl["node"]), "units": sl["units"], "p": sl["p"], "q": sl["q"],
                        "vm": sl["vm"], "ang": sl["ang"], "model": sl["model"]} for sl in net.pscad_slots],
+            "groups": [{"kind": gr["kind"], "a": _node(gr["a"]), "b": _node(gr["b"]),
+                        "members": [[t, _node(i), _node(o)] for t, i, o in gr["members"]]} for gr in net.pscad_groups],
             "components": [dict((k, v) for k, v in cm.items() if k not in ("value", "unit", "slot", "gen"))
                            for cm in comps]}
 
@@ -2942,7 +3075,8 @@ _BUILD_PSCAD = r'''# -*- coding: utf-8 -*-
        py -3 @FILE@
    It uses the PSCAD that is running (or starts one), loads the user-model libraries, creates the
    case in this folder under a free name (nothing is overwritten), places every component, sets its
-   parameters, joins the components with node labels (wires where this PSCAD has none) and saves
+   parameters, draws the single-line diagram with wires (R, L and C three times over, between breakouts,
+   where they are single-phase in this PSCAD), names each node and saves
    the case. Its log, @NAME@_build_pscad_<date_time>.txt, lists every parameter set (as PSCAD reads
    it back), everything it could not do (CHECK:) and each component type's own parameter names, so
    anything left can be set by hand. The values themselves are in @NAME@_PSCAD_DATA.txt.
@@ -3091,72 +3225,211 @@ def _range(cmp, name):
         return "?"
 
 
-PHASES = ("_pa", "_pb", "_pc")
+DY = 4                     # single-phase R, L, C: the phases' rows, top to bottom (grid units)
+TRACE = []                 # SMIB_PSCAD_TRACE=<file>: what was drawn, for smib_build's own tests
+NO_BREAKOUT = []           # why this PSCAD has no breakout, once found
 
 
-def phase_split(canvas, split, joins, log):
-    """This PSCAD's R, L and C are single-phase: each of the case's three-phase ones is placed three times (phase a
-       where the case has it, b and c right of the case) and a breakout joins every three-phase node they meet.
-       -> the number of components added."""
-    three = set(n for n in joins if n != "GND")
-    x0 = max(c["x"] for c in SPEC["components"]) + 40
-    pos = [0]
+def _trace(kind, **kw):
+    if os.environ.get("SMIB_PSCAD_TRACE"):
+        kw["kind"] = kind
+        TRACE.append(kw)
 
-    def spare():
-        pos[0] += 1
-        return x0 + 30 * ((pos[0] - 1) // 40), 4 + 8 * ((pos[0] - 1) % 40)
 
-    added, met = 0, set()
-    log("")
-    log("R, L and C are single-phase in this PSCAD: %d of them each placed three times, phases a b c (b and c "
-        "from x = %d)" % (len(split), x0))
-    for c, used, picked in split:
-        for k in range(3):
-            if k == 0:
-                got, tag = picked, c["tag"]
-            else:
-                x, y = spare()
-                try:
-                    cmp = canvas.create_component(used, x, y)
-                except Exception as e:
-                    log("CHECK: %s phase %s not created: %s" % (c["tag"], "abc"[k], e))
-                    continue
-                added += 1
-                set_params(cmp, c["params"], log, quiet=True)
-                ports, taken, got = eports(cmp), set(), []
-                for node, g0 in picked:
-                    q = pick(ports, [g0[0]], taken)
-                    if q is None:
-                        log("CHECK: %s phase %s has no port %s" % (c["tag"], "abc"[k], g0[0]))
-                        continue
-                    taken.add(q[0])
-                    got.append((node, q))
-                tag = "%s_%s" % (c["tag"], "abc"[k])
-            for node, q in got:
-                joins.setdefault("GND" if node == "GND" else node + PHASES[k], []).append((q[1], q[2], tag, q[0]))
-                if node != "GND":
-                    met.add(node)
-    for node in sorted(met & three):
-        x, y = spare()
+def _move(cmp, dx, dy):
+    """Shift a component by (dx, dy) grid units; False when this mhi.pscad cannot."""
+    if not dx and not dy:
+        return True
+    try:
+        x, y = cmp.location
+        cmp.location = (x + dx, y + dy)
+    except Exception:
         try:
-            bo = canvas.create_component("master:breakout", x, y)
+            x, y = cmp.get_location()
+            cmp.set_location(x + dx, y + dy)
+        except Exception:
+            return False
+    return True
+
+
+def _delete(canvas, cmp):
+    try:
+        cmp.delete()
+    except Exception:
+        try:
+            canvas.delete(cmp)
+        except Exception:
+            pass
+
+
+def wire(canvas, *pts):
+    """An orthogonal wire through pts (the same point twice in a row is dropped)."""
+    v = []
+    for p in pts:
+        p = (int(p[0]), int(p[1]))
+        if not v or v[-1] != p:
+            v.append(p)
+    if len(v) > 1:
+        canvas.create_wire(*v)
+        _trace("wire", pts=v)
+
+
+def ground(canvas, x, y, log):
+    """A ground on the port at (x, y): below it, joined by a wire where its own port is not right there."""
+    try:
+        g = canvas.create_component("master:ground", x, y + 2)
+        gp = eports(g)
+        if gp and (gp[0][1], gp[0][2]) != (x, y):
+            wire(canvas, (x, y), (x, gp[0][2]), (gp[0][1], gp[0][2]))
+        _trace("comp", role="ground", ports=gp)
+    except Exception as e:
+        log("CHECK: no ground at (%d, %d): %s" % (x, y, e))
+
+
+def label(canvas, x, y, name):
+    """The node's name (a node label) on the port at (x, y)."""
+    try:
+        lb = canvas.create_component("master:nodelabel", x, y, Name=name)
+        _trace("comp", role="label", name=name, ports=eports(lb))
+        return True
+    except Exception:
+        return False
+
+
+def breakout_for(canvas, targets, right, names, log):
+    """A breakout whose three single-phase ports face `targets` (the phases' ports, top to bottom) -- from their
+       left (right=True: the phases are right of it) or from their right -- named top to bottom as `names` when
+       given; its top single port level with the top target, 5 grid units off. Every orientation is tried.
+       -> (component, its three-phase port, its single ports top to bottom) or None."""
+    tx, ty = targets[0][1], targets[0][2]
+    for orient in range(8):
+        try:
+            b = canvas.create_component("master:breakout", tx - 8 if right else tx + 8, ty, orient)
+        except TypeError:
+            if orient:
+                break
+            b = canvas.create_component("master:breakout", tx - 8 if right else tx + 8, ty)
         except Exception as e:
-            log("CHECK: no breakout for node %s (%s) -- join %s to it by hand" % (node, e, " ".join(
-                node + p for p in PHASES)))
-            continue
-        added += 1
-        bp = eports(bo)
-        tri = [p for p in bp if p[3] == 3]
-        one = sorted([p for p in bp if p[3] == 1], key=lambda p: p[0])
-        if len(tri) != 1 or len(one) != 3:
-            log("CHECK: the breakout's ports are %s -- join node %s to %s by hand" % (
-                ", ".join("%s(%d)" % (p[0], p[3]) for p in bp), node, " ".join(node + p for p in PHASES)))
-            continue
-        joins[node].append((tri[0][1], tri[0][2], "BRK_" + node, tri[0][0]))
-        for k, p in enumerate(one):
-            joins.setdefault(node + PHASES[k], []).append((p[1], p[2], "BRK_" + node, p[0]))
-    log("breakouts on %d three-phase node(s): %s" % (len(met & three), ", ".join(sorted(met & three))))
+            NO_BREAKOUT.append(str(e))
+            return None
+        ps = eports(b)
+        tri = [p for p in ps if p[3] == 3]
+        one = sorted([p for p in ps if p[3] == 1], key=lambda p: p[2])
+        ok = (len(tri) == 1 and len(one) == 3 and len(set(p[1] for p in one)) == 1 and
+              len(set(p[2] for p in one)) == 3 and all(one[k][2] - one[0][2] <= DY * k for k in (1, 2)) and
+              ((tri[0][1] < one[0][1]) if right else (tri[0][1] > one[0][1])) and
+              (names is None or [p[0] for p in one] == names))
+        if ok and not _move(b, (tx - 5 if right else tx + 5) - one[0][1], ty - one[0][2]):
+            _delete(canvas, b)
+            log("CHECK: a breakout cannot be moved with this mhi.pscad")
+            return None
+        if ok:
+            ps = eports(b)
+            return b, [p for p in ps if p[3] == 3][0], sorted([p for p in ps if p[3] == 1], key=lambda p: p[2])
+        _delete(canvas, b)
+    log("CHECK: no orientation of the breakout faces the phases")
+    return None
+
+
+def phase_group(canvas, g, made, spec_of, points, log):
+    """Group g -- a run of R / L / C in series, or one to ground -- drawn three times, phases top to bottom DY
+       apart, a breakout at each three-phase end, joined by wires that never touch another phase's: each phase
+       turns at its own column. The breakouts go first: when one cannot be placed nothing is added.
+       -> the number of components added, or None (the group left as one phase)."""
+    if NO_BREAKOUT:
+        return None
+    ends = []
+    for tag in (g["members"][0][0], g["members"][-1][0]):
+        ps = [p for p in eports(made[tag][0]) if p[3] == 1]
+        if len(ps) != 2:
+            log("CHECK: %s: %d single-phase ports" % (tag, len(ps)))
+            return None
+        ends.append(sorted(ps, key=lambda p: (p[1], p[2])))
+    lf, rl = ends[0][0], ends[1][1]                  # the run's left end, its right end (phase a)
+    got = breakout_for(canvas, [(lf[0], lf[1], lf[2] + DY * k, 1) for k in range(3)], True, None, log)
+    if not got:
+        return None
+    bi, tri, one = got
+    if g["kind"] == "series":
+        got = breakout_for(canvas, [(rl[0], rl[1], rl[2] + DY * k, 1) for k in range(3)], False,
+                           [p[0] for p in one], log)
+        if not got:
+            _delete(canvas, bi)
+            return None
+        _bo, tro, oneo = got
+    rows, added = [], 2 if g["kind"] == "series" else 1
+    for k in range(3):
+        row = []
+        for tag, _nin, _nout in g["members"]:
+            cmp, used, _picked = made[tag]
+            if k:
+                c = spec_of[tag]
+                cmp = canvas.create_component(used, c["x"], c["y"] + DY * k)
+                set_params(cmp, c["params"], log, quiet=True)
+                added += 1
+            ports = sorted([p for p in eports(cmp) if p[3] == 1], key=lambda p: (p[1], p[2]))
+            _trace("comp", role="phase", tag=tag, phase=k, ports=ports)
+            row.append((tag, ports[0], ports[-1]))
+        rows.append(row)
+    for k in range(3):                               # along the run, phase by phase
+        for i in range(len(rows[k]) - 1):
+            a, b = rows[k][i][2], rows[k][i + 1][1]
+            wire(canvas, (a[1], a[2]), (b[1], a[2]), (b[1], b[2]))
+    ins, sx = [rows[k][0][1] for k in range(3)], one[0][1]
+    for k in range(3):                               # fanning out: the bottom phase turns first
+        wire(canvas, (sx, one[k][2]), (sx + 3 - k, one[k][2]), (sx + 3 - k, ins[k][2]), (ins[k][1], ins[k][2]))
+    points.setdefault(g["a"], []).append((tri[1], tri[2], "breakout", tri[0]))
+    _trace("comp", role="breakout", group=g["members"][0][0], side="in", ports=[tri] + one)
+    if g["kind"] == "series":
+        outs, sx = [rows[k][-1][2] for k in range(3)], oneo[0][1]
+        for k in range(3):                           # closing in: the top phase turns first
+            wire(canvas, (outs[k][1], outs[k][2]), (sx - 3 + k, outs[k][2]), (sx - 3 + k, oneo[k][2]),
+                 (sx, oneo[k][2]))
+        points.setdefault(g["b"], []).append((tro[1], tro[2], "breakout", tro[0]))
+        _trace("comp", role="breakout", group=g["members"][0][0], side="out", ports=[tro] + oneo)
+    else:
+        for k in range(3):
+            r = rows[k][-1][2]
+            points.setdefault("GND", []).append((r[1], r[2], g["members"][0][0], r[0]))
     return added
+
+
+def join(canvas, points, log):
+    """Wires: each node from its leftmost port, along its row to what carries on, and down a trunk to what hangs
+       below; a ground on every ground port; the node's name on its leftmost port."""
+    for node in sorted(points):
+        pts = sorted(set((p[0], p[1]) for p in points[node]))
+        if node == "GND":
+            for (x, y) in pts:
+                ground(canvas, x, y, log)
+            continue
+        if len(pts) < 2:
+            log("CHECK: node %s has one connection only" % node)
+            continue
+        ax, ay = pts[0]
+        try:
+            prev = (ax, ay)
+            for q in [q for q in pts[1:] if q[1] == ay]:
+                wire(canvas, prev, q)
+                prev = q
+            off = [q for q in pts[1:] if q[1] != ay]
+            if off:
+                ys = sorted(set([ay] + [q[1] for q in off]))
+                for y1, y2 in zip(ys, ys[1:]):
+                    wire(canvas, (ax, y1), (ax, y2))
+                for y in sorted(set(q[1] for q in off)):
+                    prev = (ax, y)
+                    for q in sorted(q for q in off if q[1] == y):
+                        if q != prev:
+                            wire(canvas, prev, q)
+                        prev = q
+        except Exception as e:
+            log("CHECK: node %s: no wires (%s) -- node labels instead" % (node, e))
+            for (x, y) in pts:
+                label(canvas, x, y, node)
+            continue
+        if not node.endswith("_RL"):
+            label(canvas, ax, ay, node)
 
 
 def main():
@@ -3212,9 +3485,8 @@ def main():
         log("CHECK: run settings not set (%s): %s" % (e, SPEC["settings"]))
     canvas = prj.canvas("Main") if hasattr(prj, "canvas") else prj.user_canvas("Main")
     seen_defn = {}
-    joins = {}                                        # node -> [(x, y, tag, port)]
-    split = []                                        # single-phase R / L / C: (spec, definition, ports)
-    made = 0
+    made = {}                                         # tag -> (component, definition, [(node, port)])
+    spec_of = dict((c["tag"], c) for c in SPEC["components"])
     for c in SPEC["components"]:
         log("")
         log("%s  (%s)  %s" % (c["tag"], c["kind"], c.get("note", "")))
@@ -3236,7 +3508,6 @@ def main():
             log("    CHECK: not created (%s) -- place it by hand and join it to %s"
                 % (" / ".join(defns), ", ".join(p["node"] for p in c["ports"])))
             continue
-        made += 1
         log("    %s at (%d, %d)" % (used, c["x"], c["y"]))
         if used not in seen_defn:
             try:
@@ -3245,62 +3516,72 @@ def main():
                 log("    its parameters: %s" % ", ".join("%s=%s" % (k, have[k]) for k in sorted(have)))
             except Exception:
                 seen_defn[used] = []
+            try:
+                log("    its bounds %s, location %s" % (tuple(cmp.bounds), tuple(cmp.location)))
+            except Exception:
+                pass
         set_params(cmp, c["params"], log)
         ports = eports(cmp)
         if any(p["node"] for p in c["ports"]) and len(ports) > len(c["ports"]) and "View" in str(seen_defn[used]):
             log("    (%d electrical ports: %s)" % (len(ports), ", ".join(p[0] for p in ports)))
         taken, picked = set(), []
-        for p in c["ports"]:
-            got = pick(ports, p["pick"], taken)
-            if got is None:
-                log("    CHECK: no port for node %s (ports: %s) -- join it by hand"
-                    % (p["node"], ", ".join("%s@(%d,%d)" % (q[0], q[1], q[2]) for q in ports) or "none"))
-                continue
-            taken.add(got[0])
-            picked.append((p["node"], got))
-        one = c["kind"] in ("R", "L", "C") and len(picked) == 2 and all(g[3] == 1 for _n, g in picked)
-        if one:
-            split.append((c, used, picked))
+        nodes = [p["node"] for p in c["ports"]]
+        if c["kind"] in ("R", "L", "C") and len(ports) == 2 and len(nodes) == 2:
+            first = c.get("in") if c.get("in") in nodes else [n for n in nodes if n != "GND"][0]
+            lr = sorted(ports, key=lambda p: (p[1], p[2]))          # its upstream node on its left port
+            picked = [(first, lr[0]), (([n for n in nodes if n != first] or nodes)[0], lr[1])]
+        else:
+            for p in c["ports"]:
+                got = pick(ports, p["pick"], taken)
+                if got is None:
+                    log("    CHECK: no port for node %s (ports: %s) -- join it by hand"
+                        % (p["node"], ", ".join("%s@(%d,%d)" % (q[0], q[1], q[2]) for q in ports) or "none"))
+                    continue
+                taken.add(got[0])
+                picked.append((p["node"], got))
+        made[c["tag"]] = (cmp, used, picked)
+        _trace("comp", role="spec", tag=c["tag"], ckind=c["kind"], ports=[q for _n, q in picked],
+               nodes=[n for n, _q in picked])
         for node, got in picked:
-            if not one:
-                joins.setdefault(node, []).append((got[1], got[2], c["tag"], got[0]))
-            log("    port %-6s (%d, %d) -> %s%s" % (got[0], got[1], got[2], node, " (phase a)" if one else ""))
-    extra = phase_split(canvas, split, joins, log) if split else 0
-    log("")
-    labels = True
-    for node, pts in sorted(joins.items()):
-        if node == "GND":
-            for (x, y, tag, port) in pts:
-                try:
-                    g = canvas.create_component("master:ground", x, y + 2)
-                    gp = eports(g)
-                    if gp and (gp[0][1], gp[0][2]) != (x, y):
-                        canvas.create_wire((x, y), (gp[0][1], gp[0][2]))
-                except Exception as e:
-                    log("CHECK: ground at %s %s not placed: %s" % (tag, port, e))
-            continue
-        if labels:
-            try:
-                for (x, y, tag, port) in pts:
-                    canvas.create_component("master:nodelabel", x, y, Name=node)
+            log("    port %-6s (%d, %d) dim %d -> %s" % (got[0], got[1], got[2], got[3], node))
+    single = any(c["kind"] in ("R", "L", "C") and made[c["tag"]][2] and
+                 all(q[3] == 1 for _n, q in made[c["tag"]][2]) for c in SPEC["components"] if c["tag"] in made)
+    points, grouped, extra = {}, set(), 0
+    if single:
+        log("")
+        log("R, L and C are single-phase in this PSCAD: each three-phase one is drawn three times, phases a b c "
+            "top to bottom, between breakouts")
+        for g in SPEC.get("groups", []):
+            tags = [t for t, _a, _b in g["members"]]
+            if not all(t in made for t in tags):
                 continue
-            except Exception as e:
-                labels = False
-                log("node labels are not available here (%s) -- wires instead" % e)
-        x0, y0 = pts[0][0], pts[0][1]
-        for (x, y, tag, port) in pts[1:]:
-            try:
-                canvas.create_wire((x0, y0), (x, y))
-            except Exception as e:
-                log("CHECK: %s: no wire to %s %s: %s" % (node, tag, port, e))
-    log("nodes joined by %s: %s" % ("node labels" if labels else "wires",
-                                     ", ".join("%s (%d)" % (n, len(p)) for n, p in sorted(joins.items()))))
+            n = phase_group(canvas, g, made, spec_of, points, log)
+            if n is None:
+                if not NO_BREAKOUT:
+                    log("CHECK: %s drawn as one phase only -- draw phases b and c by hand" % " + ".join(tags))
+                continue
+            extra += n
+            grouped.update(tags)
+        if NO_BREAKOUT:
+            log("CHECK: no breakout here (master:breakout: %s) -- every R, L and C is drawn as one phase: add phases "
+                "b and c, with breakouts, by hand" % NO_BREAKOUT[0])
+    for c in SPEC["components"]:
+        if c["tag"] in made and c["tag"] not in grouped:
+            for node, q in made[c["tag"]][2]:
+                points.setdefault(node, []).append((q[1], q[2], c["tag"], q[0]))
+    log("")
+    join(canvas, points, log)
+    made = len(made)
+    log("nodes joined by wires: %d" % len([n for n in points if n != "GND"]))
     log("")
     log("inverters -- a vendor model (UDM) goes on these nodes; a stand-in source holds the load flow until then:")
     for s in SPEC.get("slots", []):
         log("    %-24s node %-24s %5s units  P %9.3f MW  Q %8.3f MVAr  V %.5f pu at %9.4f deg  %s"
             % (s["tag"], s["node"], s["units"], s["p"], s["q"], s["vm"], s["ang"], s["model"]))
     prj.save()
+    if os.environ.get("SMIB_PSCAD_TRACE"):
+        with open(os.environ["SMIB_PSCAD_TRACE"], "w") as fh:
+            json.dump(TRACE, fh)
     log("")
     log("saved %s: %d of %d components%s, %d CHECK line(s) above"
         % (os.path.join(HERE, case + ".pscx"), made, len(SPEC["components"]),
@@ -3361,8 +3642,10 @@ def pscad_data_text(net, comps, spec):
          "Every value the build script sets, in PSCAD's units. Transformers: pu on their own MVA and winding",
          "voltages (V1 is the tapped HV voltage). Lines and collector equivalents: pi sections (C/2 at each end);",
          "detailed collectors: each section's R and L, its charging as C/2 at each end (one capacitor per node).",
+         "The drawing: a single-line diagram with wires (R, L, C three times over, between breakouts, where PSCAD's",
+         "are single-phase); the node names below are the labels on the wires.",
          "Sources: kV line-to-line rms and degrees, the angle relative to the infinite source, the PSCAD",
-         "transformers' phase shifts included (PSS/E has none). Nodes join components of the same name.",
+         "transformers' phase shifts included (PSS/E has none). A node joins the components that name it.",
          "",
          "Run settings: duration %(time_duration)s s, time step %(time_step)s us, plot step %(sample_step)s us"
          % spec["settings"],
