@@ -27,14 +27,22 @@
      Dyr_Records    .dyr records of your own (vendor models)
      PSCAD_Params   the vendor PSCAD model's parameters, by generator
 
-   THE MODEL
+   THE MODEL -- Plant: Model type, the same for PSS/E and PSCAD
+     SMIB (default):
      IB --[grid: SCR, X/R]-- POI --[gen-tie]-- HV --[MPT 1..n]-- collector bus
-        --[collector equivalent (WECC)]-- MV --[GSU equivalent]-- LV -- generator
+        --[one equivalent feeder per MPT winding]-- MV --[GSU]-- LV -- generator
      IB is the infinite bus (the swing bus; GENCLS with H = 0 in the .dyr).
      Each generator is N units aggregated (MBASE, P, Q = N x one unit) behind
-     its GSUs in parallel (count x MVA, the same % impedance) and its collector
-     equivalent. Generators can share an MPT (its LV or tertiary winding), have
-     MPTs of their own, share a collector system, or sit on any bus.
+     its GSUs in parallel (count x MVA, the same % impedance). The collectors
+     on one MPT winding are one feeder: the WECC equivalent of them all, each
+     weighed by the MW it carries, every generator's GSU at its far end.
+     Generators can share an MPT (its LV or tertiary winding), have MPTs of
+     their own, share a collector system, or sit on any bus.
+     DETAILED: every feeder section as a branch (identical feeder copies
+     lumped); the units of a generator at each node a machine of their own
+     (its generator's unit data and dynamic models, P in proportion) behind
+     its own GSU (the generator's, scaled). Rows in Dyr_Params, Dyr_Records
+     and PSCAD_Params that name a generator apply to all of its machines.
 
    WECC COLLECTOR EQUIVALENT
      Each collector system is given feeder by feeder, section by section from
@@ -96,7 +104,7 @@
                              that has mhi.pscad. It builds <name>.pscx
                              from master-library parts: the infinite source at
                              the solved voltage, the grid impedance, gen-tie,
-                             MPTs, the collectors (the WECC equivalent, or
+                             MPTs, the collectors (SMIB: one feeder per MPT;
                              DETAILED: every feeder section), the GSUs and, on
                              each GSU's LV side, the inverter: your vendor model
                              (UDM: PSCAD library / definition / AC port in
@@ -189,6 +197,9 @@ REEC_OK = {"PV": ("REEC_A", "REEC_D"), "WT4": ("REEC_A", "REEC_D"), "WT3": ("REE
 FAULT_TYPES = ["ABCG", "ABC", "AG", "BG", "CG", "ABG", "BCG", "ACG", "AB", "BC", "AC"]
 PLANT_FIELDS = [
     ("name", "Name", "", "model name: file names and the PSCAD case (letters, digits, _)", None),
+    ("model_type", "Model type", "", "SMIB: one equivalent feeder (WECC) per MPT, each generator one machine behind "
+     "one GSU | DETAILED: every feeder section, the units at each node a machine of their own behind their own GSU "
+     "-- PSS/E and PSCAD alike (blank = SMIB)", ["SMIB", "DETAILED"]),
     ("sbase_mva", "System base", "MVA", "PSS/E system base (blank = 100)", None),
     ("freq_hz", "Frequency", "Hz", "blank = 60", None),
     ("first_bus", "First bus number", "", "buses are numbered from here + 1 (Bus_Numbers sets any one)", None),
@@ -311,8 +322,6 @@ GEN_COLS = [
     ("pscad_ac_port", "PSCAD AC port", "its AC port (blank = its 3-phase port)", None, 9),
     ("pscad_inv_at", "PSCAD inverter at", "LV: the inverter (your UDM or the stand-in source) on the GSU's LV side, "
      "the GSU built | MV: on its HV side, for a UDM with its GSU inside (blank = LV)", ["LV", "MV"], 8),
-    ("pscad_collector", "PSCAD collector", "EQUIVALENT: one pi section, as PSS/E | DETAILED: every Feeders section, "
-     "a GSU and an inverter at every node with units (blank = EQUIVALENT)", ["EQUIVALENT", "DETAILED"], 11),
 ]
 
 FEEDER_COLS = [
@@ -342,8 +351,6 @@ CABLE_COLS = [
 COLLECTOR_COLS = [
     ("name", "Name", "# shared collector: its far-end bus has this name", None, 11),
     ("connect", "Connect to", "the bus it starts from (MPT1, MPT1:TV ...)", None, 11),
-    ("pscad_collector", "PSCAD collector", "EQUIVALENT | DETAILED: every section, a GSU and an inverter per "
-     "generator at every node (blank = EQUIVALENT)", ["EQUIVALENT", "DETAILED"], 11),
 ]
 
 LOAD_COLS = [
@@ -403,7 +410,7 @@ _BESS_FEEDER = [("1000AL", 0.80, 0), ("500AL", 0.15, 1), ("500AL", 0.15, 1), ("4
 # by section, a GSU and an inverter slot at every node
 EXAMPLE = {
     "plant": {
-        "name": "Hybrid_PV100_BESS100", "sbase_mva": 100.0, "freq_hz": 60.0, "first_bus": 1000,
+        "name": "Hybrid_PV100_BESS100", "model_type": "SMIB", "sbase_mva": 100.0, "freq_hz": 60.0, "first_bus": 1000,
         "poi_kv": 230.0, "poi_name": "POI", "grid_scr": 3.0, "grid_x_r": 10.0,
         "tie_length": 5.0, "tie_unit": "km", "tie_r_per": 0.0720, "tie_x_per": 0.4950, "tie_b_per": 3.35,
         "tie_parallel": 1, "tie_rate_mva": 400.0,
@@ -420,13 +427,11 @@ EXAMPLE = {
         {"name": "PV", "type": "PV", "id": "1", "connect": "MPT1", "units": 25, "unit_mva": 4.2,
          "unit_pmax_mw": 4.0, "unit_pmin_mw": 0.0, "unit_qmax_mvar": 1.28, "unit_qmin_mvar": -1.28, "kv": 0.63,
          "q_mode": "share", "gsu_mva": 4.2, "gsu_hv_kv": 34.5, "gsu_lv_kv": 0.63, "gsu_z_pct": 6.5,
-         "gsu_x_r": 8.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_A", "pscad_inv_at": "LV",
-         "pscad_collector": "DETAILED"},
+         "gsu_x_r": 8.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_A", "pscad_inv_at": "LV"},
         {"name": "BESS", "type": "BESS", "id": "1", "connect": "MPT1", "units": 25, "unit_mva": 4.4,
          "unit_pmax_mw": 4.0, "unit_pmin_mw": -4.0, "unit_qmax_mvar": 1.83, "unit_qmin_mvar": -1.83, "kv": 0.69,
          "q_mode": "share", "gsu_mva": 4.4, "gsu_hv_kv": 34.5, "gsu_lv_kv": 0.69, "gsu_z_pct": 6.0,
-         "gsu_x_r": 7.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_C", "pscad_inv_at": "LV",
-         "pscad_collector": "DETAILED"},
+         "gsu_x_r": 7.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_C", "pscad_inv_at": "LV"},
     ],
     "feeders": [{"collector": gen, "feeder": "F", "copies": 5, "section": k + 1, "cable": c, "length": ln,
                  "unit": "km", "units": u}
@@ -462,6 +467,11 @@ README = [
               "bus). Numbers are automatic from First bus number; Bus_Numbers sets any one."),
     ("Plant", "Bases, the POI, the grid (SCR and X/R, or short-circuit MVA, or R/X), the gen-tie, the operating "
               "point, the plant controller and the PSCAD run settings."),
+    ("MODEL TYPE", "Plant: Model type sets PSS/E and PSCAD alike. SMIB (default): the collectors on one MPT winding "
+                   "are one equivalent feeder (WECC, each collector weighed by its MW), each generator one machine "
+                   "behind one GSU at its far end. DETAILED: every feeder section is a branch (identical feeder "
+                   "copies lumped), the units of a generator at each node a machine of their own behind their own "
+                   "GSU; a generator's Dyr_Params, Dyr_Records and PSCAD_Params rows apply to all its machines."),
     ("", "Control mode Q: the plant holds the POI voltage with Q at POI into the grid; PF: with that power factor; "
          "V: the plant holds the POI voltage with the infinite bus at Grid voltage. The infinite-bus voltage (and "
          "the generators' Q) come out of the load flow."),
@@ -477,8 +487,7 @@ README = [
                    "shares the POI's Q, its electrical control model in the .dyr (REEC_A: REECA1, PV and wind; "
                    "REEC_C: REECCU1, BESS; REEC_D: REECDU1, PV, BESS and WT4) and its PSCAD model (vendor library "
                    "and definition, or blank for a voltage source at the solved terminal voltage: a network check "
-                   "against PSS/E), where the inverter connects (LV or MV side of the GSU) and how the collector "
-                   "is drawn in PSCAD (EQUIVALENT or DETAILED)."),
+                   "against PSS/E) and where the inverter connects (LV or MV side of the GSU)."),
     ("Feeders", "The collector feeders section by section from the collector bus out: cable, length and the units "
                 "tapped at the section's far end. A daisy chain needs no From section; a lateral names the section "
                 "it leaves from (its far end); 0 = straight from the collector bus. Copies: identical feeders. "
@@ -765,7 +774,8 @@ def parse_workbook(book, path):
         item = _txt(r[0])
         key = items.get(_key(item or ""))
         if key is None:
-            unknown.append(item)
+            if len(r) > 1 and _txt(r[1]) is not None:       # a section title has no value
+                unknown.append(item)
             continue
         inp["plant"][key] = r[1] if len(r) > 1 else None
     inp["_unknown"] = ["Plant: '%s'" % u for u in unknown if u]
@@ -809,29 +819,63 @@ def parse_workbook(book, path):
 _XL_STYLES = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-    '<fonts count="4"><font><sz val="10"/><name val="Calibri"/></font>'
+    '<fonts count="10"><font><sz val="10"/><name val="Calibri"/></font>'
     '<font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
     '<font><i/><sz val="9"/><color rgb="FF595959"/><name val="Calibri"/></font>'
-    '<font><b/><sz val="10"/><name val="Calibri"/></font></fonts>'
-    '<fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
+    '<font><b/><sz val="10"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="16"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
+    '<font><i/><sz val="10"/><color rgb="FFD9E1F2"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="11"/><color rgb="FF1F3864"/><name val="Calibri"/></font>'
+    '<font><u/><sz val="10"/><color rgb="FF0563C1"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="10"/><color rgb="FFC00000"/><name val="Calibri"/></font>'
+    '<font><sz val="9"/><name val="Consolas"/></font></fonts>'
+    '<fills count="7"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
     '<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/></patternFill></fill>'
-    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF2CC"/></patternFill></fill></fills>'
-    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF2CC"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFDDEBF7"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFF2F2F2"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFE2EFDA"/></patternFill></fill></fills>'
+    '<borders count="3"><border><left/><right/><top/><bottom/><diagonal/></border>'
+    '<border><left style="thin"><color rgb="FFBFBFBF"/></left><right style="thin"><color rgb="FFBFBFBF"/></right>'
+    '<top style="thin"><color rgb="FFBFBFBF"/></top><bottom style="thin"><color rgb="FFBFBFBF"/></bottom>'
+    '<diagonal/></border>'
+    '<border><left/><right/><top/><bottom style="medium"><color rgb="FF1F3864"/></bottom><diagonal/></border>'
+    '</borders>'
     '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-    '<cellXfs count="6">'
+    '<cellXfs count="15">'
     '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
-    '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1">'
-    '<alignment wrapText="1" vertical="center"/></xf>'
-    '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1">'
-    '<alignment wrapText="1" vertical="top"/></xf>'
-    '<xf numFmtId="0" fontId="0" fillId="3" borderId="0" xfId="0" applyFill="1"/>'
+    '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" '
+    'applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="2" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" '
+    'applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1">'
+    '<alignment vertical="top"/></xf>'
     '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1">'
     '<alignment vertical="top"/></xf>'
     '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1">'
-    '<alignment wrapText="1" vertical="top"/></xf>'
+    '<alignment vertical="top" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="4" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1">'
+    '<alignment vertical="center" indent="1"/></xf>'
+    '<xf numFmtId="0" fontId="6" fillId="4" borderId="2" xfId="0" applyFont="1" applyFill="1" applyBorder="1" '
+    'applyAlignment="1"><alignment vertical="center"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1">'
+    '<alignment vertical="top" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="7" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" '
+    'applyAlignment="1"><alignment vertical="top"/></xf>'
+    '<xf numFmtId="0" fontId="5" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1">'
+    '<alignment vertical="center" indent="1"/></xf>'
+    '<xf numFmtId="0" fontId="8" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" '
+    'applyAlignment="1"><alignment vertical="top"/></xf>'
+    '<xf numFmtId="0" fontId="3" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" '
+    'applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="6" borderId="1" xfId="0" applyFill="1" applyBorder="1" '
+    'applyAlignment="1"><alignment horizontal="center" vertical="top"/></xf>'
+    '<xf numFmtId="0" fontId="9" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" '
+    'applyAlignment="1"><alignment vertical="top"/></xf>'
     '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
     '</styleSheet>')
-XS_HEAD, XS_NOTE, XS_INPUT, XS_BOLD, XS_WRAP = 1, 2, 3, 4, 5
+(XS_HEAD, XS_NOTE, XS_INPUT, XS_BOLD, XS_WRAP, XS_TITLE, XS_SECTION, XS_CELL, XS_LINK, XS_SUB, XS_REQ, XS_ITEM,
+ XS_TAG, XS_CODE) = range(1, 15)
 
 
 def _xl_cell(ref, v, st):
@@ -844,19 +888,28 @@ def _xl_cell(ref, v, st):
     return '<c r="%s" s="%d" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>' % (ref, st, _xml_escape(str(v)))
 
 
-def _xl_sheet(rows, widths, freeze=(0, 0), lists=()):
-    """rows: lists of values or (value, style); lists: [(range, [choices])] for drop-down cells."""
+def _xl_sheet(rows, widths, freeze=(0, 0), lists=(), merges=(), links=(), heights=None, tab=None, grid=True,
+              landscape=True, fit=False):
+    """rows: lists of values or (value, style); lists: [(range, [choices])] for drop-down cells; merges: ["A1:D1"];
+       links: [(cell, sheet)] to another sheet; heights: {row (1-based): points}; tab: the tab's colour (RRGGBB)."""
     xs, ys = freeze
+    heights = heights or {}
     o = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">', '<sheetViews>']
+         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">']
+    if tab or fit:
+        o.append('<sheetPr>%s%s</sheetPr>' % (('<tabColor rgb="FF%s"/>' % tab) if tab else "",
+                                             '<pageSetUpPr fitToPage="1"/>' if fit else ""))
+    o.append('<sheetViews>')
+    gl = '' if grid else ' showGridLines="0"'
     if xs or ys:
         tl = "%s%d" % (_col_letters(xs), ys + 1)
         pane = "bottomRight" if xs and ys else ("bottomLeft" if ys else "topRight")
-        o.append('<sheetView workbookViewId="0"><pane %s%stopLeftCell="%s" activePane="%s" state="frozen"/>'
-                 '</sheetView>' % (('xSplit="%d" ' % xs) if xs else "", ('ySplit="%d" ' % ys) if ys else "", tl, pane))
+        o.append('<sheetView%s workbookViewId="0"><pane %s%stopLeftCell="%s" activePane="%s" state="frozen"/>'
+                 '</sheetView>' % (gl, ('xSplit="%d" ' % xs) if xs else "", ('ySplit="%d" ' % ys) if ys else "", tl,
+                                   pane))
     else:
-        o.append('<sheetView workbookViewId="0"/>')
-    o.append('</sheetViews><cols>')
+        o.append('<sheetView%s workbookViewId="0"/>' % gl)
+    o.append('</sheetViews><sheetFormatPr defaultRowHeight="14"/><cols>')
     for i, w in enumerate(widths):
         o.append('<col min="%d" max="%d" width="%s" customWidth="1"/>' % (i + 1, i + 1, w))
     o.append('</cols><sheetData>')
@@ -865,14 +918,25 @@ def _xl_sheet(rows, widths, freeze=(0, 0), lists=()):
         for ci, x in enumerate(r):
             v, st = x if isinstance(x, tuple) else (x, 0)
             cells.append(_xl_cell("%s%d" % (_col_letters(ci), ri + 1), v, st))
-        o.append('<row r="%d">%s</row>' % (ri + 1, "".join(cells)))
+        h = heights.get(ri + 1)
+        o.append('<row r="%d"%s>%s</row>' % (ri + 1, (' ht="%s" customHeight="1"' % h) if h else "", "".join(cells)))
     o.append('</sheetData>')
+    if merges:
+        o.append('<mergeCells count="%d">%s</mergeCells>' % (len(merges), "".join('<mergeCell ref="%s"/>' % m
+                                                                                for m in merges)))
     if lists:
         o.append('<dataValidations count="%d">' % len(lists))
         for rng, choices in lists:
             o.append('<dataValidation type="list" allowBlank="1" showErrorMessage="1" sqref="%s">'
                      '<formula1>"%s"</formula1></dataValidation>' % (rng, _xml_escape(",".join(choices))))
         o.append('</dataValidations>')
+    if links:
+        o.append('<hyperlinks>%s</hyperlinks>' % "".join(
+            '<hyperlink ref="%s" location="%s" display="%s"/>' % (cell, _xml_escape("'%s'!A1" % sh), _xml_escape(sh))
+            for cell, sh in links))
+    o.append('<pageMargins left="0.4" right="0.4" top="0.5" bottom="0.5" header="0.3" footer="0.3"/>')
+    o.append('<pageSetup orientation="%s"%s/>' % ("landscape" if landscape else "portrait",
+                                                  ' fitToWidth="1" fitToHeight="0"' if fit else ""))
     o.append('</worksheet>')
     return "".join(o)
 
@@ -921,31 +985,325 @@ def write_xlsx(path, sheets):
         z.close()
 
 
+# ---- the workbook's reference sheets ----
+PLANT_SECTIONS = {"name": "MODEL", "poi_kv": "POI AND GRID (the infinite bus behind its Thevenin impedance)",
+                  "tie_length": "GEN-TIE (POI to the HV bus; blank = none)",
+                  "control_mode": "OPERATING POINT (the load flow's targets at the POI)",
+                  "plant_ctrl": "PLANT CONTROLLER (PSS/E .dyr)", "pscad_time_step_us": "PSCAD RUN",
+                  "pscad_fault": "PSCAD FAULT AT THE POI", "pscad_libraries": "PSCAD LIBRARIES"}
+
+MODEL_DOC = {
+    "GENCLS": "infinite bus (IB): classical machine, H = 0",
+    "REGCA1": "generator / converter interface, inverters (REGC_A)",
+    "REGCAU1": "REGC_A as the WECC user model (Plant: REGC_A / REPC_A records USRMDL)",
+    "REECA1": "electrical control REEC_A: PV, wind (WT3, WT4)",
+    "REECCU1": "electrical control REEC_C: BESS, with state of charge",
+    "REECDU1": "electrical control REEC_D: PV, BESS, WT4 (10-point VDL curves, current compensation)",
+    "REPCA1": "plant controller REPC_A, one on each generator (Plant controller REPC_A)",
+    "REPCAU1": "REPC_A as the WECC user model",
+    "PLNTBU1": "plant controller REPC_B, one for the whole plant at the POI (Plant controller REPC_B)",
+    "REAX4BU1": "REPC_B's auxiliary model on each generator: its share of the plant's P and Q",
+    "WTDTA1": "WT3 drive train", "WTARA1": "WT3 aerodynamics", "WTPTA1": "WT3 pitch control",
+    "WTTQA1": "WT3 torque control", "GENROU": "synchronous machine, round rotor (type SYNC)",
+    "SEXS": "simplified excitation system (type SYNC)", "TGOV1": "steam turbine-governor (type SYNC)"}
+
+AUTO_PARAMS = {"REECA1": ("QMax", "QMin", "PMAX", "PMIN", "PFLAG"), "REECCU1": ("QMax", "QMin", "PMAX", "PMIN"),
+               "REECDU1": ("QMax", "QMin", "PMAX", "PMIN", "Ke"),
+               "REPCA1": ("BUSR", "BUS1", "BUS2", "CKT", "Qmax", "Qmin", "Pmax", "Pmin", "Dup"),
+               "REPCAU1": ("BUSR", "BUS1", "BUS2", "CKT", "Qmax", "Qmin", "Pmax", "Pmin", "Dup"),
+               "PLNTBU1": ("BUSR", "BUS1", "BUS2", "CKT", "Qmax", "Qmin", "Pmax", "Pmin", "Dup", "MVAbase"),
+               "REAX4BU1": ("PCBUS", "Kz", "Kw", "Qmax", "Qmin", "Pmax", "Pmin"), "WTTQA1": ("TRATE",),
+               "TGOV1": ("VMAX",)}
+
+PARAM_DOC = {
+    "H": "inertia constant (s; 0 = infinite bus)", "D": "damping (pu)",
+    "LVPLSW": "low-voltage power logic: 0 off, 1 on", "Tg": "converter current control time constant (s)",
+    "Rrpwr": "active current recovery rate after a fault (pu/s)", "Brkpt": "LVPL breakpoint voltage (pu)",
+    "Zerox": "LVPL zero-crossing voltage (pu)", "Lvpl1": "LVPL current limit at the breakpoint (pu)",
+    "Volim": "high-voltage reactive current limit: voltage (pu)",
+    "Lvpnt1": "low-voltage active current management: upper voltage (pu)",
+    "Lvpnt0": "low-voltage active current management: lower voltage (pu)",
+    "Iolim": "high-voltage clamp: current limit (pu, negative)",
+    "Tfltr": "voltage (or Q) measurement filter time constant (s)", "Khv": "high-voltage clamp acceleration factor",
+    "Iqrmax": "reactive current rate up (pu/s)", "Iqrmin": "reactive current rate down (pu/s)",
+    "Accel": "acceleration factor of the converter's network solution",
+    "BUSR": "regulated bus (0 = the terminal)", "PFFLAG": "1 constant power factor, 0 Q control",
+    "VFLAG": "1 voltage loop (Kvp, Kvi) after the Q loop, 0 Q loop only",
+    "QFLAG": "1 voltage / Q control, 0 constant power factor or Q", "PFLAG": "1 P reference times speed (wind)",
+    "PQFLAG": "at the current limit: 0 Q priority, 1 P priority",
+    "VCMPFLAG": "1 current compensation (Rc, Xc), 0 reactive droop (Kc)",
+    "Vdip": "voltage below which the dip logic acts (pu)", "Vup": "voltage above which the dip logic acts (pu)",
+    "Trv": "terminal voltage filter time constant (s)", "dbd1": "deadband, lower edge (pu, 0 or less)",
+    "dbd2": "deadband, upper edge (pu, 0 or more)", "Kqv": "reactive current injection gain in a dip (pu/pu)",
+    "Iqh1": "reactive current injection, upper limit (pu)", "Iql1": "reactive current injection, lower limit (pu)",
+    "Vref0": "reference voltage for the injection (pu; 0 = the initial terminal voltage)",
+    "Iqfrz": "reactive current held after a dip (pu)", "Thld": "time the injection is held after a dip (s)",
+    "Thld2": "time the active current limit is held after a dip (s)",
+    "Tp": "active power measurement filter time constant (s)", "QMax": "Q limit, upper (pu on MBASE)",
+    "QMin": "Q limit, lower (pu on MBASE)", "VMAX": "voltage control limit, upper (pu)",
+    "VMIN": "voltage control limit, lower (pu)", "Kqp": "Q loop proportional gain", "Kqi": "Q loop integral gain",
+    "Kvp": "voltage loop proportional gain", "Kvi": "voltage loop integral gain",
+    "Vref1": "voltage reference with VFLAG 0 (pu)", "Tiq": "reactive current command time constant (s)",
+    "dPmax": "P reference ramp up (pu/s)", "dPmin": "P reference ramp down (pu/s)",
+    "PMAX": "P limit, upper (pu on MBASE)", "PMIN": "P limit, lower (pu on MBASE; negative: charging)",
+    "Imax": "converter current limit (pu on MBASE)", "Tpord": "P order filter time constant (s)",
+    "T": "battery discharge time at rated power (s)", "SOCini": "initial state of charge (pu)",
+    "SOCmax": "state of charge, upper limit (pu)", "SOCmin": "state of charge, lower limit (pu)",
+    "Rc": "current / line drop compensation resistance (pu)", "Xc": "current / line drop compensation reactance (pu)",
+    "Tr1": "compensated voltage filter time constant (s)", "Kc": "reactive droop gain",
+    "Ke": "lower active current limit scaling: 0 no charging, -1 charging as discharging (storage)",
+    "Vblkl": "voltage below which the inverter blocks (pu)", "Vblkh": "voltage above which the inverter blocks (pu)",
+    "Tblk_delay": "blocking delay (s)", "BUS1": "P and Q measured on the branch from this bus",
+    "BUS2": "... to this bus", "CKT": "... this circuit", "VCFLAG": "1 voltage control with line drop compensation, "
+    "0 reactive droop", "REFFLAG": "1 voltage control, 0 Q control", "FFLAG": "1 frequency response on, 0 off",
+    "Kp": "voltage / Q loop proportional gain", "Ki": "voltage / Q loop integral gain",
+    "Tft": "lead time constant (s)", "Tfv": "lag time constant (s)",
+    "Vfrz": "voltage below which the controller freezes (pu)", "emax": "error limit, upper (pu)",
+    "emin": "error limit, lower (pu)", "Qmax": "Q command limit, upper (pu)", "Qmin": "Q command limit, lower (pu)",
+    "Kpg": "frequency (P) loop proportional gain", "Kig": "frequency (P) loop integral gain",
+    "fdbd1": "frequency deadband, lower edge (pu)", "fdbd2": "frequency deadband, upper edge (pu)",
+    "femax": "frequency error limit, upper (pu)", "femin": "frequency error limit, lower (pu)",
+    "Pmax": "P command limit, upper (pu)", "Pmin": "P command limit, lower (pu)",
+    "Tlag": "P command lag time constant (s)", "Ddn": "droop gain, over-frequency (pu P / pu f)",
+    "Dup": "droop gain, under-frequency (pu P / pu f)", "MVAbase": "the plant controller's MVA base",
+    "PCBUS": "the plant controller's (PLNTBU1's) bus", "CON1": "reserved",
+    "Kz": "its share of the plant's Q command", "Kw": "its share of the plant's P command",
+    "DAMP": "drive train damping (pu)", "Htfrac": "turbine's share of the inertia",
+    "Freq1": "first shaft torsional frequency (Hz)", "Dshaft": "shaft damping (pu)", "Ka": "aerodynamic gain",
+    "Theta0": "initial pitch angle (deg)", "Kiw": "pitch control integral gain (speed)",
+    "Kpw": "pitch control proportional gain (speed)", "Kic": "pitch compensation integral gain",
+    "Kpc": "pitch compensation proportional gain", "Kcc": "pitch compensation cross gain",
+    "TetaMax": "pitch angle, upper (deg)", "TetaMin": "pitch angle, lower (deg)",
+    "RTetaMax": "pitch rate, upper (deg/s)", "RTetaMin": "pitch rate, lower (deg/s)",
+    "TFLAG": "1 speed reference from power, 0 torque", "Kpp": "torque control proportional gain",
+    "Kip": "torque control integral gain", "Twref": "speed reference time constant (s)",
+    "Temax": "electrical torque, upper (pu)", "Temin": "electrical torque, lower (pu)",
+    "TRATE": "turbine rating (MW)", "Tdop": "T'do (s)", "Tdopp": "T''do (s)", "Tqop": "T'qo (s)",
+    "Tqopp": "T''qo (s)", "Xd": "Xd (pu)", "Xq": "Xq (pu)", "Xdp": "X'd (pu)", "Xqp": "X'q (pu)",
+    "Xdpp": "X''d = X''q (pu)", "Xl": "leakage reactance (pu)", "S1": "saturation at 1.0 pu", "S12":
+    "saturation at 1.2 pu", "TA_TB": "TA / TB", "TB": "TB (s)", "K": "exciter gain", "TE": "TE (s)",
+    "EMIN": "field voltage, lower (pu)", "EMAX": "field voltage, upper (pu)", "R": "droop (pu)", "T1": "T1 (s)",
+    "T2": "T2 (s)", "T3": "T3 (s)", "Dt": "turbine damping (pu)"}
+
+
+def _param_doc(name):
+    m = re.match(r"^(V|I)(q|p)(\d+)$", name)
+    if m:
+        return "%s current limit curve (%s), point %s: %s" % (
+            "reactive" if m.group(2) == "q" else "active", "VDL1" if m.group(2) == "q" else "VDL2", m.group(3),
+            "voltage (pu)" if m.group(1) == "V" else "current limit (pu)")
+    m = re.match(r"^(p|spd)(\d)$", name)
+    if m:
+        return "power-speed curve, point %s: %s" % (m.group(2), "power (pu)" if m.group(1) == "p" else "speed (pu)")
+    return PARAM_DOC.get(name, "")
+
+
+PSCAD_KEYS_DOC = [
+    ("{UNITS}", "the units the inverter stands for"), ("{MVA}", "their MVA"),
+    ("{P_MW}", "their P where the inverter connects (MW)"), ("{Q_MVAR}", "their Q there (MVAr)"),
+    ("{P_PU}", "P on {MVA}"), ("{Q_PU}", "Q on {MVA}"), ("{UNIT_MVA}", "one unit's MVA"),
+    ("{UNIT_P_MW}", "one unit's P (MW)"), ("{UNIT_Q_MVAR}", "one unit's Q (MVAr)"),
+    ("{V_PU}", "the voltage where it connects (pu)"), ("{V_KV}", "the same in kV"), ("{KV}", "that bus's base kV"),
+    ("{ANGLE}", "its PSCAD angle (deg, the transformers' phase shifts included)"), ("{FREQ}", "frequency (Hz)"),
+    ("{P_INV_MW}", "P at the inverters' own terminals (MW; a UDM on the MV side)"),
+    ("{Q_INV_MVAR}", "Q there (MVAr)"), ("{V_INV_PU}", "the voltage there (pu)")]
+
+
+def _blank_means(note):
+    m = re.search(r"blank\s*=\s*([^|;)]+)", note or "")
+    return m.group(1).strip().rstrip(".,") if m else ""
+
+
+def _used_by(sheet, key):
+    if sheet in ("Dyr_Params", "Dyr_Records") or key in ("plant_ctrl", "regc_repc", "reec", "zsorce_x", "wmod"):
+        return "PSS/E .dyr"
+    if sheet == "PSCAD_Params" or key.startswith("pscad"):
+        return "PSCAD"
+    return "PSS/E + PSCAD"
+
+
+SHEET_INDEX = [
+    ("Plant", "input", "model name and type, bases, POI and grid, gen-tie, operating point, plant controller, PSCAD"),
+    ("MPT", "input", "main power transformers, 2 or 3 windings"),
+    ("Generators", "input", "one row per generator: units, GSU, collector, Q control, dynamic and PSCAD models"),
+    ("Feeders", "input", "the collector feeders, section by section"),
+    ("Cables", "input", "cable data per length"),
+    ("Collectors", "input", "collector systems shared by several generators"),
+    ("Loads_Shunts", "input", "auxiliary loads, capacitor banks, reactors"),
+    ("Bus_Numbers", "input", "bus numbers and names of your own (blank = automatic)"),
+    ("Dyr_Params", "input", "any dynamic model parameter, by generator, model and name"),
+    ("Dyr_Records", "input", ".dyr records of your own (vendor models)"),
+    ("PSCAD_Params", "input", "the vendor PSCAD model's parameters, by generator"),
+    ("Input_Reference", "reference", "every input: what it is, its unit, the default when blank, the choices, which "
+     "model uses it"),
+    ("Dynamic_Models", "reference", "every dynamic model's parameters: position, default and meaning")]
+_TAB_IN, _TAB_REF, _TAB_HOME = "2E75B6", "70AD47", "1F3864"
+
+
+def _rows_high(texts_widths, line=13.0, most=160.0):
+    """A row's height (points) for wrapped text: [(text, column width)]."""
+    n = 1
+    for t, w in texts_widths:
+        per = max(8, int(w * 1.15))
+        n = max(n, sum(max(1, -(-len(part) // per)) for part in str(t or "").split("\n")))
+    return min(most, line * n + 4)
+
+
 def write_template(path, data=None, roles=None):
-    """The input workbook, filled in with `data` (the example), README first."""
+    """The input workbook, filled in with `data` (the example): a cover sheet, the input sheets, the references."""
     data = data or EXAMPLE
+    stamp = time.strftime("%Y-%m-%d")
     sheets = []
-    rows = [[("SMIB plant model -- input workbook", XS_BOLD), ""]]
+
+    # cover
+    rows, merges, links, hts = [], [], [], {}
+    rows.append([("SMIB PLANT MODEL  |  INPUT WORKBOOK", XS_TITLE), ("", XS_TITLE), ("", XS_TITLE)])
+    rows.append([("PSS/E (.raw, .dyr) and PSCAD (.pscx) models of a plant from one workbook -- smib_build.py, "
+                  + stamp, XS_SUB), ("", XS_SUB), ("", XS_SUB)])
+    merges += ["A1:C1", "A2:C2"]
+    hts.update({1: 34, 2: 20})
+
+    def section(title):
+        rows.append([])
+        rows.append([(title, XS_SECTION), ("", XS_SECTION), ("", XS_SECTION)])
+        merges.append("A%d:C%d" % (len(rows), len(rows)))
+        hts[len(rows)] = 20
+
+    section("HOW TO USE")
+    for k, t in enumerate([
+            "Fill in the yellow cells -- the example plant (100 MW PV + 100 MW BESS on one MPT) shows the format. "
+            "A blank cell takes its default (Input_Reference lists every one).",
+            "Plant: Model type -- SMIB: one equivalent feeder per MPT, each generator one machine | DETAILED: every "
+            "feeder section, the units at each node a machine of their own. PSS/E and PSCAD are built alike.",
+            "Save, then run:   python smib_build.py <this workbook>.xlsx   (or keep the workbook next to the script "
+            "and run the script on its own).",
+            "Read <name>_REPORT.txt in the output folder: the equivalents, the load flow, the models and every "
+            "CHECK line."]):
+        rows.append([("Step %d" % (k + 1), XS_ITEM), (t, XS_CELL), ""])
+        hts[len(rows)] = _rows_high([(t, 100)])
+    section("SHEETS")
+    for name, kind, what in SHEET_INDEX:
+        rows.append([(name, XS_LINK), (what, XS_CELL), (kind, XS_TAG)])
+        links.append(("A%d" % len(rows), name))
+    section("COLOURS")
+    for st, sample, what in ((XS_INPUT, "", "your inputs"), (XS_NOTE, "note", "what to enter, the default when "
+                                                                              "blank"),
+                             (XS_HEAD, "Column", "column titles"), (XS_SECTION, "SECTION", "a group of items"),
+                             (XS_TAG, "PSS/E + PSCAD", "which model an input goes into")):
+        rows.append([(sample, st), (what, XS_CELL), ""])
+    section("GUIDE")
     for topic, text in README:
-        rows.append([(topic, XS_BOLD), (text, XS_WRAP)])
-    sheets.append(("README", _xl_sheet(rows, [14, 120])))
-    rows = [[("Item", XS_HEAD), ("Value", XS_HEAD), ("Unit", XS_HEAD), ("Notes", XS_HEAD)]]
-    lists = []
+        rows.append([(topic, XS_ITEM if topic else XS_CELL), (text, XS_CELL), ""])
+        hts[len(rows)] = _rows_high([(text, 100)])
+    sheets.append(("README", _xl_sheet(rows, [18, 100, 14], merges=merges, links=links, heights=hts, tab=_TAB_HOME,
+                                       grid=False, fit=True)))
+
+    # Plant: sections of items
+    head = ["Item", "Value", "Unit", "Blank means", "Choices", "Description", "Used by"]
+    widths = [26, 18, 7, 18, 22, 72, 13]
+    rows, merges, lists, hts = [[(h, XS_HEAD) for h in head]], [], [], {1: 22}
     pl = data.get("plant", {})
-    for k, (key, item, unit, note, choices) in enumerate(PLANT_FIELDS):
-        rows.append([(item, XS_BOLD), (pl.get(key), XS_INPUT), unit, (note, XS_NOTE)])
+    for key, item, unit, note, choices in PLANT_FIELDS:
+        if key in PLANT_SECTIONS:
+            rows.append([(PLANT_SECTIONS[key], XS_SECTION)] + [("", XS_SECTION)] * (len(head) - 1))
+            merges.append("A%d:G%d" % (len(rows), len(rows)))
+            hts[len(rows)] = 18
+        blank = "required" if key == "poi_kv" else ("one of SCR, short-circuit MVA or R + X" if key == "grid_scr"
+                                                    else _blank_means(note))
+        rows.append([(item, XS_ITEM), (pl.get(key), XS_INPUT), (unit, XS_CELL),
+                     (blank, XS_REQ if blank.startswith(("required", "one of")) else XS_CELL),
+                     (" | ".join(choices) if choices else "", XS_CELL), (note, XS_NOTE),
+                     (_used_by("Plant", key), XS_TAG)])
+        hts[len(rows)] = _rows_high([(note, 72), (" | ".join(choices or []), 22), (blank, 18)])
         if choices:
-            lists.append(("B%d" % (k + 2), choices))
-    sheets.append(("Plant", _xl_sheet(rows, [24, 18, 7, 90], (0, 1), lists)))
+            lists.append(("B%d" % len(rows), choices))
+    sheets.append(("Plant", _xl_sheet(rows, widths, (1, 1), lists, merges=merges, heights=hts, tab=_TAB_IN, fit=True)))
+
+    # the tables
     for sheet, key, cols in TABLES:
+        widths = [max(c[4], 10) for c in cols]
         rows = [[(c[1], XS_HEAD) for c in cols], [(c[2] or "", XS_NOTE) for c in cols]]
+        hts = {1: 32, 2: _rows_high([(c[2], w) for c, w in zip(cols, widths)], line=12.0, most=132.0)}
         recs = list(data.get(key, []))
         if key == "bus_numbers" and roles and not recs:
             recs = [{"bus": r, "number": None, "name": None} for r in roles]
         for rec in recs:
-            rows.append([(rec.get(c[0]), XS_INPUT if c[0] != "record" else 0) for c in cols])
+            rows.append([(rec.get(c[0]), XS_CODE if c[0] == "record" else XS_INPUT) for c in cols])
+        while len(rows) < max(len(recs) + 2 + 12, 22):
+            rows.append([(None, XS_CODE if c[0] == "record" else XS_INPUT) for c in cols])
         lists = [("%s3:%s500" % (_col_letters(i), _col_letters(i)), c[3]) for i, c in enumerate(cols) if c[3]]
-        sheets.append((sheet, _xl_sheet(rows, [c[4] for c in cols], (1, 2), lists)))
+        sheets.append((sheet, _xl_sheet(rows, widths, (1, 2), lists, heights=hts, tab=_TAB_IN, fit=len(cols) < 15)))
+
+    # Input_Reference: every input
+    head = ["Sheet", "Field", "Key", "Unit", "Blank means", "Choices", "Description", "Used by"]
+    widths = [14, 26, 18, 7, 20, 24, 80, 13]
+    rows = [[("INPUT REFERENCE  |  every input of every sheet", XS_TITLE)] + [("", XS_TITLE)] * 7,
+            [("What each input is, its unit, what a blank cell means, the choices and which model it goes into. "
+              "Bus names and the PSCAD placeholders are at the end.", XS_SUB)] + [("", XS_SUB)] * 7,
+            [(h, XS_HEAD) for h in head]]
+    merges, links, hts = ["A1:H1", "A2:H2"], [], {1: 30, 2: 18, 3: 20}
+
+    def ref_section(title, sheet=None):
+        rows.append([(title, XS_SECTION)] + [("", XS_SECTION)] * 7)
+        merges.append("A%d:H%d" % (len(rows), len(rows)))
+        hts[len(rows)] = 18
+        if sheet:
+            links.append(("A%d" % len(rows), sheet))
+
+    ref_section("Plant", "Plant")
+    for key, item, unit, note, choices in PLANT_FIELDS:
+        rows.append([("Plant", XS_CELL), (item, XS_ITEM), (key, XS_CELL), (unit, XS_CELL),
+                     ("required" if key == "poi_kv" else _blank_means(note), XS_CELL),
+                     (" | ".join(choices) if choices else "", XS_CELL), (note, XS_CELL),
+                     (_used_by("Plant", key), XS_TAG)])
+        hts[len(rows)] = _rows_high([(note, 80), (" | ".join(choices or []), 24), (_blank_means(note), 20)])
+    for sheet, key, cols in TABLES:
+        ref_section(sheet, sheet)
+        for c in cols:
+            note = (c[2] or "").lstrip("# ").strip()
+            rows.append([(sheet, XS_CELL), (c[1], XS_ITEM), (c[0], XS_CELL), ("", XS_CELL),
+                         (_blank_means(note), XS_CELL), (" | ".join(c[3]) if c[3] else "", XS_CELL), (note, XS_CELL),
+                         (_used_by(sheet, c[0]), XS_TAG)])
+            hts[len(rows)] = _rows_high([(note, 80), (" | ".join(c[3] or []), 24), (_blank_means(note), 20)])
+    ref_section("BUS NAMES -- Connect to, At, Bus_Numbers and {<bus>} in Dyr_Records take these")
+    for nm, what in (("IB", "the infinite bus"), ("POI", "the point of interconnection"),
+                     ("HV", "the gen-tie's plant end (the POI when there is no gen-tie)"),
+                     ("<MPT> or <MPT>:LV", "an MPT's LV winding"), ("<MPT>:TV", "a 3-winding MPT's tertiary"),
+                     ("<MPT>:HV", "an MPT with a tie line of its own: its HV end"),
+                     ("<MPT>:COLL", "SMIB: the far end of the MPT's one equivalent feeder"),
+                     ("<collector>", "a shared collector's far end (SMIB without merging)"),
+                     ("<generator>:MV", "a generator's GSU HV side"),
+                     ("<generator> or <generator>:LV", "a generator's terminal"),
+                     ("<collector>_<feeder>_S<n>", "DETAILED: the far end of feeder section n"),
+                     ("<generator>_<feeder>_S<n>:LV", "DETAILED: the terminal of the units at that node")):
+        rows.append([("", XS_CELL), (nm, XS_ITEM), ("", XS_CELL), ("", XS_CELL), ("", XS_CELL), ("", XS_CELL),
+                     (what, XS_CELL), ("", XS_CELL)])
+    ref_section("PSCAD_Params PLACEHOLDERS -- filled in for each inverter a vendor model stands for", "PSCAD_Params")
+    for k, what in PSCAD_KEYS_DOC:
+        rows.append([("PSCAD_Params", XS_CELL), (k, XS_ITEM), ("", XS_CELL), ("", XS_CELL), ("", XS_CELL),
+                     ("", XS_CELL), (what, XS_CELL), ("PSCAD", XS_TAG)])
+    sheets.append(("Input_Reference", _xl_sheet(rows, widths, (2, 3), merges=merges, links=links, heights=hts,
+                                                tab=_TAB_REF, fit=True)))
+
+    # Dynamic_Models: every parameter of every model
+    head = ["Model", "Position", "Parameter", "Default", "Set by the script", "Description"]
+    rows = [[("DYNAMIC MODELS  |  every parameter, its default and meaning", XS_TITLE)] + [("", XS_TITLE)] * 5,
+            [("To change one: a row in Dyr_Params with the Generator (IB: the infinite bus, PLANT: the plant "
+              "controller), the Model, the Parameter (or its position) and the Value. 'auto' values come from the "
+              "plant data (limits on MBASE, buses, shares).", XS_SUB)] + [("", XS_SUB)] * 5,
+            [(h, XS_HEAD) for h in head]]
+    merges, hts = ["A1:F1", "A2:F2"], {1: 30, 2: 30, 3: 20}
+    for model, (hdr, nic, names) in DYR_LIB.items():
+        rows.append([("%s -- %s" % (model, MODEL_DOC.get(model, "")), XS_SECTION)] + [("", XS_SECTION)] * 5)
+        merges.append("A%d:F%d" % (len(rows), len(rows)))
+        hts[len(rows)] = 18
+        for k, nm in enumerate(names):
+            pos = ("ICON%d" % (k + 1)) if k < nic else ("CON%d" % (k - nic + 1))
+            rows.append([(model, XS_CELL), (pos, XS_CELL), (nm, XS_ITEM), (DYN_DEFAULTS[model].get(nm), XS_CELL),
+                         ("auto" if nm in AUTO_PARAMS.get(model, ()) else "", XS_TAG if nm in
+                          AUTO_PARAMS.get(model, ()) else XS_CELL), (_param_doc(nm), XS_CELL)])
+    sheets.append(("Dynamic_Models", _xl_sheet(rows, [11, 9, 13, 11, 14, 78], (0, 3), merges=merges, heights=hts,
+                                               tab=_TAB_REF, fit=True)))
     write_xlsx(path, sheets)
     return path
 
@@ -965,7 +1323,10 @@ class Net(object):
         self.ctl = {}
         self.op = {}                             # the operating point
         self.plant_ctrl = None                   # REPC_B: {model, gens, mbase} (the .dyr)
-        self.pscad_slots, self.pscad_det = [], []  # PSCAD: the inverters' slots, the detailed collectors
+        self.model = "SMIB"                      # SMIB: one feeder per MPT | DETAILED: every feeder section
+        self.moved = {}                          # DETAILED: bus names that now stand for the collector's root
+        self.merged = []                         # SMIB: the feeders made of several collectors
+        self.pscad_slots = []                    # PSCAD: the inverters' slots
         self.pscad_groups = []                   # PSCAD: the runs of R, L, C (single-phase R, L, C: drawn three times)
         self.notes = []
 
@@ -1386,21 +1747,28 @@ def build_network(inp, log):
             raise InputError("%s: collector %s has no rows in Feeders" % (w, cname))
         used.add(cname.upper())
         res = wecc_collector(cname, rows, cables, net.kv(at), sb, f, unit_mw, None, log)
-        res.update({"root": at, "own": None,
-                    "pscad": _choice(r, "pscad_collector", w, ["EQUIVALENT", "DETAILED"], "EQUIVALENT")})
+        res.update({"root": at, "own": None, "end": "C:" + cname})
         net.colls[cname] = res
         net.add_bus("C:" + cname, net.kv(at), w, aliases=(cname,))
         add_line(net, at, "C:" + cname, {"r": res["r"], "x": res["x"], "b": res["b"], "R": res["R"],
                                            "X": res["X"], "B": res["B"], "count": 1, "rate": 0.0, "kv": net.kv(at),
-                                           "km": 0.0}, cname, "COLLECTOR", w)
+                                           "km": 0.0, "w_mw": res["W"]}, cname, "COLLECTOR", w)
 
     for g in gens:
         build_generator(net, g, feeders, cables, unit_mw, used, log)
+    net.model = _choice(pl, "model_type", W, ["SMIB", "DETAILED"], "SMIB")
+    if net.model == "SMIB":
+        one_feeder_per_mpt(net)
+    else:
+        expand_collectors(net)
 
     for r in inp["loads_shunts"]:
         w = r["_where"]
         kind = _choice(r, "kind", w, ["LOAD", "SHUNT"], "LOAD")
         at = net.find(_txt(r.get("at")), w)
+        if _txt(r.get("at")).upper() in net.moved:
+            net.notes.append("NOTE: %s: %s -- in the DETAILED model %s, the collector's root" % (
+                w, _txt(r.get("at")), at))
         if kind == "LOAD":
             net.loads.append({"bus": at, "mw": _num(r, "mw", w, 0.0), "mvar": _num(r, "mvar", w, 0.0),
                               "name": _txt(r.get("name")) or "LOAD", "where": w})
@@ -1417,7 +1785,8 @@ def build_network(inp, log):
     control(net, pl)
     number_buses(net, pl, inp["bus_numbers"])
     for u in inp.get("_unknown", []):
-        net.notes.append("NOTE: not used -- %s" % u)
+        net.notes.append("NOTE: not used -- %s%s" % (u, " (Plant: Model type, SMIB or DETAILED, now sets PSS/E and "
+                                                        "PSCAD alike)" if "PSCAD COLLECTOR" in u.upper() else ""))
     return net
 
 
@@ -1509,8 +1878,7 @@ def gen_data(r):
          "q_mode": _choice(r, "q_mode", w, ["share", "fixed"], "share"),
          "zsorce_x": _num(r, "zsorce_x", w), "wmod": _int(r, "wmod", w, None),
          "pscad": {"library": _txt(r.get("pscad_library")), "definition": _txt(r.get("pscad_definition")),
-                   "ac_port": _txt(r.get("pscad_ac_port")), "at": _choice(r, "pscad_inv_at", w, ["LV", "MV"], "LV"),
-                   "collector": _choice(r, "pscad_collector", w, ["EQUIVALENT", "DETAILED"], "EQUIVALENT")}}
+                   "ac_port": _txt(r.get("pscad_ac_port")), "at": _choice(r, "pscad_inv_at", w, ["LV", "MV"], "LV")}}
     d = _num(r, "dispatch_mw", w)
     g["dispatch"] = g["pmax"] if d is None else d
     if g["dispatch"] > g["pmax"] + 1e-6 or g["dispatch"] < g["pmin"] - 1e-6:
@@ -1544,14 +1912,14 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
             raise InputError("%s: Collector FEEDERS but Feeders has no rows for %s" % (w, name))
         used.add(name.upper())
         res = wecc_collector(name, rows, cables, kv, net.sb, net.f, unit_mw, name, log)
-        res.update({"root": at, "own": name, "pscad": g["pscad"]["collector"]})
+        res.update({"root": at, "own": name, "end": mv})
         net.colls[name] = res
         n = res["N"].get(name.upper(), 0)
         if n != g["n"]:
             net.notes.append("CHECK: %s: its feeders carry %d units, Units says %d -- the equivalent weighs the "
                              "feeders' units; the machine has %d" % (w, n, g["n"], g["n"]))
         line = {"r": res["r"], "x": res["x"], "b": res["b"], "R": res["R"], "X": res["X"], "B": res["B"],
-                "count": 1, "rate": 0.0, "kv": kv, "km": 0.0}
+                "count": 1, "rate": 0.0, "kv": kv, "km": 0.0, "w_mw": res["W"]}
     elif mode == "EQUIVALENT":
         if rows:
             raise InputError("%s: Collector EQUIVALENT, but Feeders has rows for %s" % (w, name))
@@ -1562,16 +1930,13 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
             line = {"r": rr, "x": xx, "b": bb, "R": rr * zb, "X": xx * zb, "B": bb / zb * 1e6}
         else:
             line = {"r": rr / zb, "x": xx / zb, "b": bb * 1e-6 * zb, "R": rr, "X": xx, "B": bb}
-        line.update({"count": 1, "rate": 0.0, "kv": kv, "km": 0.0})
+        line.update({"count": 1, "rate": 0.0, "kv": kv, "km": 0.0, "w_mw": max(abs(g["pmax"]), abs(g["pmin"]))})
         if abs(complex(line["r"], line["x"])) < 1e-9:
             raise InputError("%s: the collector equivalent has no impedance" % w)
     else:
         if rows:
             raise InputError("%s: Collector NONE, but Feeders has rows for %s" % (w, name))
         line = None
-    if g["pscad"]["collector"] == "DETAILED" and mode != "FEEDERS":
-        net.notes.append("NOTE: %s: PSCAD collector DETAILED needs Collector FEEDERS -- PSCAD draws the %s"
-                         % (w, "equivalent" if line else "units on %s" % at))
     if line:
         net.add_bus(mv, kv, w)
         add_line(net, at, mv, line, name + "-COLL", "COLLECTOR", w)
@@ -1608,6 +1973,135 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
     if any(x["bus"] == g["bus"] for x in net.gens):
         raise InputError("%s: two generators on one terminal bus -- give each its own GSU" % w)
     net.gens.append(g)
+
+
+def _drop_bus(net, role, to):
+    """Bus `role` goes: every name that stood for it now stands for `to` -> those names."""
+    names = [a for a, r in net.alias.items() if r == role]
+    for a in names:
+        net.alias[a] = to
+    del net.bus[role]
+    return names
+
+
+def one_feeder_per_mpt(net):
+    """SMIB: the collector equivalents that start at one bus (an MPT's LV or TV winding) become one feeder: the
+       WECC equivalent of them all, each weighed by the MW it carries -- Z = sum(Zc Wc^2) / W^2, B = sum(Bc) --
+       with every generator's GSU at its far end."""
+    terminals = set(g["bus"] for g in net.gens)
+    groups = collections.OrderedDict()
+    for ln in net.lines:
+        if ln["kind"] == "COLLECTOR" and ln["to"] not in terminals:
+            groups.setdefault(ln["fr"], []).append(ln)
+    for root, lns in groups.items():
+        W = sum(ln["w_mw"] for ln in lns)
+        if len(lns) < 2 or not W > 0:
+            continue
+        base = root[:-3] if root.upper().endswith(":LV") else root
+        at = list(net.bus).index(lns[0]["to"])
+        end = net.add_bus(base + ":COLL", net.kv(root), "Plant (SMIB)")
+        order = list(net.bus.items())                    # numbered where the first one was
+        order.insert(at, order.pop())
+        net.bus = collections.OrderedDict(order)
+        z = sum((complex(ln["r"], ln["x"]) * ln["w_mw"] ** 2 for ln in lns), 0j) / W ** 2
+        Z = sum((complex(ln["R"], ln["X"]) * ln["w_mw"] ** 2 for ln in lns), 0j) / W ** 2
+        ends = [ln["to"] for ln in lns]
+        for e in ends:
+            _drop_bus(net, e, end)
+        for t in net.tx2 + net.tx3:
+            for k in ("hv", "lv", "tv"):
+                if t.get(k) in ends:
+                    t[k] = end
+        for g in net.gens:
+            if g["mv"] in ends:
+                g["mv"] = end
+        for res in net.colls.values():
+            if res.get("end") in ends:
+                res["end"] = end
+        k = net.lines.index(lns[0])
+        net.lines = [ln for ln in net.lines if not any(ln is x for x in lns)]
+        merged = {"r": z.real, "x": z.imag, "b": sum(ln["b"] for ln in lns), "R": Z.real, "X": Z.imag,
+                  "B": sum(ln["B"] for ln in lns), "count": 1, "rate": 0.0, "kv": net.kv(root), "km": 0.0, "w_mw": W,
+                  "fr": root, "to": end, "name": base.replace(":", "_") + "-COLL", "kind": "COLLECTOR",
+                  "where": "Plant (SMIB)", "of": [(ln["name"], ln["w_mw"]) for ln in lns]}
+        net.lines.insert(k, merged)
+        net.merged.append(merged)
+
+
+def expand_collectors(net):
+    """DETAILED: every collector from Feeders, section by section (identical feeder copies lumped); the units of
+       a generator at each node a machine of their own (its generator's unit data, P and Q in proportion) behind
+       a GSU of its own (its generator's, scaled to them)."""
+    for cname, res in list(net.colls.items()):
+        end, root = res["end"], res["root"]
+        line = next((ln for ln in net.lines if ln["kind"] == "COLLECTOR" and ln["to"] == end), None)
+        gby = dict((g["name"].upper(), g) for g in net.gens)
+        mine = [gby[G] for G in res["N"] if G in gby]
+        odd = [g["name"] for g in mine if g["mv"] != end or g["bus"] == end]
+        if line is None or odd:
+            net.notes.append("NOTE: DETAILED: collector %s stays its equivalent -- %s" % (
+                cname, "%s not straight on it (a collector of its own, or no GSU)" % ", ".join(odd) if odd
+                else "no line"))
+            continue
+        kv = res["kv"]
+        w = "Feeders (collector %s)" % cname
+        net.lines.remove(line)
+        nodes = {}
+        for fd in res["feeders"]:
+            for sc in fd["sections"]:
+                nodes[(fd["name"], sc["num"])] = net.add_bus("%s_%s_S%d" % (_node(cname), _node(fd["name"]),
+                                                                            sc["num"]), kv, w)
+        slots = collections.OrderedDict((g["name"], []) for g in mine)
+        for fd in res["feeders"]:
+            n = fd["copies"]
+            for sc in fd["sections"]:
+                a = root if sc["from"] == 0 else nodes[(fd["name"], sc["from"])]
+                b = nodes[(fd["name"], sc["num"])]
+                add_line(net, a, b, {"r": sc["z"].real / n, "x": sc["z"].imag / n, "b": sc["b"] * n,
+                                     "R": sc["R"] / n, "X": sc["X"] / n, "B": sc["B"] * n, "count": 1, "rate": 0.0,
+                                     "kv": kv, "km": sc["length"] * LEN_KM[sc["unit"]], "copies": n},
+                         b, "SECTION", sc["where"])
+                for G, cnt in sc["units"].items():
+                    g = gby[G]
+                    slots[g["name"]].append(_unit_group(net, g, "%s_%s_S%d" % (_node(g["name"]), _node(fd["name"]),
+                                                                             sc["num"]), cnt * n, b, sc["where"]))
+        net.moved.update((a, "%s (collector %s)" % (root, cname)) for a in _drop_bus(net, end, root))
+        for g in mine:
+            if g["gsu"]:
+                net.tx2.remove(g["gsu"])
+                net.moved.update((a, "%s (%s)" % (root, g["name"])) for a in _drop_bus(net, g["bus"], root))
+            k = net.gens.index(g)
+            net.gens[k:k + 1] = slots[g["name"]]
+        res["end"] = None
+    seen = set()
+    for g in net.gens:
+        if g["name"].upper() in seen:
+            raise InputError("%s: DETAILED: two machines are named %s -- rename a generator or feeder"
+                             % (g["where"], g["name"]))
+        seen.add(g["name"].upper())
+
+
+def _unit_group(net, g, name, units, at, where):
+    """The units of generator g at one collector node: a machine of g's kind with g's unit data, P (and fixed Q)
+       in proportion, behind its own GSU (g's, scaled to them)."""
+    k = float(units) / g["n"]
+    u = dict(g)
+    u.update({"name": name, "family": g["name"], "n": units, "mbase": units * g["unit"]["mva"],
+              "pmax": units * g["unit"]["pmax"], "pmin": units * g["unit"]["pmin"],
+              "qmax": units * g["unit"]["qmax"], "qmin": units * g["unit"]["qmin"], "dispatch": g["dispatch"] * k,
+              "connect": at, "mv": at, "where": "%s, %s" % (g["where"], name)})
+    if g["q_mode"] == "fixed" and not isinstance(g["q_fixed"], tuple):
+        u["q_fixed"] = g["q_fixed"] * k
+    if g["gsu"]:
+        lv = net.add_bus(name + ":LV", net.kv(g["bus"]), where)
+        d = dict((key, g["gsu"].get(key)) for key in ("kind", "z_pct", "x_r", "load_loss_kw", "kv1", "kv2", "tap",
+                                                       "vector", "nll_pct", "im_pct", "unit_mva"))
+        d.update({"name": name + "-GSU", "hv": at, "lv": lv, "mva": g["gsu"]["mva"] * k,
+                  "units": g["gsu"]["units"] * k, "rate": g["gsu"]["rate"] * k, "count": 1, "where": where})
+        u["gsu"], u["bus"] = add_tx2(net, d), lv
+    else:
+        u["gsu"], u["bus"] = None, at
+    return u
 
 
 def thevenin(net, pl, gens):
@@ -2304,14 +2798,15 @@ def dyr_params(net, inp):
     """{GENERATOR, IB or PLANT: {MODEL: {param: value}}} from Dyr_Params; each name (or ICONn / CONn) checked
        against the model."""
     out = collections.defaultdict(lambda: collections.defaultdict(dict))
-    gnames = dict((g["name"].upper(), g["name"]) for g in net.gens)
-    gnames["IB"] = "IB"
-    gnames["PLANT"] = "PLANT"
+    gnames = members(net)
+    gnames["IB"] = ["IB"]
+    gnames["PLANT"] = ["PLANT"]
     for r in inp["dyr_params"]:
         w = r["_where"]
         gen = (_txt(r.get("generator")) or "").upper()
         if gen not in gnames:
-            raise InputError("%s: Generator %r -- one of %s" % (w, r.get("generator"), ", ".join(sorted(gnames))))
+            raise InputError("%s: Generator %r -- one of %s" % (w, r.get("generator"), ", ".join(
+                sorted(members(net, family_only=True)) + ["IB", "PLANT"])))
         model = (_txt(r.get("model")) or "").upper()
         if model not in DYR_LIB:
             raise InputError("%s: Model %r -- one of %s" % (w, r.get("model"), ", ".join(DYR_LIB)))
@@ -2334,7 +2829,20 @@ def dyr_params(net, inp):
             val = _txt(val) or "1"
         else:
             val = _num(r, "value", w, required=True)
-        out[gnames[gen]][model][names[pname.upper()]] = val
+        for gname in gnames[gen]:
+            out[gname][model][names[pname.upper()]] = val
+    return out
+
+
+def members(net, family_only=False):
+    """{GENERATOR (upper): [machine names]}: a generator's own name stands for all its machines (DETAILED: one per
+       collector node), a machine's name for itself."""
+    out = collections.OrderedDict()
+    for g in net.gens:
+        out.setdefault(g.get("family", g["name"]).upper(), []).append(g["name"])
+    if not family_only:
+        for g in net.gens:
+            out.setdefault(g["name"].upper(), [g["name"]])
     return out
 
 
@@ -2455,15 +2963,17 @@ def write_dyr(net, inp, path):
         if not text:
             continue
         gname = _txt(r.get("generator"))
-        g = None
+        gs = [None]
         if gname:
-            g = next((x for x in net.gens if x["name"].upper() == gname.upper()), None)
-            if g is None:
+            names = members(net).get(gname.upper())
+            if not names:
                 raise InputError("%s: Generator %r -- no such generator" % (w, gname))
-        rec = fill_placeholders(net, text, g, w).strip()
-        if not rec.endswith("/"):
-            rec += " /"
-        L.append(rec)
+            gs = [x for x in net.gens if x["name"] in names]
+        for g in gs:
+            rec = fill_placeholders(net, text, g, w).strip()
+            if not rec.endswith("/"):
+                rec += " /"
+            L.append(rec)
     _write_text(path, "\n".join(L))
     return recs
 
@@ -2571,62 +3081,48 @@ def pscad_model(net, inp):
                       "params": [_pp("fault time", ["TF"], "%s [s]" % _g(t)),
                                  _pp("fault duration", ["DF"], "%s [s]" % _g(flt["dur"]))], "ports": []})
 
-    def line(ln, xx, yy):
+    cap = collections.OrderedDict()                     # each node's line and cable charging: one C there
+
+    def line(ln):
         n = ln["count"]
         a, b = ln["fr"], ln["to"]
         mid = ln["name"] + "_RL"
         out = []
         if ln["R"] > 1e-9:
-            out.append(_rlc(ln["name"] + "_R", "R", ln["R"] / n, a, mid, xx, yy, "%s R" % ln["name"]))
+            out.append(_rlc(ln["name"] + "_R", "R", ln["R"] / n, a, mid, 0, 0, "%s R" % ln["name"]))
         else:
             mid = a
-        out.append(_rlc(ln["name"] + "_L", "L", ln["X"] / n / w, mid, b, xx + 10, yy, "%s L" % ln["name"]))
-        if ln["B"] > 0:
-            cc = ln["B"] * n / w / 2.0                          # uS / (rad/s) = uF; half at each end
-            out.append(_rlc(ln["name"] + "_C1", "C", cc, a, "GND", xx, yy + 8, "%s C/2 (%s end)" % (ln["name"], a)))
-            out.append(_rlc(ln["name"] + "_C2", "C", cc, b, "GND", xx + 10, yy + 8,
-                            "%s C/2 (%s end)" % (ln["name"], b)))
+        out.append(_rlc(ln["name"] + "_L", "L", ln["X"] / n / w, mid, b, 0, 0, "%s L" % ln["name"]))
+        for nd in (a, b):
+            if ln["B"] > 0:
+                c0 = cap.setdefault(nd, [0.0, []])
+                c0[0] += ln["B"] * n / w / 2.0               # uS / (rad/s) = uF: half at each end
+                c0[1].append(ln["name"])
         return out
 
     for ln in net.lines:
-        if ln["kind"] in ("GENTIE", "TIE"):
-            comps.extend(line(ln, nx(14), y0))
-            nx(6)
-    for t in net.tx2:
-        if t["kind"] != "MPT":
-            continue
-        comps.append(_tx2_comp(t, net, nx(14), y0))
-    for t in net.tx3:
-        comps.append(_tx3_comp(t, net, nx(16), y0))
-    yy = y0 + 22
-    dets = detailed_collectors(net, shift)
-    drawn = set(d["name"] for d in dets)
-    covered = set(gn for d in dets for gn in d["gens"])
-    for ln in net.lines:
-        if ln["kind"] == "COLLECTOR" and ln["to"].startswith("C:") and ln["name"] not in drawn:
-            comps.extend(line(ln, 20, yy))
-            yy += 20
+        if ln["kind"] != "GRID":                         # the grid's Thevenin impedance: drawn above
+            comps.extend(line(ln))
     slots = []
+    inside = set(id(g["gsu"]) for g in net.gens if g["gsu"] and _gen_slot(net, g, shift)["at"] == "MV")
+    for t in net.tx2:
+        if t["kind"] == "MPT":
+            comps.append(_tx2_comp(t, net, 0, 0))
+    for t in net.tx3:
+        comps.append(_tx3_comp(t, net, 0, 0))
     for g in net.gens:
-        if g["name"] in covered:
-            continue
-        xx = 20
-        ln = next((l for l in net.lines if l["kind"] == "COLLECTOR" and l["to"] == g["mv"] and l["name"] ==
-                   g["name"] + "-COLL"), None)
-        if ln:
-            comps.extend(line(ln, xx, yy))
         sl = _gen_slot(net, g, shift)
-        if g["gsu"] and sl["at"] == "LV":
-            comps.append(_tx2_comp(g["gsu"], net, xx + 26, yy))
-        comps.append(_inverter_comp(g, sl, net, xx + 42, yy))
+        first = len(comps)
+        if g["gsu"] and id(g["gsu"]) not in inside:
+            comps.append(_tx2_comp(g["gsu"], net, 0, 0))
+        comps.append(_inverter_comp(g, sl, net, 0, 0))
+        comps[first]["hang"] = bool(g.get("family"))    # a DETAILED unit group: below its feeder node, always
         slots.append(sl)
-        yy += 20
-    for d in dets:
-        got, yy = _detailed_comps(net, d, 20, yy)
-        comps.extend(got)
-        slots.extend(d["slots"])
-    net.pscad_slots, net.pscad_det = slots, dets
-    xx = 20
+    net.pscad_slots = slots
+    for nd, (cuf, names) in cap.items():
+        comps.append(_rlc(_node(nd) + "_CHG", "C", cuf, nd, "GND", 0, 0, "charging at %s: C/2 of %s" % (
+            nd, ", ".join(names))))
+    xx = yy = 0
     for ld in net.loads:
         v = net.kv(ld["bus"])
         if ld["mw"] > 0:
@@ -2717,7 +3213,7 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
 
     def chain(c, frm, x, y):
         """c hanging off node frm (at x) on row y, then what lies beyond it -> (bottom, right)"""
-        x0 = x + (pad if rlc(c) and frm and not mid(frm) else 0)
+        x0 = x + (pad if rlc(c) and frm and not mid(frm) else 0) + c.get("lead", 0)
         put(c, x0 + cw // 2, y, frm)
         right, bottom = x0 + cw * c.get("room", 1), y
         far = [n for n in nodes[id(c)] if n != frm]
@@ -2734,9 +3230,9 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
         kids = [c for c in at[n] if id(c) not in placed]
         chains = [c for c in kids if len(nodes[id(c)]) >= 2]
         big = [c for c in chains if not small(c, n)]
-        main = big[0] if big else (chains[0] if chains else None)
-        if main is None:
-            main = next((c for c in kids if len(nodes[id(c)]) == 1 and
+        main = big[0] if big else next((c for c in chains if not c.get("hang")), None)
+        if main is None and not chains:
+            main = next((c for c in kids if len(nodes[id(c)]) == 1 and not c.get("hang") and
                          not any(p["node"] == "GND" for p in c["ports"])), None)
         drops = [c for c in kids if c is not main and (len(nodes[id(c)]) == 1 or small(c, n))]
         others = [c for c in kids if c is not main and all(c is not d for d in drops)]
@@ -2757,7 +3253,7 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
     x0, y0 = 20, 10
     for c in [c for c in at[root] if len(nodes[id(c)]) == 1]:
         if not any(p["node"] == "GND" for p in c["ports"]):
-            put(c, x0 - cw // 2, y0, None)          # the infinite source, left of its bus
+            put(c, x0 - cw // 2 - 6, y0, None)      # the infinite source, left of its bus: room for its name
     bottom, _r = node(root, x0, y0)
     for c in comps:                                     # in the room left beside the one it goes with (a timer)
         t = next((t for t in comps if t["tag"] == c.get("beside") and id(t) in placed), None)
@@ -2880,163 +3376,18 @@ def _inverter_comp(g, sl, net, x, y):
     if ps["definition"]:
         sl["tag"], sl["model"] = sl["name"] + "_INV", ps["definition"]
         return {"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
-                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [],
+                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6,
                 "note": "inverter: vendor model %s -- %s" % (ps["definition"], what),
                 "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
                            ["@dim3", "@first"]}]}
     sl["tag"], sl["model"] = sl["name"] + "_SRC", "stand-in source"
     c = _source(sl["tag"], sl["name"], sl["kv"], sl["vm"], sl["ang"], net.f, x, y, sl["node"])
+    c["lead"] = 6                                       # a wire of its own to its node: the node's name, a UDM's place
+    c["orient"] = 4                                     # mirrored: its terminal faces the node (on its left)
     c["note"] += (" -- stand-in for the inverter (%s): holds the load flow; your UDM goes on node %s"
                   % (what, _node(sl["node"])))
     c["gen"], c["slot"] = g["name"], sl
     return c
-
-
-def detailed_collectors(net, shift):
-    """The collectors PSCAD draws section by section (PSCAD collector DETAILED), each one solved."""
-    out = []
-    for cname, res in net.colls.items():
-        if res.get("pscad") != "DETAILED":
-            continue
-        gens = [g for g in net.gens if g["name"].upper() in res["N"]]
-        gone = set()
-        for g in gens:
-            gone.update((g["mv"], g["bus"]))
-        if res["own"] is None:
-            gone.add("C:" + cname)
-            bad = ["%s (no units on its feeders)" % g["name"] for g in net.gens
-                   if g["connect"] == "C:" + cname and g not in gens]
-            bad += ["%s (not straight on it: a collector of its own)" % g["name"] for g in gens
-                    if g["mv"] != "C:" + cname]
-            if bad:
-                net.notes.append("NOTE: PSCAD collector %s DETAILED: %s -- PSCAD draws its equivalent"
-                                 % (cname, ", ".join(bad)))
-                continue
-        on = sorted(set(x["bus"] for x in net.loads + net.shunts if x["bus"] in gone))
-        if on:
-            net.notes.append("NOTE: PSCAD collector %s DETAILED: a load or shunt on %s, which the detailed feeders "
-                             "replace -- PSCAD draws the equivalent" % (cname, ", ".join(on)))
-            continue
-        out.append(detailed_collector(net, cname, res, gens, shift))
-    return out
-
-
-def detailed_collector(net, cname, res, gens, shift):
-    """Collector `cname` section by section -- identical feeder copies lumped (R and X over the copies, B times
-       them) -- with the units at each node behind a GSU of their own (their generator's, scaled to them), solved
-       with its root at the load-flow voltage and every unit at its generator's P and Q."""
-    w = "PSCAD collector %s" % cname
-    sb = net.sb
-    sub = Net(net.name, sb, net.f)
-    root = res["root"]
-    sub.add_bus(root, net.kv(root), w)
-    gby = dict((g["name"].upper(), g) for g in gens)
-    rows, slots, nodes = [], [], {}
-    for k, fd in enumerate(res["feeders"]):
-        for sc in fd["sections"]:
-            nodes[(k, sc["num"])] = sub.add_bus("%s_%s_S%d" % (_node(cname), _node(fd["name"]), sc["num"]),
-                                                res["kv"], w)
-    for k, fd in enumerate(res["feeders"]):
-        n = fd["copies"]
-        row = []
-        for sc in fd["sections"]:
-            a = root if sc["from"] == 0 else nodes[(k, sc["from"])]
-            b = nodes[(k, sc["num"])]
-            ln = add_line(sub, a, b, {"r": sc["z"].real / n, "x": sc["z"].imag / n, "b": sc["b"] * n,
-                                      "R": sc["R"] / n, "X": sc["X"] / n, "B": sc["B"] * n, "count": 1, "rate": 0.0,
-                                      "kv": res["kv"], "km": 0.0}, b, "SECTION", w)
-            here = []
-            for G, cnt in sc["units"].items():
-                g = gby[G]
-                share = float(cnt * n) / res["N"][G]
-                sl = {"name": "%s_%s_S%d" % (_node(g["name"]), _node(fd["name"]), sc["num"]), "gen": g["name"],
-                      "units": cnt * n, "mva": cnt * n * g["unit"]["mva"], "mv": b, "copies": n,
-                      "s": complex(g["p"], g["q"]) * share, "at": g["pscad"]["at"] if g["gsu"] else "LV"}
-                if g["gsu"]:
-                    lv = sub.add_bus(sl["name"] + "_LV", net.kv(g["bus"]), w)
-                    d = dict((key, g["gsu"].get(key)) for key in ("kind", "z_pct", "x_r", "load_loss_kw", "kv1", "kv2",
-                                                                  "tap", "vector", "nll_pct", "im_pct", "unit_mva"))
-                    d.update({"name": sl["name"] + "_GSU", "hv": b, "lv": lv, "mva": g["gsu"]["mva"] * share,
-                              "units": g["gsu"]["units"] * share, "rate": g["gsu"]["mva"] * share, "count": 1,
-                              "where": w})
-                    sl["gsu"], sl["lv"] = add_tx2(sub, d), lv
-                else:
-                    sl["gsu"], sl["lv"] = None, b
-                here.append(sl)
-            row.append((ln, here))
-            slots.extend(here)
-        rows.append((fd, row))
-    roles = list(sub.bus)
-    idx, Y, N = ybus(sub, roles)
-    bs = net.bus[root]
-    v0 = cmath.rect(bs["vm"], math.radians(bs["va"]))
-    sinj = [0j] * N
-    for sl in slots:
-        sinj[idx[sl["lv"]]] += sl["s"] / sb
-    V, ok, _it = newton(Y, idx[root], v0, sinj, [v0] * N)
-    flows(sub, idx, V, Y)
-    fl = dict((f["name"], f) for f in sub.op["flows"])
-    for sl in slots:
-        g = gby[sl["gen"].upper()]
-        if sl["at"] == "MV" and sl["gsu"]:
-            node, s_at = sl["mv"], -fl[sl["gsu"]["name"]]["s1"]
-        else:
-            node, s_at = sl["lv"], sl["s"]
-        v = V[idx[node]]
-        sl.update({"node": node, "kv": sub.kv(node), "vm": abs(v), "p": s_at.real, "q": s_at.imag,
-                   "s_inv": sl["s"], "v_inv": abs(V[idx[sl["lv"]]]),
-                   "ang": math.degrees(cmath.phase(v)) + shift.get(g["bus"] if node == sl["lv"] and sl["gsu"]
-                                                                   else root, 0.0)})
-    s_root = sum((f["s1"] for f in sub.op["flows"] if f["kind"] == "SECTION" and f["a"] == root), 0j)
-    eq = next((f for f in net.op["flows"] if f["kind"] == "COLLECTOR" and f["a"] == root and
-               f["name"] == (cname if res["own"] is None else cname + "-COLL")), None)
-    if not ok:
-        net.notes.append("CHECK: PSCAD collector %s DETAILED: its load flow did not converge -- the stand-in "
-                         "sources' voltages are approximate" % cname)
-    return {"name": cname, "root": root, "sub": sub, "rows": rows, "slots": slots, "gens": [g["name"] for g in gens],
-            "s_root": s_root, "s_eq": eq["s1"] if eq else None, "ok": ok}
-
-
-def _detailed_comps(net, d, x0, y0):
-    """PSCAD components of a detailed collector: per feeder a row of sections (R, L; the charging as one
-       capacitor per node), and at each node with units a GSU and the inverter per generator."""
-    w = 2.0 * math.pi * net.f
-    comps = []
-    cap = collections.OrderedDict()
-    for _fd, row in d["rows"]:
-        for ln, _here in row:
-            for nd in (ln["fr"], ln["to"]):
-                cap[nd] = cap.get(nd, 0.0) + ln["B"] / w / 2.0          # uS / (rad/s) = uF; half at each end
-    gby = dict((g["name"], g) for g in net.gens)
-    if cap.get(d["root"], 0.0) > 0:
-        comps.append(_rlc("%s_ROOT_C" % _node(d["name"]), "C", cap[d["root"]], d["root"], "GND", x0, y0 + 8,
-                          "%s: the first sections' C/2 at %s" % (d["name"], d["root"])))
-    y = y0
-    for fd, row in d["rows"]:
-        x = x0 + 8
-        tall = 1
-        for ln, here in row:
-            a, b = ln["fr"], ln["to"]
-            mid = b + "_RL"
-            note = "feeder %s%s section %s" % (fd["name"], (" (x %d lumped)" % fd["copies"]) if fd["copies"] > 1
-                                               else "", b.rsplit("_S", 1)[-1])
-            if ln["R"] > 1e-9:
-                comps.append(_rlc(b + "_R", "R", ln["R"], a, mid, x, y, note + " R"))
-            else:
-                mid = a
-            comps.append(_rlc(b + "_L", "L", ln["X"] / w, mid, b, x + 10, y, note + " L"))
-            if cap.get(b, 0.0) > 0:
-                comps.append(_rlc(b + "_C", "C", cap[b], b, "GND", x + 20, y + 8, "C/2 of the sections at " + b))
-            for j, sl in enumerate(here):
-                g = gby[sl["gen"]]
-                yj = y + 18 + 14 * j
-                if sl["gsu"] and sl["at"] == "LV":
-                    comps.append(_tx2_comp(sl["gsu"], net, x + 20, yj))
-                comps.append(_inverter_comp(g, sl, net, x + 36, yj))
-            tall = max(tall, len(here))
-            x += 48
-        y += 18 + 14 * tall + 8
-    return comps, y
 
 
 def pscad_shifts(vg):
@@ -3102,13 +3453,15 @@ def pscad_spec(net, inp, comps):
     params = collections.defaultdict(list)
     for r in inp["pscad_params"]:
         gname = _txt(r.get("generator"))
-        g = next((x for x in net.gens if x["name"].upper() == (gname or "").upper()), None)
-        if g is None:
+        names = members(net).get((gname or "").upper())
+        if not names:
             raise InputError("%s: Generator %r -- no such generator" % (r["_where"], gname))
+        g = next(x for x in net.gens if x["name"] == names[0])
         if not g["pscad"]["definition"]:
             net.notes.append("NOTE: %s: PSCAD_Params for %s, which has no PSCAD definition -- not used"
-                             % (r["_where"], g["name"]))
-        params[g["name"]].append((_txt(r.get("parameter")), _txt(r.get("value")) or "", r["_where"]))
+                             % (r["_where"], gname))
+        for nm in names:
+            params[nm].append((_txt(r.get("parameter")), _txt(r.get("value")) or "", r["_where"]))
     for cm in comps:
         if cm["kind"] == "VENDOR":
             vals = slot_values(cm["slot"], net)
@@ -3278,22 +3631,27 @@ def choice_value(cmp, name, words):
     return None
 
 
-def set_params(cmp, items, log, quiet=False):
-    try:
-        have = cmp.parameters() or {}
-    except Exception as e:
-        log("    CHECK: its parameters cannot be read (%s)" % e)
-        return
-    up = dict((k.upper(), k) for k in have)
+def set_params(cmp, items, log, quiet=False, names=None, read_back=True):
+    """Set the component's parameters -- in one call, one at a time where that is refused -- and log them (as
+       PSCAD reads them back where read_back). names: its parameters' names, when known (saves a call)."""
+    if names is None:
+        try:
+            names = list((cmp.parameters() or {}).keys())
+        except Exception as e:
+            log("    CHECK: its parameters cannot be read (%s)" % e)
+            return
+    have = set(names)
+    up = dict((k.upper(), k) for k in names)
+    todo = []
     for it in items:
-        names = [n for n in it["names"] if n in have] or [up[n.upper()] for n in it["names"] if n.upper() in up]
-        if not names:
+        found = [n for n in it["names"] if n in have] or [up[n.upper()] for n in it["names"] if n.upper() in up]
+        if not found:
             if it.get("need", True):
                 log("    CHECK: %-26s no parameter %s -- set it by hand: %s"
                     % (it["what"], "/".join(it["names"]), it["value"] if it["value"] is not None
                        else "/".join(it["choice"] or [])))
             continue
-        name = names[0]
+        name = found[0]
         val = it["value"]
         if it.get("choice"):
             val = choice_value(cmp, name, it["choice"])
@@ -3301,13 +3659,34 @@ def set_params(cmp, items, log, quiet=False):
                 log("    CHECK: %-26s %s: no choice like %s (its choices: %s)"
                     % (it["what"], name, "/".join(it["choice"]), _range(cmp, name)))
                 continue
+        todo.append((it, name, val))
+    if not todo:
+        return
+    refused = set()
+    try:
+        cmp.parameters(parameters=dict((name, val) for _it, name, val in todo))
+    except Exception:
+        for it, name, val in todo:                    # one at a time: which one is refused
+            try:
+                cmp.parameters(parameters={name: val})
+            except Exception as e:
+                refused.add(name)
+                log("    CHECK: %-26s %s = %r refused: %s" % (it["what"], name, val, e))
+    if quiet:
+        return
+    got = {}
+    if read_back:
         try:
-            cmp.parameters(parameters={name: val})
-            got = (cmp.parameters() or {}).get(name)
-            if not quiet:
-                log("    %-28s %-8s = %-22s read back: %s" % (it["what"], name, val, got))
-        except Exception as e:
-            log("    CHECK: %-26s %s = %r refused: %s" % (it["what"], name, val, e))
+            got = cmp.parameters() or {}
+        except Exception:
+            read_back = False
+    for it, name, val in todo:
+        if name in refused:
+            continue
+        if read_back:
+            log("    %-28s %-8s = %-22s read back: %s" % (it["what"], name, val, got.get(name)))
+        else:
+            log("    %-28s %-8s = %s" % (it["what"], name, val))
 
 
 def _range(cmp, name):
@@ -3326,6 +3705,10 @@ DRAWN = []                 # every component placed
 REACH = [0, 0]             # how far right and down the drawing goes (grid units)
 PAGE = [0, 0]              # the page set: width, height (grid units)
 NEED = [0, 0]              # the drawing's size it was set for
+NAMES = {}                 # each component type's parameter names (read once)
+BREAKOUT_ORIENT = {}       # the breakout orientation that faced the phases, each side
+READ_BACK = False          # True: log every value as PSCAD reads it back (slower); else the first of each type
+T0 = time.time()
 
 
 def _trace(kind, **kw):
@@ -3457,7 +3840,8 @@ def label(canvas, x, y, name):
     """The node's name (a node label) on the port at (x, y)."""
     try:
         lb = _made(canvas.create_component("master:nodelabel", x, y, Name=name), x, y)
-        _trace("comp", role="label", name=name, ports=eports(lb))
+        if os.environ.get("SMIB_PSCAD_TRACE"):
+            _trace("comp", role="label", name=name, ports=eports(lb))
         return True
     except Exception:
         return False
@@ -3469,13 +3853,13 @@ def breakout_for(canvas, targets, right, names, log):
        given; its top single port level with the top target, 5 grid units off. Every orientation is tried.
        -> (component, its three-phase port, its single ports top to bottom) or None."""
     tx, ty = targets[0][1], targets[0][2]
-    for orient in range(8):
+    for orient in sorted(range(8), key=lambda o: o != BREAKOUT_ORIENT.get(right)):
+        fixed = False
         try:
             b = canvas.create_component("master:breakout", tx - 8 if right else tx + 8, ty, orient)
-        except TypeError:
-            if orient:
-                break
+        except TypeError:                            # this mhi.pscad places it one way only
             b = canvas.create_component("master:breakout", tx - 8 if right else tx + 8, ty)
+            fixed = True
         except Exception as e:
             NO_BREAKOUT.append(str(e))
             return None
@@ -3491,10 +3875,13 @@ def breakout_for(canvas, targets, right, names, log):
             log("CHECK: a breakout cannot be moved with this mhi.pscad")
             return None
         if ok:
+            BREAKOUT_ORIENT[right] = orient
             ps = eports(b)
             _made(b, tx, ty + 2 * DY)
             return b, [p for p in ps if p[3] == 3][0], sorted([p for p in ps if p[3] == 1], key=lambda p: p[2])
         _delete(canvas, b)
+        if fixed:
+            break
     log("CHECK: no orientation of the breakout faces the phases")
     return None
 
@@ -3533,7 +3920,7 @@ def phase_group(canvas, g, made, spec_of, points, log):
             if k:
                 c = spec_of[tag]
                 cmp = _made(canvas.create_component(used, c["x"], c["y"] + DY * k), c["x"], c["y"] + DY * k)
-                set_params(cmp, c["params"], log, quiet=True)
+                set_params(cmp, c["params"], log, quiet=True, names=NAMES.get(used))
                 added += 1
             ports = sorted([p for p in eports(cmp) if p[3] == 1], key=lambda p: (p[1], p[2]))
             _trace("comp", role="phase", tag=tag, phase=k, ports=ports)
@@ -3562,42 +3949,86 @@ def phase_group(canvas, g, made, spec_of, points, log):
     return added
 
 
-def join(canvas, points, log):
-    """Wires: each node from its leftmost port, along its row to what carries on, and down a trunk to what hangs
-       below; a ground on every ground port; the node's name on its leftmost port."""
+def plan(points):
+    """Each node's wires: from its leftmost port along its row to what carries on, and down a trunk to what hangs
+       below -> {node: [(a, b) ...]}."""
+    out = {}
     for node in sorted(points):
         pts = sorted(set((p[0], p[1]) for p in points[node]))
-        if node == "GND":
-            for (x, y) in pts:
-                ground(canvas, x, y, log)
-            continue
-        if len(pts) < 2:
-            log("CHECK: node %s has one connection only" % node)
+        if node == "GND" or len(pts) < 2:
             continue
         ax, ay = pts[0]
+        segs, prev = [], (ax, ay)
+        for q in [q for q in pts[1:] if q[1] == ay]:
+            segs.append((prev, q))
+            prev = q
+        off = [q for q in pts[1:] if q[1] != ay]
+        if off:
+            ys = sorted(set([ay] + [q[1] for q in off]))
+            for y1, y2 in zip(ys, ys[1:]):
+                segs.append(((ax, y1), (ax, y2)))
+            for y in sorted(set(q[1] for q in off)):
+                prev = (ax, y)
+                for q in sorted(q for q in off if q[1] == y):
+                    if q != prev:
+                        segs.append((prev, q))
+                    prev = q
+        out[node] = segs
+    return out
+
+
+def _inside(p, a, b):
+    return ((a[0] == b[0] == p[0] and min(a[1], b[1]) < p[1] < max(a[1], b[1])) or
+            (a[1] == b[1] == p[1] and min(a[0], b[0]) < p[0] < max(a[0], b[0])))
+
+
+def spot(node, wires, points):
+    """Where the node's name goes: the middle of its longest wire (along a row before a trunk), clear of the
+       symbols at its ends and of every other node's wires -> (wire index, point) or None (its first port)."""
+    best = None
+    for k, (a, b) in enumerate(wires[node]):
+        n = abs(b[0] - a[0]) + abs(b[1] - a[1])
+        if n < 4:
+            continue
+        m = ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
+        if any(_inside(m, c, d) or m in (c, d) for other, ws in wires.items() if other != node for c, d in ws):
+            continue
+        if any((p[0], p[1]) == m for other, ps in points.items() if other != node for p in ps):
+            continue
+        key = (a[1] == b[1] and n >= 8, n)
+        if best is None or key > best[0]:
+            best = (key, k, m)
+    return best[1:] if best else None
+
+
+def join(canvas, points, log):
+    """Wires: each node from its leftmost port, along its row to what carries on, and down a trunk to what hangs
+       below; a ground on every ground port; the node's name in the middle of its longest wire."""
+    for (x, y) in sorted(set((p[0], p[1]) for p in points.get("GND", []))):
+        ground(canvas, x, y, log)
+    wires = plan(points)
+    for node in sorted(points):
+        if node == "GND":
+            continue
+        if node not in wires:
+            log("CHECK: node %s has one connection only" % node)
+            continue
+        at = spot(node, wires, points)
         try:
-            prev = (ax, ay)
-            for q in [q for q in pts[1:] if q[1] == ay]:
-                wire(canvas, prev, q)
-                prev = q
-            off = [q for q in pts[1:] if q[1] != ay]
-            if off:
-                ys = sorted(set([ay] + [q[1] for q in off]))
-                for y1, y2 in zip(ys, ys[1:]):
-                    wire(canvas, (ax, y1), (ax, y2))
-                for y in sorted(set(q[1] for q in off)):
-                    prev = (ax, y)
-                    for q in sorted(q for q in off if q[1] == y):
-                        if q != prev:
-                            wire(canvas, prev, q)
-                        prev = q
+            for k, (a, b) in enumerate(wires[node]):
+                if at and k == at[0]:
+                    wire(canvas, a, at[1])
+                    wire(canvas, at[1], b)
+                else:
+                    wire(canvas, a, b)
         except Exception as e:
             log("CHECK: node %s: no wires (%s) -- node labels instead" % (node, e))
-            for (x, y) in pts:
+            for (x, y) in sorted(set((p[0], p[1]) for p in points[node])):
                 label(canvas, x, y, node)
             continue
         if not node.endswith("_RL"):
-            label(canvas, ax, ay, node)
+            x, y = at[1] if at else wires[node][0][0]
+            label(canvas, x, y, node)
 
 
 def main():
@@ -3671,7 +4102,12 @@ def main():
         cmp, used = None, None
         for d in defns:
             try:
-                cmp = canvas.create_component(d, c["x"], c["y"])
+                try:
+                    cmp = canvas.create_component(d, c["x"], c["y"], c.get("orient", 0))
+                except TypeError:
+                    cmp = canvas.create_component(d, c["x"], c["y"])
+                    if c.get("orient"):
+                        log("    CHECK: it could not be mirrored here -- its terminal is on the far side")
                 used = d
                 if cmp is not None:
                     _made(cmp, c["x"], c["y"])
@@ -3683,18 +4119,24 @@ def main():
                 % (" / ".join(defns), ", ".join(p["node"] for p in c["ports"])))
             continue
         log("    %s at (%d, %d)" % (used, c["x"], c["y"]))
-        if used not in seen_defn:
+        first = used not in seen_defn
+        if first:
             try:
                 have = cmp.parameters() or {}
                 seen_defn[used] = sorted(have)
                 log("    its parameters: %s" % ", ".join("%s=%s" % (k, have[k]) for k in sorted(have)))
             except Exception:
-                seen_defn[used] = []
+                seen_defn[used] = None
             try:
                 log("    its bounds %s, location %s" % (tuple(cmp.bounds), tuple(cmp.location)))
             except Exception:
                 pass
-        set_params(cmp, c["params"], log)
+        NAMES[used] = seen_defn[used]
+        set_params(cmp, c["params"], log, names=seen_defn[used], read_back=first or READ_BACK)
+        if len(made) % 10 == 9:
+            print("  ... %d of %d components placed (%.0f s)" % (len(made) + 1, len(SPEC["components"]),
+                                                              time.time() - T0))
+            sys.stdout.flush()
         ports = eports(cmp)
         if any(p["node"] for p in c["ports"]) and len(ports) > len(c["ports"]) and "View" in str(seen_defn[used]):
             log("    (%d electrical ports: %s)" % (len(ports), ", ".join(p[0] for p in ports)))
@@ -3718,6 +4160,7 @@ def main():
                nodes=[n for n, _q in picked])
         for node, got in picked:
             log("    port %-6s (%d, %d) dim %d -> %s" % (got[0], got[1], got[2], got[3], node))
+    t_placed = time.time()
     single = any(c["kind"] in ("R", "L", "C") and made[c["tag"]][2] and
                  all(q[3] == 1 for _n, q in made[c["tag"]][2]) for c in SPEC["components"] if c["tag"] in made)
     points, grouped, extra = {}, set(), 0
@@ -3747,7 +4190,9 @@ def main():
         if c.get("drives") and c["tag"] in made and c["drives"] in made:
             link(canvas, made[c["tag"]][0], made[c["drives"]][0], "%s -> %s" % (c["tag"], c["drives"]), log)
     log("")
+    t_phases = time.time()
     join(canvas, points, log)
+    t_wired = time.time()
     made = len(made)
     log("nodes joined by wires: %d" % len([n for n in points if n != "GND"]))
     w, h = reach(canvas)
@@ -3759,6 +4204,8 @@ def main():
         log("    %-24s node %-24s %5s units  P %9.3f MW  Q %8.3f MVAr  V %.5f pu at %9.4f deg  %s"
             % (s["tag"], s["node"], s["units"], s["p"], s["q"], s["vm"], s["ang"], s["model"]))
     prj.save()
+    log("time: components %.0f s, phases b and c %.0f s, wires and names %.0f s, saving %.0f s" % (
+        t_placed - T0, t_phases - t_placed, t_wired - t_phases, time.time() - t_wired))
     if os.environ.get("SMIB_PSCAD_TRACE"):
         with open(os.environ["SMIB_PSCAD_TRACE"], "w") as fh:
             json.dump(TRACE, fh)
@@ -3809,15 +4256,6 @@ def pscad_slot_lines(net, ind):
     flt = next((c for c in getattr(net, "pscad_comps", []) if c["kind"] == "FAULT"), None)
     if flt:
         L.append(ind + "POI_FAULT: %s (its timing: POI_FAULT_TIMER)" % flt["note"])
-    for d in net.pscad_det:
-        nsec = sum(len(row) for _fd, row in d["rows"])
-        L.append(ind + "Collector %s DETAILED: %d feeder row(s) (identical copies lumped), %d sections, %d inverters; "
-                       "at %s the feeders take %s" % (d["name"], len(d["rows"]), nsec, len(d["slots"]), d["root"],
-                                                      _c(d["s_root"])))
-        if d["s_eq"] is not None:
-            ds = d["s_root"] - d["s_eq"]
-            L.append(ind + "  the WECC equivalent takes %s there in the load flow (PSS/E): %+.4f MW, %+.4f MVAr apart"
-                           % (_c(d["s_eq"]), ds.real, ds.imag))
     return L
 
 
@@ -3923,6 +4361,18 @@ def report_text(net, inp, recs, comps, files, src):
     for sh in net.shunts:
         L.append("   shunt %-10s at %-10s %.3f MVAr at 1 pu" % (sh["name"], sh["bus"], sh["mvar"]))
     L += ["", "4. WECC COLLECTOR EQUIVALENTS  (Zeq = sum(Zi Wi^2) / W^2, Beq = sum(Bi); Wi = MW downstream)"]
+    if net.model == "DETAILED":
+        secs = [ln for ln in net.lines if ln["kind"] == "SECTION"]
+        L.append("   MODEL TYPE DETAILED: every feeder section (identical feeder copies lumped) -- %d sections, %d "
+                 "machines, each the units at one node behind its own GSU; the equivalents below are for reference"
+                 % (len(secs), len(net.gens)))
+    else:
+        L.append("   MODEL TYPE SMIB: one equivalent feeder per MPT winding, each generator one machine behind one GSU")
+        for m in net.merged:
+            L.append("   feeder %s (%s -> %s) = %s, weighed by MW: R %.5f X %.5f ohm, B %.3f uS = r %.7f x %.7f "
+                     "b %.7f pu" % (m["name"], m["fr"], m["to"], " + ".join("%s %.1f MW" % (n, wmw) for n, wmw in
+                                                                             m["of"]), m["R"], m["X"], m["B"],
+                                    m["r"], m["x"], m["b"]))
     if not net.colls:
         L.append("   (none from feeders)")
     for cname, res in net.colls.items():
@@ -4461,9 +4911,13 @@ def build(src, out_dir=None, check=True, pscad=True):
     log("[smib] input  %s" % src)
     inp = read_input(src)
     net = build_network(inp, log)
-    log("[smib] %d buses, %d generators (%s), %d collector equivalents from feeders"
-        % (len(net.bus), len(net.gens), ", ".join("%s %s" % (g["name"], g["type"]) for g in net.gens),
-           len(net.colls)))
+    gens = collections.OrderedDict((g.get("family", g["name"]), g["type"]) for g in net.gens)
+    log("[smib] %s model: %d buses, %d generators (%s) as %d machines, %s"
+        % (net.model, len(net.bus), len(gens), ", ".join("%s %s" % kv for kv in gens.items()), len(net.gens),
+           ("%d feeder sections" % len([ln for ln in net.lines if ln["kind"] == "SECTION"])) if net.model == "DETAILED"
+           else "%d collector feeder(s)%s" % (len([ln for ln in net.lines if ln["kind"] == "COLLECTOR"]),
+                                              " (%d merged per MPT)" % sum(len(m["of"]) for m in net.merged)
+                                              if net.merged else "")))
     operating_point(net, log)
     s = net.op["s_grid"]
     log("[smib] operating point: P at POI %.3f MW, Q %.3f MVAr, POI %.5f pu, infinite bus %.5f pu"
