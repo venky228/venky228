@@ -89,8 +89,11 @@
      found by itself (the py launcher, PythonXY folders) or PSSE_PYTHON.
 
    PSCAD
-     <name>_build_pscad.py   run it with a Python that has PSCAD's automation
-                             library (mhi.pscad, PSCAD 5). It builds <name>.pscx
+     <name>.pscx             the PSCAD case: built right away (PSCAD_BUILD) when
+                             this Python has PSCAD's automation library mhi.pscad
+                             (pip install mhi.pscad) and PSCAD 5 is on this PC
+     <name>_build_pscad.py   what builds it -- run it again any time with a Python
+                             that has mhi.pscad. It builds <name>.pscx
                              from master-library parts: the infinite source at
                              the solved voltage, the grid impedance, gen-tie,
                              MPTs, the collectors (the WECC equivalent, or
@@ -119,6 +122,7 @@
        python smib_build.py --template SMIB_INPUT.xlsx   an input workbook to fill in
        python smib_build.py SMIB_INPUT.xlsx              the models
        python smib_build.py SMIB_INPUT.xlsx --no-psse    the models, no PSS/E check
+       python smib_build.py SMIB_INPUT.xlsx --no-pscad   the models, no PSCAD build
        python smib_build.py                              (the Run button) the workbook
            in INPUT_XLSX, else the one beside this script; several or none: a
            file dialog -- none chosen: a new SMIB_INPUT.xlsx beside it to fill in
@@ -151,6 +155,7 @@ PSSE_CHECK = True                 # PSS/E found: the .raw read back and solved, 
 PSSE_VERSION = 35                 # the PSS/E that checks the models: 35 | 34 | 36 ... | None = the newest installed
 PSSE_PYTHON = ""                  # a Python PSS/E has a psspy for (its PSSPYxy folders), used when this one has none
                                   # (3.13 ...): "" = found (the py launcher, PythonXY folders) | r"C:\...\python.exe"
+PSCAD_BUILD = True                # this Python has mhi.pscad (PSCAD 5's automation library): the .pscx built right away
 FLAT_RUN_S = 10.0                 # flat run length (s)
 FLAT_TOL = (0.5, 0.5, 0.001)      # MW, MVAr, pu: a larger drift in the flat run is listed for review
 DYN_PARAMS = (60, 0.60, 0.0000095, 1.0 / 240.0, 0.033333)   # NITER, ACCEL, TOL, DELT, FREQFILT
@@ -490,7 +495,9 @@ README = [
                      "{UNIT_P_MW} {UNIT_Q_MVAR} one unit's, {V_PU} {V_KV} {KV} {ANGLE} the voltage there, its base "
                      "and PSCAD angle, {P_INV_MW} {Q_INV_MVAR} {V_INV_PU} at the inverters' own terminals (a UDM on "
                      "the MV side), {FREQ} -- e.g. Ninv = {UNITS}, Vt0 = {V_PU}."),
-    ("PSCAD", "The case holds the grid (source and Thevenin impedance), the gen-tie, the MPTs, each collector (the "
+    ("PSCAD", "The .pscx is built in the same run when PSCAD 5 and its Python library mhi.pscad (pip install "
+              "mhi.pscad) are on the PC; otherwise run <name>_build_pscad.py where they are. "
+              "The case holds the grid (source and Thevenin impedance), the gen-tie, the MPTs, each collector (the "
               "WECC equivalent as a pi section, or DETAILED: every feeder section, identical feeder copies lumped), "
               "the GSUs and, on each GSU's LV side, the inverter: your UDM (PSCAD library, definition and AC port "
               "in Generators) or a stand-in source at the solved voltage -- delete it and connect your UDM to its "
@@ -3045,7 +3052,7 @@ def choice_value(cmp, name, words):
     return None
 
 
-def set_params(cmp, items, log):
+def set_params(cmp, items, log, quiet=False):
     try:
         have = cmp.parameters() or {}
     except Exception as e:
@@ -3071,7 +3078,8 @@ def set_params(cmp, items, log):
         try:
             cmp.parameters(parameters={name: val})
             got = (cmp.parameters() or {}).get(name)
-            log("    %-28s %-8s = %-22s read back: %s" % (it["what"], name, val, got))
+            if not quiet:
+                log("    %-28s %-8s = %-22s read back: %s" % (it["what"], name, val, got))
         except Exception as e:
             log("    CHECK: %-26s %s = %r refused: %s" % (it["what"], name, val, e))
 
@@ -3081,6 +3089,74 @@ def _range(cmp, name):
         return sorted(str(x) for x in cmp.range(name))
     except Exception:
         return "?"
+
+
+PHASES = ("_pa", "_pb", "_pc")
+
+
+def phase_split(canvas, split, joins, log):
+    """This PSCAD's R, L and C are single-phase: each of the case's three-phase ones is placed three times (phase a
+       where the case has it, b and c right of the case) and a breakout joins every three-phase node they meet.
+       -> the number of components added."""
+    three = set(n for n in joins if n != "GND")
+    x0 = max(c["x"] for c in SPEC["components"]) + 40
+    pos = [0]
+
+    def spare():
+        pos[0] += 1
+        return x0 + 30 * ((pos[0] - 1) // 40), 4 + 8 * ((pos[0] - 1) % 40)
+
+    added, met = 0, set()
+    log("")
+    log("R, L and C are single-phase in this PSCAD: %d of them each placed three times, phases a b c (b and c "
+        "from x = %d)" % (len(split), x0))
+    for c, used, picked in split:
+        for k in range(3):
+            if k == 0:
+                got, tag = picked, c["tag"]
+            else:
+                x, y = spare()
+                try:
+                    cmp = canvas.create_component(used, x, y)
+                except Exception as e:
+                    log("CHECK: %s phase %s not created: %s" % (c["tag"], "abc"[k], e))
+                    continue
+                added += 1
+                set_params(cmp, c["params"], log, quiet=True)
+                ports, taken, got = eports(cmp), set(), []
+                for node, g0 in picked:
+                    q = pick(ports, [g0[0]], taken)
+                    if q is None:
+                        log("CHECK: %s phase %s has no port %s" % (c["tag"], "abc"[k], g0[0]))
+                        continue
+                    taken.add(q[0])
+                    got.append((node, q))
+                tag = "%s_%s" % (c["tag"], "abc"[k])
+            for node, q in got:
+                joins.setdefault("GND" if node == "GND" else node + PHASES[k], []).append((q[1], q[2], tag, q[0]))
+                if node != "GND":
+                    met.add(node)
+    for node in sorted(met & three):
+        x, y = spare()
+        try:
+            bo = canvas.create_component("master:breakout", x, y)
+        except Exception as e:
+            log("CHECK: no breakout for node %s (%s) -- join %s to it by hand" % (node, e, " ".join(
+                node + p for p in PHASES)))
+            continue
+        added += 1
+        bp = eports(bo)
+        tri = [p for p in bp if p[3] == 3]
+        one = sorted([p for p in bp if p[3] == 1], key=lambda p: p[0])
+        if len(tri) != 1 or len(one) != 3:
+            log("CHECK: the breakout's ports are %s -- join node %s to %s by hand" % (
+                ", ".join("%s(%d)" % (p[0], p[3]) for p in bp), node, " ".join(node + p for p in PHASES)))
+            continue
+        joins[node].append((tri[0][1], tri[0][2], "BRK_" + node, tri[0][0]))
+        for k, p in enumerate(one):
+            joins.setdefault(node + PHASES[k], []).append((p[1], p[2], "BRK_" + node, p[0]))
+    log("breakouts on %d three-phase node(s): %s" % (len(met & three), ", ".join(sorted(met & three))))
+    return added
 
 
 def main():
@@ -3136,7 +3212,8 @@ def main():
         log("CHECK: run settings not set (%s): %s" % (e, SPEC["settings"]))
     canvas = prj.canvas("Main") if hasattr(prj, "canvas") else prj.user_canvas("Main")
     seen_defn = {}
-    joins = {}                                        # node -> [(x, y)]
+    joins = {}                                        # node -> [(x, y, tag, port)]
+    split = []                                        # single-phase R / L / C: (spec, definition, ports)
     made = 0
     for c in SPEC["components"]:
         log("")
@@ -3172,7 +3249,7 @@ def main():
         ports = eports(cmp)
         if any(p["node"] for p in c["ports"]) and len(ports) > len(c["ports"]) and "View" in str(seen_defn[used]):
             log("    (%d electrical ports: %s)" % (len(ports), ", ".join(p[0] for p in ports)))
-        taken = set()
+        taken, picked = set(), []
         for p in c["ports"]:
             got = pick(ports, p["pick"], taken)
             if got is None:
@@ -3180,8 +3257,15 @@ def main():
                     % (p["node"], ", ".join("%s@(%d,%d)" % (q[0], q[1], q[2]) for q in ports) or "none"))
                 continue
             taken.add(got[0])
-            joins.setdefault(p["node"], []).append((got[1], got[2], c["tag"], got[0]))
-            log("    port %-6s (%d, %d) -> %s" % (got[0], got[1], got[2], p["node"]))
+            picked.append((p["node"], got))
+        one = c["kind"] in ("R", "L", "C") and len(picked) == 2 and all(g[3] == 1 for _n, g in picked)
+        if one:
+            split.append((c, used, picked))
+        for node, got in picked:
+            if not one:
+                joins.setdefault(node, []).append((got[1], got[2], c["tag"], got[0]))
+            log("    port %-6s (%d, %d) -> %s%s" % (got[0], got[1], got[2], node, " (phase a)" if one else ""))
+    extra = phase_split(canvas, split, joins, log) if split else 0
     log("")
     labels = True
     for node, pts in sorted(joins.items()):
@@ -3218,8 +3302,9 @@ def main():
             % (s["tag"], s["node"], s["units"], s["p"], s["q"], s["vm"], s["ang"], s["model"]))
     prj.save()
     log("")
-    log("saved %s: %d of %d components, %d CHECK line(s) above"
-        % (os.path.join(HERE, case + ".pscx"), made, len(SPEC["components"]), log.checks))
+    log("saved %s: %d of %d components%s, %d CHECK line(s) above"
+        % (os.path.join(HERE, case + ".pscx"), made, len(SPEC["components"]),
+           (" (+ %d for phases b and c, breakouts)" % extra) if extra else "", log.checks))
     return 0
 
 
@@ -3874,7 +3959,35 @@ def example_roles():
     return [r.replace("C:", "") for r in net.bus]
 
 
-def build(src, out_dir=None, check=True):
+def pscad_build(files, out, log):
+    """<name>_build_pscad.py run right away when this Python has mhi.pscad: PSCAD 5 builds <name>.pscx."""
+    script = files["pscad_build"]
+    try:
+        import importlib.util
+        have = importlib.util.find_spec("mhi.pscad") is not None
+    except Exception:
+        have = False
+    if not have:
+        log("[pscad] no mhi.pscad in this Python -- install it (%s -m pip install mhi.pscad) and run this again, or "
+            "run %s with a Python that has it: PSCAD 5 builds the .pscx" % (os.path.basename(sys.executable),
+                                                                         os.path.basename(script)))
+        return
+    log("[pscad] PSCAD builds the case: %s" % os.path.basename(script))
+    rc = subprocess.call([sys.executable, script], cwd=out)
+    pscx = sorted(glob.glob(os.path.join(out, "*.pscx")), key=os.path.getmtime)
+    logs = sorted(glob.glob(os.path.join(out, "*_build_pscad_*.txt")), key=os.path.getmtime)
+    last = ""
+    if logs:
+        with io.open(logs[-1], encoding="utf-8", errors="replace") as fh:
+            last = ([ln.strip() for ln in fh if ln.strip()] or [""])[-1]
+    if pscx:
+        files["pscx"] = pscx[-1]
+        log("[pscad] %s" % (last or pscx[-1]))
+    else:
+        log("[pscad] *** no .pscx (exit %s)%s" % (rc, (" -- see %s" % os.path.basename(logs[-1])) if logs else ""))
+
+
+def build(src, out_dir=None, check=True, pscad=True):
     """Everything from the workbook `src`; returns (net, files)."""
     log = Log()
     log("[smib] input  %s" % src)
@@ -3921,6 +4034,9 @@ def build(src, out_dir=None, check=True):
         made = [os.path.basename(files[k]) for k in ("sav", "raw_psse", "snp") if files.get(k)]
         if made:
             log("[psse] PSS/E wrote %s" % ", ".join(made))
+    if pscad and PSCAD_BUILD:
+        log("")
+        pscad_build(files, out, log)
     return net, files
 
 
@@ -4046,7 +4162,7 @@ def main(argv=None):
         print("[smib] *** no file %s" % src)
         return 2
     try:
-        build(os.path.abspath(src), check="--no-psse" not in argv)
+        build(os.path.abspath(src), check="--no-psse" not in argv, pscad="--no-pscad" not in argv)
     except InputError as e:
         print("[smib] *** input: %s" % e)
         return 2
