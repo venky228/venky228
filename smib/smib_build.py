@@ -30,12 +30,13 @@
    THE MODEL -- Plant: Model type, the same for PSS/E and PSCAD
      SMIB (default):
      IB --[grid: SCR, X/R]-- POI --[gen-tie]-- HV --[MPT 1..n]-- collector bus
-        --[one equivalent feeder per MPT winding]-- MV --[GSU]-- LV -- generator
+        --[each generator's own equivalent feeder]-- MV --[GSU]-- LV -- generator
      IB is the infinite bus (the swing bus; GENCLS with H = 0 in the .dyr).
      Each generator is N units aggregated (MBASE, P, Q = N x one unit) behind
-     its GSUs in parallel (count x MVA, the same % impedance). The collectors
-     on one MPT winding are one feeder: the WECC equivalent of them all, each
-     weighed by the MW it carries, every generator's GSU at its far end.
+     its GSUs in parallel (count x MVA, the same % impedance), on a collector
+     equivalent of its own (WECC, each feeder weighed by the MW it carries)
+     from its MPT winding; a generator's collector systems on one winding are
+     one equivalent.
      Generators can share an MPT (its LV or tertiary winding), have MPTs of
      their own, share a collector system, or sit on any bus.
      DETAILED: every feeder section as a branch (identical feeder copies
@@ -104,7 +105,7 @@
                              that has mhi.pscad. It builds <name>.pscx
                              from master-library parts: the infinite source at
                              the solved voltage, the grid impedance, gen-tie,
-                             MPTs, the collectors (SMIB: one feeder per MPT;
+                             MPTs, the collectors (SMIB: one per generator;
                              DETAILED: every feeder section), the GSUs and, on
                              each GSU's LV side, the inverter: your vendor model
                              (UDM: PSCAD library / definition / AC port in
@@ -200,9 +201,9 @@ REEC_OK = {"PV": ("REEC_A", "REEC_D"), "WT4": ("REEC_A", "REEC_D"), "WT3": ("REE
 FAULT_TYPES = ["ABCG", "ABC", "AG", "BG", "CG", "ABG", "BCG", "ACG", "AB", "BC", "AC"]
 PLANT_FIELDS = [
     ("name", "Name", "", "model name: file names and the PSCAD case (letters, digits, _)", None),
-    ("model_type", "Model type", "", "SMIB: one equivalent feeder (WECC) per MPT, each generator one machine behind "
-     "one GSU | DETAILED: every feeder section, the units at each node a machine of their own behind their own GSU "
-     "-- PSS/E and PSCAD alike (blank = SMIB)", ["SMIB", "DETAILED"]),
+    ("model_type", "Model type", "", "SMIB: each generator one machine behind one GSU on its own equivalent feeder "
+     "(WECC) from its MPT | DETAILED: every feeder section, the units at each node a machine of their own behind "
+     "their own GSU -- PSS/E and PSCAD alike (blank = SMIB)", ["SMIB", "DETAILED"]),
     ("sbase_mva", "System base", "MVA", "PSS/E system base (blank = 100)", None),
     ("freq_hz", "Frequency", "Hz", "blank = 60", None),
     ("first_bus", "First bus number", "", "buses are numbered from here + 1 (Bus_Numbers sets any one)", None),
@@ -470,9 +471,9 @@ README = [
               "bus). Numbers are automatic from First bus number; Bus_Numbers sets any one."),
     ("Plant", "Bases, the POI, the grid (SCR and X/R, or short-circuit MVA, or R/X), the gen-tie, the operating "
               "point, the plant controller and the PSCAD run settings."),
-    ("MODEL TYPE", "Plant: Model type sets PSS/E and PSCAD alike. SMIB (default): the collectors on one MPT winding "
-                   "are one equivalent feeder (WECC, each collector weighed by its MW), each generator one machine "
-                   "behind one GSU at its far end. DETAILED: every feeder section is a branch (identical feeder "
+    ("MODEL TYPE", "Plant: Model type sets PSS/E and PSCAD alike. SMIB (default): each generator is one machine "
+                   "behind one GSU on a collector equivalent of its own (WECC, each feeder weighed by its MW) from "
+                   "its MPT winding. DETAILED: every feeder section is a branch (identical feeder "
                    "copies lumped), the units of a generator at each node a machine of their own behind their own "
                    "GSU; a generator's Dyr_Params, Dyr_Records and PSCAD_Params rows apply to all its machines."),
     ("", "Control mode Q: the plant holds the POI voltage with Q at POI into the grid; PF: with that power factor; "
@@ -586,16 +587,16 @@ def _num(row, key, where, default=None, required=False, positive=False, label=No
         v = v.strip() or None
     if v is None:
         if required:
-            raise InputError("%s: %s is missing" % (where, label or _label(key)))
+            raise InputError("%s: %s is missing" % (where, label or _label(key, where)))
         return default
     try:
         x = float(v)
     except (TypeError, ValueError):
-        raise InputError("%s: %s = %r is not a number" % (where, label or _label(key), v))
+        raise InputError("%s: %s = %r is not a number" % (where, label or _label(key, where), v))
     if x != x or x in (float("inf"), float("-inf")):
-        raise InputError("%s: %s = %r is not a number" % (where, label or _label(key), v))
+        raise InputError("%s: %s = %r is not a number" % (where, label or _label(key, where), v))
     if positive and not x > 0:
-        raise InputError("%s: %s must be above 0 (it is %s)" % (where, label or _label(key), v))
+        raise InputError("%s: %s must be above 0 (it is %s)" % (where, label or _label(key, where), v))
     return x
 
 
@@ -604,10 +605,10 @@ def _int(row, key, where, default=None, required=False, minimum=None):
     if x is None:
         return default
     if abs(x - round(x)) > 1e-9:
-        raise InputError("%s: %s = %s is not a whole number" % (where, _label(key), x))
+        raise InputError("%s: %s = %s is not a whole number" % (where, _label(key, where), x))
     x = int(round(x))
     if minimum is not None and x < minimum:
-        raise InputError("%s: %s = %d is below %d" % (where, _label(key), x, minimum))
+        raise InputError("%s: %s = %d is below %d" % (where, _label(key, where), x, minimum))
     return x
 
 
@@ -618,19 +619,22 @@ def _choice(row, key, where, choices, default):
     for c in choices:
         if s.upper() == c.upper():
             return c
-    raise InputError("%s: %s = %r -- one of %s" % (where, _label(key), s, ", ".join(choices)))
+    raise InputError("%s: %s = %r -- one of %s" % (where, _label(key, where), s, ", ".join(choices)))
 
 
 _LABELS = {}
+_SHEET_LABELS = {}                               # (sheet, key): the column's own title on that sheet
 for _k, _lab, _u, _n, _c in PLANT_FIELDS:
     _LABELS[_k] = _lab
 for _sh, _ik, _cols in TABLES:
     for _c in _cols:
         _LABELS.setdefault(_c[0], _c[1])
+        _SHEET_LABELS[(_sh.upper(), _c[0])] = _c[1]
 
 
-def _label(key):
-    return "'%s'" % _LABELS.get(key, key)
+def _label(key, where=None):
+    sheet = re.split(r"[\s(]", str(where or ""), maxsplit=1)[0].upper()
+    return "'%s'" % _SHEET_LABELS.get((sheet, key), _LABELS.get(key, key))
 
 
 def _g(x, nd=6):
@@ -1176,7 +1180,7 @@ def write_template(path, data=None, roles=None):
     for k, t in enumerate([
             "Fill in the yellow cells -- the example plant (100 MW PV + 100 MW BESS on one MPT) shows the format. "
             "A blank cell takes its default (Input_Reference lists every one).",
-            "Plant: Model type -- SMIB: one equivalent feeder per MPT, each generator one machine | DETAILED: every "
+            "Plant: Model type -- SMIB: each generator one machine on its own equivalent feeder | DETAILED: every "
             "feeder section, the units at each node a machine of their own. PSS/E and PSCAD are built alike.",
             "Save, then run:   python smib_build.py <this workbook>.xlsx   (or keep the workbook next to the script "
             "and run the script on its own).",
@@ -1273,8 +1277,7 @@ def write_template(path, data=None, roles=None):
                      ("HV", "the gen-tie's plant end (the POI when there is no gen-tie)"),
                      ("<MPT> or <MPT>:LV", "an MPT's LV winding"), ("<MPT>:TV", "a 3-winding MPT's tertiary"),
                      ("<MPT>:HV", "an MPT with a tie line of its own: its HV end"),
-                     ("<MPT>:COLL", "SMIB: the far end of the MPT's one equivalent feeder"),
-                     ("<collector>", "a shared collector's far end (SMIB without merging)"),
+                     ("<collector>", "a shared collector's far end"),
                      ("<generator>:MV", "a generator's GSU HV side"),
                      ("<generator> or <generator>:LV", "a generator's terminal"),
                      ("<collector>_<feeder>_S<n>", "DETAILED: the far end of feeder section n"),
@@ -1326,9 +1329,9 @@ class Net(object):
         self.ctl = {}
         self.op = {}                             # the operating point
         self.plant_ctrl = None                   # REPC_B: {model, gens, mbase} (the .dyr)
-        self.model = "SMIB"                      # SMIB: one feeder per MPT | DETAILED: every feeder section
+        self.model = "SMIB"                      # SMIB: one feeder per generator | DETAILED: every feeder section
         self.moved = {}                          # DETAILED: bus names that now stand for the collector's root
-        self.merged = []                         # SMIB: the feeders made of several collectors
+        self.merged = []                         # SMIB: a generator's collector systems made one feeder
         self.pscad_slots = []                    # PSCAD: the inverters' slots
         self.pscad_groups = []                   # PSCAD: the runs of R, L, C (single-phase R, L, C: drawn three times)
         self.notes = []
@@ -1351,8 +1354,16 @@ class Net(object):
 
     def find(self, ref, where):
         r = self.alias.get(str(ref or "").strip().upper())
+        if r is None and not str(ref or "").strip():
+            raise InputError("%s: no bus given -- buses: %s" % (where, ", ".join(sorted(self.alias))))
         if r is None:
-            raise InputError("%s: no bus %r -- buses: %s" % (where, ref, ", ".join(sorted(self.alias))))
+            raise InputError("%s: no bus %r -- buses: %s%s" % (where, ref, ", ".join(sorted(self.alias)), (
+                " (each generator has a collector of its own now: <generator>:MV is its far end)"
+                if str(ref).strip().upper().endswith(":COLL") else "")))
+        if str(ref).strip().upper() in self.moved and not (where or "").startswith("Loads_Shunts"):
+            raise InputError("%s: %s is no bus of its own in the DETAILED model (each unit group has its own GSU "
+                             "and terminal) -- give the row the generator's name to have each unit group's own"
+                             % (where, ref))
         return r
 
     def kv(self, role):
@@ -1502,16 +1513,20 @@ def add_line(net, fr, to, ld, name, kind, where):
 # ============================================================================
 # WECC COLLECTOR EQUIVALENT
 # ============================================================================
-def read_cables(rows):
+def read_cables(rows, log=None):
     out = {}
     for r in rows:
         w = r["_where"]
         name = _txt(r.get("cable"))
         if not name:
             raise InputError("%s: the cable has no name" % w)
+        if name.upper() in out:
+            raise InputError("%s: cable %s is already given in %s" % (w, name, out[name.upper()]["where"]))
         unit = _choice(r, "unit", w, LEN_UNITS, "km")
         b = _num(r, "b_per", w)
         c = _num(r, "c_per", w)
+        if b is not None and c is not None and log:
+            log("NOTE: %s: cable %s has both B and C -- B used" % (w, name))
         out[name.upper()] = {"name": name, "unit": unit, "r": _num(r, "r_per", w, required=True),
                              "x": _num(r, "x_per", w, required=True), "b": b, "c": c, "where": w}
     return out
@@ -1522,15 +1537,20 @@ def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
        unit_mw: {GENERATOR (upper): MW of one unit}; own_gen: whose units a row without 'Units of' carries
        (None: a shared collector -- every row says)."""
     zb = kv * kv / sb
-    feeders = collections.OrderedDict()
-    for r in rows:
-        feeders.setdefault(_txt(r.get("feeder")) or "F1", []).append(r)
+    feeders, spelt, fname = collections.OrderedDict(), {}, "F1"
+    for r in rows:                                   # a blank Feeder: the row above's; names in any case alike
+        fname = spelt.setdefault(_txt(r.get("feeder")).upper(), _txt(r.get("feeder"))) if _txt(
+            r.get("feeder")) else fname
+        feeders.setdefault(fname, []).append(r)
     out = []
     sum_zw2, sum_b, W = 0j, 0.0, 0.0
     counts = collections.OrderedDict()
     for fname, frows in feeders.items():
         where = "%s (collector %s, feeder %s)" % (frows[0]["_where"], cname, fname)
-        copies = max(_int(r, "copies", r["_where"], 1, minimum=1) for r in frows)
+        given = sorted(set(_int(r, "copies", r["_where"], None, minimum=1) for r in frows) - set([None]))
+        copies = given[-1] if given else 1
+        if len(given) > 1:
+            log("NOTE: %s: Copies %s on its rows -- %d used" % (where, " / ".join(str(k) for k in given), copies))
         secs, order, last = {}, [], 0
         for r in frows:
             w = r["_where"]
@@ -1576,15 +1596,13 @@ def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
                     raise InputError("%s: units of %s on %s's own collector -- share it through Collectors"
                                      % (w, who, own_gen))
                 s["units"][who] = s["units"].get(who, 0) + n
-        prev = 0
         for num in order:                            # a daisy chain unless a section says where it starts
             s = secs[num]
             if s["from"] is None:
-                s["from"] = prev
+                s["from"] = max([n for n in order if n < num] or [0])
             elif s["from"] and s["from"] not in secs:
                 raise InputError("%s: section %d starts from section %d, which feeder %s does not have"
                                  % (s["where"], num, s["from"], fname))
-            prev = num
         kids = dict((n, []) for n in [0] + order)
         for num in order:
             kids[secs[num]["from"]].append(num)
@@ -1598,7 +1616,8 @@ def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
             todo.extend(kids[n])
         if len(seen) != len(order) + 1:
             bad = [n for n in order if n not in seen]
-            raise InputError("%s: sections %s do not lead back to the collector bus (a loop?)" % (where, bad))
+            raise InputError("%s (collector %s, feeder %s): sections %s do not lead back to the collector bus (a "
+                             "loop? see their From section)" % (secs[bad[0]]["where"], cname, fname, bad))
         for n in reversed(post):                     # leaves first: what each section carries downstream
             if n == 0:
                 continue
@@ -1629,7 +1648,10 @@ def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
     z = sum_zw2 / (W * W)
     res = {"name": cname, "kv": kv, "r": z.real, "x": z.imag, "b": sum_b, "R": z.real * zb, "X": z.imag * zb,
            "B": sum_b / zb * 1e6, "W": W, "N": counts, "feeders": out, "_mw": dict(unit_mw)}
-    res["check"] = wecc_check(res, sb)
+    try:
+        res["check"] = wecc_check(res, sb)
+    except (OverflowError, ZeroDivisionError, ValueError):     # feeders far too long for their load
+        res["check"] = None
     return res
 
 
@@ -1720,7 +1742,7 @@ def build_network(inp, log):
     for r in inp["mpt"]:
         build_mpt(net, r, f)
 
-    cables = read_cables(inp["cables"])
+    cables = read_cables(inp["cables"], net.notes.append)
     feeders = collections.OrderedDict()
     for r in inp["feeders"]:
         c = _txt(r.get("collector"))
@@ -1760,24 +1782,50 @@ def build_network(inp, log):
     for g in gens:
         build_generator(net, g, feeders, cables, unit_mw, used, log)
     net.model = _choice(pl, "model_type", W, ["SMIB", "DETAILED"], "SMIB")
+    for g in gens:                                       # Units against the units its feeders carry
+        on = [(c, res["N"].get(g["name"].upper(), 0)) for c, res in net.colls.items()
+              if res["N"].get(g["name"].upper())]
+        n = sum(k for _c, k in on)
+        if on and n != g["n"]:
+            net.notes.append("CHECK: %s: the feeders carry %d of its units (%s), Units says %d -- %s" % (
+                g["where"], n, ", ".join("%d on %s" % (k, c) for c, k in on), g["n"],
+                "the equivalent weighs the feeders' units; the machine has %d" % g["n"] if net.model == "SMIB" else
+                "DETAILED: its unit groups have the feeders' %d units (P and MVA in proportion)" % n))
+        ends = [net.colls[c]["end"] for c, _k in on]
+        if on and g["mv"] not in ends:
+            net.notes.append("CHECK: %s: %s has units on %s, but its GSU is at %s -- connect it to its collector "
+                             "(Connect to) or give its units to the generator on it" % (
+                                 g["where"], g["name"], ", ".join(c for c, _k in on), g["mv"]))
     if net.model == "SMIB":
-        one_feeder_per_mpt(net)
+        one_feeder_per_generator(net)
     else:
         expand_collectors(net)
 
+    taken = set()
     for r in inp["loads_shunts"]:
         w = r["_where"]
         kind = _choice(r, "kind", w, ["LOAD", "SHUNT"], "LOAD")
-        at = net.find(_txt(r.get("at")), w)
+        if not _txt(r.get("at")):
+            raise InputError("%s: At is missing -- the bus of this %s" % (w, kind.lower()))
+        at = net.find(_txt(r.get("at")), w + " At")
         if _txt(r.get("at")).upper() in net.moved:
             net.notes.append("NOTE: %s: %s -- in the DETAILED model %s, the collector's root" % (
                 w, _txt(r.get("at")), at))
+        nm = _safe_name(_txt(r.get("name")) or kind)[:20]
+        k = 1
+        while nm.upper() in taken:                  # PSCAD tags and PSS/E ids must differ
+            k += 1
+            nm = "%s_%d" % (_safe_name(_txt(r.get("name")) or kind)[:17], k)
+        taken.add(nm.upper())
         if kind == "LOAD":
             net.loads.append({"bus": at, "mw": _num(r, "mw", w, 0.0), "mvar": _num(r, "mvar", w, 0.0),
-                              "name": _txt(r.get("name")) or "LOAD", "where": w})
+                              "name": nm, "where": w})
         else:
-            net.shunts.append({"bus": at, "mvar": _num(r, "mvar", w, required=True),
-                               "name": _txt(r.get("name")) or "SHUNT", "where": w})
+            mvar = _num(r, "mvar", w, required=True)
+            if mvar == 0:
+                net.notes.append("NOTE: %s: shunt %s of 0 MVAr -- not used" % (w, nm))
+                continue
+            net.shunts.append({"bus": at, "mvar": mvar, "name": nm, "where": w})
 
     left = [k for k in feeders if k not in used]
     if left:
@@ -1917,10 +1965,6 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
         res = wecc_collector(name, rows, cables, kv, net.sb, net.f, unit_mw, name, log)
         res.update({"root": at, "own": name, "end": mv})
         net.colls[name] = res
-        n = res["N"].get(name.upper(), 0)
-        if n != g["n"]:
-            net.notes.append("CHECK: %s: its feeders carry %d units, Units says %d -- the equivalent weighs the "
-                             "feeders' units; the machine has %d" % (w, n, g["n"], g["n"]))
         line = {"r": res["r"], "x": res["x"], "b": res["b"], "R": res["R"], "X": res["X"], "B": res["B"],
                 "count": 1, "rate": 0.0, "kv": kv, "km": 0.0, "w_mw": res["W"]}
     elif mode == "EQUIVALENT":
@@ -1987,46 +2031,49 @@ def _drop_bus(net, role, to):
     return names
 
 
-def one_feeder_per_mpt(net):
-    """SMIB: the collector equivalents that start at one bus (an MPT's LV or TV winding) become one feeder: the
-       WECC equivalent of them all, each weighed by the MW it carries -- Z = sum(Zc Wc^2) / W^2, B = sum(Bc) --
-       with every generator's GSU at its far end."""
+def one_feeder_per_generator(net):
+    """SMIB: each generator its own collector equivalent from its MPT winding. The equivalents that start at one
+       bus and carry the same generators' units (two collector systems of one generator) become one: the WECC
+       equivalent of them all, each weighed by the MW it carries -- Z = sum(Zc Wc^2) / W^2, B = sum(Bc) -- ending
+       where the first one with a GSU on it ends."""
     terminals = set(g["bus"] for g in net.gens)
+    gsu_at = set(g["mv"] for g in net.gens if g["mv"] != g["bus"])
+    ends = dict((res["end"], tuple(sorted(G for G, k in res["N"].items() if k))) for res in net.colls.values())
     groups = collections.OrderedDict()
     for ln in net.lines:
         if ln["kind"] == "COLLECTOR" and ln["to"] not in terminals:
-            groups.setdefault(ln["fr"], []).append(ln)
-    for root, lns in groups.items():
+            who = ends.get(ln["to"]) or tuple(sorted(g["name"].upper() for g in net.gens if g["mv"] == ln["to"]))
+            groups.setdefault((ln["fr"], who or (ln["name"],)), []).append(ln)
+    for (root, who), lns in groups.items():
         W = sum(ln["w_mw"] for ln in lns)
         if len(lns) < 2 or not W > 0:
             continue
-        base = root[:-3] if root.upper().endswith(":LV") else root
-        at = list(net.bus).index(lns[0]["to"])
-        end = net.add_bus(base + ":COLL", net.kv(root), "Plant (SMIB)")
-        order = list(net.bus.items())                    # numbered where the first one was
-        order.insert(at, order.pop())
-        net.bus = collections.OrderedDict(order)
+        end = next((ln["to"] for ln in lns if ln["to"] in gsu_at), lns[0]["to"])
         z = sum((complex(ln["r"], ln["x"]) * ln["w_mw"] ** 2 for ln in lns), 0j) / W ** 2
         Z = sum((complex(ln["R"], ln["X"]) * ln["w_mw"] ** 2 for ln in lns), 0j) / W ** 2
-        ends = [ln["to"] for ln in lns]
-        for e in ends:
+        gone = [ln["to"] for ln in lns if ln["to"] != end]
+        for e in gone:
             _drop_bus(net, e, end)
         for t in net.tx2 + net.tx3:
             for k in ("hv", "lv", "tv"):
-                if t.get(k) in ends:
+                if t.get(k) in gone:
                     t[k] = end
         for g in net.gens:
-            if g["mv"] in ends:
+            if g["mv"] in gone:
                 g["mv"] = end
         for res in net.colls.values():
-            if res.get("end") in ends:
+            if res.get("end") in gone:
                 res["end"] = end
         k = net.lines.index(lns[0])
         net.lines = [ln for ln in net.lines if not any(ln is x for x in lns)]
+        real = dict((g.get("family", g["name"]).upper(), g.get("family", g["name"])) for g in net.gens)
+        name = "_".join(real.get(n, n) for n in who) + "-COLL"
+        if any(ln["name"].upper() == name.upper() for ln in net.lines):
+            name = _node(root) + "_" + name
         merged = {"r": z.real, "x": z.imag, "b": sum(ln["b"] for ln in lns), "R": Z.real, "X": Z.imag,
                   "B": sum(ln["B"] for ln in lns), "count": 1, "rate": 0.0, "kv": net.kv(root), "km": 0.0, "w_mw": W,
-                  "fr": root, "to": end, "name": base.replace(":", "_") + "-COLL", "kind": "COLLECTOR",
-                  "where": "Plant (SMIB)", "of": [(ln["name"], ln["w_mw"]) for ln in lns]}
+                  "fr": root, "to": end, "name": name, "kind": "COLLECTOR", "where": "Plant (SMIB)",
+                  "of": [(ln["name"], ln["w_mw"]) for ln in lns]}
         net.lines.insert(k, merged)
         net.merged.append(merged)
 
@@ -2035,26 +2082,57 @@ def expand_collectors(net):
     """DETAILED: every collector from Feeders, section by section (identical feeder copies lumped); the units of
        a generator at each node a machine of their own (its generator's unit data, P and Q in proportion) behind
        a GSU of its own (its generator's, scaled to them)."""
+    gby = collections.OrderedDict((g["name"].upper(), g) for g in net.gens)
+    carriers = collections.OrderedDict()                 # GENERATOR: the collectors with its units
+    for cname, res in net.colls.items():
+        for G, k in res["N"].items():
+            if k and G in gby:
+                carriers.setdefault(G, []).append(cname)
+    line_of, why = {}, collections.OrderedDict()
+    for cname, res in net.colls.items():
+        line_of[cname] = next((ln for ln in net.lines if ln["kind"] == "COLLECTOR" and ln["to"] == res["end"]), None)
+        hang = [c for c, r in net.colls.items() if r["root"] == res["end"]] + [
+            g["name"] for g in net.gens if g["connect"] == res["end"] and g["name"].upper() not in res["N"]]
+        if line_of[cname] is None:
+            why[cname] = "no line"
+        elif hang:
+            why[cname] = "%s start%s at its far end" % (", ".join(hang), "s" if len(hang) == 1 else "")
+        else:
+            for G in carriers:
+                g = gby[G]
+                if cname in carriers[G] and not g["gsu"]:
+                    why[cname] = "%s has no GSU (its units are its terminal)" % g["name"]
+                elif cname in carriers[G] and g["mv"] not in [net.colls[c]["end"] for c in carriers[G]]:
+                    why[cname] = "%s is not on it (its GSU is at %s)" % (g["name"], g["mv"])
+    while True:                                          # a generator stays whole: all its collectors, or none
+        more = [c for G, cs in carriers.items() if any(x in why for x in cs) for c in cs if c not in why]
+        if not more:
+            break
+        for c in more:
+            why[c] = "its generators' other collectors stay equivalents"
+    for cname in why:
+        net.notes.append("NOTE: DETAILED: collector %s stays its equivalent -- %s" % (cname, why[cname]))
+    slots = collections.OrderedDict()
     for cname, res in list(net.colls.items()):
-        end, root = res["end"], res["root"]
-        line = next((ln for ln in net.lines if ln["kind"] == "COLLECTOR" and ln["to"] == end), None)
-        gby = dict((g["name"].upper(), g) for g in net.gens)
-        mine = [gby[G] for G in res["N"] if G in gby]
-        odd = [g["name"] for g in mine if g["mv"] != end or g["bus"] == end]
-        if line is None or odd:
-            net.notes.append("NOTE: DETAILED: collector %s stays its equivalent -- %s" % (
-                cname, "%s not straight on it (a collector of its own, or no GSU)" % ", ".join(odd) if odd
-                else "no line"))
+        if cname in why:
             continue
+        end, root = res["end"], res["root"]
+        line = line_of[cname]
+        mine = [gby[G] for G in res["N"] if G in carriers and cname in carriers[G]]
         kv = res["kv"]
         w = "Feeders (collector %s)" % cname
         net.lines.remove(line)
-        nodes = {}
+        nodes, alike = {}, {}
         for fd in res["feeders"]:
+            other = alike.setdefault(_node(fd["name"]).upper(), fd["name"])
+            if other != fd["name"]:
+                raise InputError("%s: feeders %r and %r give the same bus names (%s_%s_S1 ...) -- rename one"
+                                 % (w, other, fd["name"], _node(cname), _node(fd["name"])))
             for sc in fd["sections"]:
                 nodes[(fd["name"], sc["num"])] = net.add_bus("%s_%s_S%d" % (_node(cname), _node(fd["name"]),
                                                                             sc["num"]), kv, w)
-        slots = collections.OrderedDict((g["name"], []) for g in mine)
+        for g in mine:
+            slots.setdefault(g["name"], [])
         for fd in res["feeders"]:
             n = fd["copies"]
             for sc in fd["sections"]:
@@ -2066,16 +2144,18 @@ def expand_collectors(net):
                          b, "SECTION", sc["where"])
                 for G, cnt in sc["units"].items():
                     g = gby[G]
-                    slots[g["name"]].append(_unit_group(net, g, "%s_%s_S%d" % (_node(g["name"]), _node(fd["name"]),
-                                                                             sc["num"]), cnt * n, b, sc["where"]))
+                    pre = _node(g["name"]) + ("_" + _node(cname) if len(carriers[G]) > 1 else "")
+                    slots[g["name"]].append(_unit_group(net, g, "%s_%s_S%d" % (pre, _node(fd["name"]), sc["num"]),
+                                                        cnt * n, b, sc["where"]))
         net.moved.update((a, "%s (collector %s)" % (root, cname)) for a in _drop_bus(net, end, root))
-        for g in mine:
-            if g["gsu"]:
-                net.tx2.remove(g["gsu"])
-                net.moved.update((a, "%s (%s)" % (root, g["name"])) for a in _drop_bus(net, g["bus"], root))
-            k = net.gens.index(g)
-            net.gens[k:k + 1] = slots[g["name"]]
         res["end"] = None
+    for name, groups in slots.items():                   # each generator: its unit groups in its place
+        g = gby[name.upper()]
+        root = net.colls[carriers[name.upper()][0]]["root"]
+        net.tx2.remove(g["gsu"])
+        net.moved.update((a, "%s (%s)" % (root, g["name"])) for a in _drop_bus(net, g["bus"], root))
+        k = net.gens.index(g)
+        net.gens[k:k + 1] = groups
     seen = set()
     for g in net.gens:
         if g["name"].upper() in seen:
@@ -2173,6 +2253,9 @@ def control(net, pl):
     flt = c["pscad"]["fault"]
     if flt and flt["t"] is not None and flt["t"] < 0:
         raise InputError("Plant: %s must be 0 or more (it is %s)" % (_label("pscad_fault_s"), _g(flt["t"])))
+    if flt and flt["t"] is not None and flt["t"] >= c["pscad"]["duration_s"]:
+        net.notes.append("NOTE: Plant: PSCAD fault time %s s is past the run's end (%s s) -- no fault in the run"
+                         % (_g(flt["t"]), _g(c["pscad"]["duration_s"])))
     net.ctl = c
 
 
@@ -2187,6 +2270,11 @@ def number_buses(net, pl, rows):
         num = _int(r, "number", w, None, minimum=1)
         nm = _txt(r.get("name"))
         role = net.alias.get(ref.upper())
+        if ref.upper() in net.moved:              # DETAILED: each unit group has its own GSU and terminal
+            if num is not None or nm:
+                net.notes.append("NOTE: %s: %s is no bus of its own in the DETAILED model (each unit group has its "
+                                 "own GSU and terminal) -- its number / name not used" % (w, ref))
+            continue
         if role is None:                          # a bus of the other model type (SMIB / DETAILED), or a typo
             if num is not None or nm:
                 net.notes.append("NOTE: %s: no bus %s in this %s model -- its number / name not used (buses: %s)"
@@ -2216,6 +2304,20 @@ def number_buses(net, pl, rows):
         if b["num"] > 999997:
             raise InputError("Plant: bus numbers run past 999997 -- a lower First bus number")
         b["name"] = names.get(role) or b["name"] or role.replace("C:", "").replace(":", "_")[:12]
+    seen = {}
+    for role in names:                            # names given in Bus_Numbers stay as given
+        key = net.bus[role]["name"].strip().upper()
+        if key in seen:
+            net.notes.append("NOTE: Bus_Numbers: buses %s and %s are both named %s" % (seen[key], role, names[role]))
+        seen.setdefault(key, role)
+    for role, b in net.bus.items():               # automatic names, cut to 12 characters: each its own
+        key = b["name"].strip().upper()
+        if role not in names:
+            if key in seen:
+                tail = "_%d" % b["num"]
+                b["name"] = b["name"][:12 - len(tail)] + tail
+                key = b["name"].upper()
+            seen.setdefault(key, role)
 
 
 # ============================================================================
@@ -2392,7 +2494,14 @@ def operating_point(net, log):
         if not ok:
             V, ok, it = newton(Y, poi, vpoi, sinj, None)
         if not ok:
-            raise SolveError("the plant's load flow does not converge (alpha %.3f, Q %.1f MVAr)" % (alpha, beta))
+            bad = [k for k, res in net.colls.items() if res.get("check") is None or not (
+                res["check"]["detailed"]["ok"] and res["check"]["equivalent"]["ok"])]
+            raise SolveError("the plant's load flow does not converge (alpha %.3f, Q %.1f MVAr)%s" % (
+                alpha, beta, (" -- %s %s %s not solve on %s own either: check the Feeders lengths and their "
+                              "unit (km, mi, kft, m, ft) and the cables' R and X" % (
+                                  "collector" if len(bad) == 1 else "collectors", ", ".join(bad),
+                                  "does" if len(bad) == 1 else "do", "its" if len(bad) == 1 else "their"))
+                if bad else ""))
         state["V"] = V
         i_poi = sum(Y[poi][k] * V[k] for k in range(N))
         s_grid = -(V[poi] * i_poi.conjugate()) * sb                # MW + jMVAr from the POI into the grid
@@ -2477,6 +2586,18 @@ def operating_point(net, log):
             t["vstar"], t["astar"] = abs(v), math.degrees(cmath.phase(v))
     for g in net.gens:
         g["p"], g["q"] = pq[g["name"]]
+    if "P" in targets:                                         # the scaled dispatch within each generator's range
+        fam = collections.OrderedDict()
+        for g in net.gens:
+            f = fam.setdefault(g.get("family", g["name"]), [0.0, 0.0, 0.0])
+            f[0] += g["p"]
+            f[1] += g["pmin"]
+            f[2] += g["pmax"]
+        for nm, (pg, lo, hi) in fam.items():
+            if pg > hi + 1e-3 or pg < lo - 1e-3:
+                net.notes.append("CHECK: Plant: P at POI %.1f MW puts %s at %.3f MW, outside its Pmin .. Pmax %.3f .. "
+                                 "%.3f MW -- a P at POI the plant can give, or the dispatches in Generators"
+                                 % (c["p_poi"], nm, pg, lo, hi))
     net.op = {"s_grid": s_grid, "e": abs(e), "alpha": x[0] if "P" in targets else 1.0, "targets": targets}
 
     # the whole network once more, from the infinite bus: the POI must come out at its target
@@ -2554,6 +2675,13 @@ def flows(net, idx, V, Y):
     for f in out:
         if f["load"] is not None and f["load"] > 100.0:
             net.notes.append("CHECK: %s loaded to %.1f %% of %.1f MVA" % (f["name"], f["load"], f["rate"]))
+    for t in net.tx3:                                      # its LV and TV windings against their own MVA
+        f = next((x for x in out if x["name"] == t["name"] and "s3" in x), None)
+        for w, key in ((1, "mva2"), (2, "mva3")):
+            mva = (t.get(key) or 0.0) * t["count"]
+            if f and mva and abs(f["s3"][w]) > mva * 1.0001:
+                net.notes.append("CHECK: %s %s winding loaded to %.1f %% of its %.1f MVA" % (
+                    t["name"], "LV" if w == 1 else "TV", abs(f["s3"][w]) / mva * 100.0, mva))
     net.op["flows"] = out
     net.op["loss"] = sum(f["s1"] + f["s2"] for f in out if f["kind"] != "GRID")
 
@@ -2567,9 +2695,9 @@ def _num_of(net, role):
 
 def write_raw(net, path):
     sb = net.sb
-    L = ["0, %.2f, 33, 0, 0, %.2f     / PSS(R)E-33 RAW  SMIB %s -- smib_build.py  %s"
-         % (sb, net.f, net.name, time.strftime("%Y-%m-%d %H:%M")),
-         ("SMIB %s" % net.name)[:60],
+    L = ["0, %.2f, 33, 0, 0, %.2f     / PSS(R)E-33 RAW  %s %s -- smib_build.py  %s"
+         % (sb, net.f, net.model, net.name, time.strftime("%Y-%m-%d %H:%M")),
+         ("%s %s" % (net.model, net.name))[:60],
          ("POI %.1f kV  SCR %s  X/R %s" % (net.kv("POI"), _g(net.thev["scr"], 4) if net.thev["scr"] else "-",
                                            _g(net.thev["x_r"], 4)))[:60]]
     gen_buses = set(g["bus"] for g in net.gens)
@@ -2817,8 +2945,8 @@ def dyr_params(net, inp):
         w = r["_where"]
         gen = (_txt(r.get("generator")) or "").upper()
         if gen not in gnames:
-            raise InputError("%s: Generator %r -- one of %s" % (w, r.get("generator"), ", ".join(
-                sorted(members(net, family_only=True)) + ["IB", "PLANT"])))
+            _no_gen(net, w, r.get("generator"), sorted(members(net, family_only=True)) + ["IB", "PLANT"])
+            continue
         model = (_txt(r.get("model")) or "").upper()
         if model not in DYR_LIB:
             raise InputError("%s: Model %r -- one of %s" % (w, r.get("model"), ", ".join(DYR_LIB)))
@@ -2841,9 +2969,38 @@ def dyr_params(net, inp):
             val = _txt(val) or "1"
         else:
             val = _num(r, "value", w, required=True)
-        for gname in gnames[gen]:
-            out[gname][model][names[pname.upper()]] = val
+        many, pn = gnames[gen], names[pname.upper()]
+        for gname in many:
+            v = val
+            if model == "REAX4BU1" and pn in ("Kz", "Kw") and len(many) > 1:   # DETAILED: the share split
+                key = "qmax" if pn == "Kz" else "pmax"
+                gs = [x for x in net.gens if x["name"] in many]
+                tot = sum(x[key] for x in gs)
+                v = val * next(x for x in gs if x["name"] == gname)[key] / tot if tot else val / len(many)
+            out[gname][model][pn] = v
+        if model == "REAX4BU1" and pn in ("Kz", "Kw") and len(many) > 1:
+            net.notes.append("NOTE: %s: %s %s %s split over its %d unit groups by their %s" % (
+                w, gen, pn, _g(val), len(many), "Qmax" if pn == "Kz" else "Pmax"))
     return out
+
+
+def _reax_share(g, recs):
+    """(Kz, Kw) of generator g's REAX4BU1 as written to the .dyr."""
+    vals = dict(next((v for n, m, v in recs if n == g["name"] and m == "REAX4BU1"), []))
+    return float(vals.get("Kz", g["pc_share"][0])), float(vals.get("Kw", g["pc_share"][1]))
+
+
+def _no_gen(net, w, name, choices):
+    """A Generator cell naming no generator: a unit group of the DETAILED model in an SMIB run is skipped with a
+       NOTE; anything else stops the run."""
+    nm = _txt(name)
+    if not nm:
+        raise InputError("%s: Generator is missing -- one of %s" % (w, ", ".join(choices)))
+    fams = members(net, family_only=True)
+    if net.model == "SMIB" and any(re.match(r"^%s_.+_S\d+$" % re.escape(f), nm.upper()) for f in fams):
+        net.notes.append("NOTE: %s: %s is a unit group of the DETAILED model -- not used in this SMIB model" % (w, nm))
+        return
+    raise InputError("%s: Generator %r -- one of %s" % (w, nm, ", ".join(choices)))
 
 
 def members(net, family_only=False):
@@ -2936,6 +3093,11 @@ def fill_placeholders(net, text, g, where):
                 return _g(g["mbase"])
             if key == "MV":
                 return str(_num_of(net, g["mv"]))
+            fam = g.get("family", "").upper()
+            if fam and key in (fam, fam + ":LV"):        # DETAILED: this unit group's own terminal and GSU
+                return str(_num_of(net, g["bus"]))
+            if fam and key == fam + ":MV":
+                return str(_num_of(net, g["mv"]))
         if key in ("BUS", "ID", "MBASE", "MV"):
             raise InputError("%s: {%s} needs a Generator" % (where, key))
         return str(_num_of(net, net.find(m.group(1), where)))
@@ -2944,7 +3106,7 @@ def fill_placeholders(net, text, g, where):
 
 def write_dyr(net, inp, path):
     recs = dyr_models(net, inp)
-    L = ["/ SMIB %s -- written by smib_build.py on %s" % (net.name, time.strftime("%Y-%m-%d %H:%M")),
+    L = ["/ %s %s -- written by smib_build.py on %s" % (net.model, net.name, time.strftime("%Y-%m-%d %H:%M")),
          "/ generic WECC models: placeholders until the vendor's models (parameters: Dyr_Params)"]
     gen_of = dict((g["name"], g) for g in net.gens)
     for gname, model, vals in recs:
@@ -2970,6 +3132,14 @@ def write_dyr(net, inp, path):
             L.append("     " + "  ".join(cons[k:k + 6]) + ("  /" if k + 6 >= len(cons) else ""))
         if not cons:
             L[-1] += "  /"
+    L.extend(user_records(net, inp))
+    _write_text(path, "\n".join(L))
+    return recs
+
+
+def user_records(net, inp):
+    """Dyr_Records: each row's record, its placeholders filled (a generator's: one per machine), cut at its '/'."""
+    out = []
     for r in inp["dyr_records"]:
         w = r["_where"]
         text = _txt(r.get("record"))
@@ -2980,15 +3150,17 @@ def write_dyr(net, inp, path):
         if gname:
             names = members(net).get(gname.upper())
             if not names:
-                raise InputError("%s: Generator %r -- no such generator" % (w, gname))
+                _no_gen(net, w, gname, list(members(net, family_only=True)) + [
+                    "or blank for a record of the plant's own ({POI}, {IB} ... for its buses)"])
+                continue
             gs = [x for x in net.gens if x["name"] in names]
+        end = re.match(r"^((?:[^'/]|'[^']*')*/)", text)    # what follows the record's '/' is a remark
         for g in gs:
-            rec = fill_placeholders(net, text, g, w).strip()
+            rec = fill_placeholders(net, end.group(1) if end else text, g, w).strip()
             if not rec.endswith("/"):
                 rec += " /"
-            L.append(rec)
-    _write_text(path, "\n".join(L))
-    return recs
+            out.append(rec)
+    return out
 
 
 # ============================================================================
@@ -3159,9 +3331,14 @@ def pscad_model(net, inp):
         xx += 12
     seen = set()
     for cm in comps:
-        if cm["tag"] in seen:
-            raise InputError("PSCAD: two components are named %s -- rename a load / shunt" % cm["tag"])
-        seen.add(cm["tag"])
+        tag, k = cm["tag"], 1
+        while tag.upper() in seen:                  # a load / shunt named like another part: the later one renamed
+            k += 1
+            tag = "%s_%d" % (cm["tag"], k)
+        if tag != cm["tag"]:
+            net.notes.append("NOTE: PSCAD: two components named %s -- the second is %s" % (cm["tag"], tag))
+            cm["tag"] = tag
+        seen.add(tag.upper())
     for c3 in pscad_layout(comps, cw=PSCAD_W3, ch=PSCAD_H3, pad=0)[0]:
         c3["x3"], c3["y3"] = c3["x"], c3["y"]          # where R, L and C are three-phase in this PSCAD
     comps, net.pscad_groups = pscad_layout(comps)
@@ -3468,7 +3645,8 @@ def pscad_spec(net, inp, comps):
         gname = _txt(r.get("generator"))
         names = members(net).get((gname or "").upper())
         if not names:
-            raise InputError("%s: Generator %r -- no such generator" % (r["_where"], gname))
+            _no_gen(net, r["_where"], gname, list(members(net, family_only=True)))
+            continue
         g = next(x for x in net.gens if x["name"] == names[0])
         if not g["pscad"]["definition"]:
             net.notes.append("NOTE: %s: PSCAD_Params for %s, which has no PSCAD definition -- not used"
@@ -3483,7 +3661,7 @@ def pscad_spec(net, inp, comps):
     libs = list(c["libraries"]) + [cm["library"] for cm in comps if cm.get("library")]
     return {"case": _safe_name(net.name, 30), "written": time.strftime("%Y-%m-%d %H:%M"),
             "settings": {"time_duration": c["duration_s"], "time_step": c["time_step_us"],
-                         "sample_step": c["plot_step_us"], "description": ("SMIB %s" % net.name)[:60]},
+                         "sample_step": c["plot_step_us"], "description": ("%s %s" % (net.model, net.name))[:60]},
             "libraries": [l for k, l in enumerate(libs) if l and l not in libs[:k]],
             "slots": [{"tag": sl["tag"], "node": _node(sl["node"]), "units": sl["units"], "p": sl["p"], "q": sl["q"],
                        "vm": sl["vm"], "ang": sl["ang"], "model": sl["model"]} for sl in net.pscad_slots],
@@ -4273,7 +4451,7 @@ def pscad_slot_lines(net, ind):
 
 
 def pscad_data_text(net, comps, spec):
-    L = ["PSCAD DATA -- SMIB %s   (written by smib_build.py on %s)" % (net.name, spec["written"]),
+    L = ["PSCAD DATA -- %s %s   (written by smib_build.py on %s)" % (net.model, net.name, spec["written"]),
          "=" * 100,
          "Every value the build script sets, in PSCAD's units. Transformers: pu on their own MVA and winding",
          "voltages (V1 is the tapped HV voltage). Lines and collector equivalents: pi sections (C/2 at each end);",
@@ -4310,7 +4488,7 @@ def report_text(net, inp, recs, comps, files, src):
     sb = net.sb
     th, op, c = net.thev, net.op, net.ctl
     shift = phase_shifts(net)
-    L = ["SMIB MODEL  %s" % net.name,
+    L = ["%s MODEL  %s" % (net.model, net.name),
          "written %s by smib_build.py from %s" % (time.strftime("%Y-%m-%d %H:%M"), src), "=" * 100, ""]
     L.append("1. GRID, POI AND OPERATING POINT")
     L.append("   POI %.4g kV, bus %d '%s'" % (net.kv("POI"), net.bus["POI"]["num"], net.bus["POI"]["name"]))
@@ -4328,9 +4506,13 @@ def report_text(net, inp, recs, comps, files, src):
     if pcx:
         L.append("   plant controller (.dyr): REPC_B -- %s at the POI (bus %d) on %.3f MVA commands %s through a "
                  "REAX4BU1 each" % (pcx["model"], net.bus["POI"]["num"], pcx["mbase"], ", ".join(pcx["gens"])))
-    else:
+    elif c.get("plant_ctrl") == "REPC_B":
+        L.append("   plant controller (.dyr): REPC_B, but no generator for it (Q mode share) -- none written")
+    elif held:
         L.append("   plant controller (.dyr): REPC_A -- a %s on each generator that holds the POI" % (
             "REPCAU1" if c.get("regc_repc") == "USRMDL" else "REPCA1"))
+    else:
+        L.append("   plant controller (.dyr): none -- no generator holds the POI")
     s = op["s_grid"]
     L.append("   solved: P at POI %.3f MW, Q at POI %.3f MVAr (into the grid), POI %.6f pu at %.4f deg"
              % (s.real, s.imag, net.bus["POI"]["vm"], net.bus["POI"]["va"]))
@@ -4380,7 +4562,7 @@ def report_text(net, inp, recs, comps, files, src):
                  "machines, each the units at one node behind its own GSU; the equivalents below are for reference"
                  % (len(secs), len(net.gens)))
     else:
-        L.append("   MODEL TYPE SMIB: one equivalent feeder per MPT winding, each generator one machine behind one GSU")
+        L.append("   MODEL TYPE SMIB: each generator one machine behind one GSU on its own equivalent feeder")
         for m in net.merged:
             L.append("   feeder %s (%s -> %s) = %s, weighed by MW: R %.5f X %.5f ohm, B %.3f uS = r %.7f x %.7f "
                      "b %.7f pu" % (m["name"], m["fr"], m["to"], " + ".join("%s %.1f MW" % (n, wmw) for n, wmw in
@@ -4412,12 +4594,17 @@ def report_text(net, inp, recs, comps, files, src):
         L.append("     EQUIVALENT: R %.5f X %.5f ohm, B %.3f uS  =  r %.7f x %.7f b %.7f pu (%.0f MVA, %.4g kV)"
                  % (res["R"], res["X"], res["B"], res["r"], res["x"], res["b"], sb, res["kv"]))
         ck = res["check"]
+        if ck is None or not (ck["detailed"]["ok"] and ck["equivalent"]["ok"]):
+            L.append("     WECC check: the feeders' load flow (every unit at full output) does not solve")
+            net.notes.append("CHECK: collector %s: its feeders' load flow does not solve at full output -- check the "
+                             "Feeders lengths and their unit (km, mi, ft, m) and the cables' R and X" % cname)
+            continue
         d, e = ck["detailed"], ck["equivalent"]
         dp = (e["p"] - d["p"]) / d["p"] * 100.0 if d["p"] else 0.0
         L.append("     WECC check, every unit at full output, collector bus 1.0 pu: losses detailed %.4f MW %.4f "
                  "MVAr, equivalent %.4f MW %.4f MVAr (P %+.2f %%)" % (d["p"], d["q"], e["p"], e["q"], dp))
         L.append("       detailed feeders %.5f .. %.5f pu; the equivalent's far end %.5f pu%s"
-                 % (d["vmin"], d["vmax"], e["v"], "" if d["ok"] and e["ok"] else "  *** a sweep did not converge"))
+                 % (d["vmin"], d["vmax"], e["v"], ""))
         if abs(dp) > 5.0:
             net.notes.append("CHECK: collector %s: the equivalent's P loss is %+.1f %% off the detailed feeders'"
                              % (cname, dp))
@@ -4434,8 +4621,8 @@ def report_text(net, inp, recs, comps, files, src):
         if g["q_mode"] == "share":
             L.append("       Q share %.1f %% (of Qmax); PSS/E: regulates the POI (%d) at %.4f pu, RMPCT %.1f%s" % (
                 100.0 * g["share"], net.bus["POI"]["num"], c["v_poi"], 100.0 * g["share"],
-                ("; REAX4BU1: %.4f of the plant's Q, %.4f of its P" % g["pc_share"]) if "REAX4BU1" in g.get("dyr", [])
-                else ""))
+                ("; REAX4BU1: %.4f of the plant's Q, %.4f of its P" % _reax_share(g, recs)) if "REAX4BU1" in
+                g.get("dyr", []) else ""))
         else:
             L.append("       fixed Q (QT = QB = %.3f MVAr)" % g["q"])
         L.append("       PSS/E ZSORCE X %s pu, WMOD %d; .dyr: %s; PSCAD: %s" % (
@@ -4679,7 +4866,7 @@ def psse_check(net, recs, inp, files, out, here_only=False):
                     files[k] = os.path.join(out, net.name + ext)
             return log
     log = FileLog(path)
-    log("PSS/E CHECK -- SMIB %s   %s" % (net.name, time.strftime("%Y-%m-%d %H:%M")))
+    log("PSS/E CHECK -- %s %s   %s" % (net.model, net.name, time.strftime("%Y-%m-%d %H:%M")))
     for ln in pre.lines:
         log(ln)
     if psspy is None:
@@ -4929,7 +5116,7 @@ def build(src, out_dir=None, check=True, pscad=True):
         % (net.model, len(net.bus), len(gens), ", ".join("%s %s" % kv for kv in gens.items()), len(net.gens),
            ("%d feeder sections" % len([ln for ln in net.lines if ln["kind"] == "SECTION"])) if net.model == "DETAILED"
            else "%d collector feeder(s)%s" % (len([ln for ln in net.lines if ln["kind"] == "COLLECTOR"]),
-                                              " (%d merged per MPT)" % sum(len(m["of"]) for m in net.merged)
+                                              " (%d merged per generator)" % sum(len(m["of"]) for m in net.merged)
                                               if net.merged else "")))
     operating_point(net, log)
     s = net.op["s_grid"]
@@ -4944,18 +5131,23 @@ def build(src, out_dir=None, check=True, pscad=True):
     os.makedirs(out)
     files = {"raw": os.path.join(out, net.name + ".raw"), "dyr": os.path.join(out, net.name + ".dyr"),
              "json": os.path.join(out, net.name + "_inputs.json")}
-    write_raw(net, files["raw"])
-    recs = write_dyr(net, inp, files["dyr"])
-    comps, spec, files["pscad_build"] = write_pscad(net, inp, out, log)
-    files["pscad_data"] = os.path.join(out, net.name + "_PSCAD_DATA.txt")
-    _write_text(files["pscad_data"], pscad_data_text(net, comps, spec))
-    clean = dict((k, v) for k, v in inp.items() if not k.startswith("_"))
-    _write_text(files["json"], json.dumps(clean, indent=1, sort_keys=True, default=str))
-    if src.lower().endswith((".xlsx", ".xlsm")):
-        files["xlsx"] = os.path.join(out, os.path.basename(src))
-        shutil.copy2(src, _new(files["xlsx"]))
-    files["report"] = os.path.join(out, net.name + "_REPORT.txt")
-    _write_text(files["report"], report_text(net, inp, recs, comps, files, src))
+    try:
+        write_raw(net, files["raw"])
+        recs = write_dyr(net, inp, files["dyr"])
+        comps, spec, files["pscad_build"] = write_pscad(net, inp, out, log)
+        files["pscad_data"] = os.path.join(out, net.name + "_PSCAD_DATA.txt")
+        _write_text(files["pscad_data"], pscad_data_text(net, comps, spec))
+        clean = dict((k, v) for k, v in inp.items() if not k.startswith("_"))
+        _write_text(files["json"], json.dumps(clean, indent=1, sort_keys=True, default=str))
+        if src.lower().endswith((".xlsx", ".xlsm")):
+            files["xlsx"] = os.path.join(out, os.path.basename(src))
+            shutil.copy2(src, _new(files["xlsx"]))
+        files["report"] = os.path.join(out, net.name + "_REPORT.txt")
+        net.notes[:] = list(collections.OrderedDict.fromkeys(net.notes))
+        _write_text(files["report"], report_text(net, inp, recs, comps, files, src))
+    except BaseException:
+        shutil.rmtree(out, ignore_errors=True)   # this run's own new folder: no half-written models left
+        raise
     log("[smib] written to %s" % out)
     for k in ("raw", "dyr", "report", "pscad_data", "pscad_build"):
         log("         %s" % os.path.basename(files[k]))
@@ -5244,7 +5436,7 @@ def gui(start=None):
         for r in data.get("mpt", []):
             n = r.get("name")
             if n:
-                names += [n, n + ":LV"] + ([n + ":TV"] if r.get("tv_kv") else []) + [n + ":HV", n + ":COLL"]
+                names += [n, n + ":LV"] + ([n + ":TV"] if r.get("tv_kv") else []) + [n + ":HV"]
         names += [r["name"] for r in data.get("collectors", []) if r.get("name")]
         for r in data.get("generators", []):
             if r.get("name"):
@@ -5867,6 +6059,10 @@ def gui(start=None):
             inp = read_input(p)
             net = build_network(inp, Log())
             operating_point(net, Log())
+            dyr_models(net, inp)                    # Dyr_Params, Dyr_Records and PSCAD_Params checked too
+            user_records(net, inp)
+            pscad_spec(net, inp, pscad_model(net, inp))
+            net.notes[:] = list(collections.OrderedDict.fromkeys(net.notes))
             s = net.op["s_grid"]
             for n in net.notes:
                 print("[smib] " + n)
