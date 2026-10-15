@@ -1671,21 +1671,64 @@ def oem_model(path):
         ports, params = [], []
         for x in el.iter():
             t = x.tag.lower()
-            if t == "port" and x.get("name"):
-                text = " ".join([str(v) for v in x.attrib.values()] + [str(q.get("value") or "") for q in x.iter()
-                                                                       if q is not x]).upper()
-                kind = "in" if "INPUT" in text else "out" if "OUTPUT" in text else "electrical"
+            prm = dict(((q.get("name") or "").lower(), q.get("value") or "") for q in x.iter("param"))
+            if t == "port" and (x.get("name") or prm.get("name")):
+                mode = (prm.get("mode") or x.get("mode") or "").upper()
+                kind = "in" if mode in ("INPUT", "1") else "out" if mode in ("OUTPUT", "2") else "electrical"
                 try:
-                    dim = int(x.get("dim") or 1)
+                    dim = int(x.get("dim") or prm.get("dim") or 1)
                 except ValueError:
                     dim = 1
-                ports.append((x.get("name"), dim, kind))
+                ports.append((x.get("name") or prm["name"], dim, kind))
             elif t == "parameter" and x.get("name"):
                 params.append((x.get("name"), x.get("desc") or ""))
         defs[el.get("name")] = {"name": el.get("name"), "desc": desc, "ports": ports, "params": params}
     for d in defs.values():
         d["ids"] = placed.get(d["name"].upper(), [])
     return scope, list(defs.values())
+
+
+def oem_symbol(path, name=None, iid=None):
+    """The symbol of definition `name` -- or of the component with ID iid -- in an OEM's PSCAD file (.pscx /
+       .pslx), from its XML: {"w", "h": its extent, "ports": {name: (x, y)} electrical} in grid units from its
+       origin, or None."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return None
+    if not name and iid:
+        name = next((el.get("defn").split(":", 1)[1] for el in root.iter()
+                     if el.get("id") == str(iid) and ":" in (el.get("defn") or "")), None)
+    el = next((d for d in root.iter() if d.tag.lower() == "definition" and
+               (d.get("name") or "").upper() == (name or "").upper()), None) if name else None
+    g = el.find(".//graphics") if el is not None else None
+    xs, ys, ports = [], [], {}
+    for x in (g.iter() if g is not None else []):
+        t, prm = x.tag.lower(), dict(((q.get("name") or "").lower(), q.get("value") or "") for q in x.iter("param"))
+        try:
+            gx, gy = float(x.get("x") or 0) / 18.0, float(x.get("y") or 0) / 18.0
+        except ValueError:
+            continue
+        if t == "port":
+            if (prm.get("mode") or x.get("mode") or "ELECTRICAL").upper() in ("ELECTRICAL", "3"):
+                ports[x.get("name") or prm.get("name") or "?"] = (gx, gy)
+            pts = [(gx, gy)]
+        elif t != "gfx":
+            continue
+        elif "text" in (x.get("classid") or "").lower():
+            w = len(x.get("text") or prm.get("text") or "") * NAME_CH / 2.0
+            pts = [(gx - w, gy), (gx + w, gy)]
+        else:
+            pts = [(gx + float(v.get("x") or 0) / 18.0, gy + float(v.get("y") or 0) / 18.0) for v in x.iter("vertex")]
+            if x.get("w") is not None:
+                pts.append((gx + float(x.get("w")) / 18.0, gy + float(x.get("h") or 0) / 18.0))
+            pts.append((gx, gy))
+        xs += [a for a, _b in pts]
+        ys += [b for _a, b in pts]
+    if not xs:
+        return None
+    return {"w": max(xs) - min(xs), "h": max(ys) - min(ys), "ports": ports}
 
 
 def section_rxb(r, cab, f, w):
@@ -3899,7 +3942,7 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
         if edge is not None and frm and not rlc(c):
             x0 = max(x0, edge + room(frm) + half(c) - cw // 2)
         put(c, x0 + cw // 2, y, frm)
-        right, bottom = x0 + cw * c.get("room", 1), y
+        right, bottom = x0 + max(cw * c.get("room", 1), cw // 2 - half(c) + c.get("sym_w", 0) + 3), y
         far = [n for n in nodes[id(c)] if n != frm]
         if far:
             x1 = right + (pad if rlc(c) and not mid(far[0]) else 0)
@@ -4064,6 +4107,20 @@ def _gen_slot(net, g, shift):
             "p": s.real, "q": s.imag, "at": at, "s_inv": complex(g["p"], g["q"]), "v_inv": net.bus[g["bus"]]["vm"]}
 
 
+_SYMS = {}
+
+
+def _sym_room(c, path, name, iid=None):
+    """Vendor model c given its symbol's width and height (grid units) where the OEM's file can be read, so the
+       layout leaves room for it -> c."""
+    key = (path, name, iid)
+    if key not in _SYMS:
+        _SYMS[key] = oem_symbol(path, name, iid) if path and os.path.isfile(path) else None
+    if _SYMS[key]:
+        c["sym_w"], c["sym_h"] = int(math.ceil(_SYMS[key]["w"])), int(math.ceil(_SYMS[key]["h"]))
+    return c
+
+
 def _inverter_comp(g, sl, net, x, y):
     """The inverter in its slot: the generator's vendor model (UDM), or a stand-in source holding the load flow."""
     ps = g["pscad"]
@@ -4077,7 +4134,7 @@ def _inverter_comp(g, sl, net, x, y):
                        "%s from %s" % (ps["definition"], os.path.basename(src)))
         c = {"tag": sl["tag"], "kind": "VENDOR", "defn": [], "gen": g["name"], "slot": sl, "x": x, "y": y,
              "library": src if os.path.splitext(src)[1].lower() in (".pscx", ".pslx") else ps["library"],
-             "params": [], "lead": 6, "note": "inverter: %s%s -- %s" % (
+             "params": [], "lead": 6, "half": SYMBOL_HALF["VENDOR"], "note": "inverter: %s%s -- %s" % (
                  sl["model"], ", its settings kept" if ps["iid"] else "", what),
              "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
                         ["@dim3", "@first"]}]}
@@ -4085,16 +4142,17 @@ def _inverter_comp(g, sl, net, x, y):
             c["copy_of"] = {"source": src, "iid": ps["iid"]}
         if ps["definition"]:
             c["defn_from"] = {"source": src, "definition": ps["definition"].split(":")[-1]}
+        _sym_room(c, src, ps["definition"].split(":")[-1] if ps["definition"] else None, ps["iid"])
         return c
     if src and ps["definition"]:                        # an OEM library: its definition used from it
         ps = dict(ps, library=src)
     if ps["definition"]:
         sl["tag"], sl["model"] = sl["name"] + "_INV", ps["definition"]
-        return {"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
-                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6,
+        return _sym_room({"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
+                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6, "half": SYMBOL_HALF["VENDOR"],
                 "note": "inverter: vendor model %s -- %s" % (ps["definition"], what),
                 "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
-                           ["@dim3", "@first"]}]}
+                           ["@dim3", "@first"]}]}, ps["library"], ps["definition"].split(":")[-1])
     sl["tag"], sl["model"] = sl["name"] + "_SRC", "stand-in source"
     c = _source(sl["tag"], sl["name"], sl["kv"], sl["vm"], sl["ang"], net.f, x, y, sl["node"])
     c["lead"] = 6                                       # a wire of its own to its node: the node's name, a UDM's place
@@ -4639,6 +4697,134 @@ def pi_ports(cmp, c, reported, log, first):
 
 
 PI_NOTE = []               # the PI Sections whose ports PSCAD reports where it does not draw them
+PORT_NOTE = {}             # the vendor models whose AC port PSCAD reports where their symbol does not draw it
+DEFN_XML = {}              # "case:name" -> its definition's XML (an OEM's, or read from PSCAD)
+MIRRORED = set()           # the vendor models mirrored here: their symbol had the AC port on its right
+
+
+def _box(cmp):
+    """A component's drawn extent [x1, y1, x2, y2] (grid units), or None."""
+    try:
+        b = [float(v) for v in tuple(cmp.bounds)]
+        return b if len(b) == 4 and b[2] > b[0] else None
+    except Exception:
+        return None
+
+
+def _mirror(canvas, cmp, how):
+    """Mirror a component left to right, one way (its own command, the canvas's, its orientation) -> whether
+       this mhi.pscad took it."""
+    try:
+        if how == "component":
+            return cmp.mirror() is not False
+        if how == "canvas":
+            return canvas.mirror(cmp) is not False
+        cmp.orient = int(cmp.orient) ^ 4
+        return True
+    except Exception:
+        return False
+
+
+def drawn_ports(el):
+    """A definition's electrical ports where its symbol draws them: {name: [(x, y)]}, grid units from its origin
+       ({} where its XML has no symbol)."""
+    out = {}
+    g = el.find(".//graphics") if el is not None else None
+    for x in (g.iter() if g is not None else []):
+        if x.tag.lower() != "port":
+            continue
+        prm = dict(((q.get("name") or "").lower(), q.get("value") or "") for q in x.iter("param"))
+        name = x.get("name") or prm.get("name")
+        if name and (prm.get("mode") or x.get("mode") or "ELECTRICAL").upper() in ("ELECTRICAL", "3"):
+            try:
+                out.setdefault(name, []).append((float(x.get("x")) / 18.0, float(x.get("y")) / 18.0))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _defn_el(pscad, used):
+    if used not in DEFN_XML:
+        el = None
+        try:
+            x = getattr(definition(pscad, used), "xml", None)
+            x = x() if callable(x) else x
+            el = ET.fromstring(x) if isinstance(x, (bytes, str)) else x
+        except Exception:
+            el = None
+        DEFN_XML[used] = el
+    return DEFN_XML[used]
+
+
+def _on_edge(b, x, y):
+    """Whether (x, y) lies on box b's outline, half a grid unit either way."""
+    return b is not None and ((min(abs(x - b[0]), abs(x - b[2])) <= 0.5 and b[1] - 0.5 <= y <= b[3] + 0.5) or
+                              (min(abs(y - b[1]), abs(y - b[3])) <= 0.5 and b[0] - 0.5 <= x <= b[2] + 0.5))
+
+
+def udm_port(pscad, cmp, c, used, p):
+    """Port p (name, x, y, dim) as PSCAD reports it -- or where the vendor model's symbol draws it, when PSCAD
+       reports it off the symbol's outline and its definition draws it once, on it."""
+    b = _box(cmp)
+    if c.get("copy_of") or b is None or _on_edge(b, p[1], p[2]):
+        return p
+    spots = sorted(set(drawn_ports(_defn_el(pscad, used)).get(p[0], [])))
+    try:
+        lx, ly = [float(v) for v in cmp.location]
+    except Exception:
+        return p
+    if len(spots) != 1:
+        return p
+    sx, sy = spots[0]
+    d = (int(round(lx + (-sx if c["tag"] in MIRRORED else sx))), int(round(ly + sy)))
+    if d == (p[1], p[2]) or not _on_edge(b, d[0], d[1]):
+        return p
+    PORT_NOTE[c["tag"]] = "%s: PSCAD reports its port %s at (%d, %d); its symbol draws it at (%d, %d) -- wired " \
+        "there" % (c["tag"], p[0], p[1], p[2], d[0], d[1])
+    return (p[0], d[0], d[1], p[3])
+
+
+def udm_fit(pscad, canvas, cmp, c, used, ports, log, first):
+    """A vendor model (UDM) in its slot: its AC port on the side facing its GSU -- mirrored when its symbol has
+       the port on its right -- and at the end of its lead, the wire from its node -> its electrical ports."""
+    p = pick(ports, c["ports"][0]["pick"], set()) if c["ports"] else None
+    if p is None:
+        return ports
+
+    def now(name):
+        got = eports(cmp)
+        q = next((x for x in got if x[0] == name), None)
+        return got, (udm_port(pscad, cmp, c, used, q) if q is not None else None)
+    p = udm_port(pscad, cmp, c, used, p)
+    b = _box(cmp)
+    if b is not None and p[1] > (b[0] + b[2]) / 2.0:          # on its right, away from its GSU: mirrored
+        for how in ("component", "canvas", "orient"):
+            if not _mirror(canvas, cmp, how):
+                continue
+            MIRRORED.symmetric_difference_update([c["tag"]])
+            got, q = now(p[0])
+            b2 = _box(cmp)
+            if q is not None and b2 is not None and q[1] < (b2[0] + b2[2]) / 2.0:
+                ports, p, b = got, q, b2
+                if first:
+                    log("    its AC port %s is on its right: mirrored to face its GSU" % p[0])
+                break
+            _mirror(canvas, cmp, how)                         # not left to right that way: back as it was
+            MIRRORED.symmetric_difference_update([c["tag"]])
+        else:
+            log("    CHECK: its AC port %s is on its right and it cannot be mirrored here -- the wire crosses it to "
+                "the port: mirror it by hand (right-click > Mirror) and wire the port to node %s"
+                % (p[0], c["ports"][0]["node"]))
+    tx, ty = c["x"] - c.get("half", 3), c["y"]                 # the end of its lead
+    dx = int(round(tx - (min(p[1], b[0]) if b is not None else p[1])))
+    dy = int(round(ty - p[2]))
+    if (dx or dy) and _move(cmp, dx, dy):
+        got, q = now(p[0])
+        if q is not None:
+            ports, p = got, q
+        if first:
+            log("    moved (%+d, %+d): its AC port %s at the end of its lead, (%d, %d)" % (dx, dy, p[0], p[1], p[2]))
+    return [p if x[0] == p[0] else x for x in ports]
 COPIES = {}                # (source, ID) -> the first copy of it in this case: the rest are its clones
 RESOURCES = set()          # the source cases whose resources (.lib, .obj ...) this case has been given
 
@@ -4709,6 +4895,7 @@ def import_definition(pscad, prj, case, src, name, log):
     except Exception:
         pass
     IMPORTED[key] = "%s:%s" % (case, found)
+    DEFN_XML[IMPORTED[key]] = defs[found]
     return IMPORTED[key]
 
 
@@ -5170,6 +5357,8 @@ def main():
         ports = eports(cmp)
         if c["kind"] == "PI":                         # where its symbol has them
             ports = pi_ports(cmp, c, ports, log, first)
+        elif c["kind"] == "VENDOR":                   # its AC port facing its GSU, at the end of its lead
+            ports = udm_fit(pscad, canvas, cmp, c, used, ports, log, first)
         if any(p["node"] for p in c["ports"]) and len(ports) > len(c["ports"]) and "View" in str(seen_defn[used]):
             log("    (%d electrical ports: %s)" % (len(ports), ", ".join(p[0] for p in ports)))
         taken, picked = set(), []
@@ -5230,6 +5419,11 @@ def main():
     if PI_NOTE:
         log("PI Sections: %d whose ports PSCAD reports away from where it draws them -- wired to the drawn ends; %s"
             % (len(PI_NOTE), PI_NOTE[0]))
+    if PORT_NOTE:
+        log("vendor models: %d whose AC port PSCAD reports away from where their symbol draws it -- wired to the "
+            "drawn port; %s" % (len(PORT_NOTE), PORT_NOTE[sorted(PORT_NOTE)[0]]))
+    if MIRRORED:
+        log("vendor models mirrored to face their GSU (their symbol has the AC port on its right): %d" % len(MIRRORED))
     w, h = reach(canvas)
     if PAGE[0] and (w > PAGE[0] or h > PAGE[1]) and (w > NEED[0] or h > NEED[1]):    # past what the layout said
         page(canvas, w, h, log)
