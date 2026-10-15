@@ -202,6 +202,7 @@ IB_ID = "IB"                      # infinite-bus machine id
 IB_MBASE = 100000.0               # infinite-bus machine base (MVA)
 IB_XSOURCE = 0.01                 # pu on IB_MBASE (= 0.00001 pu on 100 MVA): the grid impedance is the branch POI-IB
 IBR_ZSORCE_X = 9999.0             # inverter-based units: source reactance (pu on MBASE) unless Generators says
+REGCB_XE = 0.15                   # REGC_B: the converter's coupling reactance Xe (ZSORCE X, pu on MBASE) unless given
 
 # ============================================================================
 # THE INPUT WORKBOOK -- its sheets and columns, and the example it is written with
@@ -212,6 +213,7 @@ GEN_TYPES = ["PV", "BESS", "WT4", "WT3", "SYNC", "USER"]
 # the electrical control models (REEC) each inverter type takes; the first is its default
 REEC_OK = {"PV": ("REEC_A", "REEC_D"), "WT4": ("REEC_A", "REEC_D"), "WT3": ("REEC_A",),
            "BESS": ("REEC_C", "REEC_D")}
+REGC_OK = {"PV": ("REGC_A", "REGC_B"), "WT4": ("REGC_A", "REGC_B"), "BESS": ("REGC_A", "REGC_B"), "WT3": ("REGC_A",)}
 
 # Plant sheet (Item | Value | Unit | Notes): (key, item, unit, note, choices)
 FAULT_TYPES = ["ABCG", "ABC", "AG", "BG", "CG", "ABG", "BCG", "ACG", "AB", "BC", "AC"]
@@ -225,6 +227,8 @@ PLANT_FIELDS = [
     ("out_dyr", "Build PSS/E .dyr", "", "YES = the dynamic models (blank = YES)", ["YES", "NO"]),
     ("out_pscad", "Build PSCAD model", "", "YES = the PSCAD build script, its data and the .pscx (blank = YES)",
      ["YES", "NO"]),
+    ("out_epc", "Build PSLF .epc", "", "YES = the load-flow case for GE PSLF (blank = YES)", ["YES", "NO"]),
+    ("out_dyd", "Build PSLF .dyd", "", "YES = the dynamic models for GE PSLF (blank = YES)", ["YES", "NO"]),
     ("freq_hz", "Frequency", "Hz", "blank = 60", None),
     ("first_bus", "First bus number", "", "buses are numbered from here + 1 (Bus_Numbers sets any one)", None),
     ("poi_kv", "POI kV", "kV", "", None),
@@ -346,6 +350,9 @@ GEN_COLS = [
     ("coll_units", "Collector units", "pu: system base at collector kV | ohm: R X in ohm, B in uS", ["pu", "ohm"], 8),
     ("zsorce_x", "ZSORCE X pu", "on MBASE (blank: inverters 9999, SYNC X''d)", None, 8),
     ("wmod", "WMOD", "blank: inverters 1, SYNC 0", None, 6),
+    ("regc", "Converter model", "PSS/E .dyr -- REGC_A: a current source (REGCA1) | REGC_B: a voltage source behind "
+     "ZSORCE R + jX, for weak grids (REGCBU1; ZSORCE X its Xe) -- PV, BESS, WT4 (blank = REGC_A)",
+     ["REGC_A", "REGC_B"], 9),
     ("reec", "Electrical control", "PSS/E .dyr -- REEC_A: PV, WT | REEC_C: BESS | REEC_D: PV, BESS, WT4 (blank = "
      "REEC_A, BESS REEC_C)", ["REEC_A", "REEC_C", "REEC_D"], 9),
     ("pscad_library", "PSCAD library", "vendor library .pslx (blank = none)", None, 18),
@@ -463,7 +470,8 @@ _BESS_FEEDER = [("1000AL", 0.80, 0), ("500AL", 0.15, 1), ("500AL", 0.15, 1), ("4
 EXAMPLE = {
     "plant": {
         "name": "Hybrid_PV100_BESS100", "model_type": "SMIB", "sbase_mva": 100.0, "out_raw": "YES",
-        "out_dyr": "YES", "out_pscad": "YES", "freq_hz": 60.0, "first_bus": 1000,
+        "out_dyr": "YES", "out_pscad": "YES", "out_epc": "YES", "out_dyd": "YES", "freq_hz": 60.0,
+        "first_bus": 1000,
         "poi_kv": 230.0, "poi_name": "POI", "grid_scr": 3.0, "grid_x_r": 10.0,
         "tie_length": 5.0, "tie_unit": "km", "tie_per_unit": "km", "tie_r_per": 0.0720, "tie_x_per": 0.4950,
         "tie_b_per": 3.35,
@@ -1188,7 +1196,8 @@ def _blank_means(note):
 
 
 def _used_by(sheet, key):
-    if sheet in ("Dyr_Params", "Dyr_Records") or key in ("plant_ctrl", "regc_repc", "reec", "zsorce_x", "wmod"):
+    if sheet in ("Dyr_Params", "Dyr_Records") or key in ("plant_ctrl", "regc_repc", "regc", "reec", "zsorce_x",
+                                                          "wmod"):
         return "PSS/E .dyr"
     if sheet == "PSCAD_Params" or key.startswith("pscad"):
         return "PSCAD"
@@ -2162,6 +2171,14 @@ def gen_data(r):
                                                                                     " or ".join(REEC_OK[typ])))
     elif reec:
         raise InputError("%s: Electrical control %s -- only inverters take one (PV, BESS, WT4, WT3)" % (w, reec))
+    regc = _choice(r, "regc", w, ["REGC_A", "REGC_B"], None)
+    if typ in REGC_OK:
+        regc = regc or "REGC_A"
+        if regc not in REGC_OK[typ]:
+            raise InputError("%s: Converter model %s -- a %s generator takes %s" % (w, regc, typ,
+                                                                                 " or ".join(REGC_OK[typ])))
+    elif regc:
+        raise InputError("%s: Converter model %s -- only inverters take one (PV, BESS, WT4, WT3)" % (w, regc))
     n = _int(r, "units", w, required=True, minimum=1)
     pmax = _num(r, "unit_pmax_mw", w, required=True)
     pmin = _num(r, "unit_pmin_mw", w, 0.0)
@@ -2177,7 +2194,8 @@ def gen_data(r):
         raise InputError("%s: Unit Pmin is above Unit Pmax" % w)
     if qmin > qmax:
         raise InputError("%s: Unit Qmin is above Unit Qmax" % w)
-    g = {"name": name, "type": typ, "reec": reec, "id": (_txt(r.get("id")) or "1")[:2], "row": r, "where": w, "n": n,
+    g = {"name": name, "type": typ, "reec": reec, "regc": regc, "id": (_txt(r.get("id")) or "1")[:2], "row": r,
+         "where": w, "n": n,
          "unit": {"mva": s, "pmax": pmax, "pmin": pmin, "qmax": qmax, "qmin": qmin, "pf": pf},
          "mbase": n * s, "pmax": n * pmax, "pmin": n * pmin, "qmax": n * qmax, "qmin": n * qmin,
          "q_mode": _choice(r, "q_mode", w, ["share", "fixed"], "share"),
@@ -3110,7 +3128,11 @@ def raw_gen(net, g, poi):
     else:
         qt, qb, vs, ireg, rmp = g["q"], g["q"], net.bus[g["bus"]]["vm"], 0, 100.0
     zx = g["zsorce_x"]
-    if zx is None:
+    if zx is None and g.get("regc") == "REGC_B":
+        zx = REGCB_XE
+        net.notes.append("CHECK: %s: REGC_B with ZSORCE X blank -- Xe %g pu on MBASE used: set the converter's own "
+                         "coupling reactance (Generators: ZSORCE X)" % (g.get("family", g["name"]), zx))
+    elif zx is None:
         zx = DYN_DEFAULTS["GENROU"]["Xdpp"] if g["type"] == "SYNC" else IBR_ZSORCE_X
     wmod = g["wmod"] if g["wmod"] is not None else (0 if g["type"] == "SYNC" else 1)
     g["zx"], g["wmod_used"], g["ireg"], g["vs"] = zx, wmod, ireg, vs
@@ -3208,6 +3230,291 @@ def write_raw(net, path):
 
 
 # ============================================================================
+# PSLF -- the .epc, laid out as PSLF 23 writes it (each record's fields and its continuation lines as in a PSLF 23
+# export; what this model does not use left at PSLF's own defaults)
+# ============================================================================
+EPC_DATES = "  400101   391231"              # in service from 1940 to 2039: PSLF's own 'always'
+
+
+def _pq(text, n):
+    """A PSLF string: in double quotes, n characters."""
+    return '"%-*s"' % (n, (text or "")[:n].replace('"', "'"))
+
+
+def _pref(net, role):
+    """A bus as a branch, transformer or generator record names it: number, name, kV -- or none (0)."""
+    if role is None:
+        return '      0 "            "   0.00'
+    b = net.bus[role]
+    return "%7d %s %6.2f" % (b["num"], _pq(b["name"], 12), b["kv"])
+
+
+def _pf(v, fmt="%.8f"):
+    """A number for PSLF, with its decimal point."""
+    return fmt % v
+
+
+def _tx_lines(net, t, hv, lv, tv, ck, z, ratio, rates):
+    """A transformer's six lines: z [(r, x)] for ps, pt, ts in pu on the system base -- its tbase (as PSLF's own
+       cases have it: the same whichever base PSLF's units flags name); ratio (tap, ftaps, ftapt); rates (rate1 of
+       each winding)."""
+    (rps, xps), (rpt, xpt), (rts, xts) = z
+    tap, ftaps, ftapt = ratio
+    gmag, bmag = t["mag_g"], t["mag_b"]
+    kvt = net.kv(tv) if tv else 0.0
+    tbases = (net.sb, net.sb if tv else 0.0, net.sb if tv else 0.0)
+    return [
+        '%s     %s  %s   " " :   1  1 %s  0 %s %s    1    1 %12.6f %.6e %.6e %.6e %.6e %.6e %.6e /' % (
+            _pref(net, hv), _pref(net, lv), _pq(ck, 2), _pref(net, None), _pref(net, None), _pref(net, tv),
+            tbases[0], rps, xps, rpt, xpt, rts, xts),
+        ' %f %f %f  0.000000 %.6e %.6e %8.1f    0.0    0.0    0.0 0.000  %f  %f  1.100000  0.900000  0.006250  %f  '
+        '1.000000  %f  %f %s   0 1     0.0    0.0    0.0    0.0 /' % (
+            net.kv(hv), net.kv(lv), kvt, gmag, bmag, rates[0], max(1.1, tap), min(0.9, tap), tap, ftaps, ftapt,
+            EPC_DATES),
+        '   1 1.000   0 1.000   0 1.000   0 1.000   0 0.000   0 0.000   0 0.000   0 0.000  0 /',
+        '   %f   %f  0.000000  0.000000 %8.1f %6.1f    0.0 %8.1f %6.1f    0.0 0.000 0.000  0  0  0 0.0000 0.0000 0  '
+        '0  0   0.000000   0.000000  0.000000  0.000000  " "   0.000000 /' % (
+            tbases[1], tbases[2], rates[1], 0.0, rates[2], 0.0),
+        "   " + "    ".join(["0.00"] * 13) + "/",
+        "   " + "    ".join(["0.00"] * 9)]
+
+
+def epc_gen(net, g, poi):
+    """A generator's .epc values: (regulated bus role, qrf, qmax, qmin, gen_x) as raw_gen sets its .raw values."""
+    qt, qb, _vs, ireg, rmp, zx, _wmod = raw_gen(net, g, poi)
+    return ("POI" if ireg else g["bus"]), rmp / 100.0, qt, qb, zx
+
+
+def write_epc(net, path):
+    sb = net.sb
+    poi = _num_of(net, "POI")
+    L = ["# history file date %s" % time.strftime("%a %b %d %H:%M:%S %Y"),
+         "# present file date %s" % time.strftime("%a %b %d %H:%M:%S %Y"),
+         "# Version 23.1.1", "# Exported to Version 23",
+         "title", ("%s %s" % (net.model, net.name))[:80],
+         ("POI %.1f kV  SCR %s  X/R %s -- smib_build.py %s" % (
+             net.kv("POI"), _g(net.thev["scr"], 4) if net.thev["scr"] else "-", _g(net.thev["x_r"], 4),
+             time.strftime("%Y-%m-%d %H:%M")))[:80],
+         "!", "comments", "generic WECC models: placeholders until the vendor's (the .dyd)", "!",
+         "solution parameters",
+         "tap    1    tcul  enabled/disabled", "phas   0    ps    enabled/disabled",
+         "area   0    area  enabled/disabled", "svd    1    svd   enabled/disabled",
+         "dctap  1    dc    enabled/disabled", "gcd    0    gcd   enabled/disabled",
+         "jump  0.000100    jumper threshold", "toler   0.1000    newton tolerance",
+         "sbase %8.4f    system mva base" % sb, "!"]
+    gens = [(g, epc_gen(net, g, poi)) for g in net.gens]
+    held = set(e[0] for g, e in gens if e[0] != g["bus"])      # remote buses the generators hold
+    L.append("bus data  [%5d]               ty  vsched   volt     angle    ar zone  vmax   vmin   date_in date_out "
+             "pid L own st  latitude  longitude island    sdmon   vmax1      vmin1      dvmax subst" % len(net.bus))
+    gen_buses = set(g["bus"] for g in net.gens)
+    for role, b in net.bus.items():
+        ty = 0 if role == "IB" else (2 if role in gen_buses else 1)
+        vs = net.ctl["v_poi"] if role in held else b["vm"]
+        L.append('%7d %s %9.4f " "  0  :  %d %.8f %.8f %.8f    1    1 1.1000 0.9000 %s   0 0   1 0   0.000000   '
+                 '0.000000     0 0    1.10000    0.90000    0.00000 -1 " "     0 -1 " "  0  " " '
+                 % (b["num"], _pq(b["name"], 12), b["kv"], ty, vs, b["vm"], b["va"], EPC_DATES))
+    nbr = sum(ln["count"] for ln in net.lines)
+    L.append("branch data  [%5d]                                          ck  se  ------------long_id_------------    "
+             "st resist   react   charge   rate1  rate2  rate3  rate4 aloss  lngth " % nbr)
+    for ln in net.lines:
+        for c in range(ln["count"]):
+            L.append('%s     %s  %s   1 " "  :  1 %s %s %s %7.2f    0.00    0.00    0.00 0.000    0.000 /' % (
+                _pref(net, ln["fr"]), _pref(net, ln["to"]), _pq(str(c + 1), 2), _pf(ln["r"]), _pf(ln["x"]),
+                _pf(ln["b"]), ln["rate"]))
+            L.append('   1    1  0.000000  0.000000  0.000000 %s   0 1  0    0.00    0.00    0.00    0.00   1 1.000   '
+                     '0 0.000   0 0.000   0 0.000   0 0.000   0 0.000   0 0.000   0 0.000  0 0  0  0  0  0.000   '
+                     '0.000000  0.000000  " "     0.00    0.00    0.00    0.00 ' % EPC_DATES)
+    ntx = sum(t["count"] for t in net.tx2) + sum(t["count"] for t in net.tx3)
+    L.append("transformer data  [%4d]                                     ck   ------------long_id_------------     st "
+             "ty --no---    reg_name          zt         int                           tert                      "
+             "ar zone  tbase   ps_r    ps_x    pt_r    pt_x    ts_r    ts_x" % ntx)
+    for t in net.tx2:
+        t1, t2 = t["windv1"] / net.kv(t["hv"]), t["windv2"] / net.kv(t["lv"])
+        k = sb / t["mva"] * t2 * t2                 # one tap, on the HV side: t1 / t2; the impedance t2^2 its own
+        for c in range(t["count"]):
+            L.extend(_tx_lines(net, t, t["hv"], t["lv"], None, str(c + 1),
+                               [(t["r"] * k, t["x"] * k), (0.0, 0.0), (0.0, 0.0)], (t1 / t2, 1.0, 1.0),
+                               (t["rate"], 0.0, 0.0)))
+    for t in net.tx3:
+        tk = [t["windv"][w] / net.kv(role) for w, role in enumerate((t["hv"], t["lv"], t["tv"]))]
+        z = [(t["r" + p] * sb / t["s" + p], t["x" + p] * sb / t["s" + p]) for p in ("12", "31", "23")]
+        for c in range(t["count"]):
+            L.extend(_tx_lines(net, t, t["hv"], t["lv"], t["tv"], str(c + 1), z, (tk[0], tk[1], tk[2]),
+                               (t["rate"], t["mva2"] or 0.0, t["mva3"] or 0.0)))
+    L.append("generator data  [%4d]         id   ------------long_id_------------    st ---no--     reg_name           "
+             "prf  qrf  ar zone   pgen   pmax   pmin   qgen   qmax   qmin   mbase  cmp_r cmp_x gen_r gen_x           "
+             "hbus                         tbus                date_in date_out pid N" % (len(net.gens) + 1))
+    s = next(f["s2"] for f in net.op["flows"] if f["kind"] == "GRID")      # what the infinite bus takes in
+    rows = [("IB", IB_ID, "IB", 1.0, s.real, 99999.0, -99999.0, s.imag, 99999.0, -99999.0, IB_MBASE, IB_XSOURCE)]
+    for g, (reg, qrf, qmax, qmin, zx) in gens:
+        rows.append((g["bus"], g["id"], reg, qrf, g["p"], g["pmax"], g["pmin"], g["q"], qmax, qmin, g["mbase"], zx))
+    for bus, gid, reg, qrf, p, pmax, pmin, q, qmax, qmin, mb, zx in rows:
+        L.append('%s %s  " " :  1 %s  1.000000  %f   1    1 %f %f %f %f %f %f %.4f 0.000 0.000 0.000 %.3f %s %s %s '
+                 '  0 1 /' % (_pref(net, bus), _pq(gid, 2), _pref(net, reg), qrf, p, pmax, pmin, q, qmax, qmin, mb, zx,
+                             _pref(net, None), _pref(net, None), EPC_DATES))
+        L.append(' 0.0000 0.0000 1.0000   1 1.000   0 0.000   0 0.000   0 0.000   0 0.000   0 0.000   0 0.000   0 '
+                 '0.000    0   0   0   0   0   0   0    0.0 0 0  0.000000    0  " "  0  0   0   0   0   0   0.000000 /')
+        L.append('  0   0  0.000000   0  0.000000   0.000000  " "     0     0   0.000000   0.000000 ')
+    ids, loads = collections.defaultdict(int), []
+    for x in net.loads + net.shunts:                     # a fixed shunt: a constant-impedance load, ids S1, S2 ...
+        sh = "mw" not in x
+        ids[(x["bus"], sh)] += 1
+        loads.append((x["bus"], ("S%d" if sh else "%d") % ids[(x["bus"], sh)], 0.0 if sh else x["mw"],
+                      -x["mvar"] if sh else x["mvar"]))
+    L.append("load data  [%4d]             id   ------------long_id_------------     st      mw      mvar    mw_i    "
+             "mvar_i  mw_z      mvar_z  ar zone  date_in date_out pid N own M nonc  thr_bus flg" % len(loads))
+    for bus, lid, mw, mvar in loads:
+        L.append('%s %s   " " :  1 0.000000 0.000000 0.000000 0.000000 %f %f   1    1 %s   0 1   1 0    0 %s   0 " "'
+                 '    0  0 %s "  " 0.000000 0.000000 0 0 0.000000 0.000000 0 0  0.000000  " "  ' % (
+                     _pref(net, bus), _pq(lid, 2), mw, mvar, EPC_DATES, _pref(net, None), _pref(net, None)) +
+                 " ".join(["0.000000"] * 11) + " 0")
+    L += ["zone data  [   1]                            pnet     qnet",
+          '    1 %s    0.000    0.000 0 ' % _pq("SMIB", 32),
+          "owner data  [    1]    owner name           s name       net_mw   net_mvar     sch_mw   sch_mvar  ar M",
+          '       1 %s %s :      0.000      0.000      0.000      0.000   0 0 ' % (_pq("SMIB", 32), _pq("SMIB", 4)),
+          "end"]
+    _write_text(path, "\n".join(L) + "\n")
+
+
+# PSLF .dyd: each PSS/E model of the .dyr as the PSLF model it stands for, its values in PSLF's parameter order
+# (positional records, as PSLF 24 writes them): a name takes that PSS/E parameter's value, a number is PSLF's own
+# setting. The orders are those of PSLF's dyd templates and of PSLF cases of plants with these models.
+_PSLF_VDL = ["Vq1", "Iq1", "Vq2", "Iq2", "Vq3", "Iq3", "Vq4", "Iq4", "Vp1", "Ip1", "Vp2", "Ip2", "Vp3", "Ip3", "Vp4",
+             "Ip4"]
+_PSLF_VDL10 = ["%s%d" % (n, k) for vi in (("Vq", "Iq"), ("Vp", "Ip")) for k in range(1, 11) for n in vi]
+_LHVRT = ["vref"] + ["dvtrp%d" % k for k in range(1, 11)] + ["dttrp%d" % k for k in range(1, 11)] + ["alarm"]
+_LHFRT = ["fref"] + ["dftrp%d" % k for k in range(1, 11)] + ["dttrp%d" % k for k in range(1, 11)] + ["alarm"]
+PSLF_DYD = {
+    #           PSLF name  header  parameters
+    "GENCLS": ("gencls", "mva", ["H", "D", 0.0, "_XS", 0.0, 0.0]),             # h d ra lppd rcomp xcomp
+    "REGCA1": ("regc_a", "mva", ["LVPLSW", "Rrpwr", "Brkpt", "Zerox", "Lvpl1", "Volim", "Lvpnt1", "Lvpnt0", "Iolim",
+                                 "Accel", "Tg", "Tfltr", "Iqrmax", "Iqrmin", 0.0]),
+    "REECA1": ("reec_a", None, [0.0, "Vdip", "Vup", "Trv", "dbd1", "dbd2", "Kqv", "Iqh1", "Iql1", "Vref0", "Iqfrz",
+                                "Thld", "Thld2", "Tp", "QMax", "QMin", "VMAX", "VMIN", "Kqp", "Kqi", "Kvp", "Kvi",
+                                "Vref1", "Tiq", "dPmax", "dPmin", "PMAX", "PMIN", "Imax", "Tpord", "PFFLAG", "VFLAG",
+                                "QFLAG", "PFLAG", "PQFLAG"] + _PSLF_VDL),
+    "REECCU1": ("reec_c", None, [0.0, "Vdip", "Vup", "Trv", "dbd1", "dbd2", "Kqv", "Iqh1", "Iql1", "Vref0", "SOCini",
+                                 "SOCmax", "SOCmin", "T", "Tp", "QMax", "QMin", "VMAX", "VMIN", "Kqp", "Kqi", "Kvp",
+                                 "Kvi", "Tiq", "dPmax", "dPmin", "PMAX", "PMIN", "Imax", "Tpord", "PFFLAG", "VFLAG",
+                                 "QFLAG", "PQFLAG"] + _PSLF_VDL),
+    "REPCA1": ("repc_a", "branch", [0.0, "Tfltr", "Kp", "Ki", "Tft", "Tfv", "REFFLAG", "Vfrz", "Rc", "Xc", "Kc",
+                                    "VCFLAG", "emax", "emin", "_DBD", "Qmax", "Qmin", "Kpg", "Kig", "Tp", "fdbd1",
+                                    "fdbd2", "femax", "femin", "Pmax", "Pmin", "Tlag", "Ddn", "Dup", "FFLAG", 0.0,
+                                    0.0]),                       # ... frqflg outflag puflag (WECC's base cases: 0 0)
+    "GENROU": ("genrou", "mva", ["Tdop", "Tdopp", "Tqop", "Tqopp", "H", "D", "Xd", "Xq", "Xdp", "Xqp", "Xdpp", "Xl",
+                                 "S1", "S12", 0.0, 0.0, 0.0, 0.0]),
+    "SEXS": ("sexs", None, ["TA_TB", "TB", "K", "TE", "EMIN", "EMAX", 1.0, 0.0, -999.0, 999.0, 0.0]),
+    "TGOV1": ("tgov1", "mwcap", ["R", "T1", "VMAX", "VMIN", "T2", "T3", "Dt"]),
+    # PSLF's reec_d: its six flags (vcmpflag first) after tpord, then rc xc tr1 kc ke, vblkh before vblkl, tblkdelay,
+    # the two ten-point VDL tables
+    "REECDU1": ("reec_d", None, [0.0, "Vdip", "Vup", "Trv", "dbd1", "dbd2", "Kqv", "Iqh1", "Iql1", "Vref0", "Iqfrz",
+                                 "Thld", "Thld2", "Tp", "QMax", "QMin", "VMAX", "VMIN", "Kqp", "Kqi", "Kvp", "Kvi",
+                                 "Vref1", "Tiq", "dPmax", "dPmin", "PMAX", "PMIN", "Imax", "Tpord", "VCMPFLAG",
+                                 "PFFLAG", "VFLAG", "QFLAG", "PFLAG", "PQFLAG", "Rc", "Xc", "Tr1", "Kc", "Ke", "Vblkh",
+                                 "Vblkl", "Tblk_delay"] + _PSLF_VDL10),
+    # PSLF's regc_b: re + j xe its source impedance -- the generator's ZSORCE, as in the .epc
+    "REGCBU1": ("regc_b", "mva", ["Tfltr", "Tg", "Te", "Rrpwr", "_RE", "_XE", "Iqrmax", "Iqrmin", "RateFlag", "Imax",
+                                  "PQFLAG"]),
+    "LHVRT": ("lhvrt", "watch", _LHVRT),
+    "LHFRT": ("lhfrt", "watch", _LHFRT),
+    # type 3 wind (the orders GridDyn's PSLF reader takes): wtgt_a's turbine and generator inertias and shaft
+    # stiffness from WTDTA1's H, Htfrac and Freq1
+    "WTDTA1": ("wtgt_a", None, [0.0, lambda v: v["H"] * v["Htfrac"], lambda v: v["H"] * (1.0 - v["Htfrac"]), "Dshaft",
+                                lambda v: 2.0 * v["Htfrac"] * (1.0 - v["Htfrac"]) * v["H"] * v["Freq1"] ** 2]),
+    "WTARA1": ("wtga_a", None, [0.0, "Ka", "Theta0"]),
+    "WTPTA1": ("wtgp_a", None, [0.0, "Kiw", "Kpw", "Kic", "Kpc", "Kcc", "Tp", "TetaMax", "TetaMin", "RTetaMax",
+                                "RTetaMin"]),
+    "WTTQA1": ("wtgq_a", None, [0.0, "Kip", "Kpp", "Tp", "Twref", "Temax", "Temin", "p1", "spd1", "p2", "spd2", "p3",
+                                "spd3", "p4", "spd4", "TFLAG"]),
+}
+PSLF_NAME = {}                             # PSS/E models PSLF has, their parameter order not here yet
+PSLF_DYD["REGCAU1"], PSLF_DYD["REPCAU1"] = PSLF_DYD["REGCA1"], PSLF_DYD["REPCA1"]
+
+
+def _dv(v):
+    """A .dyd value: short, its decimal point kept."""
+    t = "%.6g" % float(v)
+    return t if any(c in t for c in ".en") else t + ".0"
+
+
+def _dbus(net, num):
+    """A bus as a .dyd record names it: number "name" kV."""
+    role = next((r for r, b in net.bus.items() if b["num"] == int(num)), None)
+    b = net.bus[role]
+    return "%7d %s %7.2f" % (b["num"], _pq(b["name"], 12), b["kv"])
+
+
+def pslf_records(net, recs):
+    """[(generator name | IB | PLANT, PSS/E model, its .dyd record, "" where it has none of its own, or None)]: None
+       where PSLF has no model here. REPC_B (PLNTBU1 + a REAX4BU1 on each generator) goes as a repc_a on each of its
+       generators -- PLNTBU1's settings, the generator's own limits (REAX4BU1's) -- holding the same bus through the
+       same branch, as WECC cases have several inverters on one POI."""
+    gen_of = dict((g["name"], g) for g in net.gens)
+    plant = dict(next((v for n, m, v in recs if m == "PLNTBU1"), []))
+    out = []
+    for gname, model, vals in recs:
+        if model == "PLNTBU1":
+            out.append((gname, model, ""))
+            continue
+        if model == "REAX4BU1" and plant:
+            vals = list(dict(plant, **dict((k, x) for k, x in vals if k in ("Qmax", "Qmin", "Pmax", "Pmin"))).items())
+            model = "REPCA1"
+        spec = PSLF_DYD.get(model)
+        if spec is None:
+            out.append((gname, model, None))
+            continue
+        name, head, order = spec
+        v = dict(vals)
+        if gname == "IB":
+            bus, gid, mva = _num_of(net, "IB"), IB_ID, IB_MBASE
+            v["H"] = v["H"] or 9999.0                  # PSS/E's H 0 (an infinite bus): a very large H for PSLF
+            v["_XS"] = IB_XSOURCE
+        else:
+            g = gen_of[gname]
+            bus, gid, mva = _num_of(net, g["bus"]), g["id"], g["mbase"]
+            v["_RE"], v["_XE"] = 0.0, g.get("zx", IBR_ZSORCE_X)
+        rec = "%-8s %s %s" % (name, _dbus(net, bus), '"%s"' % gid)
+        if head == "branch":                          # the bus it holds, then the branch it measures
+            rec += "  %s !  !  %s %s %s" % (_dbus(net, v["BUSR"] or bus), _dbus(net, v["BUS1"]), _dbus(net, v["BUS2"]),
+                                             '"%s"' % v["CKT"])
+            v["_DBD"] = max(abs(float(v["dbd1"])), abs(float(v["dbd2"])))
+        if head == "watch":                           # the bus whose voltage / frequency it watches
+            rec += "  %s" % _dbus(net, bus)
+        rec += " : #9"
+        if head == "mva":
+            rec += " mva=%s" % _dv(mva)
+        elif head == "mwcap":
+            rec += " mwcap=%s" % _dv(mva)
+        words = [_dv(x(v) if callable(x) else (v[x] if isinstance(x, str) else x)) for x in order]
+        lines, cur = [], rec
+        for k, w in enumerate(words):
+            if k and len(cur) + len(w) > 118:
+                lines.append(cur + " /")
+                cur = " "
+            cur += " " + w
+        out.append((gname, model, "\n".join(lines + [cur])))
+    return out
+
+
+def write_dyd(net, recs, path):
+    L = ["#   dynamics data written %s by smib_build.py" % time.strftime("%a %b %d %H:%M:%S %Y"),
+         "#   %s %s: generic WECC models, placeholders until the vendor's" % (net.model, net.name), "#", "models"]
+    for gname, model, rec in pslf_records(net, recs):
+        if rec == "":
+            continue
+        if rec is None:
+            pn = PSLF_NAME.get(model, model)
+            L.append("# %s: %s (PSS/E %s) not written -- add it by hand" % (gname, pn, model))
+            fam = next((g.get("family", g["name"]) for g in net.gens if g["name"] == gname), gname)
+            note = "CHECK: PSLF .dyd: %s %s (PSS/E %s) not written -- add it by hand" % (fam, pn, model)
+            if note not in net.notes:
+                net.notes.append(note)
+        else:
+            L.append(rec)
+    _write_text(path, "\n".join(L) + "\n")
+
+
+# ============================================================================
 # PSS/E -- the .dyr
 # ============================================================================
 # The models -- WECC-approved only (WECC Approved Dynamic Model List): REGC_A, REEC_A, REEC_C, REEC_D, REPC_A,
@@ -3249,6 +3556,8 @@ DYR_LIB = collections.OrderedDict([
     ("REECA1", (None, 6, ["BUSR", "PFFLAG", "VFLAG", "QFLAG", "PFLAG", "PQFLAG"] + _REECA + _VDL)),
     ("REPCA1", (None, 7, _REPCA)),
     ("REGCAU1", ((101, 1, 1, 14, 3, 4), 1, _REGCA)),
+    ("REGCBU1", ((101, 1, 2, 7, 5, 8), 2, ["RateFlag", "PQFLAG", "Tg", "Tfltr", "Iqrmax", "Iqrmin", "Rrpwr", "Te",
+                                           "Imax"])),
     ("REECCU1", ((102, 0, 5, 45, 7, 6), 5, ["BUSR", "PFFLAG", "VFLAG", "QFLAG", "PQFLAG",
                                              "Vdip", "Vup", "Trv", "dbd1", "dbd2", "Kqv", "Iqh1", "Iql1", "Vref0", "Tp",
                                              "QMax", "QMin", "VMAX", "VMIN", "Kqp", "Kqi", "Kvp", "Kvi", "Tiq", "dPmax",
@@ -3268,7 +3577,14 @@ DYR_LIB = collections.OrderedDict([
                           "S12"])),
     ("SEXS", (None, 0, ["TA_TB", "TB", "K", "TE", "EMIN", "EMAX"])),
     ("TGOV1", (None, 0, ["R", "T1", "VMAX", "VMIN", "T2", "T3", "Dt"])),
+    ("LHVRT", (None, 0, _LHVRT)),
+    ("LHFRT", (None, 0, _LHFRT)),
 ])
+# the ride-through relays, set as PSLF's lhvrt / lhfrt (a reference and up to ten trip points: a deviation from it
+# and a time): in the .dyd as they are, in the .dyr as one VTGTPAT / FRQTPAT (a generator trip relay of one band)
+# per trip point, its other side open
+RELAYS = {"LHVRT": ("VTGTPAT", "vref", "dvtrp", 99.0), "LHFRT": ("FRQTPAT", "fref", "dftrp", 99.0)}
+PSLF_ONLY = tuple(RELAYS)
 DYR_USRBUS = ("PLNTBU1",)                  # bus-level user models: 'USRBUS' records, no machine
 DYR_ALIAS = {"TG": "Tlag", "VBIAS": "Vref1", "IQHL": "Iqh1", "IQLL": "Iql1", "TA/TB": "TA_TB", "TATB": "TA_TB"}
 
@@ -3315,6 +3631,21 @@ DYN_DEFAULTS = {
 }
 
 DYN_DEFAULTS["REGCAU1"] = dict(DYN_DEFAULTS["REGCA1"])
+# protection (PSLF lhvrt / lhfrt on each inverter): trips just past NERC PRC-024-2's no-trip boundaries -- voltage
+# (pu from vref): HV 1.2 at once, 1.175 0.2 s, 1.15 0.5 s, 1.1 1 s; LV 0.45 0.15 s, 0.65 0.3 s, 0.75 2 s, 0.9 3 s;
+# frequency (Hz from fref, the Western Interconnection's): 61.7 at once, 61.6 30 s, 60.6 180 s; 57.0 at once,
+# 57.3 0.75 s, 57.8 7.5 s, 58.4 30 s, 59.4 180 s. A trip time of 0: PSLF takes two time steps.
+for _m, _ref, _pts in (("LHVRT", ("vref", 1.0), [(0.2, 0.0), (0.175, 0.2), (0.15, 0.5), (0.1, 1.0), (-0.55, 0.15),
+                                                 (-0.35, 0.3), (-0.25, 2.0), (-0.1, 3.0)]),
+                       ("LHFRT", ("fref", 60.0), [(1.7, 0.0), (1.6, 30.0), (0.6, 180.0), (-3.0, 0.0), (-2.7, 0.75),
+                                                  (-2.2, 7.5), (-1.6, 30.0), (-0.6, 180.0)])):
+    _d = dict([_ref, ("alarm", 0)])
+    for _k in range(10):
+        _d[DYR_LIB[_m][2][1 + _k]], _d[DYR_LIB[_m][2][11 + _k]] = _pts[_k] if _k < len(_pts) else (0.0, 0.0)
+    DYN_DEFAULTS[_m] = _d
+# REGC_B (PSS/E 35's REGCBU1): its PQ flag and Imax follow its REEC's (set so in the .dyr unless Dyr_Params says)
+DYN_DEFAULTS["REGCBU1"] = {"RateFlag": 0, "PQFLAG": 0, "Tg": 0.02, "Tfltr": 0.02, "Iqrmax": 99.0, "Iqrmin": -99.0,
+                           "Rrpwr": 10.0, "Te": 0.02, "Imax": 1.1}
 DYN_DEFAULTS["REPCAU1"] = dict(DYN_DEFAULTS["REPCA1"])
 DYN_DEFAULTS["PLNTBU1"] = dict(DYN_DEFAULTS["REPCA1"], MVAbase=100.0)
 # REEC_D: REEC_A's generic values and flags (all 0: the same whether the first ICON is a flag or a bus), flat
@@ -3342,7 +3673,7 @@ def gen_chain(g, ctl):
     if g["type"] == "USER":
         return []
     usr = ctl.get("regc_repc") == "USRMDL"
-    chain = ["REGCAU1" if usr else "REGCA1", REEC_MODEL[g["reec"]]]
+    chain = ["REGCBU1" if g.get("regc") == "REGC_B" else ("REGCAU1" if usr else "REGCA1"), REEC_MODEL[g["reec"]]]
     if g["q_mode"] == "share":                   # fixed Q: no plant controller, its REEC holds its own Q
         chain.append("REAX4BU1" if on_plntbu1(g, ctl) else ("REPCAU1" if usr else "REPCA1"))
     if g["type"] == "WT3":
@@ -3523,12 +3854,17 @@ def dyr_models(net, inp):
             "TGOV1": {"VMAX": max(1.05, g["p"] / mb + 0.05)},
         }
         auto["REPCAU1"] = auto["REPCA1"]
+        prot = list(PSLF_ONLY) if g["type"] in REGC_OK else []
         for m in over.get(g["name"], {}):
             note = "NOTE: Dyr_Params for %s %s: %s is not in its model chain %s -- not used" % (
-                g.get("family", g["name"]), m, m, "+".join(chain) or "(none: type USER)")
-            if m not in chain and note not in net.notes:
+                g.get("family", g["name"]), m, m, "+".join(chain + prot) or "(none: type USER)")
+            if m not in chain + prot and note not in net.notes:
                 net.notes.append(note)
-        for m in chain:
+        if "REGCBU1" in chain:                     # the converter's current limit as its electrical control's
+            rv = dict(_merged(chain[1], auto.get(chain[1], {}), over[g["name"]][chain[1]]))
+            auto["REGCBU1"] = {"PQFLAG": rv["PQFLAG"], "Imax": rv["Imax"]}
+        auto["LHFRT"] = {"fref": net.f}
+        for m in chain + prot:
             out.append((g["name"], m, list(_merged(m, auto.get(m, {}), over[g["name"]][m]))))
         g["dyr"] = chain
     net.plant_ctrl = None
@@ -3588,7 +3924,11 @@ def write_dyr(net, inp, path):
     L = ["/ %s %s -- written by smib_build.py on %s" % (net.model, net.name, time.strftime("%Y-%m-%d %H:%M")),
          "/ generic WECC models: placeholders until the vendor's models (parameters: Dyr_Params)"]
     gen_of = dict((g["name"], g) for g in net.gens)
+    mins = [0]
     for gname, model, vals in recs:
+        if model in RELAYS:
+            L.extend(relay_records(net, gen_of[gname], model, dict(vals), mins))
+            continue
         hdr, nic, _names = DYR_LIB[model]
         if gname == "IB":
             bus, mid = _num_of(net, "IB"), IB_ID
@@ -3614,6 +3954,23 @@ def write_dyr(net, inp, path):
     L.extend(user_records(net, inp))
     _write_text(path, "\n".join(L))
     return recs
+
+
+def relay_records(net, g, model, v, mins):
+    """Generator g's ride-through relay as PSS/E has it: a VTGTPAT / FRQTPAT for each trip point (a deviation below
+       the reference: the lower threshold; above it: the upper), each its own instance number (MINS)."""
+    name, ref, dev, far = RELAYS[model]
+    bus = _num_of(net, g["bus"])
+    out = []
+    for k in range(1, 11):
+        d, t = float(v["%s%d" % (dev, k)]), float(v["dttrp%d" % k])
+        if d == 0.0 and t == 0.0:
+            continue
+        lo, hi = (float(v[ref]) + d, far) if d < 0 else (0.0, float(v[ref]) + d)
+        mins[0] += 1
+        out.append("%d '%s' %d %d '%s'  %s  %s  %s  0.0  /" % (mins[0], name, bus, bus, g["id"], _g(lo), _g(hi),
+                                                                 _g(t)))
+    return out
 
 
 def user_records(net, inp):
@@ -5682,7 +6039,9 @@ def report_text(net, inp, recs, comps, files, src):
               "set them"]
     for gname, model, vals in recs:
         nic = DYR_LIB[model][1]
-        L.append("   %-6s %-8s ICON: %s" % (gname, model, " ".join("%s=%s" % (p, v) for p, v in vals[:nic]) or "-"))
+        L.append("   %-6s %-8s ICON: %s%s" % (gname, model, " ".join("%s=%s" % (p, v) for p, v in vals[:nic]) or "-",
+                                             ("  (.dyd: %s; .dyr: a %s per trip point)" % (
+                                                 model.lower(), RELAYS[model][0])) if model in RELAYS else ""))
         cons = ["%s=%s" % (p, _g(float(v))) for p, v in vals[nic:]]
         for k in range(0, len(cons), 8):
             L.append("   %-6s %-8s %s %s" % ("", "", "CON:" if k == 0 else "    ", "  ".join(cons[k:k + 8])))
@@ -5696,8 +6055,8 @@ def report_text(net, inp, recs, comps, files, src):
     else:
         L += ["", "8. PSCAD: not built (Plant: Build PSCAD model NO)"]
     L += ["", "9. FILES" + "".join(" -- no %s (Plant: Build ... NO)" % w for k, w in (
-        ("raw", ".raw"), ("dyr", ".dyr")) if not files.get(k))]
-    for k in ("raw", "dyr", "pscad_build", "pscad_data", "json", "xlsx"):
+        ("raw", ".raw"), ("dyr", ".dyr"), ("epc", ".epc"), ("dyd", ".dyd")) if not files.get(k))]
+    for k in ("raw", "dyr", "epc", "dyd", "pscad_build", "pscad_data", "json", "xlsx"):
         if files.get(k):
             L.append("   %s" % files[k])
     L += ["", "10. REVIEW"]
@@ -6156,6 +6515,8 @@ def pscad_build(files, out, log):
 
 
 MODEL_DIRS = {"DETAILED": "Detailed_Models", "SMIB": "Equivalent_Models"}     # in Models (OUT_DIR)
+OUT_KINDS = (("raw", "PSS/E .raw"), ("dyr", "PSS/E .dyr"), ("pscad", "PSCAD model"), ("epc", "PSLF .epc"),
+             ("dyd", "PSLF .dyd"))                              # what Plant: Build ... can say YES / NO to
 
 
 def build(src, out_dir=None, check=True, pscad=True):
@@ -6201,6 +6562,15 @@ def build(src, out_dir=None, check=True, pscad=True):
             recs = write_dyr(net, inp, files["dyr"])
         else:
             recs = dyr_models(net, inp)
+        if want["epc"] or want["dyd"]:
+            files["pslf_dir"] = os.path.join(out, "PSLF")
+            os.makedirs(files["pslf_dir"])
+        if want["epc"]:
+            files["epc"] = os.path.join(files["pslf_dir"], net.stem + ".epc")
+            write_epc(net, files["epc"])
+        if want["dyd"]:
+            files["dyd"] = os.path.join(files["pslf_dir"], net.stem + ".dyd")
+            write_dyd(net, recs, files["dyd"])
         if want["pscad"]:
             os.makedirs(pscad_dir)
             files["pscad_dir"] = pscad_dir
@@ -6221,10 +6591,10 @@ def build(src, out_dir=None, check=True, pscad=True):
         shutil.rmtree(out, ignore_errors=True)   # this run's own new folder: no half-written models left
         raise
     log("[smib] written to %s" % out)
-    for k in ("report", "raw", "dyr", "pscad_build", "pscad_data"):
+    for k in ("report", "raw", "dyr", "epc", "dyd", "pscad_build", "pscad_data"):
         if files.get(k):
             log("         %s" % os.path.relpath(files[k], out))
-    skip = [w for k, w in (("raw", "PSS/E .raw"), ("dyr", "PSS/E .dyr"), ("pscad", "PSCAD model")) if not want[k]]
+    skip = [w for k, w in OUT_KINDS if not want[k]]
     if skip:
         log("[smib] not built (Plant: Build ...): %s" % ", ".join(skip))
     for n in net.notes:
@@ -6244,9 +6614,9 @@ def build(src, out_dir=None, check=True, pscad=True):
 
 
 def outputs(inp):
-    """What Plant says to build: {"raw", "dyr", "pscad": True / False} (blank = YES)."""
+    """What Plant says to build: {"raw", "dyr", "pscad", "epc", "dyd": True / False} (blank = YES)."""
     pl = inp["plant"]
-    return dict((k, _choice(pl, "out_" + k, "Plant", ["YES", "NO"], "YES") == "YES") for k in ("raw", "dyr", "pscad"))
+    return dict((k, _choice(pl, "out_" + k, "Plant", ["YES", "NO"], "YES") == "YES") for k, _w in OUT_KINDS)
 
 
 def psse_check_only(out):
@@ -6696,8 +7066,8 @@ def gui(start=None):
     data = {"plant": {}}
 
     # ---------------------------------------------------------------- header, toolbar, tabs, status
-    ttk.Label(root, text="SMIB PLANT MODEL  |  PSS/E and PSCAD from one set of inputs", style="Head.TLabel").pack(
-        fill="x")
+    ttk.Label(root, text="SMIB PLANT MODEL  |  PSS/E, PSLF, TSAT and PSCAD from one set of inputs",
+              style="Head.TLabel").pack(fill="x")
     ttk.Label(root, text="Each tab is a sheet of the input workbook. A blank cell takes its default; the line under "
                          "each tab explains the field you are on.", style="Sub.TLabel").pack(fill="x")
     bar = ttk.Frame(root, padding=(6, 4))
@@ -7559,7 +7929,7 @@ def gui(start=None):
     # ---------------------------------------------------------------- the data in and out of the widgets
     def to_widgets():
         for key, var in app["vars"].items():
-            var.set(data["plant"].get(key) or ("YES" if key in ("out_raw", "out_dyr", "out_pscad") else ""))
+            var.set(data["plant"].get(key) or ("YES" if key in ["out_" + k for k, _w in OUT_KINDS] else ""))
         for g in app["grids"].values():
             g.refresh(0 if g.rows else None)
         app["dirty"] = False
@@ -7809,9 +8179,9 @@ def gui(start=None):
         run(job, "CHECK")
 
     def build_models():
-        if all(app["vars"][k].get() == "NO" for k in ("out_raw", "out_dyr", "out_pscad")):
-            messagebox.showinfo("Build models", "Nothing to build: tick PSS/E .raw, PSS/E .dyr or PSCAD model.",
-                                parent=root)
+        if all(app["vars"]["out_" + k].get() == "NO" for k, _w in OUT_KINDS):
+            messagebox.showinfo("Build models", "Nothing to build: tick %s or %s." % (
+                ", ".join(w for _k, w in OUT_KINDS[:-1]), OUT_KINDS[-1][1]), parent=root)
             return
         if not save():
             return
@@ -7854,8 +8224,8 @@ def gui(start=None):
     b_open.pack(side="left", padx=2)
     b_open.state(["disabled"])
     ttk.Label(bar2, text="Build:", style="Item.TLabel").pack(side="left")
-    for key, txt in (("out_raw", "PSS/E .raw"), ("out_dyr", "PSS/E .dyr"), ("out_pscad", "PSCAD model")):
-        ttk.Checkbutton(bar2, text=txt, variable=app["vars"][key], onvalue="YES", offvalue="NO").pack(
+    for key, txt in OUT_KINDS:
+        ttk.Checkbutton(bar2, text=txt, variable=app["vars"]["out_" + key], onvalue="YES", offvalue="NO").pack(
             side="left", padx=4)
     ttk.Separator(bar2, orient="vertical").pack(side="left", fill="y", padx=8)
     ttk.Label(bar2, text="Then:", style="Item.TLabel").pack(side="left")
