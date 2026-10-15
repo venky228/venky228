@@ -2752,6 +2752,65 @@ class SolveError(Exception):
     pass
 
 
+def ramped(Y, slack, vslack, sinj, steps=10):
+    """Newton from the flat start up to sinj in steps, each from the last: a heavy plant's load flow that a flat
+       start misses -> (V or None, the largest share of sinj solved, its V)."""
+    V, good, Vg = None, 0.0, None
+    k_bad = None
+    for n in range(1, steps + 1):
+        k = float(n) / steps
+        V2, ok, _it = newton(Y, slack, vslack, [x * k for x in sinj], V)
+        if not ok:
+            k_bad = k
+            break
+        V, good, Vg = V2, k, V2
+    if k_bad is None:
+        return V, 1.0, V
+    for _i in range(5):                               # how far it goes: between the last solved and the first not
+        k = (good + k_bad) / 2.0
+        V2, ok, _it = newton(Y, slack, vslack, [x * k for x in sinj], Vg)
+        if ok:
+            good, Vg = k, V2
+        else:
+            k_bad = k
+    return None, good, Vg
+
+
+def bottleneck(net, roles, idx, V):
+    """Why the plant's power does not get through, at a solved state V: the branches with the most angle and
+       voltage drop across them, and the lowest voltage -> text."""
+    sb, br = net.sb, []
+
+    def add(name, what, i, j, z, ohm=None):
+        vi, vj = V[i], V[j]
+        ang = abs(math.degrees(cmath.phase(vi / vj))) if abs(vj) > 1e-9 else 180.0
+        cur = (vi - vj) / z if abs(z) > 1e-12 else 0j
+        br.append((ang + 100.0 * abs(abs(vi) - abs(vj)), ang, abs(abs(vi) - abs(vj)), name, what, z, ohm,
+                   abs((vi * cur.conjugate()).real) * sb))
+    for ln in net.lines:
+        if ln["fr"] in idx and ln["to"] in idx:
+            n = ln["count"]
+            add(ln["name"], "line", idx[ln["fr"]], idx[ln["to"]], complex(ln["r"], ln["x"]) / n,
+                complex(ln["R"], ln["X"]) / n)
+    for t in net.tx2:
+        if t["hv"] in idx and t["lv"] in idx:
+            add(t["name"], "transformer", idx[t["hv"]], idx[t["lv"]],
+                complex(t["r"], t["x"]) * sb / t["mva"] / t["count"])
+    for t in net.tx3:
+        if "_star" in t and t["hv"] in idx:
+            zs = [complex(t["r%s" % k], t["x%s" % k]) * sb / t["s%s" % k] for k in ("12", "23", "31")]
+            add(t["name"], "transformer, HV to its star point", idx[t["hv"]], t["_star"],
+                (zs[0] + zs[2] - zs[1]) / 2.0 / t["count"])
+    br.sort(reverse=True)
+    low = min(range(len(roles)), key=lambda k: abs(V[k]))
+    out = []
+    for _key, ang, dv, name, what, z, ohm, mw in br[:2]:
+        out.append("%s (%s) has %.0f deg and %.2f pu across it with %.0f MW through it -- %s%.4g + j%.4g pu on "
+                   "%g MVA" % (name, what, ang, dv, mw, ("R %.4g + X %.4g ohm = " % (ohm.real, ohm.imag)) if ohm
+                                                       else "", z.real, z.imag, sb))
+    return "; ".join(out) + "; the lowest voltage %.3f pu at %s" % (abs(V[low]), roles[low])
+
+
 def operating_point(net, log):
     """Generators' P and Q, every bus voltage, and the infinite bus -- POI targets met (see CONTROL)."""
     c = net.ctl
@@ -2790,14 +2849,24 @@ def operating_point(net, log):
         V, ok, it = newton(Y, poi, vpoi, sinj, state["V"])
         if not ok:
             V, ok, it = newton(Y, poi, vpoi, sinj, None)
+        if not ok:                                    # a heavy plant: the dispatch in steps
+            V, share_ok, Vg = ramped(Y, poi, vpoi, sinj)
+            ok = V is not None
         if not ok:
             bad = [k for k, res in net.colls.items() if res.get("check") is None or not (
                 res["check"]["detailed"]["ok"] and res["check"]["equivalent"]["ok"])]
-            raise SolveError("the plant's load flow does not converge (alpha %.3f, Q %.1f MVAr)%s" % (
-                alpha, beta, (" -- %s %s %s not solve on %s own either: check the Feeders lengths and their "
-                              "unit (km, mi, kft, m, ft) and the cables' R and X" % (
-                                  "collector" if len(bad) == 1 else "collectors", ", ".join(bad),
-                                  "does" if len(bad) == 1 else "do", "its" if len(bad) == 1 else "their"))
+            p_all = sum(x.real for x in sinj) * sb
+            why = (" -- its network carries no more than about %.0f%% of it (%.0f of %.0f MW): there, %s. Check "
+                   "that branch's data (a line's length and its unit, R and X; a transformer's Z %% and MVA)" % (
+                       100.0 * share_ok, share_ok * p_all, p_all, bottleneck(net, roles, idx, Vg))
+                   if Vg is not None else
+                   " -- not even 10%% of it solves: a branch's data is far off (a length and its unit, R and X, "
+                   "a transformer's Z %% and MVA)")
+            raise SolveError("the plant's load flow does not converge (alpha %.3f, Q %.1f MVAr)%s%s" % (
+                alpha, beta, why, (" -- %s %s %s not solve on %s own either: check the Feeders lengths and their "
+                                   "unit (km, mi, kft, m, ft) and the cables' R and X" % (
+                                       "collector" if len(bad) == 1 else "collectors", ", ".join(bad),
+                                       "does" if len(bad) == 1 else "do", "its" if len(bad) == 1 else "their"))
                 if bad else ""))
         state["V"] = V
         i_poi = sum(Y[poi][k] * V[k] for k in range(N))
