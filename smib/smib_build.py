@@ -133,9 +133,12 @@
      <name> = the plant's name and its model type: Hybrid_PV100_BESS100_SMIB, ..._DETAILED
      Models\\Detailed_Models\\ (DETAILED) or Models\\Equivalent_Models\\ (SMIB),
      beside the workbook (OUT_DIR: Models elsewhere), then
-     <name>_<date_time>\\   <name>.raw / .dyr / .sav, <name>_REPORT.txt,
-         <name>_PSCAD_DATA.txt, <name>_build_pscad.py, <name>_inputs.json, a copy
-         of the workbook, _psse\\ (PSS/E's own output of the check run)
+     <name>_<date_time>\\   <name>_REPORT.txt, <name>_inputs.json, a copy of the
+                             workbook, and what Plant: Build ... (or the GUI's
+                             Build: boxes) chose -- any of them, or none:
+         PSSE\\    <name>.raw, <name>.dyr; the check's .sav, .snp, <name>_PSSE_CHECK.txt
+                  and _psse\\ (PSS/E's own output)
+         PSCAD\\   <name>_build_pscad.py, <name>_PSCAD_DATA.txt, <name>.pscx, its log
 
    RUN (the PSS/E Python: 3.4 for PSS/E 34, 3.7+ for PSS/E 35 -- no PSS/E is
    needed to write the models; standard library only)
@@ -216,6 +219,10 @@ PLANT_FIELDS = [
      "(WECC) from its MPT | DETAILED: every feeder section, the units at each node a machine of their own behind "
      "their own GSU -- PSS/E and PSCAD alike (blank = SMIB)", ["SMIB", "DETAILED"]),
     ("sbase_mva", "System base", "MVA", "PSS/E system base (blank = 100)", None),
+    ("out_raw", "Build PSS/E .raw", "", "YES = the load-flow case (blank = YES)", ["YES", "NO"]),
+    ("out_dyr", "Build PSS/E .dyr", "", "YES = the dynamic models (blank = YES)", ["YES", "NO"]),
+    ("out_pscad", "Build PSCAD model", "", "YES = the PSCAD build script, its data and the .pscx (blank = YES)",
+     ["YES", "NO"]),
     ("freq_hz", "Frequency", "Hz", "blank = 60", None),
     ("first_bus", "First bus number", "", "buses are numbered from here + 1 (Bus_Numbers sets any one)", None),
     ("poi_kv", "POI kV", "kV", "", None),
@@ -442,7 +449,8 @@ _BESS_FEEDER = [("1000AL", 0.80, 0), ("500AL", 0.15, 1), ("500AL", 0.15, 1), ("4
 # by section, a GSU and an inverter slot at every node
 EXAMPLE = {
     "plant": {
-        "name": "Hybrid_PV100_BESS100", "model_type": "SMIB", "sbase_mva": 100.0, "freq_hz": 60.0, "first_bus": 1000,
+        "name": "Hybrid_PV100_BESS100", "model_type": "SMIB", "sbase_mva": 100.0, "out_raw": "YES",
+        "out_dyr": "YES", "out_pscad": "YES", "freq_hz": 60.0, "first_bus": 1000,
         "poi_kv": 230.0, "poi_name": "POI", "grid_scr": 3.0, "grid_x_r": 10.0,
         "tie_length": 5.0, "tie_unit": "km", "tie_r_per": 0.0720, "tie_x_per": 0.4950, "tie_b_per": 3.35,
         "tie_parallel": 1, "tie_rate_mva": 400.0,
@@ -2807,6 +2815,21 @@ def _num_of(net, role):
     return net.bus[role]["num"]
 
 
+def raw_gen(net, g, poi):
+    """A generator's .raw values: (QT, QB, VS, IREG, RMPCT, ZX, WMOD) -- ZX, WMOD, IREG and VS kept on it for the
+       report and the .dyr, with or without the .raw."""
+    if g["q_mode"] == "share":
+        qt, qb, vs, ireg, rmp = g["qmax"], g["qmin"], net.ctl["v_poi"], poi, 100.0 * g["share"]
+    else:
+        qt, qb, vs, ireg, rmp = g["q"], g["q"], net.bus[g["bus"]]["vm"], 0, 100.0
+    zx = g["zsorce_x"]
+    if zx is None:
+        zx = DYN_DEFAULTS["GENROU"]["Xdpp"] if g["type"] == "SYNC" else IBR_ZSORCE_X
+    wmod = g["wmod"] if g["wmod"] is not None else (0 if g["type"] == "SYNC" else 1)
+    g["zx"], g["wmod_used"], g["ireg"], g["vs"] = zx, wmod, ireg, vs
+    return qt, qb, vs, ireg, rmp, zx, wmod
+
+
 def write_raw(net, path):
     sb = net.sb
     L = ["0, %.2f, 33, 0, 0, %.2f     / PSS(R)E-33 RAW  %s %s -- smib_build.py  %s"
@@ -2841,15 +2864,7 @@ def write_raw(net, path):
                 0.0, IB_XSOURCE, 99999.0, -99999.0))
     poi = _num_of(net, "POI")
     for g in net.gens:
-        if g["q_mode"] == "share":
-            qt, qb, vs, ireg, rmp = g["qmax"], g["qmin"], net.ctl["v_poi"], poi, 100.0 * g["share"]
-        else:
-            qt, qb, vs, ireg, rmp = g["q"], g["q"], net.bus[g["bus"]]["vm"], 0, 100.0
-        zx = g["zsorce_x"]
-        if zx is None:
-            zx = DYN_DEFAULTS["GENROU"]["Xdpp"] if g["type"] == "SYNC" else IBR_ZSORCE_X
-        wmod = g["wmod"] if g["wmod"] is not None else (0 if g["type"] == "SYNC" else 1)
-        g["zx"], g["wmod_used"], g["ireg"], g["vs"] = zx, wmod, ireg, vs
+        qt, qb, vs, ireg, rmp, zx, wmod = raw_gen(net, g, poi)
         L.append("%7d,'%-2s',%10.4f,%10.4f,%10.4f,%10.4f,%9.6f,%7d,%10.3f,%9.6f,%9.4f, 0.00000, 0.00000,1.00000,1,"
                  "%6.2f,%10.4f,%10.4f,   1,1.0000,   0,1.0000,   0,1.0000,   0,1.0000,%d, 1.0000"
                  % (_num_of(net, g["bus"]), g["id"], g["p"], g["q"], qt, qb, vs, ireg, g["mbase"], 0.0, zx, rmp,
@@ -5019,10 +5034,14 @@ def report_text(net, inp, recs, comps, files, src):
     if inp["dyr_records"]:
         L.append("   + %d record(s) of your own (Dyr_Records)" % len([r for r in inp["dyr_records"]
                                                                        if _txt(r.get("record"))]))
-    L += ["", "8. PSCAD: %d components -- the values are in %s; build the case with %s" % (
-        len(comps), os.path.basename(files["pscad_data"]), os.path.basename(files["pscad_build"]))]
-    L += pscad_slot_lines(net, "   ")
-    L += ["", "9. FILES"]
+    if files.get("pscad_build"):
+        L += ["", "8. PSCAD: %d components -- the values are in PSCAD\\%s; build the case with PSCAD\\%s" % (
+            len(comps), os.path.basename(files["pscad_data"]), os.path.basename(files["pscad_build"]))]
+        L += pscad_slot_lines(net, "   ")
+    else:
+        L += ["", "8. PSCAD: not built (Plant: Build PSCAD model NO)"]
+    L += ["", "9. FILES" + "".join(" -- no %s (Plant: Build ... NO)" % w for k, w in (
+        ("raw", ".raw"), ("dyr", ".dyr")) if not files.get(k))]
     for k in ("raw", "dyr", "pscad_build", "pscad_data", "json", "xlsx"):
         if files.get(k):
             L.append("   %s" % files[k])
@@ -5348,6 +5367,9 @@ def _psse_steps(net, recs, inp, files, out, work, log):
         log("CHECK: PSS/E's own .raw not written: %s" % e)
     if not ok:
         return
+    if not files.get("dyr"):
+        log("no .dyr built (Plant: Build PSS/E .dyr NO): the dynamic check is skipped")
+        return
     usr = sorted(set(m for _g_, m, _v in recs if DYR_LIB[m][0]))
     if any(re.search(r"'?USR(MDL|BUS)'?", (_txt(r.get("record")) or "").upper()) for r in inp["dyr_records"]):
         usr.append("your own")
@@ -5506,14 +5528,32 @@ def build(src, out_dir=None, check=True, pscad=True):
         out = "%s_%d" % (stem, k)
         k += 1
     os.makedirs(out)
-    files = {"raw": os.path.join(out, net.stem + ".raw"), "dyr": os.path.join(out, net.stem + ".dyr"),
-             "json": os.path.join(out, net.stem + "_inputs.json")}
+    want = outputs(inp)
+    psse_dir, pscad_dir = os.path.join(out, "PSSE"), os.path.join(out, "PSCAD")
+    files = {"json": os.path.join(out, net.stem + "_inputs.json"), "dir": out}
     try:
-        write_raw(net, files["raw"])
-        recs = write_dyr(net, inp, files["dyr"])
-        comps, spec, files["pscad_build"] = write_pscad(net, inp, out, log)
-        files["pscad_data"] = os.path.join(out, net.stem + "_PSCAD_DATA.txt")
-        _write_text(files["pscad_data"], pscad_data_text(net, comps, spec))
+        if want["raw"] or want["dyr"]:
+            os.makedirs(psse_dir)
+            files["psse_dir"] = psse_dir
+        if want["raw"]:
+            files["raw"] = os.path.join(psse_dir, net.stem + ".raw")
+            write_raw(net, files["raw"])
+        else:
+            for g in net.gens:
+                raw_gen(net, g, _num_of(net, "POI"))
+        if want["dyr"]:
+            files["dyr"] = os.path.join(psse_dir, net.stem + ".dyr")
+            recs = write_dyr(net, inp, files["dyr"])
+        else:
+            recs = dyr_models(net, inp)
+        if want["pscad"]:
+            os.makedirs(pscad_dir)
+            files["pscad_dir"] = pscad_dir
+            comps, spec, files["pscad_build"] = write_pscad(net, inp, pscad_dir, log)
+            files["pscad_data"] = os.path.join(pscad_dir, net.stem + "_PSCAD_DATA.txt")
+            _write_text(files["pscad_data"], pscad_data_text(net, comps, spec))
+        else:
+            comps = []
         clean = dict((k, v) for k, v in inp.items() if not k.startswith("_"))
         _write_text(files["json"], json.dumps(clean, indent=1, sort_keys=True, default=str))
         if src.lower().endswith((".xlsx", ".xlsm")):
@@ -5526,28 +5566,39 @@ def build(src, out_dir=None, check=True, pscad=True):
         shutil.rmtree(out, ignore_errors=True)   # this run's own new folder: no half-written models left
         raise
     log("[smib] written to %s" % out)
-    for k in ("raw", "dyr", "report", "pscad_data", "pscad_build"):
-        log("         %s" % os.path.basename(files[k]))
+    for k in ("report", "raw", "dyr", "pscad_build", "pscad_data"):
+        if files.get(k):
+            log("         %s" % os.path.relpath(files[k], out))
+    skip = [w for k, w in (("raw", "PSS/E .raw"), ("dyr", "PSS/E .dyr"), ("pscad", "PSCAD model")) if not want[k]]
+    if skip:
+        log("[smib] not built (Plant: Build ...): %s" % ", ".join(skip))
     for n in net.notes:
         log("[smib] " + n)
-    if check and PSSE_CHECK:
+    if check and PSSE_CHECK and want["raw"]:
         log("")
-        clog = psse_check(net, recs, inp, files, out)
+        clog = psse_check(net, recs, inp, files, psse_dir)
         for ln in clog.review():
             log("[psse] " + ln)
         made = [os.path.basename(files[k]) for k in ("sav", "raw_psse", "snp") if files.get(k)]
         if made:
             log("[psse] PSS/E wrote %s" % ", ".join(made))
-    if pscad and PSCAD_BUILD:
+    if pscad and PSCAD_BUILD and want["pscad"]:
         log("")
-        pscad_build(files, out, log)
+        pscad_build(files, pscad_dir, log)
     return net, files
+
+
+def outputs(inp):
+    """What Plant says to build: {"raw", "dyr", "pscad": True / False} (blank = YES)."""
+    pl = inp["plant"]
+    return dict((k, _choice(pl, "out_" + k, "Plant", ["YES", "NO"], "YES") == "YES") for k in ("raw", "dyr", "pscad"))
 
 
 def psse_check_only(out):
     """--psse-check <folder>: PSS/E's check of the models in <folder>, rebuilt from its _inputs.json -- how the
        check runs in a Python that PSS/E has a psspy for, when the one that wrote the models has none."""
-    found = glob.glob(os.path.join(out, "*_inputs.json"))
+    found = glob.glob(os.path.join(out, "*_inputs.json")) or glob.glob(os.path.join(os.path.dirname(out),
+                                                                                   "*_inputs.json"))
     if len(found) != 1:
         print("[psse] *** %s: %s _inputs.json" % (out, "more than one" if found else "no"))
         return 2
@@ -5556,7 +5607,8 @@ def psse_check_only(out):
     net = build_network(inp, quiet)
     operating_point(net, quiet)
     recs = dyr_models(net, inp)
-    files = {"raw": os.path.join(out, net.stem + ".raw"), "dyr": os.path.join(out, net.stem + ".dyr")}
+    files = dict((k, os.path.join(out, net.stem + ext)) for k, ext in (("raw", ".raw"), ("dyr", ".dyr"))
+                 if os.path.isfile(os.path.join(out, net.stem + ext)))
     psse_check(net, recs, inp, files, out, here_only=True)
     return 0 if psspy is not None else 3
 
@@ -5930,6 +5982,8 @@ def gui(start=None):
                          "each tab explains the field you are on.", style="Sub.TLabel").pack(fill="x")
     bar = ttk.Frame(root, padding=(6, 4))
     bar.pack(fill="x")
+    bar2 = ttk.Frame(root, padding=(6, 0, 6, 4))
+    bar2.pack(fill="x")
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True, padx=4, pady=(0, 2))
     status = tk.StringVar()
@@ -6634,7 +6688,7 @@ def gui(start=None):
     # ---------------------------------------------------------------- the data in and out of the widgets
     def to_widgets():
         for key, var in app["vars"].items():
-            var.set(data["plant"].get(key) or "")
+            var.set(data["plant"].get(key) or ("YES" if key in ("out_raw", "out_dyr", "out_pscad") else ""))
         for g in app["grids"].values():
             g.refresh(0 if g.rows else None)
         app["dirty"] = False
@@ -6874,15 +6928,22 @@ def gui(start=None):
         run(job, "CHECK")
 
     def build_models():
+        if all(app["vars"][k].get() == "NO" for k in ("out_raw", "out_dyr", "out_pscad")):
+            messagebox.showinfo("Build models", "Nothing to build: tick PSS/E .raw, PSS/E .dyr or PSCAD model.",
+                                parent=root)
+            return
         if not save():
             return
         path = app["path"]
 
         def job():
             net, files = build(path, check=psse_var.get(), pscad=pscad_var.get())
-            out_dir = os.path.dirname(files["raw"])
-            return {"ok": True, "out": out_dir, "msg": "Models written to\n%s\n\n%s model, %d machines; the report: %s"
-                    % (out_dir, net.model, len(net.gens), os.path.basename(files["report"]))}
+            out_dir = files["dir"]
+            made = [w for k, w in (("raw", "PSSE\\ .raw"), ("dyr", "PSSE\\ .dyr"), ("pscad_build", "PSCAD\\ model"))
+                    if files.get(k)]
+            return {"ok": True, "out": out_dir, "msg": "Models written to\n%s\n\n%s model, %d machines: %s; the "
+                    "report: %s" % (out_dir, net.model, len(net.gens), ", ".join(made),
+                                    os.path.basename(files["report"]))}
         run(job, "BUILD")
 
     def open_out():
@@ -6911,8 +6972,14 @@ def gui(start=None):
     b_open = ttk.Button(bar, text="Open output folder", command=open_out)
     b_open.pack(side="left", padx=2)
     b_open.state(["disabled"])
-    ttk.Checkbutton(bar, text="PSS/E check", variable=psse_var).pack(side="left", padx=(12, 2))
-    ttk.Checkbutton(bar, text="PSCAD build", variable=pscad_var).pack(side="left", padx=2)
+    ttk.Label(bar2, text="Build:", style="Item.TLabel").pack(side="left")
+    for key, txt in (("out_raw", "PSS/E .raw"), ("out_dyr", "PSS/E .dyr"), ("out_pscad", "PSCAD model")):
+        ttk.Checkbutton(bar2, text=txt, variable=app["vars"][key], onvalue="YES", offvalue="NO").pack(
+            side="left", padx=4)
+    ttk.Separator(bar2, orient="vertical").pack(side="left", fill="y", padx=8)
+    ttk.Label(bar2, text="Then:", style="Item.TLabel").pack(side="left")
+    ttk.Checkbutton(bar2, text="PSS/E check (needs the .raw)", variable=psse_var).pack(side="left", padx=4)
+    ttk.Checkbutton(bar2, text="build the .pscx in PSCAD", variable=pscad_var).pack(side="left", padx=4)
 
     menu = tk.Menu(root)
     fm = tk.Menu(menu, tearoff=0)
