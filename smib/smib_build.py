@@ -3293,6 +3293,7 @@ def pscad_model(net, inp):
     for t in net.tx2:
         if t["kind"] == "MPT":
             comps.append(_tx2_comp(t, net, 0, 0))
+            comps[-1]["name_gap"] = 6                    # half a meter + half a transformer: from the POI's name
     for t in net.tx3:
         comps.append(_tx3_comp(t, net, 0, 0))
     for g in net.gens:
@@ -3352,6 +3353,7 @@ PSCAD_GAP = 4         # from a node to the things hanging off it
 PSCAD_PAD = 6         # each side of a run of R, L, C: room for its breakouts where PSCAD's R, L, C are single-phase
 PSCAD_W3 = 8          # the same where PSCAD's R, L, C take the wire's three phases: no breakouts, closer together
 PSCAD_H3 = 10
+NAME_CH = 0.42        # a node name's width per character (grid units) at PSCAD's default zoom
 
 
 def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PSCAD_PAD):
@@ -3403,7 +3405,10 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
 
     def chain(c, frm, x, y):
         """c hanging off node frm (at x) on row y, then what lies beyond it -> (bottom, right)"""
-        x0 = x + (pad if rlc(c) and frm and not mid(frm) else 0) + c.get("lead", 0)
+        lead = c.get("lead", 0)
+        if c.get("name_gap") and frm:            # the wire to it carries frm's name: long enough for the text
+            lead = max(lead, max(4, 2 * int(math.ceil(len(frm) * NAME_CH / 2 + 0.75))) + c["name_gap"] - cw)
+        x0 = x + (pad if rlc(c) and frm and not mid(frm) else 0) + lead
         put(c, x0 + cw // 2, y, frm)
         right, bottom = x0 + cw * c.get("room", 1), y
         far = [n for n in nodes[id(c)] if n != frm]
@@ -3566,13 +3571,14 @@ def _inverter_comp(g, sl, net, x, y):
     if ps["definition"]:
         sl["tag"], sl["model"] = sl["name"] + "_INV", ps["definition"]
         return {"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
-                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6,
+                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6, "name_gap": 7,
                 "note": "inverter: vendor model %s -- %s" % (ps["definition"], what),
                 "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
                            ["@dim3", "@first"]}]}
     sl["tag"], sl["model"] = sl["name"] + "_SRC", "stand-in source"
     c = _source(sl["tag"], sl["name"], sl["kv"], sl["vm"], sl["ang"], net.f, x, y, sl["node"])
     c["lead"] = 6                                       # a wire of its own to its node: the node's name, a UDM's place
+    c["name_gap"] = 7                                   # half a GSU + half a source: the wire's room for that name
     c["orient"] = 4                                     # mirrored: its terminal faces the node (on its left)
     c["note"] += (" -- stand-in for the inverter (%s): holds the load flow; your UDM goes on node %s"
                   % (what, _node(sl["node"])))
@@ -4186,7 +4192,7 @@ def spot(node, wires, points):
             continue
         if any((p[0], p[1]) == m for other, ps in points.items() if other != node for p in ps):
             continue
-        key = (a[1] == b[1] and n >= 8, n)
+        key = (a[1] == b[1] and n >= max(8, len(node) * 0.42 + 2), n)     # a row wire the name fits on, or the longest
         if best is None or key > best[0]:
             best = (key, k, m)
     return best[1:] if best else None
