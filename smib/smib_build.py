@@ -2181,17 +2181,26 @@ def number_buses(net, pl, rows):
         ref = _txt(r.get("bus"))
         if not ref:
             continue
-        role = net.find(ref, w)
         num = _int(r, "number", w, None, minimum=1)
+        nm = _txt(r.get("name"))
+        role = net.alias.get(ref.upper())
+        if role is None:                          # a bus of the other model type (SMIB / DETAILED), or a typo
+            if num is not None or nm:
+                net.notes.append("NOTE: %s: no bus %s in this %s model -- its number / name not used (buses: %s)"
+                                 % (w, ref, net.model, ", ".join(sorted(net.alias))))
+            continue
         if num is not None:
             if num > 999997:
                 raise InputError("%s: bus number %d is above 999997" % (w, num))
             if num in fixed.values() and fixed.get(role) != num:
                 raise InputError("%s: bus number %d is used twice" % (w, num))
-            fixed[role] = num
-        nm = _txt(r.get("name"))
+            if role in fixed and fixed[role] != num:
+                net.notes.append("NOTE: %s: %s is bus %s here, already numbered %d -- %d not used"
+                                 % (w, ref, role, fixed[role], num))
+            else:
+                fixed[role] = num
         if nm:
-            names[role] = nm[:12]
+            names.setdefault(role, nm[:12])
     nxt = start
     for role, b in net.bus.items():
         if role in fixed:
