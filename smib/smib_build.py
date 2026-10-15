@@ -131,7 +131,9 @@
 
    OUTPUT -- nothing that exists is ever overwritten
      <name> = the plant's name and its model type: Hybrid_PV100_BESS100_SMIB, ..._DETAILED
-     {OUT_DIR}\\<name>_<date_time>\\   <name>.raw / .dyr / .sav, <name>_REPORT.txt,
+     Models\\Detailed_Models\\ (DETAILED) or Models\\Equivalent_Models\\ (SMIB),
+     beside the workbook (OUT_DIR: Models elsewhere), then
+     <name>_<date_time>\\   <name>.raw / .dyr / .sav, <name>_REPORT.txt,
          <name>_PSCAD_DATA.txt, <name>_build_pscad.py, <name>_inputs.json, a copy
          of the workbook, _psse\\ (PSS/E's own output of the check run)
 
@@ -174,7 +176,8 @@ from xml.sax.saxutils import escape as _xml_escape
 GUI = True                        # run with no file: the input window (each sheet a tab) | False: the workbook
                                   # beside the script, as before
 INPUT_XLSX = ""                   # "" = the command line's, else the one beside this script | r"C:\...\SMIB.xlsx"
-OUT_DIR = ""                      # "" = SMIB_MODELS beside the workbook; a new <name>_<date_time> folder inside
+OUT_DIR = ""                      # "" = Models beside the workbook: Detailed_Models / Equivalent_Models in it,
+                                  # a new <name>_<date_time> folder in those
 PSSE_CHECK = True                 # PSS/E found: the .raw read back and solved, the .sav saved, the .dyr run flat
 PSSE_VERSION = 35                 # the PSS/E that checks the models: 35 | 34 | 36 ... | None = the newest installed
 PSSE_PYTHON = ""                  # a Python PSS/E has a psspy for (its PSSPYxy folders), used when this one has none
@@ -5475,6 +5478,9 @@ def pscad_build(files, out, log):
         log("[pscad] *** no .pscx (exit %s)%s" % (rc, (" -- see %s" % os.path.basename(logs[-1])) if logs else ""))
 
 
+MODEL_DIRS = {"DETAILED": "Detailed_Models", "SMIB": "Equivalent_Models"}     # in Models (OUT_DIR)
+
+
 def build(src, out_dir=None, check=True, pscad=True):
     """Everything from the workbook `src`; returns (net, files)."""
     log = Log()
@@ -5492,7 +5498,8 @@ def build(src, out_dir=None, check=True, pscad=True):
     s = net.op["s_grid"]
     log("[smib] operating point: P at POI %.3f MW, Q %.3f MVAr, POI %.5f pu, infinite bus %.5f pu"
         % (s.real, s.imag, net.bus["POI"]["vm"], net.op["e"]))
-    base = out_dir or OUT_DIR or os.path.join(os.path.dirname(os.path.abspath(src)), "SMIB_MODELS")
+    base = os.path.join(out_dir or OUT_DIR or os.path.join(os.path.dirname(os.path.abspath(src)), "Models"),
+                        MODEL_DIRS[net.model])
     out = stem = os.path.join(base, "%s_%s" % (net.stem, time.strftime("%Y%m%d_%H%M%S")))
     k = 2
     while os.path.exists(out):                   # a second run within the same second: a folder of its own
@@ -6595,7 +6602,8 @@ def gui(start=None):
                      "the default shown in the help line. Model type (toolbar or Plant) chooses SMIB or DETAILED "
                      "for PSS/E and PSCAD alike.\n"
                      "Save the project (.json), then Build models: the .raw, .dyr, report and PSCAD build script "
-                     "go to SMIB_MODELS beside the project. Excel is optional: Open a workbook you have (it is "
+                     "go to Models beside the project: Detailed_Models or Equivalent_Models (SMIB) in it. "
+                     "Excel is optional: Open a workbook you have (it is "
                      "imported), or export the project as one (File menu).\n")
     for topic, text in README:
         if topic:
