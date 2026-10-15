@@ -214,6 +214,15 @@ GEN_TYPES = ["PV", "BESS", "WT4", "WT3", "SYNC", "USER"]
 REEC_OK = {"PV": ("REEC_A", "REEC_D"), "WT4": ("REEC_A", "REEC_D"), "WT3": ("REEC_A",),
            "BESS": ("REEC_C", "REEC_D")}
 REGC_OK = {"PV": ("REGC_A", "REGC_B"), "WT4": ("REGC_A", "REGC_B"), "BESS": ("REGC_A", "REGC_B"), "WT3": ("REGC_A",)}
+MODEL_CHOICE = {                  # what each choice is for: the GUI lists a generator's own (by its Type), the first
+    "regc": (REGC_OK, collections.OrderedDict([       # its default
+        ("REGC_A", "current source -- the standard"),
+        ("REGC_B", "voltage source behind ZSORCE -- weak grids (low SCR)")])),
+    "reec": (REEC_OK, collections.OrderedDict([
+        ("REEC_A", "solar, wind -- WECC's standard"),
+        ("REEC_C", "battery -- with its state of charge"),
+        ("REEC_D", "solar, battery, wind -- the newest: voltage-dependent limits, momentary cessation")])),
+}
 
 # Plant sheet (Item | Value | Unit | Notes): (key, item, unit, note, choices)
 FAULT_TYPES = ["ABCG", "ABC", "AG", "BG", "CG", "ABG", "BCG", "ACG", "AB", "BC", "AC"]
@@ -351,11 +360,13 @@ GEN_COLS = [
     ("coll_units", "Collector units", "pu: system base at collector kV | ohm: R X in ohm, B in uS", ["pu", "ohm"], 8),
     ("zsorce_x", "ZSORCE X pu", "on MBASE (blank: inverters 9999, SYNC X''d)", None, 8),
     ("wmod", "WMOD", "blank: inverters 1, SYNC 0", None, 6),
-    ("regc", "Converter model", "PSS/E .dyr -- REGC_A: a current source (REGCA1) | REGC_B: a voltage source behind "
-     "ZSORCE R + jX, for weak grids (REGCBU1; ZSORCE X its Xe) -- PV, BESS, WT4 (blank = REGC_A)",
+    ("regc", "Converter model", "REGC_A: a current source, the standard | REGC_B: a voltage source behind ZSORCE "
+     "R + jX, for weak grids (ZSORCE X its Xe) -- PV, BESS, WT4; .dyr REGCA1 / REGCBU1, .dyd regc_a / regc_b "
+     "(blank = REGC_A)",
      ["REGC_A", "REGC_B"], 9),
-    ("reec", "Electrical control", "PSS/E .dyr -- REEC_A: PV, WT | REEC_C: BESS | REEC_D: PV, BESS, WT4 (blank = "
-     "REEC_A, BESS REEC_C)", ["REEC_A", "REEC_C", "REEC_D"], 9),
+    ("reec", "Electrical control", "REEC_A: PV, WT | REEC_C: BESS (state of charge) | REEC_D: PV, BESS, WT4, the "
+     "newest (voltage-dependent limits, momentary cessation) -- .dyr and .dyd alike (blank = REEC_A, BESS REEC_C)",
+     ["REEC_A", "REEC_C", "REEC_D"], 9),
     ("pscad_library", "PSCAD library", "vendor library .pslx (blank = none)", None, 18),
     ("pscad_definition", "PSCAD definition", "vendor model, library:name (blank = a source: network check)", None, 16),
     ("pscad_ac_port", "PSCAD AC port", "its AC port (blank = its 3-phase port)", None, 9),
@@ -1197,12 +1208,15 @@ def _blank_means(note):
 
 
 def _used_by(sheet, key):
-    if sheet in ("Dyr_Params", "Dyr_Records") or key in ("plant_ctrl", "regc_repc", "regc", "reec", "zsorce_x",
-                                                          "wmod"):
-        return "PSS/E .dyr"
+    if sheet == "Dyr_Records" or key in ("regc_repc", "wmod"):
+        return "PSS/E"
+    if sheet == "Dyr_Params" or key in ("plant_ctrl", "regc", "reec", "zsorce_x"):
+        return "PSS/E + PSLF"
     if sheet == "PSCAD_Params" or key.startswith("pscad"):
         return "PSCAD"
-    return "PSS/E + PSCAD"
+    if key in ("out_epc", "out_dyd"):
+        return "PSLF"
+    return "PSS/E + PSLF + PSCAD"
 
 
 SHEET_INDEX = [
@@ -1273,7 +1287,7 @@ def write_template(path, data=None, roles=None):
     for st, sample, what in ((XS_INPUT, "", "your inputs"), (XS_NOTE, "note", "what to enter, the default when "
                                                                               "blank"),
                              (XS_HEAD, "Column", "column titles"), (XS_SECTION, "SECTION", "a group of items"),
-                             (XS_TAG, "PSS/E + PSCAD", "which model an input goes into")):
+                             (XS_TAG, "PSS/E + PSLF + PSCAD", "which model an input goes into")):
         rows.append([(sample, st), (what, XS_CELL), ""])
     section("GUIDE")
     for topic, text in README:
@@ -7170,6 +7184,9 @@ def gui(start=None):
         """The drop-down list of a table cell: its column's choices, or names the inputs give."""
         cols = dict((c[0], c) for c in dict((t[1], t[2]) for t in TABLES)[TABLE_KEY[sheet]])
         c = cols[key]
+        if sheet == "Generators" and key in MODEL_CHOICE:
+            ok, doc = MODEL_CHOICE[key]
+            return [""] + ["%s  -  %s" % (m, doc[m]) for m in ok.get((row.get("type") or "").upper(), ())], True
         if c[3]:
             return [""] + list(c[3]), True
         if (sheet, key) in (("Generators", "connect"), ("Collectors", "connect"), ("Loads_Shunts", "at"),
@@ -7328,10 +7345,21 @@ def gui(start=None):
         def rows(self):
             return data.setdefault(self.key, [])
 
+        def shown(self, r):
+            """A row's cells as shown: a blank model choice as the one the build takes, in brackets."""
+            out = []
+            for k in self.keys:
+                v = r.get(k) or ""
+                if not v and self.sheet == "Generators" and k in MODEL_CHOICE:
+                    ok = MODEL_CHOICE[k][0].get((r.get("type") or "").upper())
+                    v = "(%s)" % ok[0] if ok else ""
+                out.append(v)
+            return out
+
         def refresh(self, select=None):
             self.tree.delete(*self.tree.get_children())
             for i, r in enumerate(self.rows):
-                self.tree.insert("", "end", iid=str(i), values=[r.get(k) or "" for k in self.keys],
+                self.tree.insert("", "end", iid=str(i), values=self.shown(r),
                                  tags=("odd" if i % 2 else "even",))
             if select is not None and 0 <= select < len(self.rows):
                 self.tree.selection_set(str(select))
@@ -7352,6 +7380,18 @@ def gui(start=None):
                 col = self.tree.identify_column(e.x)
                 self.col = int(col[1:]) - 1
                 self.show_help(self.keys[self.col])
+                item = self.tree.identify_row(e.y)
+                if item and self.sheet == "Generators" and self.keys[self.col] in MODEL_CHOICE:
+                    self.tree.after_idle(lambda i=int(item), c=self.col: self.drop(i, c))
+
+        def drop(self, i, ci):
+            """A model choice's list, open: one click on its cell."""
+            self.edit(i, ci)
+            if self.edit_w and isinstance(self.edit_w[0], ttk.Combobox):
+                try:
+                    self.edit_w[0].tk.call("ttk::combobox::Post", self.edit_w[0])
+                except tk.TclError:
+                    pass
 
         def on_double(self, e):
             if self.tree.identify_region(e.x, e.y) != "cell":
@@ -7388,14 +7428,23 @@ def gui(start=None):
             x, y, wd, ht = bbox
             key = self.keys[ci]
             row = self.rows[i]
-            var = tk.StringVar(value=row.get(key) or "")
             values, fixed = choices_for(self.sheet, key, row)
+            var = tk.StringVar(value=next((x for x in values or [] if row.get(key) and x.split(" ")[0] == row.get(key)),
+                                          row.get(key) or ""))
             if values is not None:
                 w = ttk.Combobox(self.tree, textvariable=var, values=values, state="readonly" if fixed else "normal")
             else:
                 w = tk.Entry(self.tree, textvariable=var, relief="solid", borderwidth=1, background="white",
                              font=("Consolas", 9) if key == "record" else None)
-            w.place(x=x, y=y, width=max(wd, 120 if values is not None else wd), height=ht)
+            width = max(wd, 120 if values is not None else wd)
+            if values and self.sheet == "Generators" and key in MODEL_CHOICE:      # wide enough to read each one
+                try:
+                    import tkinter.font as tkfont
+                    width = max(width, min(640, max(tkfont.nametofont("TkDefaultFont").measure(x) for x in values) +
+                                           40))
+                except (tk.TclError, ImportError):
+                    pass
+            w.place(x=x, y=y, width=width, height=ht)
             w.focus_set()
             if isinstance(w, tk.Entry):
                 w.select_range(0, "end")
@@ -7419,12 +7468,18 @@ def gui(start=None):
             if keep and i < len(self.rows):
                 key = self.keys[ci]
                 v = var.get().strip()
+                if self.sheet == "Generators" and key in MODEL_CHOICE:
+                    v = v.split(" ")[0] if v else ""          # its code, not what it is for
                 if (self.rows[i].get(key) or "") != v:
                     if v:
                         self.rows[i][key] = v
                     else:
                         self.rows[i].pop(key, None)
-                    self.tree.set(str(i), key, v)
+                    if self.sheet == "Generators" and key == "type":       # model choices its Type does not take
+                        for k, (ok, _doc) in MODEL_CHOICE.items():
+                            if self.rows[i].get(k) and self.rows[i][k] not in ok.get(v.upper(), ()):
+                                self.rows[i].pop(k)
+                    self.tree.item(str(i), values=self.shown(self.rows[i]))
                     dirty()
             w.destroy()
             self.tree.focus_set()
