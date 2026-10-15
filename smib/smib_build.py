@@ -347,10 +347,10 @@ GEN_COLS = [
     ("pscad_library", "PSCAD library", "vendor library .pslx (blank = none)", None, 18),
     ("pscad_definition", "PSCAD definition", "vendor model, library:name (blank = a source: network check)", None, 16),
     ("pscad_ac_port", "PSCAD AC port", "its AC port (blank = its 3-phase port)", None, 9),
-    ("pscad_source", "PSCAD source case", "a .pscx or .pslx (or a project open in PSCAD) with one UDM set up as "
-     "you want it (with PSCAD component ID)", None, 18),
-    ("pscad_component_id", "PSCAD component ID", "that UDM's ID in the source case: copied, with its settings, "
-     "to every GSU of this generator", None, 10),
+    ("pscad_source", "PSCAD source case", "the OEM's PSCAD model (.pscx / .pslx) the UDM comes from: its PSCAD "
+     "definition added to the case (GUI: Pick UDM from OEM model)", None, 18),
+    ("pscad_component_id", "PSCAD component ID", "a UDM placed in the source case: copied with its settings "
+     "instead (blank = the definition, its values from PSCAD_Params)", None, 10),
     ("pscad_inv_at", "PSCAD inverter at", "LV: the inverter (your UDM or the stand-in source) on the GSU's LV side, "
      "the GSU built | MV: on its HV side, for a UDM with its GSU inside (blank = LV)", ["LV", "MV"], 8),
 ]
@@ -368,6 +368,9 @@ FEEDER_COLS = [
     ("units", "Units at end", "units tapped at the far end", None, 7),
     ("units_of", "Units of", "shared collectors: whose units (repeat the section for another generator's)", None, 10),
     ("parallel", "Parallel cables", "blank = 1", None, 7),
+    ("r_ohm", "R ohm", "the section's R, its parallel cables together (blank = Cable x Length)", None, 8),
+    ("x_ohm", "X ohm", "the section's X (blank = Cable x Length)", None, 8),
+    ("b_us", "B uS", "the section's charging B, total (blank = Cable x Length)", None, 8),
 ]
 
 CABLE_COLS = [
@@ -540,7 +543,9 @@ README = [
                 "tapped at the section's far end. A daisy chain needs no From section; a lateral names the section "
                 "it leaves from (its far end); 0 = straight from the collector bus. Copies: identical feeders. "
                 "WECC equivalent: Zeq = sum(Zi Wi^2) / W^2, Beq = sum(Bi), Wi = MW of the units downstream of "
-                "section i."),
+                "section i. R ohm, X ohm, B uS: a section's own values (its parallel cables together) in place of "
+                "Cable x Length -- the GUI's Fill R, X, B from cables shows them to change; Clear R, X, B goes "
+                "back. A section with R and X needs no cable."),
     ("Cables", "Cable data per length (R, X in ohm; C in uF or B in uS) and the length unit they are per."),
     ("Collectors", "Collector systems shared by more than one generator: name and the bus it starts from. Their "
                    "Feeders rows say whose units each section carries (Units of); the generators on it Connect to "
@@ -576,11 +581,12 @@ README = [
               "WECC equivalent as a pi section, or DETAILED: every feeder section, identical feeder copies lumped), "
               "the GSUs and, on each GSU's LV side, the inverter: your UDM (PSCAD library, definition and AC port "
               "in Generators) or a stand-in source at the solved voltage -- delete it and wire your UDM in its "
-              "place (the report and the build log list every inverter node). Or set one UDM up in a case of its "
-              "own (a vendor's test case) and give that case and the UDM's component ID (its Properties) in "
-              "Generators: PSCAD source case, PSCAD component ID -- it is copied, with its settings, to every GSU "
-              "of that generator (every machine of the DETAILED model), its definition and the case's resources "
-              "(.lib, .obj) with it; PSCAD_Params rows ({UNITS}, {P_PU} ...) are set on each copy. PSCAD "
+              "place (the report and the build log list every inverter node). Or take the UDM from the OEM's "
+              "PSCAD model: Generators, Pick UDM from OEM model -- the model's definitions are listed (their ports, "
+              "parameters and the IDs of the ones placed in it); the one picked is added to the case's definitions "
+              "(with the ones it uses and the model's resources, .lib / .obj) and put at every GSU of that "
+              "generator (every machine of the DETAILED model), PSCAD_Params rows ({UNITS}, {P_PU} ...) set on "
+              "each; or, with a component ID, that placed one is copied instead, its settings and all. PSCAD "
               "inverter at MV: for a UDM "
               "with its GSU inside, the inverter on the GSU's HV side and no GSU drawn. It is drawn as a "
               "single-line diagram with wires, left to right from the grid; where PSCAD's R, L and C are "
@@ -1588,6 +1594,53 @@ def read_cables(rows, log=None):
     return out
 
 
+def oem_model(path):
+    """An OEM's PSCAD model (.pscx case or .pslx library) read as XML, without PSCAD -> (project name,
+       [{name, desc, ports [(name, dim, kind)], params [(name, desc)], ids [component IDs placed]}])."""
+    import xml.etree.ElementTree as ET
+    root = ET.parse(path).getroot()
+    scope = root.get("name") or os.path.splitext(os.path.basename(path))[0]
+    defs, placed = collections.OrderedDict(), collections.defaultdict(list)
+    for el in root.iter():
+        d = el.get("defn") or ""
+        if ":" in d and el.get("id"):
+            placed[d.split(":", 1)[1].upper()].append(el.get("id"))
+        if el.tag.lower() != "definition" or not el.get("name") or el.get("name") in defs:
+            continue
+        desc = el.get("desc") or el.get("description") or ""
+        for prm in el.iter():
+            if prm.tag.lower() == "param" and (prm.get("name") or "").lower() == "description" and not desc:
+                desc = prm.get("value") or ""
+        ports, params = [], []
+        for x in el.iter():
+            t = x.tag.lower()
+            if t == "port" and x.get("name"):
+                text = " ".join([str(v) for v in x.attrib.values()] + [str(q.get("value") or "") for q in x.iter()
+                                                                       if q is not x]).upper()
+                kind = "in" if "INPUT" in text else "out" if "OUTPUT" in text else "electrical"
+                try:
+                    dim = int(x.get("dim") or 1)
+                except ValueError:
+                    dim = 1
+                ports.append((x.get("name"), dim, kind))
+            elif t == "parameter" and x.get("name"):
+                params.append((x.get("name"), x.get("desc") or ""))
+        defs[el.get("name")] = {"name": el.get("name"), "desc": desc, "ports": ports, "params": params}
+    for d in defs.values():
+        d["ids"] = placed.get(d["name"].upper(), [])
+    return scope, list(defs.values())
+
+
+def section_rxb(r, cab, f, w):
+    """A feeder section's R, X (ohm) and B (uS) from its cable's data, length and parallel cables -- what blank
+       R ohm / X ohm / B uS cells take."""
+    par = _int(r, "parallel", w, 1, minimum=1)
+    per = _num(r, "length", w, required=True, positive=True) * LEN_KM[_choice(r, "unit", w, LEN_UNITS, "km")] / \
+        LEN_KM[cab["unit"]]
+    bper = cab["b"] if cab["b"] is not None else (2.0 * math.pi * f * cab["c"] if cab["c"] is not None else 0.0)
+    return cab["r"] * per / par, cab["x"] * per / par, bper * per * par
+
+
 def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
     """The WECC equivalent of collector `cname` from its Feeders rows.
        unit_mw: {GENERATOR (upper): MW of one unit}; own_gen: whose units a row without 'Units of' carries
@@ -1612,28 +1665,35 @@ def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
             w = r["_where"]
             num = _int(r, "section", w, None, minimum=1)
             cable = _txt(r.get("cable"))
+            given = dict((k, _num(r, k, w)) for k in ("r_ohm", "x_ohm", "b_us"))
+            own = given["r_ohm"] is not None and given["x_ohm"] is not None     # a section by its R and X alone
             if num is None:
-                num = last + 1 if cable else last
+                num = last + 1 if cable or own else last
             if num == 0:
                 raise InputError("%s: units on no section" % w)
             s = secs.get(num)
             if s is None:
-                if not cable:
-                    raise InputError("%s: section %d has no cable" % (w, num))
-                cab = cables.get(cable.upper())
-                if cab is None:
+                if not cable and not own:
+                    raise InputError("%s: section %d has no cable (or R ohm and X ohm)" % (w, num))
+                cab = cables.get(cable.upper()) if cable else None
+                if cable and cab is None:
                     raise InputError("%s: cable %r is not in Cables" % (w, cable))
-                s = {"num": num, "from": _int(r, "from_section", w, None, minimum=0), "cable": cab["name"],
-                     "length": _num(r, "length", w, required=True, positive=True),
+                need = cab is not None and any(v is None for v in given.values())
+                s = {"num": num, "from": _int(r, "from_section", w, None, minimum=0),
+                     "cable": cab["name"] if cab else "(R X B)",
+                     "length": _num(r, "length", w, required=need, positive=need) or 0.0,
                      "unit": _choice(r, "unit", w, LEN_UNITS, "km"),
                      "parallel": _int(r, "parallel", w, 1, minimum=1), "units": collections.OrderedDict(),
                      "where": w}
-                per = s["length"] * LEN_KM[s["unit"]] / LEN_KM[cab["unit"]]
-                bper = cab["b"] if cab["b"] is not None else (2.0 * math.pi * f * cab["c"] if cab["c"] is not None
-                                                              else 0.0)
-                s["R"] = cab["r"] * per / s["parallel"]
-                s["X"] = cab["x"] * per / s["parallel"]
-                s["B"] = bper * per * s["parallel"]
+                s["R"], s["X"], s["B"] = section_rxb(r, cab, f, w) if need else (0.0, 0.0, 0.0)
+                s["given"] = ""
+                for k, fld in (("r_ohm", "R"), ("x_ohm", "X"), ("b_us", "B")):
+                    if given[k] is not None:
+                        if given[k] < 0 or (fld == "X" and given[k] <= 0):
+                            raise InputError("%s: %s must be %s (it is %s)" % (
+                                w, _label(k, "Feeders"), "above 0" if fld == "X" else "0 or more", _g(given[k])))
+                        s[fld] = given[k]
+                        s["given"] += fld
                 s["z"] = complex(s["R"], s["X"]) / zb
                 s["b"] = s["B"] * 1e-6 * zb
                 secs[num] = s
@@ -1990,9 +2050,11 @@ def gen_data(r):
                    "ac_port": _txt(r.get("pscad_ac_port")), "at": _choice(r, "pscad_inv_at", w, ["LV", "MV"], "LV"),
                    "source": _txt(r.get("pscad_source")), "iid": _int(r, "pscad_component_id", w, None, minimum=1)}}
     ps = g["pscad"]
-    if bool(ps["source"]) != bool(ps["iid"]):
-        raise InputError("%s: %s and %s go together -- the case with the UDM set up, and its ID" % (
-            w, _label("pscad_source"), _label("pscad_component_id")))
+    if ps["source"] and not (ps["iid"] or ps["definition"]):
+        raise InputError("%s: %s needs the UDM's %s (or %s) -- GUI: Generators, Pick UDM from OEM model" % (
+            w, _label("pscad_source"), _label("pscad_definition"), _label("pscad_component_id")))
+    if ps["iid"] and not ps["source"]:
+        raise InputError("%s: %s needs the %s it is in" % (w, _label("pscad_component_id"), _label("pscad_source")))
     d = _num(r, "dispatch_mw", w)
     g["dispatch"] = g["pmax"] if d is None else d
     if g["dispatch"] > g["pmax"] + 1e-6 or g["dispatch"] < g["pmin"] - 1e-6:
@@ -3845,16 +3907,25 @@ def _inverter_comp(g, sl, net, x, y):
     ps = g["pscad"]
     what = "%s units, P %.3f MW, Q %.3f MVAr, V %.5f pu at %.4f deg (PSCAD angle)" % (
         _g(sl["units"]), sl["p"], sl["q"], sl["vm"], sl["ang"])
-    if ps["iid"]:                                       # the UDM set up in a case of its own: copied here
-        src = ps["source"]
-        sl["tag"], sl["model"] = sl["name"] + "_INV", "a copy of %s ID %d" % (os.path.basename(src), ps["iid"])
-        return {"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]] if ps["definition"] else [],
-                "library": src if os.path.splitext(src)[1].lower() in (".pscx", ".pslx") else ps["library"],
-                "copy_of": {"source": src, "iid": ps["iid"]},
-                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6,
-                "note": "inverter: %s, its settings kept -- %s" % (sl["model"], what),
-                "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
-                           ["@dim3", "@first"]}]}
+    src = ps["source"]
+    case_file = bool(src) and os.path.splitext(src)[1].lower() != ".pslx"   # a case: its definition copied in
+    if ps["iid"] or (src and case_file):                # the OEM's UDM: a placed one copied, or its definition
+        sl["tag"] = sl["name"] + "_INV"
+        sl["model"] = ("a copy of %s ID %d" % (os.path.basename(src), ps["iid"]) if ps["iid"] else
+                       "%s from %s" % (ps["definition"], os.path.basename(src)))
+        c = {"tag": sl["tag"], "kind": "VENDOR", "defn": [], "gen": g["name"], "slot": sl, "x": x, "y": y,
+             "library": src if os.path.splitext(src)[1].lower() in (".pscx", ".pslx") else ps["library"],
+             "params": [], "lead": 6, "note": "inverter: %s%s -- %s" % (
+                 sl["model"], ", its settings kept" if ps["iid"] else "", what),
+             "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
+                        ["@dim3", "@first"]}]}
+        if ps["iid"]:
+            c["copy_of"] = {"source": src, "iid": ps["iid"]}
+        if ps["definition"]:
+            c["defn_from"] = {"source": src, "definition": ps["definition"].split(":")[-1]}
+        return c
+    if src and ps["definition"]:                        # an OEM library: its definition used from it
+        ps = dict(ps, library=src)
     if ps["definition"]:
         sl["tag"], sl["model"] = sl["name"] + "_INV", ps["definition"]
         return {"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
@@ -4410,6 +4481,75 @@ COPIES = {}                # (source, ID) -> the first copy of it in this case: 
 RESOURCES = set()          # the source cases whose resources (.lib, .obj ...) this case has been given
 
 
+IMPORTED = {}              # (OEM file, definition) -> its name in this case
+
+
+def oem_definitions(path):
+    """The definitions in an OEM's PSCAD model (.pscx / .pslx) as XML -> (its project name, {name: element})."""
+    root = ET.parse(path).getroot()
+    scope = root.get("name") or os.path.splitext(os.path.basename(path))[0]
+    defs = {}
+    for el in root.iter():
+        if el.tag.lower() == "definition" and el.get("name"):
+            defs.setdefault(el.get("name"), el)
+    return scope, defs
+
+
+def import_definition(pscad, prj, case, src, name, log):
+    """The OEM's definition `name` -- and the definitions of its own it uses, those first -- added to this case's
+       definitions from the OEM's file -> "case:name", or None. Its project's resources (.lib, .obj ...) come
+       with it."""
+    key = (os.path.normcase(os.path.abspath(src)), name.upper())
+    if key in IMPORTED:
+        return IMPORTED[key]
+    IMPORTED[key] = None
+    try:
+        scope, defs = oem_definitions(src)
+    except Exception as e:
+        log("CHECK: %s cannot be read (%s) -- the UDM's definition is not added" % (src, e))
+        return None
+    found = dict((n.upper(), n) for n in defs).get(name.upper())
+    if found is None:
+        log("CHECK: %s has no definition %s -- it has %s" % (os.path.basename(src), name, ", ".join(sorted(defs))))
+        return None
+    order, seen = [], set()
+
+    def visit(n):
+        if n in seen or n not in defs:
+            return
+        seen.add(n)
+        for el in defs[n].iter():
+            d = el.get("defn") or ""
+            if d.upper().startswith(scope.upper() + ":"):
+                visit(d.split(":", 1)[1])
+        order.append(n)
+    visit(found)
+    pat = re.compile(r'((?:defn|name)=")%s:' % re.escape(scope), re.I)
+    for n in order:
+        text = pat.sub(r"\g<1>%s:" % case, ET.tostring(defs[n], encoding="unicode"))
+        try:
+            prj.create_definition(text)
+            log("definition %s from %s added to this case%s" % (
+                n, os.path.basename(src), "" if n == found else " (%s uses it)" % found))
+        except Exception as e:
+            log("CHECK: definition %s from %s not added: %s" % (n, os.path.basename(src), e))
+            if n == found:
+                return None
+    try:                                              # its project's resources: this case gets them too
+        if key[0] not in RESOURCES:
+            RESOURCES.add(key[0])
+            for r in pscad.project(scope).resources():
+                try:
+                    prj.create_resource(r.abspath)
+                    log("resource from %s added to this case: %s" % (scope, r.abspath))
+                except Exception as e:
+                    log("CHECK: resource %s not added (%s) -- add it to this case by hand" % (r.abspath, e))
+    except Exception:
+        pass
+    IMPORTED[key] = "%s:%s" % (case, found)
+    return IMPORTED[key]
+
+
 def _iid(cmp):
     try:
         return int(cmp.iid)
@@ -4800,6 +4940,12 @@ def main():
             c["x"], c["y"], c["parts"] = c.get("x3", c["x"]), c.get("y3", c["y"]), c.get("parts3", {})
         log("R, L and C take the wire's three phases here: drawn once each, closer together")
     page(canvas, max(c["x"] for c in SPEC["components"]) + 12, max(c["y"] for c in SPEC["components"]) + 16, log)
+    for c in SPEC["components"]:                      # an OEM's UDM: its definition added to this case
+        f = c.get("defn_from")
+        if f:
+            got = import_definition(pscad, prj, case, f["source"], f["definition"], log)
+            if got:
+                c["defn"] = [got] + [d for d in c["defn"] if d != got]
     seen_defn = {}
     made = {}                                         # tag -> (component, definition, [(node, port)])
     spec_of = dict((c["tag"], c) for c in SPEC["components"])
@@ -5128,7 +5274,8 @@ def report_text(net, inp, recs, comps, files, src):
             many = len(res["N"]) > 1
             for sct in fd["sections"]:
                 L.append("       %4d %4d  %-10s %8.3f %-4s %9.5f %9.5f %10.3f %6s %9.3f" % (
-                    sct["num"], sct["from"], sct["cable"], sct["length"], sct["unit"], sct["R"], sct["X"], sct["B"],
+                    sct["num"], sct["from"], sct["cable"] + ("*" if sct.get("given") else ""), sct["length"],
+                    sct["unit"], sct["R"], sct["X"], sct["B"],
                     "+".join(("%d %s" % (n, g)) if many else str(n) for g, n in sct["units"].items()) or "0",
                     sct["W"]))
         L.append("     EQUIVALENT: R %.5f X %.5f ohm, B %.3f uS  =  r %.7f x %.7f b %.7f pu (%.0f MVA, %.4g kV)"
@@ -6350,6 +6497,13 @@ def gui(start=None):
             if sheet == "Machines":
                 ttk.Button(tools, text="List the DETAILED machines", command=self.fill_machines).pack(side="left",
                                                                                                      padx=12)
+            if sheet == "Feeders":
+                ttk.Button(tools, text="Fill R, X, B from cables", command=self.fill_rxb).pack(side="left",
+                                                                                            padx=(12, 2))
+                ttk.Button(tools, text="Clear R, X, B", command=self.clear_rxb).pack(side="left", padx=2)
+            if sheet == "Generators":
+                ttk.Button(tools, text="Pick UDM from OEM model...", command=self.pick_udm).pack(
+                    side="left", padx=12)
             ttk.Label(tools, text="Double-click a cell (or press Enter) to edit; Tab moves on.",
                       style="Hint.TLabel").pack(side="right", padx=6)
             box = ttk.Frame(tab)
@@ -6562,6 +6716,150 @@ def gui(start=None):
             r[i], r[i + d] = r[i + d], r[i]
             self.refresh(i + d)
             dirty()
+
+        def fill_rxb(self):
+            """Blank R ohm / X ohm / B uS cells: the values the cables give (Cable x Length), to see and change.
+               A value in a cell stays as it is when the cable or length changes; Clear R, X, B goes back."""
+            try:
+                inp = read_input(save_temp())
+                cabs = read_cables(inp["cables"])
+                f = _num(inp["plant"], "freq_hz", "Plant", 60.0, positive=True)
+            except (InputError, SolveError) as e:
+                messagebox.showerror("Feeders", "The inputs do not read yet:\n\n%s" % e, parent=root)
+                return
+            n = 0
+            for i, r in enumerate(self.rows):
+                cab = cabs.get(str(r.get("cable") or "").strip().upper())
+                if cab is None or str(r.get("length") or "").strip() == "":
+                    continue
+                try:
+                    vals = section_rxb(r, cab, f, "Feeders row %d" % (i + 1))
+                except InputError:
+                    continue
+                for k, v in zip(("r_ohm", "x_ohm", "b_us"), vals):
+                    if str(r.get(k) or "").strip() == "":
+                        r[k] = _g(v, 6)
+                        n += 1
+            self.refresh(self.current())
+            if n:
+                dirty()
+            set_status("%d R / X / B cell(s) filled from the cables -- change any; a filled value no longer follows "
+                       "its cable and length (Clear R, X, B)" % n)
+
+        def clear_rxb(self):
+            n = 0
+            for r in self.rows:
+                for k in ("r_ohm", "x_ohm", "b_us"):
+                    if str(r.pop(k, "") or "").strip():
+                        n += 1
+            self.refresh(self.current())
+            if n:
+                dirty()
+            set_status("%d R / X / B cell(s) cleared: each section from its cable and length again" % n)
+
+        def pick_udm(self, path=None):
+            """The selected generator's UDM from an OEM's PSCAD model: its definitions listed (ports, parameters,
+               the IDs of the ones placed in it); the one picked is added to the case and put at every GSU."""
+            i = self.current()
+            if i is None:
+                return messagebox.showinfo("Pick UDM", "Select a generator row first.", parent=root)
+            gname = self.rows[i].get("name") or "the generator"
+            path = path or filedialog.askopenfilename(
+                parent=root, title="The OEM's PSCAD model for %s" % gname, initialdir=here,
+                filetypes=[("PSCAD case or library", "*.pscx *.pslx"), ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                scope, defs = oem_model(path)
+            except Exception as e:
+                return messagebox.showerror("Pick UDM", "%s cannot be read:\n\n%s" % (path, e), parent=root)
+            defs = [d for d in defs if d["name"].upper() != "MAIN"]
+            if not defs:
+                return messagebox.showerror("Pick UDM", "%s has no definitions of its own." % path, parent=root)
+            defs.sort(key=lambda d: (not d["ids"], not any(k == "electrical" for _n, _d, k in d["ports"]),
+                                     d["name"].upper()))
+            top = tk.Toplevel(root)
+            top.title("Pick %s's UDM -- %s" % (gname, os.path.basename(path)))
+            top.transient(root)
+            ttk.Label(top, text="The definitions in %s (project %s). The one you pick is added to the PSCAD case "
+                                "and put at every GSU of %s; a component ID copies that placed one instead, its "
+                                "settings and all." % (os.path.basename(path), scope, gname), wraplength=760,
+                      justify="left").pack(fill="x", padx=10, pady=(10, 4))
+            box = ttk.Frame(top)
+            box.pack(fill="both", expand=True, padx=10)
+            cols = ("defn", "desc", "ports", "params", "ids")
+            tv = ttk.Treeview(box, columns=cols, show="headings", height=12, selectmode="browse")
+            for c_, t_, w_ in zip(cols, ("Definition", "Description", "Ports", "Parameters", "Placed (IDs)"),
+                                  (150, 200, 220, 90, 140)):
+                tv.heading(c_, text=t_)
+                tv.column(c_, width=w_, stretch=(c_ == "desc"))
+            ys = ttk.Scrollbar(box, orient="vertical", command=tv.yview)
+            tv.configure(yscrollcommand=ys.set)
+            tv.pack(side="left", fill="both", expand=True)
+            ys.pack(side="right", fill="y")
+            for k, d in enumerate(defs):
+                tv.insert("", "end", iid=str(k), values=(
+                    d["name"], d["desc"], ", ".join("%s%s" % (n, " (3-ph)" if dm == 3 else "" if kd == "electrical"
+                                                              else " (%s)" % kd) for n, dm, kd in d["ports"]),
+                    len(d["params"]), ", ".join(d["ids"][:4]) + (" ..." if len(d["ids"]) > 4 else "")))
+            form = ttk.Frame(top)
+            form.pack(fill="x", padx=10, pady=6)
+            ttk.Label(form, text="AC port").grid(row=0, column=0, sticky="w")
+            port = tk.StringVar()
+            pc = ttk.Combobox(form, textvariable=port, width=18)
+            pc.grid(row=0, column=1, sticky="w", padx=6)
+            ttk.Label(form, text="Copy the placed one").grid(row=0, column=2, sticky="w", padx=(18, 0))
+            iid = tk.StringVar()
+            ic = ttk.Combobox(form, textvariable=iid, width=26, state="readonly")
+            ic.grid(row=0, column=3, sticky="w", padx=6)
+            fresh = "no: the definition, values from PSCAD_Params"
+
+            def chosen(*_a):
+                sel = tv.selection()
+                if not sel:
+                    return
+                d = defs[int(sel[0])]
+                el = [n for n, dm, kd in d["ports"] if kd == "electrical"]
+                three = [n for n, dm, kd in d["ports"] if kd == "electrical" and dm == 3]
+                pc.configure(values=el)
+                port.set((three or el or [""])[0])
+                ic.configure(values=[fresh] + ["ID %s" % x for x in d["ids"]])
+                iid.set(fresh)
+            tv.bind("<<TreeviewSelect>>", chosen)
+            tv.selection_set("0")
+            chosen()
+            got = {}
+
+            def ok():
+                sel = tv.selection()
+                if sel:
+                    got["v"] = (defs[int(sel[0])]["name"], port.get().strip(),
+                                iid.get()[3:] if iid.get().startswith("ID ") else None)
+                top.destroy()
+            bb = ttk.Frame(top)
+            bb.pack(pady=(0, 10))
+            ttk.Button(bb, text="Use it for %s" % gname, command=ok).pack(side="left", padx=4)
+            ttk.Button(bb, text="Cancel", command=top.destroy).pack(side="left", padx=4)
+            app["udm_dialog"] = {"top": top, "tree": tv, "port": port, "iid": iid, "ok": ok}
+            top.grab_set()
+            root.wait_window(top)
+            app["udm_dialog"] = None
+            if "v" in got:
+                self.use_udm(i, path, *got["v"])
+
+        def use_udm(self, i, path, defn, port, iid=None):
+            r = self.rows[i]
+            r["pscad_source"], r["pscad_definition"] = path, defn
+            for k, v in (("pscad_ac_port", port), ("pscad_component_id", iid)):
+                if v:
+                    r[k] = str(v)
+                else:
+                    r.pop(k, None)
+            self.refresh(i)
+            dirty()
+            set_status("%s: UDM %s from %s%s -- put at every GSU when the PSCAD case is built" % (
+                r.get("name") or "the generator", defn, os.path.basename(path),
+                (", a copy of the placed one, ID %s" % iid) if iid else ""))
 
         def fill_machines(self):
             """The DETAILED model's machines (whatever Plant: Model type says) with the values they get now."""
