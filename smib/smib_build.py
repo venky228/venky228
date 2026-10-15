@@ -244,6 +244,9 @@ PLANT_FIELDS = [
     ("pscad_duration_s", "PSCAD duration", "s", "blank = 5", None),
     ("pscad_plot_step_us", "PSCAD plot step", "us", "blank = 100", None),
     ("pscad_meter", "PSCAD meter at POI", "", "YES = a multimeter between the grid and the POI", ["YES", "NO"]),
+    ("pscad_lines", "PSCAD lines as", "", "PI = the gen-tie, each collector and each feeder section one Coupled PI "
+     "Section (R, X, B in pu, its charging inside); RLC = an R and an L, the charging a C at each end (blank = PI)",
+     ["PI", "RLC"]),
     ("pscad_fault", "PSCAD fault at POI", "", "YES = a fault on the grid side of the POI with its timed fault logic, "
      "as vendors' test cases have", ["YES", "NO"]),
     ("pscad_fault_s", "PSCAD fault time", "s", "when the fault starts (blank = 100: none in the run)", None),
@@ -421,6 +424,7 @@ EXAMPLE = {
         "control_mode": "Q", "v_poi_pu": 1.0, "q_poi_mvar": 0.0, "pf_poi": 1.0, "v_grid_pu": 1.0,
         "plant_ctrl": "REPC_B", "regc_repc": "standard",
         "pscad_time_step_us": 10.0, "pscad_duration_s": 5.0, "pscad_plot_step_us": 100.0, "pscad_meter": "YES",
+        "pscad_lines": "PI",
         "pscad_fault": "YES", "pscad_fault_dur_s": 0.15, "pscad_fault_type": "ABCG", "pscad_fault_ohm": 0.01,
     },
     "mpt": [
@@ -2244,6 +2248,7 @@ def control(net, pl):
                   "duration_s": _num(pl, "pscad_duration_s", W, 5.0, positive=True),
                   "plot_step_us": _num(pl, "pscad_plot_step_us", W, 100.0, positive=True),
                   "meter": _choice(pl, "pscad_meter", W, ["YES", "NO"], "YES") == "YES",
+                  "lines": _choice(pl, "pscad_lines", W, ["PI", "RLC"], "PI"),
                   "fault": None if _choice(pl, "pscad_fault", W, ["YES", "NO"], "YES") == "NO" else {
                       "t": _num(pl, "pscad_fault_s", W, None), "type": _choice(pl, "pscad_fault_type", W, FAULT_TYPES,
                                                                                 "ABCG"),
@@ -3182,6 +3187,51 @@ def _rlc(tag, kind, value, a, b, x, y, note=""):
             "ports": [{"node": _node(a), "pick": ["N1", "@first"]}, {"node": _node(b), "pick": ["N2", "@second"]}]}
 
 
+def _fp(what, names, value, desc, cat=None, pick=None, choice=None):
+    """A parameter the build script finds in the component's form by its description (every word of desc in it,
+       every word of cat in its page's name) -- names: what it may be called where the form cannot be read; a
+       choice set by its text (pick: lists of words, the first list that matches) or by choice (its key's words)."""
+    return dict(_pp(what, names, value, choice), desc=desc, cat=cat, pick=pick)
+
+
+def _pi_comp(ln, net):
+    """A line, collector equivalent or feeder section as one Coupled PI Section: R, X and B in pu on 100 MVA and
+       the line's kV, per metre of its length (1 m where it has none: the totals); zero sequence = positive
+       sequence (no coupling between the phases: the same as an R, an L and C/2 at each end)."""
+    n = ln["count"]
+    kv = net.kv(ln["fr"])
+    zb = kv * kv / PI_MVA
+    m = ln["km"] * 1000.0 if ln.get("km") else 1.0
+    r, x, b = ln["R"] / n / zb / m, ln["X"] / n / zb / m, ln["B"] * n * 1e-6 * zb / m
+    rxb = ["R,X,B"]
+    params = [_fp("name", ["Name"], _node(ln["name"]), ["NAME"]),
+              _fp("data entered as", ["Estim", "DataType"], None, ["IMPEDANCE", "ADMITTANCE"],
+                  pick=[["R,X,B", "PU"]], choice=["X_B", "PU"]),
+              _fp("model", ["Model", "Coupled"], None, ["NOMINAL", "COUPLED"], pick=[["COUPLED"]], choice=["COUPLED"]),
+              _fp("frequency", ["F", "Freq"], _g(net.f), ["FREQUENCY"]),
+              _fp("length (m)", ["Len", "Length"], "%.10g" % m, ["LENGTH"]),
+              _fp("zero sequence", ["Zseq"], None, ["0 SEQUENCE"], pick=[["ENTER"]], choice=["ENTER"]),
+              _fp("graphics", ["View", "Disp"], None, ["GRAPHICS"], pick=[["COMPACT"], ["SINGLE"]], choice=["SINGLE"]),
+              _fp("kV", ["Vrated", "V"], _g(kv, 8), ["RATED", "VOLTAGE"], rxb),
+              _fp("MVA", ["MVA", "Sbase"], _g(PI_MVA), ["MVA"], rxb),
+              _fp("R1 (pu/m)", ["R1"], "%.10g" % r, ["POSITIVE", "RESISTANCE"], rxb),
+              _fp("X1 (pu/m)", ["X1"], "%.10g" % x, ["POSITIVE", "REACTANCE"], rxb),
+              _fp("B1 (pu/m)", ["B1"], "%.10g" % b, ["POSITIVE", "SUSCEPTANCE"], rxb),
+              _fp("R0 (pu/m)", ["R0"], "%.10g" % r, ["ZERO", "RESISTANCE"], rxb),
+              _fp("X0 (pu/m)", ["X0"], "%.10g" % x, ["ZERO", "REACTANCE"], rxb),
+              _fp("B0 (pu/m)", ["B0"], "%.10g" % b, ["ZERO", "SUSCEPTANCE"], rxb)]
+    return {"tag": ln["name"], "kind": "PI", "defn": list(PI_DEFNS), "x": 0, "y": 0, "params": params,
+            "note": "%s: R %s ohm, X %s ohm, B %s uS%s over %s m (%s kV, %s MVA base); zero sequence = positive" % (
+                ln["name"], _g(ln["R"] / n), _g(ln["X"] / n), _g(ln["B"] * n), (" (%d circuits)" % n) if n > 1 else "",
+                _g(m), _g(kv), _g(PI_MVA)),
+            "ports": [{"node": _node(ln["fr"]), "pick": ["@left", "@first"]},
+                      {"node": _node(ln["to"]), "pick": ["@right", "@second"]}]}
+
+
+PI_MVA = 100.0        # the Coupled PI Sections' MVA base
+PI_DEFNS = ("master:newpi", "master:pi_section", "master:coupled_pi", "master:cpi")   # tried after the one found
+
+
 def _source(tag, name, kv, vpu, ang, f, x, y, node):
     vll = vpu * kv
     tiny = [_pp("source impedance %s" % n, [n], v) for n, v in (("R", "0.0001 [ohm]"), ("Rs", "0.0001 [ohm]"),
@@ -3287,13 +3337,12 @@ def pscad_model(net, inp):
 
     for ln in net.lines:
         if ln["kind"] != "GRID":                         # the grid's Thevenin impedance: drawn above
-            comps.extend(line(ln))
+            comps.extend([_pi_comp(ln, net)] if c["lines"] == "PI" else line(ln))
     slots = []
     inside = set(id(g["gsu"]) for g in net.gens if g["gsu"] and _gen_slot(net, g, shift)["at"] == "MV")
     for t in net.tx2:
         if t["kind"] == "MPT":
             comps.append(_tx2_comp(t, net, 0, 0))
-            comps[-1]["name_gap"] = 6                    # half a meter + half a transformer: from the POI's name
     for t in net.tx3:
         comps.append(_tx3_comp(t, net, 0, 0))
     for g in net.gens:
@@ -3354,6 +3403,7 @@ PSCAD_PAD = 6         # each side of a run of R, L, C: room for its breakouts wh
 PSCAD_W3 = 8          # the same where PSCAD's R, L, C take the wire's three phases: no breakouts, closer together
 PSCAD_H3 = 10
 NAME_CH = 0.42        # a node name's width per character (grid units) at PSCAD's default zoom
+SYMBOL_HALF = {"XFMR2": 4, "XFMR3": 4, "PI": 3, "METER": 2, "SOURCE": 3, "VENDOR": 3}   # half widths (grid units)
 
 
 def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PSCAD_PAD):
@@ -3403,25 +3453,28 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
         placed.add(id(c))
         order.append(c)
 
-    def chain(c, frm, x, y):
-        """c hanging off node frm (at x) on row y, then what lies beyond it -> (bottom, right)"""
-        lead = c.get("lead", 0)
-        if c.get("name_gap") and frm:            # the wire to it carries frm's name: long enough for the text
-            lead = max(lead, max(4, 2 * int(math.ceil(len(frm) * NAME_CH / 2 + 0.75))) + c["name_gap"] - cw)
-        x0 = x + (pad if rlc(c) and frm and not mid(frm) else 0) + lead
+    def half(c):                                 # its symbol's half width (grid units)
+        return SYMBOL_HALF.get(c["kind"], 3)
+
+    def chain(c, frm, x, y, edge=None):
+        """c hanging off node frm (at x) on row y, then what lies beyond it -> (bottom, right). edge: the right
+           edge of the symbol before it on its row: the wire between them long enough for frm's name."""
+        x0 = x + (pad if rlc(c) and frm and not mid(frm) else 0) + c.get("lead", 0)
+        if edge is not None and frm and not rlc(c):
+            x0 = max(x0, edge + max(4, 2 * int(math.ceil(len(frm) * NAME_CH / 2 + 0.75))) + half(c) - cw // 2)
         put(c, x0 + cw // 2, y, frm)
         right, bottom = x0 + cw * c.get("room", 1), y
         far = [n for n in nodes[id(c)] if n != frm]
         if far:
             x1 = right + (pad if rlc(c) and not mid(far[0]) else 0)
-            b, r = node(far[0], x1, y)
+            b, r = node(far[0], x1, y, None if rlc(c) else x0 + cw // 2 + half(c))
             bottom, right = max(bottom, b), max(right, r)
             for n2 in far[1:]:                   # a three-winding transformer's tertiary: below
                 b, r = node(n2, x1, bottom + ch)
                 bottom, right = max(bottom, b), max(right, r)
         return bottom, right
 
-    def node(n, x, y):
+    def node(n, x, y, edge=None):
         kids = [c for c in at[n] if id(c) not in placed]
         chains = [c for c in kids if len(nodes[id(c)]) >= 2]
         big = [c for c in chains if not small(c, n)]
@@ -3437,7 +3490,7 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
             b, r = chain(c, n, x + gap, yd)
             bottom, right, wide = max(bottom, b, yd), max(right, r), max(wide, r - x)
         if main is not None:                     # its trunks clear of what hangs below this node
-            b, r = chain(main, n, x + max(0, wide + 2 - cw // 2), y)
+            b, r = chain(main, n, x + max(0, wide + 2 - cw // 2), y, edge)
             bottom, right = max(bottom, b), max(right, r)
         for c in others:
             yo = bottom + ch
@@ -3571,14 +3624,13 @@ def _inverter_comp(g, sl, net, x, y):
     if ps["definition"]:
         sl["tag"], sl["model"] = sl["name"] + "_INV", ps["definition"]
         return {"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
-                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6, "name_gap": 7,
+                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6,
                 "note": "inverter: vendor model %s -- %s" % (ps["definition"], what),
                 "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
                            ["@dim3", "@first"]}]}
     sl["tag"], sl["model"] = sl["name"] + "_SRC", "stand-in source"
     c = _source(sl["tag"], sl["name"], sl["kv"], sl["vm"], sl["ang"], net.f, x, y, sl["node"])
     c["lead"] = 6                                       # a wire of its own to its node: the node's name, a UDM's place
-    c["name_gap"] = 7                                   # half a GSU + half a source: the wire's room for that name
     c["orient"] = 4                                     # mirrored: its terminal faces the node (on its left)
     c["note"] += (" -- stand-in for the inverter (%s): holds the load flow; your UDM goes on node %s"
                   % (what, _node(sl["node"])))
@@ -3694,10 +3746,12 @@ _BUILD_PSCAD = r'''# -*- coding: utf-8 -*-
 from __future__ import print_function
 
 import os
+import re
 import sys
 import json
 import time
 import traceback
+import xml.etree.ElementTree as ET
 
 LAUNCH_NEW = False        # True = start a PSCAD of its own even when one is running
 PSCAD_VERSION = None      # None = the newest installed | "5.0.2", "5.1.0" ...
@@ -3886,6 +3940,96 @@ def set_params(cmp, items, log, quiet=False, names=None, read_back=True):
             log("    %-28s %-8s = %s" % (it["what"], name, val))
 
 
+def _norm(text):
+    return re.sub(r"\s+", "", str(text or "")).upper()
+
+
+def definition(pscad, defn):
+    """The definition object of "library:name" (None where this mhi.pscad has none)."""
+    try:
+        lib, name = defn.split(":", 1)
+        return pscad.project(lib).definition(name)
+    except Exception:
+        return None
+
+
+def form_of(d):
+    """A definition's parameter form: [(page, name, description, [(code, choice text)])]; [] where it cannot be
+       read."""
+    try:
+        x = getattr(d, "xml", None)
+        x = x() if callable(x) else x
+        if isinstance(x, (bytes, str)):
+            x = ET.fromstring(x)
+        form = x if x.tag == "form" else x.find(".//form")
+        out = []
+        for cat in form.iter("category"):
+            page = cat.get("name") or cat.get("desc") or ""
+            for p in cat.iter("parameter"):
+                desc = p.get("desc") or p.get("description") or " ".join(
+                    v for k, v in p.attrib.items() if k not in ("name", "type", "unit", "min", "max", "content_type"))
+                ch = []
+                for t in p.iter("choice"):
+                    code, _eq, text = (t.text or "").partition("=")
+                    ch.append((code.strip(), text.strip()))
+                out.append((page, p.get("name"), desc, ch))
+        return out
+    except Exception:
+        return []
+
+
+def find_def(pscad, words, log):
+    """The master library's definition whose form has a parameter described by every word: names with "pi" in
+       them first, then the rest -> "master:name" or None."""
+    try:
+        master = pscad.project("master")
+        names = [str(n) for n in master.definitions()]
+    except Exception as e:
+        log("(the master library's definitions cannot be listed: %s)" % e)
+        return None
+    t0 = time.time()
+    for n in sorted(names, key=lambda n: "PI" not in n.upper()):
+        if time.time() - t0 > 120:
+            log("(stopped looking after 120 s)")
+            break
+        try:
+            form = form_of(master.definition(n))
+        except Exception:
+            continue
+        if any(all(_norm(w) in _norm(d) for w in words) for _pg, _n, d, _c in form):
+            return n if ":" in n else "master:" + n
+    return None
+
+
+def form_pick(items, form, log):
+    """Items found in the component's form by their descriptions: the form's name first, a choice set to the code
+       of the one whose text has the words (pick); a CHECK where the form has no such parameter or choice."""
+    out = []
+    for it in items:
+        it = dict(it)
+        if form and it.get("desc"):
+            hit = next((f for f in form if all(_norm(w) in _norm(f[0]) for w in it.get("cat") or []) and
+                        all(_norm(w) in _norm(f[2]) for w in it["desc"])), None)
+            if hit is None:
+                log("    CHECK: %-26s no parameter described as %r%s in its form" % (
+                    it["what"], " ".join(it["desc"]), (" on page %s" % " ".join(it["cat"])) if it.get("cat") else ""))
+            else:
+                it["names"] = [hit[1]] + [n for n in it["names"] if n != hit[1]]
+                code = None
+                for words in it.get("pick") or []:
+                    code = next((k for k, t in hit[3] if all(_norm(w) in _norm(t) for w in words)), None)
+                    if code is not None:
+                        break
+                if code is not None:
+                    it["value"], it["choice"] = code, None
+                elif it.get("pick"):
+                    log("    CHECK: %-26s %s: no choice like %s (its choices: %s)" % (
+                        it["what"], hit[1], " / ".join(" ".join(w) for w in it["pick"]),
+                        "; ".join("%s = %s" % c for c in hit[3]) or "none"))
+        out.append(it)
+    return out
+
+
 def _range(cmp, name):
     try:
         return sorted(str(x) for x in cmp.range(name))
@@ -3903,6 +4047,7 @@ REACH = [0, 0]             # how far right and down the drawing goes (grid units
 PAGE = [0, 0]              # the page set: width, height (grid units)
 NEED = [0, 0]              # the drawing's size it was set for
 NAMES = {}                 # each component type's parameter names (read once)
+FORMS = {}                 # each component type's form, where its parameters are found by their descriptions
 BREAKOUT_ORIENT = {}       # the breakout orientation that faced the phases, each side
 READ_BACK = False          # True: log every value as PSCAD reads it back (slower); else the first of each type
 T0 = time.time()
@@ -4258,6 +4403,16 @@ def main():
             log("library loaded: %s" % lib)
         except Exception as e:
             log("CHECK: library %s not loaded: %s" % (lib, e))
+    pis = [c for c in SPEC["components"] if c["kind"] == "PI"]
+    if pis:
+        found = find_def(pscad, ["Nominal PI", "Coupled PI"], log)
+        if found:
+            log("Coupled PI Section: %s" % found)
+            for c in pis:
+                c["defn"] = [found] + [d for d in c["defn"] if d != found]
+        else:
+            log("CHECK: no Coupled PI Section found in the master library (its form asks 'Nominal PI or Coupled PI "
+                "Model') -- trying %s; or set Plant: PSCAD lines as RLC" % " / ".join(pis[0]["defn"]))
     names = set()
     for fn in ("project_names", "list_projects"):
         try:
@@ -4329,6 +4484,12 @@ def main():
             except Exception:
                 pass
         NAMES[used] = seen_defn[used]
+        if c["kind"] == "PI":                         # its parameters found by their descriptions in its form
+            if used not in FORMS:
+                FORMS[used] = form_of(definition(pscad, used))
+                if not FORMS[used]:
+                    log("    (its form cannot be read here: its parameters go by name)")
+            c["params"] = form_pick(c["params"], FORMS[used], log if first else (lambda *a: None))
         set_params(cmp, c["params"], log, names=seen_defn[used], read_back=first or READ_BACK)
         if len(made) % 10 == 9:
             print("  ... %d of %d components placed (%.0f s)" % (len(made) + 1, len(SPEC["components"]),
@@ -4339,7 +4500,7 @@ def main():
             log("    (%d electrical ports: %s)" % (len(ports), ", ".join(p[0] for p in ports)))
         taken, picked = set(), []
         nodes = [p["node"] for p in c["ports"]]
-        if c["kind"] in ("R", "L", "C") and len(ports) == 2 and len(nodes) == 2:
+        if c["kind"] in ("R", "L", "C", "PI") and len(ports) == 2 and len(nodes) == 2:
             first = c.get("in") if c.get("in") in nodes else [n for n in nodes if n != "GND"][0]
             lr = sorted(ports, key=lambda p: (p[1], p[2]))          # its upstream node on its left port
             picked = [(first, lr[0]), (([n for n in nodes if n != first] or nodes)[0], lr[1])]
@@ -4460,8 +4621,12 @@ def pscad_data_text(net, comps, spec):
     L = ["PSCAD DATA -- %s %s   (written by smib_build.py on %s)" % (net.model, net.name, spec["written"]),
          "=" * 100,
          "Every value the build script sets, in PSCAD's units. Transformers: pu on their own MVA and winding",
-         "voltages (V1 is the tapped HV voltage). Lines and collector equivalents: pi sections (C/2 at each end);",
-         "detailed collectors: each section's R and L, its charging as C/2 at each end (one capacitor per node).",
+         "voltages (V1 is the tapped HV voltage). %s" % (
+             "The gen-tie, collectors and feeder sections: one Coupled PI Section each, R, X, B in pu on" if
+             net.ctl["pscad"]["lines"] == "PI" else "Lines, collectors and feeder sections: pi sections, R and L"),
+         ("100 MVA and the line's kV, per metre (zero sequence = positive: no coupling between phases)." if
+          net.ctl["pscad"]["lines"] == "PI" else
+          "in series, the charging as C/2 at each end (one capacitor per node)."),
          "The drawing: a single-line diagram with wires (R, L, C three times over, between breakouts, where PSCAD's",
          "are single-phase), on a page sized to fit it; the node names below are the labels on the wires.",
          "Sources: kV line-to-line rms and degrees, the angle relative to the infinite source, the PSCAD",
