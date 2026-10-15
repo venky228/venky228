@@ -3961,6 +3961,12 @@ def relay_records(net, g, model, v, mins):
        the reference: the lower threshold; above it: the upper), each its own instance number (MINS)."""
     name, ref, dev, far = RELAYS[model]
     bus = _num_of(net, g["bus"])
+    if float(v.get("alarm", 0)) > 0:                 # PSLF's alarm only: PSS/E's relays have no such mode
+        note = "NOTE: %s %s alarm > 0: PSLF only reports its trips; no %s in the .dyr" % (
+            g.get("family", g["name"]), model, name)
+        if note not in net.notes:
+            net.notes.append(note)
+        return []
     out = []
     for k in range(1, 11):
         d, t = float(v["%s%d" % (dev, k)]), float(v["dttrp%d" % k])
