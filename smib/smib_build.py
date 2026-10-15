@@ -2194,6 +2194,48 @@ def build_mpt(net, r, f):
         add_tx3(net, d)
 
 
+def unit_rating(r, w):
+    """A Generators row's units and one unit's rating -> (units, Pmax, Pmin, PF, Qmax, Qmin, MVA): Pmin blank 0,
+       Qmax blank from Unit PF (blank 0.95), Qmin blank -Qmax, MVA blank from P and Q."""
+    n = _int(r, "units", w, required=True, minimum=1)
+    pmax = _num(r, "unit_pmax_mw", w, required=True)
+    pmin = _num(r, "unit_pmin_mw", w, 0.0)
+    pf = _num(r, "unit_pf", w, 0.95)
+    qmax = _num(r, "unit_qmax_mvar", w)
+    if qmax is None:
+        if not 0.0 < abs(pf) <= 1.0:
+            raise InputError("%s: Unit PF must be between 0 and 1" % w)
+        qmax = abs(pmax) * math.tan(math.acos(abs(pf)))
+    qmin = _num(r, "unit_qmin_mvar", w, -qmax)
+    s = _num(r, "unit_mva", w, None, positive=True) or math.hypot(max(abs(pmax), abs(pmin)), max(qmax, -qmin))
+    if pmin > pmax:
+        raise InputError("%s: Unit Pmin is above Unit Pmax" % w)
+    if qmin > qmax:
+        raise InputError("%s: Unit Qmin is above Unit Qmax" % w)
+    return n, pmax, pmin, pf, qmax, qmin, s
+
+
+def unit_totals(r):
+    """What a Generators row's units add up to, as the build takes them: one line (the GUI shows it live)."""
+    w = _txt(r.get("name")) or "a generator"
+    try:
+        n, pmax, pmin, _pf, qmax, qmin, s = unit_rating(r, w)
+        d = _num(r, "dispatch_mw", w)
+    except InputError as e:
+        return "%s: %s" % (w, str(e).split(": ", 1)[-1])
+    f = lambda x: "%.6g" % (x + 0.0)
+    txt = "%s: %d x %s MVA = %s MVA, P %s to %s MW, Q %s to %s MVAr" % (
+        w, n, f(s), f(n * s), f(n * pmin), f(n * pmax), f(n * qmin), f(n * qmax))
+    try:
+        gm = _num(r, "gsu_mva", w, None, positive=True)
+        cnt = _int(r, "gsu_count", w, n, minimum=1)
+    except InputError:
+        gm = None
+    if gm:
+        txt += ", GSU %d x %s = %s MVA" % (cnt, f(gm), f(cnt * gm))
+    return txt + (", dispatch %s MW" % f(d) if d is not None else ", dispatch %s MW (Pmax)" % f(n * pmax))
+
+
 def gen_data(r):
     w = r["_where"]
     name = _txt(r.get("name"))
@@ -2223,21 +2265,7 @@ def gen_data(r):
                                                                                  " or ".join(REGC_OK[typ])))
     elif regc:
         raise InputError("%s: Converter model %s -- only inverters take one (PV, BESS, WT4, WT3)" % (w, regc))
-    n = _int(r, "units", w, required=True, minimum=1)
-    pmax = _num(r, "unit_pmax_mw", w, required=True)
-    pmin = _num(r, "unit_pmin_mw", w, 0.0)
-    pf = _num(r, "unit_pf", w, 0.95)
-    qmax = _num(r, "unit_qmax_mvar", w)
-    if qmax is None:
-        if not 0.0 < abs(pf) <= 1.0:
-            raise InputError("%s: Unit PF must be between 0 and 1" % w)
-        qmax = abs(pmax) * math.tan(math.acos(abs(pf)))
-    qmin = _num(r, "unit_qmin_mvar", w, -qmax)
-    s = _num(r, "unit_mva", w, None, positive=True) or math.hypot(max(abs(pmax), abs(pmin)), max(qmax, -qmin))
-    if pmin > pmax:
-        raise InputError("%s: Unit Pmin is above Unit Pmax" % w)
-    if qmin > qmax:
-        raise InputError("%s: Unit Qmin is above Unit Qmax" % w)
+    n, pmax, pmin, pf, qmax, qmin, s = unit_rating(r, w)
     g = {"name": name, "type": typ, "reec": reec, "regc": regc, "id": (_txt(r.get("id")) or "1")[:2], "row": r,
          "where": w, "n": n,
          "unit": {"mva": s, "pmax": pmax, "pmin": pmin, "qmax": qmax, "qmin": qmin, "pf": pf},
@@ -7290,6 +7318,7 @@ def gui(start=None):
     st.configure("Item.TLabel", font=("Segoe UI", 9, "bold"))
     st.configure("Hint.TLabel", foreground=grey, font=("Segoe UI", 8))
     st.configure("Req.TLabel", foreground="#C00000", font=("Segoe UI", 8, "bold"))
+    st.configure("Total.TLabel", foreground="#1F3864", font=("Segoe UI", 9, "bold"))
     st.configure("Tag.TLabel", foreground="#375623", font=("Segoe UI", 8))
     st.configure("Help.TLabel", background="#F2F2F2", foreground="#262626", font=("Segoe UI", 9), padding=(8, 5))
     st.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
@@ -7525,6 +7554,10 @@ def gui(start=None):
             self.help = tk.StringVar(value="Click a column title or a cell to see what the column is.")
             ttk.Label(tab, textvariable=self.help, style="Help.TLabel", wraplength=1200, justify="left").pack(
                 fill="x", side="bottom")
+            self.total = tk.StringVar()                  # Generators: what its units add up to, live
+            if sheet == "Generators":
+                ttk.Label(tab, textvariable=self.total, style="Total.TLabel", wraplength=1200, justify="left").pack(
+                    fill="x", side="bottom", padx=8, pady=(4, 2))
             self.col = 0
             self.tree.bind("<Double-1>", self.on_double)
             self.tree.bind("<Button-1>", self.on_click, add="+")
@@ -7550,8 +7583,15 @@ def gui(start=None):
                 out.append(v)
             return out
 
+        def sums(self):
+            if self.sheet == "Generators":
+                rows = [r for r in self.rows if any(v not in (None, "") for v in r.values())]
+                self.total.set("Totals -- units x one unit, as the models take them:\n" +
+                               "\n".join("   " + unit_totals(r) for r in rows) if rows else "")
+
         def refresh(self, select=None):
             self.tree.delete(*self.tree.get_children())
+            self.sums()
             for i, r in enumerate(self.rows):
                 self.tree.insert("", "end", iid=str(i), values=self.shown(r),
                                  tags=("odd" if i % 2 else "even",))
@@ -7674,6 +7714,7 @@ def gui(start=None):
                             if self.rows[i].get(k) and self.rows[i][k] not in ok.get(v.upper(), ()):
                                 self.rows[i].pop(k)
                     self.tree.item(str(i), values=self.shown(self.rows[i]))
+                    self.sums()
                     dirty()
             w.destroy()
             self.tree.focus_set()
