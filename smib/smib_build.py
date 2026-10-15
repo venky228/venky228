@@ -22,6 +22,7 @@
      Cables         cable data per length
      Collectors     collector systems shared by more than one generator
      Loads_Shunts   auxiliary loads and shunts (capacitor banks, reactors)
+     Machines       DETAILED: a machine's own Pgen, Pmax, Pmin, Qmax, Qmin, Q, MBASE, ID
      Bus_Numbers    bus numbers / names of your own (blank = automatic)
      Dyr_Params     any .dyr model parameter, by generator, model and name
      Dyr_Records    .dyr records of your own (vendor models)
@@ -43,7 +44,10 @@
      lumped); the units of a generator at each node a machine of their own
      (its generator's unit data and dynamic models, P in proportion) behind
      its own GSU (the generator's, scaled). Rows in Dyr_Params, Dyr_Records
-     and PSCAD_Params that name a generator apply to all of its machines.
+     and PSCAD_Params that name a generator apply to all of its machines;
+     Machines gives one machine values of its own. Scale up (GUI) or --scale:
+     a test plant -- MPTs (copies of the first, with its generators), feeders
+     per MPT, GSUs per feeder, inverters per GSU.
 
    WECC COLLECTOR EQUIVALENT
      Each collector system is given feeder by feeder, section by section from
@@ -137,6 +141,9 @@
        python smib_build.py SMIB_INPUT.xlsx              the models
        python smib_build.py SMIB_INPUT.xlsx --no-psse    the models, no PSS/E check
        python smib_build.py SMIB_INPUT.xlsx --no-pscad   the models, no PSCAD build
+       python smib_build.py --scale 2 25 1 4 SMIB_INPUT.xlsx   a test plant: 2 MPTs, 25
+           feeders on each, 1 GSU per feeder, 4 inverters per GSU (0 = as it
+           is; a new workbook -- the GUI: Scale up)
        python smib_build.py                              (the Run button) the workbook
            in INPUT_XLSX, else the one beside this script; several or none: a
            file dialog -- none chosen: a new SMIB_INPUT.xlsx beside it to fill in
@@ -375,6 +382,19 @@ BUS_COLS = [
     ("name", "Name", "blank = automatic (12 characters at most)", None, 14),
 ]
 
+MACHINE_COLS = [
+    ("machine", "Machine", "# DETAILED model: a machine, <generator>_<feeder>_S<section> (the GUI lists them); its "
+     "values in place of its share of its generator's", None, 16),
+    ("id", "Machine ID", "blank = its generator's", None, 7),
+    ("pgen_mw", "Pgen MW", "its dispatch (blank = its share of its generator's Dispatch MW)", None, 8),
+    ("pmax_mw", "Pmax MW", "blank = its units x Unit Pmax", None, 8),
+    ("pmin_mw", "Pmin MW", "blank = its units x Unit Pmin", None, 8),
+    ("qmax_mvar", "Qmax MVAr", "blank = its units x Unit Qmax", None, 8),
+    ("qmin_mvar", "Qmin MVAr", "blank = its units x Unit Qmin", None, 8),
+    ("q_mvar", "Fixed Q MVAr", "a value: this Q, fixed (blank = as its generator's Q mode)", None, 8),
+    ("mbase_mva", "MBASE MVA", "blank = its units x Unit MVA", None, 8),
+]
+
 DYRP_COLS = [
     ("generator", "Generator", "# IB: the infinite bus | PLANT: the plant controller (REPC_B)", None, 11),
     ("model", "Model", "REGCA1 (REGCAU1) | REECA1 REECCU1 REECDU1 | REPCA1 (REPCAU1) or REAX4BU1 | PLANT: PLNTBU1 | "
@@ -402,6 +422,7 @@ TABLES = [  # (sheet, input key, columns)
     ("Cables", "cables", CABLE_COLS),
     ("Collectors", "collectors", COLLECTOR_COLS),
     ("Loads_Shunts", "loads_shunts", LOAD_COLS),
+    ("Machines", "machines", MACHINE_COLS),
     ("Bus_Numbers", "bus_numbers", BUS_COLS),
     ("Dyr_Params", "dyr_params", DYRP_COLS),
     ("Dyr_Records", "dyr_records", DYRR_COLS),
@@ -453,6 +474,7 @@ EXAMPLE = {
     ],
     "collectors": [],
     "loads_shunts": [{"kind": "LOAD", "at": "MPT1", "mw": 1.0, "mvar": 0.3, "name": "AUX"}],
+    "machines": [],
     "bus_numbers": [],
     "dyr_params": [{"generator": "PLANT", "model": "PLNTBU1", "parameter": "Kp", "value": 1.0},
                    {"generator": "BESS", "model": "REECCU1", "parameter": "SOCini", "value": 0.5}],
@@ -508,6 +530,10 @@ README = [
                    "its name."),
     ("Loads_Shunts", "Auxiliary loads (constant impedance, MW and MVAr at 1 pu) and shunts (MVAr at 1 pu: + "
                      "capacitor, - reactor) on any bus."),
+    ("Machines", "DETAILED model only: a machine's own Pgen, Pmax, Pmin, Qmax, Qmin, fixed Q, MBASE and ID in place "
+                 "of its share of its generator's (the GUI's 'List the DETAILED machines' fills in their names and "
+                 "values). Scale up (GUI) or --scale: a test plant -- MPTs (copies of the first, with its generators), "
+                 "feeders per MPT, GSUs per feeder and inverters per GSU."),
     ("Bus_Numbers", "Bus numbers or names of your own, by role (the report lists every role and its number)."),
     ("Dyr_Params", "Any parameter of the WECC-approved generic models, by generator, model and PSS/E name or "
                    "position (ICON2, CON14) -- IB for the infinite bus, PLANT for the plant controller. Inverters: "
@@ -1142,6 +1168,7 @@ SHEET_INDEX = [
     ("Cables", "input", "cable data per length"),
     ("Collectors", "input", "collector systems shared by several generators"),
     ("Loads_Shunts", "input", "auxiliary loads, capacitor banks, reactors"),
+    ("Machines", "input", "DETAILED: each machine's own Pgen, P and Q limits, MBASE and ID"),
     ("Bus_Numbers", "input", "bus numbers and names of your own (blank = automatic)"),
     ("Dyr_Params", "input", "any dynamic model parameter, by generator, model and name"),
     ("Dyr_Records", "input", ".dyr records of your own (vendor models)"),
@@ -1806,6 +1833,7 @@ def build_network(inp, log):
         one_feeder_per_generator(net)
     else:
         expand_collectors(net)
+    machines(net, inp["machines"])
 
     taken = set()
     for r in inp["loads_shunts"]:
@@ -2170,6 +2198,62 @@ def expand_collectors(net):
         seen.add(g["name"].upper())
 
 
+def machines(net, rows):
+    """Machines: a DETAILED machine's own Pgen, Pmax, Pmin, Qmax, Qmin, fixed Q, MBASE and ID in place of its share
+       of its generator's."""
+    if not rows:
+        return
+    if net.model != "DETAILED":
+        net.notes.append("NOTE: Machines: %d row(s) not used -- they are for the DETAILED model (Plant: Model type)"
+                         % len(rows))
+        return
+    by = collections.OrderedDict((g["name"].upper(), g) for g in net.gens if g.get("family"))
+    seen = set()
+    for r in rows:
+        w = r["_where"]
+        nm = _txt(r.get("machine")) or ""
+        g = by.get(nm.upper())
+        if g is None:
+            names = [x["name"] for x in by.values()]
+            raise InputError("%s: no machine %s in the DETAILED model -- its machines: %s" % (
+                w, nm, ", ".join(names[:12]) + (" ... (%d)" % len(names) if len(names) > 12 else "") or "none"))
+        if nm.upper() in seen:
+            raise InputError("%s: machine %s is in Machines twice" % (w, g["name"]))
+        seen.add(nm.upper())
+        done = []
+        for key, fld, what in (("pmax_mw", "pmax", "Pmax"), ("pmin_mw", "pmin", "Pmin"), ("qmax_mvar", "qmax", "Qmax"),
+                               ("qmin_mvar", "qmin", "Qmin"), ("pgen_mw", "dispatch", "Pgen")):
+            v = _num(r, key, w)
+            if v is not None:
+                g[fld] = v
+                done.append("%s %s" % (what, _g(v)))
+        v = _num(r, "mbase_mva", w, None, positive=True)
+        if v is not None:
+            g["mbase"] = v
+            done.append("MBASE %s" % _g(v))
+        v = _num(r, "q_mvar", w)
+        if v is not None:
+            g["q_mode"], g["q_fixed"] = "fixed", v
+            done.append("Q %s fixed" % _g(v))
+        v = _txt(r.get("id"))
+        if v:
+            g["id"] = v[:2]
+            done.append("ID %s" % g["id"])
+        for lo, hi, what in (("pmin", "pmax", "P"), ("qmin", "qmax", "Q")):
+            if g[lo] > g[hi] + 1e-9:
+                raise InputError("%s: %s %smin %s is above its %smax %s" % (w, g["name"], what, _g(g[lo]), what,
+                                                                           _g(g[hi])))
+        if g["dispatch"] > g["pmax"] + 1e-6 or g["dispatch"] < g["pmin"] - 1e-6:
+            raise InputError("%s: %s Pgen %.3f MW is outside Pmin..Pmax (%.3f .. %.3f MW)"
+                             % (w, g["name"], g["dispatch"], g["pmin"], g["pmax"]))
+        if g["mbase"] < max(abs(g["pmax"]), abs(g["pmin"])) - 1e-6:
+            net.notes.append("CHECK: %s: %s MBASE %s MVA is below its P range (%s .. %s MW)" % (
+                w, g["name"], _g(g["mbase"]), _g(g["pmin"]), _g(g["pmax"])))
+        if done:
+            g["where"] += " (Machines: %s)" % ", ".join(done)
+            net.notes.append("NOTE: %s: %s -- %s" % (w, g["name"], ", ".join(done)))
+
+
 def _unit_group(net, g, name, units, at, where):
     """The units of generator g at one collector node: a machine of g's kind with g's unit data, P (and fixed Q)
        in proportion, behind its own GSU (g's, scaled to them)."""
@@ -2384,28 +2468,46 @@ def ybus(net, roles):
 
 
 def _lin_solve(A, b):
-    """A x = b by Gaussian elimination with partial pivoting (A, b are changed)."""
+    """A x = b by sparse Gaussian elimination: A's rows as lists or {column: value}; the next pivot in a column
+       with the fewest entries left (little fill-in on a radial network), a row with a large enough entry in it
+       and the fewest entries."""
     n = len(b)
-    for c in range(n):
-        p = max(range(c, n), key=lambda r: abs(A[r][c]))
-        if abs(A[p][c]) < 1e-14:
+    rows = [dict(r) if isinstance(r, dict) else dict((k, v) for k, v in enumerate(r) if v) for r in A]
+    b = list(b)
+    cols = [set() for _k in range(n)]
+    for i, r in enumerate(rows):
+        for k in r:
+            cols[k].add(i)
+    left, order = set(range(n)), []
+    for _step in range(n):
+        c = min(left, key=lambda k: len(cols[k]))
+        cand = cols[c]
+        big = max([abs(rows[i][c]) for i in cand] or [0.0])
+        if big < 1e-14:
             raise ZeroDivisionError("singular matrix")
-        if p != c:
-            A[c], A[p] = A[p], A[c]
-            b[c], b[p] = b[p], b[c]
-        piv = A[c][c]
-        rowc = A[c]
-        for r in range(c + 1, n):
-            f = A[r][c] / piv
-            if f:
-                rr = A[r]
-                for k in range(c, n):
-                    rr[k] -= f * rowc[k]
-                b[r] -= f * b[c]
+        p = min((i for i in cand if abs(rows[i][c]) >= 0.1 * big), key=lambda i: len(rows[i]))
+        left.discard(c)
+        prow = rows[p]
+        for k in prow:
+            cols[k].discard(p)
+        piv = prow[c]
+        for i in list(cand):
+            r = rows[i]
+            f = r.pop(c) / piv
+            for k, v in prow.items():
+                if k != c:
+                    if k not in r:
+                        cols[k].add(i)
+                        r[k] = -f * v
+                    else:
+                        r[k] -= f * v
+            b[i] -= f * b[p]
+        cols[c] = set()
+        order.append((p, c))
     x = [0.0] * n
-    for r in range(n - 1, -1, -1):
-        s = b[r] - sum(A[r][k] * x[k] for k in range(r + 1, n))
-        x[r] = s / A[r][r]
+    for p, c in reversed(order):
+        r = rows[p]
+        x[c] = (b[p] - sum(v * x[k] for k, v in r.items() if k != c)) / r[c]
     return x
 
 
@@ -2425,7 +2527,7 @@ def newton(Y, slack, vslack, sinj, v0=None, tol=1e-10, itmax=40):
         if it == itmax:
             break
         pos = dict((k, a) for a, k in enumerate(pq))
-        J = [[0.0] * (2 * m) for _r in range(2 * m)]
+        J = [{} for _r in range(2 * m)]
         vm = [abs(v) for v in V]
         va = [cmath.phase(v) for v in V]
         for a, i in enumerate(pq):
@@ -3393,6 +3495,7 @@ def pscad_model(net, inp):
         seen.add(tag.upper())
     for c3 in pscad_layout(comps, cw=PSCAD_W3, ch=PSCAD_H3, pad=0)[0]:
         c3["x3"], c3["y3"] = c3["x"], c3["y"]          # where R, L and C are three-phase in this PSCAD
+        c3["parts3"] = c3.pop("parts", {})
     comps, net.pscad_groups = pscad_layout(comps)
     net.pscad_comps = comps
     return comps
@@ -3405,6 +3508,7 @@ PSCAD_PAD = 6         # each side of a run of R, L, C: room for its breakouts wh
 PSCAD_W3 = 8          # the same where PSCAD's R, L, C take the wire's three phases: no breakouts, closer together
 PSCAD_H3 = 10
 NAME_CH = 0.42        # a node name's width per character (grid units) at PSCAD's default zoom
+PSCAD_TALL = 720       # a drawing this tall (grid units) goes on in another column: PSCAD's largest page is 800
 SYMBOL_HALF = {"XFMR2": 4, "XFMR3": 4, "PI": 3, "METER": 2, "SOURCE": 3, "VENDOR": 3}   # half widths (grid units)
 
 
@@ -3458,12 +3562,15 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
     def half(c):                                 # its symbol's half width (grid units)
         return SYMBOL_HALF.get(c["kind"], 3)
 
+    def room(n):                                 # a wire long enough for node n's name
+        return max(4, 2 * int(math.ceil(len(n) * NAME_CH / 2 + 0.75)))
+
     def chain(c, frm, x, y, edge=None):
         """c hanging off node frm (at x) on row y, then what lies beyond it -> (bottom, right). edge: the right
            edge of the symbol before it on its row: the wire between them long enough for frm's name."""
         x0 = x + (pad if rlc(c) and frm and not mid(frm) else 0) + c.get("lead", 0)
         if edge is not None and frm and not rlc(c):
-            x0 = max(x0, edge + max(4, 2 * int(math.ceil(len(frm) * NAME_CH / 2 + 0.75))) + half(c) - cw // 2)
+            x0 = max(x0, edge + room(frm) + half(c) - cw // 2)
         put(c, x0 + cw // 2, y, frm)
         right, bottom = x0 + cw * c.get("room", 1), y
         far = [n for n in nodes[id(c)] if n != frm]
@@ -3494,10 +3601,22 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
         if main is not None:                     # its trunks clear of what hangs below this node
             b, r = chain(main, n, x + max(0, wide + 2 - cw // 2), y, edge)
             bottom, right = max(bottom, b), max(right, r)
+        cx, cbot, part, k = x, bottom, 0, 0      # the column they go down in, its bottom, its number, how many
         for c in others:
-            yo = bottom + ch
-            b, r = chain(c, n, x + gap, yo)
-            bottom, right = max(bottom, b, yo), max(right, r)
+            mark = len(order)
+            b, r = chain(c, n, cx + gap, cbot + ch)
+            if b > PSCAD_TALL and k:             # past the page: a column of its own right of all so far, joined to
+                for c2 in order[mark:]:          # the rest of n by n's name (a node label)
+                    placed.discard(id(c2))
+                    c2.pop("parts", None)
+                del order[mark:]
+                part, k, cx, cbot = part + 1, 0, right + room(n) + gap, y
+                b, r = chain(c, n, cx + gap, cbot + ch)
+            if part:
+                c["parts"] = {n: part}
+            k += 1
+            cbot = max(cbot + ch, b)
+            bottom, right = max(bottom, cbot), max(right, r)
         return bottom, right
 
     x0, y0 = 20, 10
@@ -4278,14 +4397,16 @@ def phase_group(canvas, g, made, spec_of, points, log):
     ins, sx = [rows[k][0][1] for k in range(3)], one[0][1]
     for k in range(3):                               # fanning out: the bottom phase turns first
         wire(canvas, (sx, one[k][2]), (sx + 3 - k, one[k][2]), (sx + 3 - k, ins[k][2]), (ins[k][1], ins[k][2]))
-    points.setdefault(g["a"], []).append((tri[1], tri[2], "breakout", tri[0]))
+    points.setdefault(g["a"], []).append((tri[1], tri[2], "breakout", tri[0],
+                                          spec_of[g["members"][0][0]].get("parts", {}).get(g["a"], 0)))
     _trace("comp", role="breakout", group=g["members"][0][0], side="in", ports=[tri] + one)
     if g["kind"] == "series":
         outs, sx = [rows[k][-1][2] for k in range(3)], oneo[0][1]
         for k in range(3):                           # closing in: the top phase turns first
             wire(canvas, (outs[k][1], outs[k][2]), (sx - 3 + k, outs[k][2]), (sx - 3 + k, oneo[k][2]),
                  (sx, oneo[k][2]))
-        points.setdefault(g["b"], []).append((tro[1], tro[2], "breakout", tro[0]))
+        points.setdefault(g["b"], []).append((tro[1], tro[2], "breakout", tro[0],
+                                              spec_of[g["members"][-1][0]].get("parts", {}).get(g["b"], 0)))
         _trace("comp", role="breakout", group=g["members"][0][0], side="out", ports=[tro] + oneo)
     else:
         for k in range(3):
@@ -4351,6 +4472,16 @@ def join(canvas, points, log):
        below; a ground on every ground port; the node's name in the middle of its longest wire."""
     for (x, y) in sorted(set((p[0], p[1]) for p in points.get("GND", []))):
         ground(canvas, x, y, log)
+    split = {}                                        # a node in columns of its own: each part wired on its own,
+    for node, pts in points.items():                  # joined to the rest by its name
+        for p in pts:
+            split.setdefault(node if node == "GND" or len(p) < 5 or not p[4] else "%s@%d" % (node, p[4]),
+                             []).append(p)
+    for key, pts in split.items():
+        if "@" in key and len(set((p[0], p[1]) for p in pts)) == 1:     # one port: a wire of its own for the name
+            n = key.split("@")[0]
+            pts.append((pts[0][0] - max(4, int(len(n) * 0.42 + 2.5)), pts[0][1], "name", "", 0))
+    points = split
     wires = plan(points)
     for node in sorted(points):
         if node == "GND":
@@ -4369,11 +4500,11 @@ def join(canvas, points, log):
         except Exception as e:
             log("CHECK: node %s: no wires (%s) -- node labels instead" % (node, e))
             for (x, y) in sorted(set((p[0], p[1]) for p in points[node])):
-                label(canvas, x, y, node)
+                label(canvas, x, y, node.split("@")[0])
             continue
         if not node.endswith("_RL"):
             x, y = at[1] if at else wires[node][0][0]
-            label(canvas, x, y, node)
+            label(canvas, x, y, node.split("@")[0])
 
 
 def main():
@@ -4440,7 +4571,7 @@ def main():
     canvas = prj.canvas("Main") if hasattr(prj, "canvas") else prj.user_canvas("Main")
     if not rlc_single(canvas, log):
         for c in SPEC["components"]:
-            c["x"], c["y"] = c.get("x3", c["x"]), c.get("y3", c["y"])
+            c["x"], c["y"], c["parts"] = c.get("x3", c["x"]), c.get("y3", c["y"]), c.get("parts3", {})
         log("R, L and C take the wire's three phases here: drawn once each, closer together")
     page(canvas, max(c["x"] for c in SPEC["components"]) + 12, max(c["y"] for c in SPEC["components"]) + 16, log)
     seen_defn = {}
@@ -4546,7 +4677,7 @@ def main():
     for c in SPEC["components"]:
         if c["tag"] in made and c["tag"] not in grouped:
             for node, q in made[c["tag"]][2]:
-                points.setdefault(node, []).append((q[1], q[2], c["tag"], q[0]))
+                points.setdefault(node, []).append((q[1], q[2], c["tag"], q[0], c.get("parts", {}).get(node, 0)))
     for c in SPEC["components"]:
         if c.get("drives") and c["tag"] in made and c["drives"] in made:
             link(canvas, made[c["tag"]][0], made[c["drives"]][0], "%s -> %s" % (c["tag"], c["drives"]), log)
@@ -5466,6 +5597,178 @@ def gui_value(key, s):
     return int(x) if x == int(x) and "." not in s and "e" not in s.lower() and abs(x) < 1e15 else x
 
 
+def _split(total, weights):
+    """total in whole parts in proportion to weights, the largest remainders first."""
+    tw = float(sum(weights)) or 1.0
+    raw = [total * w / tw for w in weights]
+    out = [int(math.floor(x)) for x in raw]
+    for i in sorted(range(len(raw)), key=lambda i: -(raw[i] - out[i]))[:total - sum(out)]:
+        out[i] += 1
+    return out
+
+
+def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None):
+    """A test plant scaled from this one -- None or 0 keeps what the plant has:
+         mpts      MPTs: copies of the first, each with a copy of the generators on it (PV, BESS -> PV_2, BESS_2 ...)
+         per_mpt   feeders on each MPT, shared among its generators by their MW
+         gsus      GSUs on each feeder: a section of its own each, the feeder's cables in order (the last repeated)
+         per_gsu   inverters (units) behind each GSU
+       Each generator's Units, GSU count, GSU MVA (its MVA per inverter kept) and Dispatch follow; the MPTs' MVA
+       follows their MW, the gen-tie circuits the plant's. -> (inputs, [what was done])."""
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def upper(v):
+        return str(v or "").upper()
+
+    d = json.loads(json.dumps(data, default=str))
+    if not d.get("mpt"):
+        raise InputError("Scale up: the plant has no MPT")
+    for v, what in ((mpts, "MPTs"), (per_mpt, "feeders per MPT"), (gsus, "GSUs per feeder"),
+                    (per_gsu, "inverters per GSU")):
+        if v is not None and v < 0:
+            raise InputError("Scale up: %s must be 1 or more (0 or blank: as it is)" % what)
+    base = d["mpt"][0]
+    bname = str(base.get("name") or "MPT1")
+    names = set(upper(r.get("name")) for k in ("mpt", "generators", "collectors") for r in d.get(k, []))
+    m = re.match(r"^(.*?)(\d+)$", bname)
+
+    def fresh(nm):
+        while upper(nm) in names:
+            nm += "X"
+        names.add(upper(nm))
+        return nm
+
+    def on_base(where):                                   # MPT1, MPT1:LV, MPT1:TV
+        return upper(where) == upper(bname) or upper(where).startswith(upper(bname) + ":")
+
+    shared = [c for c in d.get("collectors", []) if on_base(c.get("connect"))]
+    shared_n = set(upper(c.get("name")) for c in shared)
+    gens = [g for g in d.get("generators", []) if on_base(g.get("connect")) or upper(g.get("connect")) in shared_n]
+    if not gens:
+        raise InputError("Scale up: no generator is connected to %s" % bname)
+    feeders = d.get("feeders", [])
+    own = [g for g in gens if upper(g.get("collector") or "FEEDERS") == "FEEDERS" and
+           upper(g.get("connect")) not in shared_n and any(upper(r.get("collector")) == upper(g["name"])
+                                                           for r in feeders)]
+    mpts = int(mpts or len(d["mpt"]) or 1)
+
+    def mw(g, units=None):
+        return (num(g.get("units")) if units is None else units) * (num(g.get("unit_pmax_mw")) or 0.0)
+
+    plan = []                                              # (generator, template sections, units at them, feeders)
+    for g in own:
+        rows = [r for r in feeders if upper(r.get("collector")) == upper(g["name"])]
+        first = rows[0].get("feeder")
+        tpl = sorted([r for r in rows if r.get("feeder") == first], key=lambda r: num(r.get("section")) or 0)
+        fc = collections.OrderedDict()                     # its feeders now: each with its copies
+        for r in rows:
+            fc.setdefault(r.get("feeder"), num(r.get("copies")) or 1)
+        plan.append((g, tpl, int(sum(fc.values()))))
+    per_mpt = int(per_mpt or sum(p[2] for p in plan) or 0)
+    if own and per_mpt < len(own):
+        raise InputError("Scale up: %d feeders per MPT are fewer than the %d generators with feeders on %s"
+                         % (per_mpt, len(own), bname))
+    nfs = _split(per_mpt, [max(mw(g), 1e-6) for g in own]) if own else []
+    for i, g in enumerate(own):                            # every generator at least one feeder
+        if nfs[i] == 0:
+            j = max(range(len(nfs)), key=lambda j: nfs[j])
+            nfs[i], nfs[j] = 1, nfs[j] - 1
+    old_mw = dict((upper(g["name"]), mw(g)) for g in gens)
+    new_gen, did = {}, []
+    for (g, tpl, nf0), nf in zip(plan, nfs):
+        us = [num(r.get("units")) or 0 for r in tpl]
+        k0 = [i for i, u in enumerate(us) if u] or [len(tpl) - 1]
+        head = tpl[:k0[0]]                                 # the home run: the sections before the first units
+        unit_secs = [tpl[i] for i in k0]
+        n_gsu = int(gsus or len(unit_secs))
+        units = num(g.get("units")) or 1.0
+        cnt = num(g.get("gsu_count")) or units
+        inv = int(per_gsu or max(1, int(round(units / cnt))))
+        nu = nf * n_gsu * inv
+        gg = dict(g, units=nu, gsu_count=nf * n_gsu if g.get("gsu_mva") not in (None, "") else g.get("gsu_count"))
+        if g.get("gsu_mva") not in (None, ""):
+            gg["gsu_mva"] = round(num(g["gsu_mva"]) * cnt / units * inv, 4)
+        if g.get("dispatch_mw") not in (None, ""):
+            gg["dispatch_mw"] = round(num(g["dispatch_mw"]) * nu / units, 4)
+        rows = []
+        for j in range(nf):
+            secs = head + [unit_secs[min(i, len(unit_secs) - 1)] for i in range(n_gsu)]
+            for k, r in enumerate(secs):
+                rows.append(dict(r, feeder="F%d" % (j + 1), copies=1, section=k + 1, from_section=None,
+                                 units=inv if k >= len(head) else None))
+        new_gen[upper(g["name"])] = (gg, rows)
+        did.append("%s: %d feeders x %d GSUs x %d inverters = %d units (%.1f MW), GSU %s MVA" % (
+            g["name"], nf, n_gsu, inv, nu, mw(gg), _g(num(gg.get("gsu_mva")) or 0)))
+    for g in gens:
+        if upper(g["name"]) not in new_gen:
+            new_gen[upper(g["name"])] = (dict(g), [dict(r) for r in feeders
+                                                   if upper(r.get("collector")) == upper(g.get("connect"))
+                                                   and upper(g.get("connect")) in shared_n])
+    ratio = (sum(mw(gg) for gg, _r in new_gen.values()) / sum(old_mw.values())) if sum(old_mw.values()) else 1.0
+    out_mpt, out_gen, out_col, out_f = [], [], [], []
+    gname = {}
+    for k in range(1, mpts + 1):
+        mn = bname if k == 1 else fresh("%s%d" % (m.group(1), int(m.group(2)) + k - 1) if m else "%s_%d" % (bname, k))
+        r = dict(base, name=mn)
+        for key in ("mva", "lv_mva", "tv_mva", "rate_mva", "base_hl_mva", "base_ht_mva", "base_lt_mva"):
+            if num(r.get(key)):
+                r[key] = round(num(r[key]) * ratio, 1)
+        out_mpt.append(r)
+
+        def moved(where):
+            w = str(where or "")
+            return mn + w[len(bname):] if on_base(w) else w
+        for c in shared:
+            nm = c["name"] if k == 1 else fresh("%s_%d" % (c["name"], k))
+            gname[(upper(c["name"]), k)] = nm
+            out_col.append(dict(c, name=nm, connect=moved(c.get("connect"))))
+            out_f.extend(dict(fr, collector=nm) for fr in feeders if upper(fr.get("collector")) == upper(c["name"]))
+        for g in gens:
+            gg, rows = new_gen[upper(g["name"])]
+            nm = g["name"] if k == 1 else fresh("%s_%d" % (g["name"], k))
+            gname[(upper(g["name"]), k)] = nm
+            con = g.get("connect")
+            con = gname.get((upper(con), k), con) if upper(con) in shared_n else moved(con)
+            out_gen.append(dict(gg, name=nm, connect=con))
+            out_f.extend(dict(r, collector=nm) for r in rows if upper(r.get("collector")) == upper(g["name"]))
+    gens_id = set(id(g) for g in gens)
+    d["mpt"] = out_mpt + [r for r in d["mpt"] if r is not base]
+    d["generators"] = out_gen + [g for g in d.get("generators", []) if id(g) not in gens_id]
+    d["collectors"] = out_col + [c for c in d.get("collectors", []) if all(c is not x for x in shared)]
+    moved_f = set(upper(g["name"]) for g in own) | shared_n
+    d["feeders"] = out_f + [r for r in feeders if upper(r.get("collector")) not in moved_f]
+    for key in ("dyr_params", "dyr_records", "pscad_params"):
+        rows = []
+        for r in d.get(key, []):
+            rows.append(r)
+            g = upper(r.get("generator"))
+            rows.extend(dict(r, generator=gname[(g, k)]) for k in range(2, mpts + 1) if (g, k) in gname)
+        d[key] = rows
+    total = sum(mw(gg) for gg, _r in new_gen.values()) * mpts
+    did.insert(0, "%d MPT(s) of %s MVA (copies of %s, which had %.1f MW), %d feeders on each: %.1f MW in all" % (
+        mpts, _g(num(out_mpt[0].get("mva")) or 0), bname, sum(old_mw.values()), per_mpt, total))
+    pl = d.setdefault("plant", {})
+    if pl.get("tie_length") not in (None, "", 0):
+        old = int(num(pl.get("tie_parallel")) or 1)
+        pl["tie_parallel"] = max(1, int(math.ceil(old * total / max(sum(old_mw.values()), 1e-6) - 1e-9)))
+        if pl["tie_parallel"] != old:
+            did.append("gen-tie circuits: %d (were %d)" % (pl["tie_parallel"], old))
+    if shared:
+        did.append("shared collector(s) %s copied as they are" % ", ".join(c["name"] for c in shared))
+    for key, what in (("machines", "Machines"), ("bus_numbers", "Bus_Numbers")):
+        if d.get(key):
+            did.append("%s cleared (its names changed)" % what)
+            d[key] = []
+    left = [g["name"] for g in d["generators"][len(out_gen):]]
+    if left:
+        did.append("as they were (not on %s): %s" % (bname, ", ".join(left)))
+    return d, did
+
+
 def gui_save_data(data):
     """The project as written to its .json (and read back by read_input): typed values, empty rows left out."""
     out = {"plant": dict((k, gui_value(k, v)) for k, v in data["plant"].items() if gui_value(k, v) is not None)}
@@ -5702,6 +6005,9 @@ def gui(start=None):
                 ttk.Button(tools, text=txt, command=fn).pack(side="left", padx=2)
             if sheet == "Bus_Numbers":
                 ttk.Button(tools, text="List this model's buses", command=self.fill_buses).pack(side="left", padx=12)
+            if sheet == "Machines":
+                ttk.Button(tools, text="List the DETAILED machines", command=self.fill_machines).pack(side="left",
+                                                                                                     padx=12)
             ttk.Label(tools, text="Double-click a cell (or press Enter) to edit; Tab moves on.",
                       style="Hint.TLabel").pack(side="right", padx=6)
             box = ttk.Frame(tab)
@@ -5912,6 +6218,25 @@ def gui(start=None):
             r = self.rows
             r[i], r[i + d] = r[i + d], r[i]
             self.refresh(i + d)
+            dirty()
+
+        def fill_machines(self):
+            """The DETAILED model's machines (whatever Plant: Model type says) with the values they get now."""
+            try:
+                inp = read_input(save_temp())
+                inp["plant"]["model_type"], inp["machines"] = "DETAILED", []
+                net = build_network(inp, Log(echo=False))
+            except (InputError, SolveError) as e:
+                messagebox.showerror("Machines", "The inputs do not build yet:\n\n%s" % e, parent=root)
+                return
+            have = set((r.get("machine") or "").upper() for r in self.rows)
+            for g in net.gens:
+                if g.get("family") and g["name"].upper() not in have:
+                    self.rows.append({"machine": g["name"], "id": g["id"], "pgen_mw": round(g["dispatch"], 4),
+                                      "pmax_mw": round(g["pmax"], 4), "pmin_mw": round(g["pmin"], 4),
+                                      "qmax_mvar": round(g["qmax"], 4), "qmin_mvar": round(g["qmin"], 4),
+                                      "mbase_mva": round(g["mbase"], 4)})
+            self.refresh()
             dirty()
 
         def fill_buses(self):
@@ -6135,6 +6460,60 @@ def gui(start=None):
         load(EXAMPLE if example else {"plant": {"model_type": "SMIB"}}, None,
              "a new project from the example plant" if example else "a new, empty project")
 
+    def scale_up(*given):
+        """A test plant from this one: MPTs, feeders per MPT, GSUs per feeder, inverters per GSU (asked for when not
+           given; blank or 0 keeps what the plant has)."""
+        from_widgets()
+        src = gui_save_data(data)
+        if not given:
+            try:
+                _d, now = scale_plant(src)
+            except InputError as e:
+                messagebox.showerror("Scale up", str(e), parent=root)
+                return False
+            top = tk.Toplevel(root)
+            top.title("Scale up")
+            top.transient(root)
+            ttk.Label(top, text="A test plant from this one: copies of the first MPT with its generators. Blank keeps "
+                                "what it has now:\n\n" + "\n".join(now[:3]), wraplength=520,
+                      justify="left").grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 8), sticky="w")
+            vs = []
+            for i, txt in enumerate(("Number of MPTs", "Feeders per MPT", "GSUs per feeder", "Inverters per GSU")):
+                v = tk.StringVar()
+                ttk.Label(top, text=txt).grid(row=i + 1, column=0, sticky="w", padx=12, pady=3)
+                tk.Spinbox(top, from_=0, to=1000, textvariable=v, width=8).grid(row=i + 1, column=1, sticky="w",
+                                                                              padx=12)
+                v.set("")
+                vs.append(v)
+            got = {}
+
+            def ok():
+                got["v"] = [v.get().strip() for v in vs]
+                top.destroy()
+            bb = ttk.Frame(top)
+            bb.grid(row=5, column=0, columnspan=2, pady=12)
+            ttk.Button(bb, text="Scale up", command=ok).pack(side="left", padx=4)
+            ttk.Button(bb, text="Cancel", command=top.destroy).pack(side="left", padx=4)
+            top.grab_set()
+            root.wait_window(top)
+            if "v" not in got:
+                return False
+            try:
+                given = [int(x) if x else None for x in got["v"]]
+            except ValueError:
+                messagebox.showerror("Scale up", "Whole numbers, please: %s" % ", ".join(got["v"]), parent=root)
+                return False
+        try:
+            d, did = scale_plant(src, *given)
+        except InputError as e:
+            messagebox.showerror("Scale up", str(e), parent=root)
+            return False
+        load(d, None, "scaled up -- not saved yet")
+        app["dirty"] = True
+        messagebox.showinfo("Scale up", "The inputs now have:\n\n" + "\n".join("- " + x for x in did) +
+                            "\n\nSave makes them a new project (the one you had is not changed).", parent=root)
+        return True
+
     def export_xlsx():
         from_widgets()
         path = filedialog.asksaveasfilename(parent=root, title="Export as a workbook", defaultextension=".xlsx",
@@ -6271,7 +6650,7 @@ def gui(start=None):
     # ---------------------------------------------------------------- toolbar and menu
     model_var = app["vars"]["model_type"]
     psse_var, pscad_var = tk.BooleanVar(value=PSSE_CHECK), tk.BooleanVar(value=PSCAD_BUILD)
-    for txt, fn in (("New", lambda: new(True)), ("Open...", open_any), ("Save", save)):
+    for txt, fn in (("New", lambda: new(True)), ("Open...", open_any), ("Save", save), ("Scale up...", scale_up)):
         ttk.Button(bar, text=txt, command=fn).pack(side="left", padx=2)
     ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
     ttk.Label(bar, text="Model type:", style="Item.TLabel").pack(side="left")
@@ -6332,7 +6711,8 @@ def gui(start=None):
     root.after(100, poll)
     root.smib = {"data": data, "app": app, "nb": nb, "save": save, "check": check, "build": build_models,
                  "open": open_any, "export": export_xlsx, "load": load, "vars": app["vars"], "grids": app["grids"],
-                 "new": new, "goto": goto, "from_widgets": from_widgets, "status": status, "psse": psse_var,
+                 "new": new, "scale": scale_up, "goto": goto, "from_widgets": from_widgets, "status": status,
+                 "psse": psse_var,
                  "pscad": pscad_var, "ot": ot}               # the window's parts, for smib_build's own tests
     root.mainloop()
     return 0
@@ -6367,6 +6747,27 @@ def main(argv=None):
         write_template(path, EXAMPLE, roles)
         print("[smib] input workbook written: %s" % path)
         print("       fill it in, then: python %s \"%s\"" % (os.path.basename(__file__), path))
+        return 0
+    if "--scale" in argv:
+        k = argv.index("--scale")
+        try:
+            nums, src = [int(x) for x in argv[k + 1:k + 5]], os.path.abspath(argv[k + 5])
+        except (IndexError, ValueError):
+            print("[smib] *** --scale MPTS FEEDERS_PER_MPT GSUS_PER_FEEDER INVERTERS_PER_GSU input.xlsx|.json "
+                  "[output.xlsx]   (0 = as it is)")
+            return 2
+        dst = (os.path.abspath(argv[k + 6]) if len(argv) > k + 6 else
+               os.path.splitext(src)[0] + "_scaled_%s.xlsx" % "_".join(str(x) for x in nums))
+        if os.path.exists(dst):
+            print("[smib] *** %s exists -- nothing is overwritten: give it another name" % dst)
+            return 2
+        try:
+            d, did = scale_plant(gui_save_data(gui_data(read_input(src))), *[x or None for x in nums])
+        except InputError as e:
+            print("[smib] *** %s" % e)
+            return 2
+        write_template(dst, d)
+        print("[smib] scaled up: %s\n       %s" % (dst, "\n       ".join(did)))
         return 0
     if "--help" in argv or "-h" in argv:
         print(__doc__)
