@@ -243,7 +243,7 @@ PLANT_FIELDS = [
      None),
     ("tie_unit", "Gen-tie length unit", "", "km, mi, kft, m, ft (blank = km)", LEN_UNITS),
     ("tie_per_unit", "Gen-tie values per", "", "the length R, X, B, C below are per: km, mi, kft, m, ft (blank = "
-     "the Gen-tie length unit)", LEN_UNITS),
+     "km or mi, whichever matches a line of the POI kV)", LEN_UNITS),
     ("tie_r_per", "Gen-tie R per length", "ohm", "one circuit (blank = a typical overhead line of the POI kV)", None),
     ("tie_x_per", "Gen-tie X per length", "ohm", "one circuit (blank = typical)", None),
     ("tie_b_per", "Gen-tie B per length", "uS", "one circuit, total charging (blank = typical)", None),
@@ -308,7 +308,8 @@ MPT_COLS = [
     ("rate_mva", "Rating MVA", "blank = MVA", None, 8),
     ("tie_length", "Tie length", "a line of its own from HV to this MPT (blank = none)", None, 9),
     ("tie_unit", "Tie length unit", "", LEN_UNITS, 7),
-    ("tie_per_unit", "Tie values per", "the length R, X, B are per (blank = Tie length unit)", LEN_UNITS, 7),
+    ("tie_per_unit", "Tie values per", "the length R, X, B are per (blank = km or mi, whichever matches a line of "
+     "its kV)", LEN_UNITS, 7),
     ("tie_r_per", "Tie R per length", "ohm (blank = a typical overhead line of the HV kV)", None, 8),
     ("tie_x_per", "Tie X per length", "ohm (blank = typical)", None, 8),
     ("tie_b_per", "Tie B per length", "uS (blank = typical)", None, 8),
@@ -1469,8 +1470,9 @@ def ohl_typical(kv, f):
 
 def line_data(d, prefix, kv, sb, f, where):
     """A line from <prefix>length / _unit / _r_per ... (or _r_ohm ... totals): None when none is given. The per
-       length values are per <prefix>per_unit (blank = the length's unit); blank ones take a typical overhead line
-       of its kV (OHL_TYPICAL), and ones far from it are CHECKed (a unit mixed up).
+       length values are per <prefix>per_unit (blank = km or mi, whichever brings them nearer a typical line of
+       its kV); blank ones take a typical overhead line of its kV (OHL_TYPICAL), and ones far from it are CHECKed
+       (a unit mixed up).
        r, x, b in pu on sb at kv for one circuit; R, X (ohm), B (uS) one circuit; count circuits; notes."""
     g = lambda k: d.get(prefix + k)
     length = _num(d, prefix + "length", where)
@@ -1478,9 +1480,18 @@ def line_data(d, prefix, kv, sb, f, where):
     if not totals and not length:
         return None
     unit = _choice(d, prefix + "unit", where, LEN_UNITS, "km")
-    per_unit = _choice(d, prefix + "per_unit", where, LEN_UNITS, None) or unit
+    per_unit = _choice(d, prefix + "per_unit", where, LEN_UNITS, None)
     km = (length or 0.0) * LEN_KM[unit]
     typ, notes, used = ohl_typical(kv, f), [], []
+    if per_unit is None:                              # per km or per mile: whichever is nearer a line of its kV
+        given = [(v, typ[k]) for v, k in ((_num(d, prefix + "r_per", where), "r"), (_num(d, prefix + "x_per", where),
+                                                                                   "x"),
+                                          (_num(d, prefix + "b_per", where), "b")) if v]
+        per_unit = min(("km", "mi"), key=lambda u: sum(abs(math.log(abs(v) / LEN_KM[u] / t)) for v, t in given))
+        if given and not totals:
+            notes.append("NOTE: %s: values per blank -- R, X, B taken per %s (nearer a typical %g kV line than per "
+                         "%s); set its 'values per' if they are per another length" % (
+                             where, per_unit, typ["kv"], "mi" if per_unit == "km" else "km"))
     if totals:
         R = _num(d, prefix + "r_ohm", where, 0.0)
         X = _num(d, prefix + "x_ohm", where, 0.0)
@@ -1511,9 +1522,8 @@ def line_data(d, prefix, kv, sb, f, where):
             if v > 0 and not 0.2 <= v / t <= 5.0:
                 msg = "%s: %s %.4g %s/km is %s a typical %g kV line's %.4g -- %s" % (
                     where, what, v, "uS" if what == "B" else "ohm", "%.0f times" % (v / t) if v > t else
-                    "1/%.0f of" % (t / v), typ["kv"], t, "are the R, X, B per %s? ('values per' unit: the length "
-                    "they are per%s)" % (per_unit, "" if totals else ", now %s" % per_unit) if not totals else
-                    "check the totals and the length")
+                    "1/%.0f of" % (t / v), typ["kv"], t, "the R, X, B are read per %s: set 'values per' to the "
+                    "length they are per (km, mi ...)" % per_unit if not totals else "check the totals and the length")
                 if not 0.02 <= v / t <= 50.0:
                     raise InputError(msg)
                 notes.append("CHECK: " + msg)
@@ -2663,6 +2673,18 @@ def number_buses(net, pl, rows):
 # ============================================================================
 # LOAD FLOW -- Newton-Raphson on the plant's own network (no PSS/E needed)
 # ============================================================================
+ZMIN = 1e-4                # the smallest series impedance the load flow takes (pu): PSS/E's and PSLF's jumper
+                           # threshold -- a shorter branch (a few feet of gen-tie) is a jumper there
+
+
+def _yser(z):
+    """A series admittance 1/z, z at least ZMIN (its angle kept)."""
+    a = abs(z)
+    if a < ZMIN:
+        z = ZMIN * (z / a if a > 0 else 1j)
+    return 1.0 / z
+
+
 def ybus(net, roles):
     """(index of each role, Y, size) over `roles`, with a star point for every three-winding transformer on them.
        PSS/E's models: lines as pi sections; a two-winding transformer as bus I -[t1:1]- Z -[1:t2]- bus J
@@ -2682,13 +2704,13 @@ def ybus(net, roles):
 
     for ln in net.lines:
         if ln["fr"] in idx and ln["to"] in idx:
-            y = 1.0 / complex(ln["r"], ln["x"])
+            y = _yser(complex(ln["r"], ln["x"]))
             hb = 0.5j * ln["b"]
             for _c in range(ln["count"]):
                 branch(idx[ln["fr"]], idx[ln["to"]], y + hb, -y, -y, y + hb)
     for t in net.tx2:
         if t["hv"] in idx and t["lv"] in idx:
-            y = 1.0 / (complex(t["r"], t["x"]) * net.sb / t["mva"])
+            y = _yser(complex(t["r"], t["x"]) * net.sb / t["mva"])
             t1 = t["windv1"] / net.kv(t["hv"])
             t2 = t["windv2"] / net.kv(t["lv"])
             ym = complex(t["mag_g"], t["mag_b"])
@@ -2702,8 +2724,7 @@ def ybus(net, roles):
         t["_star"] = k_star
         for c in range(t["count"]):
             for w, role in enumerate((t["hv"], t["lv"], t["tv"])):
-                z = zk[w] if abs(zk[w]) > 1e-9 else 1e-9j
-                y = 1.0 / z
+                y = _yser(zk[w])
                 tk = t["windv"][w] / net.kv(role)
                 branch(idx[role], k_star, y / (tk * tk), -y / tk, -y / tk, y)
             Y[idx[t["hv"]]][idx[t["hv"]]] += complex(t["mag_g"], t["mag_b"])
@@ -3064,7 +3085,7 @@ def flows(net, idx, V, Y):
 
     for ln in net.lines:
         i, j = idx[ln["fr"]], idx[ln["to"]]
-        y = 1.0 / complex(ln["r"], ln["x"])
+        y = _yser(complex(ln["r"], ln["x"]))
         hb = 0.5j * ln["b"]
         s1 = s_ij(i, y + hb, -y, j) * ln["count"]
         s2 = s_ij(j, y + hb, -y, i) * ln["count"]
@@ -3073,7 +3094,7 @@ def flows(net, idx, V, Y):
                     "rate": rate, "load": (max(abs(s1), abs(s2)) / rate * 100.0) if rate else None})
     for t in net.tx2:
         i, j = idx[t["hv"]], idx[t["lv"]]
-        y = 1.0 / (complex(t["r"], t["x"]) * sb / t["mva"])
+        y = _yser(complex(t["r"], t["x"]) * sb / t["mva"])
         t1, t2 = t["windv1"] / net.kv(t["hv"]), t["windv2"] / net.kv(t["lv"])
         ym = complex(t["mag_g"], t["mag_b"])
         s1 = s_ij(i, y / (t1 * t1) + ym, -y / (t1 * t2), j) * t["count"]
@@ -3090,7 +3111,7 @@ def flows(net, idx, V, Y):
         zk = [(zs[0] + zs[2] - zs[1]) / 2.0, (zs[0] + zs[1] - zs[2]) / 2.0, (zs[1] + zs[2] - zs[0]) / 2.0]
         ss = []
         for w, role in enumerate((t["hv"], t["lv"], t["tv"])):
-            y = 1.0 / (zk[w] if abs(zk[w]) > 1e-9 else 1e-9j)
+            y = _yser(zk[w])
             tk = t["windv"][w] / net.kv(role)
             i = idx[role]
             yy = y / (tk * tk) + (complex(t["mag_g"], t["mag_b"]) if w == 0 else 0)
@@ -7179,7 +7200,7 @@ def gui(start=None):
     plant_help = tk.StringVar(value="Click a field to see what it is.")
     ttk.Label(plant_tab, textvariable=plant_help, style="Help.TLabel", wraplength=1200, justify="left").pack(
         fill="x", side="bottom")
-    widgets = {}
+    widgets, hints = {}, {}
     row_i = [0]
     for key, item, unit, note, choices in PLANT_FIELDS:
         if key in PLANT_SECTIONS:
@@ -7200,9 +7221,11 @@ def gui(start=None):
         ttk.Label(form, text=unit, background="white").grid(row=row_i[0], column=2, sticky="w", padx=2)
         blank = "required" if key == "poi_kv" else ("one of SCR, short-circuit MVA or R + X" if key == "grid_scr"
                                                     else _blank_means(note))
-        ttk.Label(form, text=("blank = " + blank) if blank and not blank.startswith(("required", "one of")) else blank,
-                  style="Req.TLabel" if blank.startswith(("required", "one of")) else "Hint.TLabel",
-                  background="white").grid(row=row_i[0], column=3, sticky="w", padx=6)
+        hint = ttk.Label(form, text=("blank = " + blank) if blank and not blank.startswith(("required", "one of"))
+                         else blank, style="Req.TLabel" if blank.startswith(("required", "one of")) else "Hint.TLabel",
+                         background="white")
+        hint.grid(row=row_i[0], column=3, sticky="w", padx=6)
+        hints[key] = (hint, hint.cget("text"), hint.cget("style"))
         ttk.Label(form, text=_used_by("Plant", key), style="Tag.TLabel", background="white").grid(
             row=row_i[0], column=4, sticky="w", padx=6)
         txt = help_text("Plant", key, item, note, choices, unit)
@@ -7210,6 +7233,35 @@ def gui(start=None):
         var.trace_add("write", dirty) if hasattr(var, "trace_add") else var.trace("w", dirty)
         row_i[0] += 1
     form.columnconfigure(3, weight=1)
+
+    def tie_live(*_a):
+        """The gen-tie as the build will take it, beside its total R, X, B -- kept up as its fields change."""
+        for k in ("tie_per_unit", "tie_r_ohm", "tie_x_ohm", "tie_b_us"):
+            h, txt, style = hints[k]
+            h.configure(text=txt, style=style)
+        d = dict((k, v.get()) for k, v in app["vars"].items())
+        try:
+            kv = float(d.get("poi_kv") or 0)
+            if not kv > 0:
+                return
+            ln = line_data(d, "tie_", kv, float(d.get("sbase_mva") or 100.0), float(d.get("freq_hz") or 60.0),
+                           "Gen-tie")
+        except (InputError, ValueError) as e:
+            hints["tie_r_ohm"][0].configure(text=str(e).split(": ", 1)[-1][:150], style="Req.TLabel")
+            return
+        if ln is None:
+            return
+        per = next((n for n in ln["notes"] if "values per blank" in n), "")
+        if per:
+            hints["tie_per_unit"][0].configure(text="blank = per %s here" % per.split("taken per ")[1].split()[0])
+        if not d.get("tie_r_ohm") and not d.get("tie_x_ohm"):
+            hints["tie_r_ohm"][0].configure(text="now %.5g ohm (%.3f km)  -> r %.6g x %.6g pu on %g MVA" % (
+                ln["R"], ln["km"], ln["r"], ln["x"], float(d.get("sbase_mva") or 100.0)))
+            hints["tie_x_ohm"][0].configure(text="now %.5g ohm" % ln["X"])
+            hints["tie_b_us"][0].configure(text="now %.5g uS  -> b %.6g pu" % (ln["B"], ln["b"]))
+    for k in [k for k in app["vars"] if k.startswith("tie_")] + ["poi_kv", "sbase_mva", "freq_hz"]:
+        v = app["vars"][k]
+        v.trace_add("write", tie_live) if hasattr(v, "trace_add") else v.trace("w", tie_live)
 
     # ---------------------------------------------------------------- table tabs: a grid each, edited in place
     class Grid(object):
@@ -8283,7 +8335,7 @@ def gui(start=None):
     root.smib = {"data": data, "app": app, "nb": nb, "save": save, "check": check, "build": build_models,
                  "open": open_any, "export": export_xlsx, "load": load, "vars": app["vars"], "grids": app["grids"],
                  "new": new, "scale": scale_up, "goto": goto, "from_widgets": from_widgets, "status": status,
-                 "psse": psse_var,
+                 "psse": psse_var, "hints": hints,
                  "pscad": pscad_var, "ot": ot}               # the window's parts, for smib_build's own tests
     root.mainloop()
     return 0
