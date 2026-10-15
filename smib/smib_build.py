@@ -148,7 +148,9 @@
        python smib_build.py SMIB_INPUT.xlsx --no-pscad   the models, no PSCAD build
        python smib_build.py --scale 2 25 1 4 SMIB_INPUT.xlsx   a test plant: 2 MPTs, 25
            feeders on each, 1 GSU per feeder, 4 inverters per GSU (0 = as it
-           is; a new workbook -- the GUI: Scale up)
+           is; a new workbook -- the GUI: Scale up). One per MPT: --scale 3
+           12,8,10 1 4 ... (MPT1 12 feeders, MPT2 8, MPT3 10). The gen-tie:
+           one per MPT (--tie per-mpt, the default) or --tie shared
        python smib_build.py                              (the Run button) the workbook
            in INPUT_XLSX, else the one beside this script; several or none: a
            file dialog -- none chosen: a new SMIB_INPUT.xlsx beside it to fill in
@@ -5731,14 +5733,30 @@ def _split(total, weights):
     return out
 
 
-def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None):
+def scale_arg(text):
+    """A Scale up value: blank or 0 -> None, "12" -> 12, "12, 8, 10" -> [12, 8, 10] (one per MPT)."""
+    parts = [x for x in re.split(r"[,;\s]+", str(text or "").strip()) if x]
+    try:
+        vals = [int(float(x)) for x in parts]
+    except ValueError:
+        raise InputError("Scale up: %r -- a whole number, or one per MPT: 12, 8, 10" % text)
+    if any(float(x) != int(float(x)) for x in parts):
+        raise InputError("Scale up: %r -- whole numbers, please" % text)
+    return None if not vals else vals[0] or None if len(vals) == 1 else vals
+
+
+def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None, tie="PER_MPT"):
     """A test plant scaled from this one -- None or 0 keeps what the plant has:
          mpts      MPTs: copies of the first, each with a copy of the generators on it (PV, BESS -> PV_2, BESS_2 ...)
          per_mpt   feeders on each MPT, shared among its generators by their MW
          gsus      GSUs on each feeder: a section of its own each, the feeder's cables in order (the last repeated)
          per_gsu   inverters (units) behind each GSU
-       Each generator's Units, GSU count, GSU MVA (its MVA per inverter kept) and Dispatch follow; the MPTs' MVA
-       follows their MW, the gen-tie circuits the plant's. -> (inputs, [what was done])."""
+       per_mpt, gsus, per_gsu: one number for every MPT, or a list -- one per MPT in turn (MPT1, MPT2 ...; the last
+       one for the rest): feeders [12, 8, 10]. Each generator's Units, GSU count, GSU MVA (its MVA per inverter
+       kept) and Dispatch follow; each MPT's MVA follows its own MW.
+         tie       the gen-tie with more than one MPT: PER_MPT -- each MPT a tie of its own to the POI, as the
+                   plant's gen-tie was; SHARED -- the plant's one gen-tie, all the MPTs on it, as it was
+       -> (inputs, [what was done])."""
     def num(v):
         try:
             return float(v)
@@ -5748,13 +5766,25 @@ def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None):
     def upper(v):
         return str(v or "").upper()
 
+    def listed(v, what):
+        vs = list(v) if isinstance(v, (list, tuple)) else [v]
+        for x in vs:
+            if x is not None and x < 0:
+                raise InputError("Scale up: %s must be 1 or more (0 or blank: as it is)" % what)
+        return [x or None for x in vs] or [None]
+
     d = json.loads(json.dumps(data, default=str))
     if not d.get("mpt"):
         raise InputError("Scale up: the plant has no MPT")
-    for v, what in ((mpts, "MPTs"), (per_mpt, "feeders per MPT"), (gsus, "GSUs per feeder"),
-                    (per_gsu, "inverters per GSU")):
-        if v is not None and v < 0:
-            raise InputError("Scale up: %s must be 1 or more (0 or blank: as it is)" % what)
+    if mpts is not None and mpts < 0:
+        raise InputError("Scale up: MPTs must be 1 or more (0 or blank: as it is)")
+    per_mpt, gsus, per_gsu = (listed(per_mpt, "feeders per MPT"), listed(gsus, "GSUs per feeder"),
+                              listed(per_gsu, "inverters per GSU"))
+    longest = max(len(per_mpt), len(gsus), len(per_gsu))
+    if mpts and longest > mpts:
+        raise InputError("Scale up: %d MPT(s), but %d values given one per MPT -- as many as the MPTs or fewer (the "
+                         "last one goes on for the rest)" % (mpts, longest))
+    mpts = int(mpts or (longest if longest > 1 else len(d["mpt"])) or 1)
     base = d["mpt"][0]
     bname = str(base.get("name") or "MPT1")
     names = set(upper(r.get("name")) for k in ("mpt", "generators", "collectors") for r in d.get(k, []))
@@ -5778,64 +5808,72 @@ def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None):
     own = [g for g in gens if upper(g.get("collector") or "FEEDERS") == "FEEDERS" and
            upper(g.get("connect")) not in shared_n and any(upper(r.get("collector")) == upper(g["name"])
                                                            for r in feeders)]
-    mpts = int(mpts or len(d["mpt"]) or 1)
 
-    def mw(g, units=None):
-        return (num(g.get("units")) if units is None else units) * (num(g.get("unit_pmax_mw")) or 0.0)
+    def mw(g):
+        return (num(g.get("units")) or 0.0) * (num(g.get("unit_pmax_mw")) or 0.0)
 
-    plan = []                                              # (generator, template sections, units at them, feeders)
+    plan = []                                              # (generator, its first feeder's sections)
+    nf_now = 0
     for g in own:
         rows = [r for r in feeders if upper(r.get("collector")) == upper(g["name"])]
         first = rows[0].get("feeder")
-        tpl = sorted([r for r in rows if r.get("feeder") == first], key=lambda r: num(r.get("section")) or 0)
+        plan.append((g, sorted([r for r in rows if r.get("feeder") == first],
+                               key=lambda r: num(r.get("section")) or 0)))
         fc = collections.OrderedDict()                     # its feeders now: each with its copies
         for r in rows:
             fc.setdefault(r.get("feeder"), num(r.get("copies")) or 1)
-        plan.append((g, tpl, int(sum(fc.values()))))
-    per_mpt = int(per_mpt or sum(p[2] for p in plan) or 0)
-    if own and per_mpt < len(own):
-        raise InputError("Scale up: %d feeders per MPT are fewer than the %d generators with feeders on %s"
-                         % (per_mpt, len(own), bname))
-    nfs = _split(per_mpt, [max(mw(g), 1e-6) for g in own]) if own else []
-    for i, g in enumerate(own):                            # every generator at least one feeder
-        if nfs[i] == 0:
-            j = max(range(len(nfs)), key=lambda j: nfs[j])
-            nfs[i], nfs[j] = 1, nfs[j] - 1
-    old_mw = dict((upper(g["name"]), mw(g)) for g in gens)
-    new_gen, did = {}, []
-    for (g, tpl, nf0), nf in zip(plan, nfs):
-        us = [num(r.get("units")) or 0 for r in tpl]
-        k0 = [i for i, u in enumerate(us) if u] or [len(tpl) - 1]
-        head = tpl[:k0[0]]                                 # the home run: the sections before the first units
-        unit_secs = [tpl[i] for i in k0]
-        n_gsu = int(gsus or len(unit_secs))
-        units = num(g.get("units")) or 1.0
-        cnt = num(g.get("gsu_count")) or units
-        inv = int(per_gsu or max(1, int(round(units / cnt))))
-        nu = nf * n_gsu * inv
-        gg = dict(g, units=nu, gsu_count=nf * n_gsu if g.get("gsu_mva") not in (None, "") else g.get("gsu_count"))
-        if g.get("gsu_mva") not in (None, ""):
-            gg["gsu_mva"] = round(num(g["gsu_mva"]) * cnt / units * inv, 4)
-        if g.get("dispatch_mw") not in (None, ""):
-            gg["dispatch_mw"] = round(num(g["dispatch_mw"]) * nu / units, 4)
-        rows = []
-        for j in range(nf):
-            secs = head + [unit_secs[min(i, len(unit_secs) - 1)] for i in range(n_gsu)]
-            for k, r in enumerate(secs):
-                rows.append(dict(r, feeder="F%d" % (j + 1), copies=1, section=k + 1, from_section=None,
-                                 units=inv if k >= len(head) else None))
-        new_gen[upper(g["name"])] = (gg, rows)
-        did.append("%s: %d feeders x %d GSUs x %d inverters = %d units (%.1f MW), GSU %s MVA" % (
-            g["name"], nf, n_gsu, inv, nu, mw(gg), _g(num(gg.get("gsu_mva")) or 0)))
-    for g in gens:
-        if upper(g["name"]) not in new_gen:
-            new_gen[upper(g["name"])] = (dict(g), [dict(r) for r in feeders
-                                                   if upper(r.get("collector")) == upper(g.get("connect"))
-                                                   and upper(g.get("connect")) in shared_n])
-    ratio = (sum(mw(gg) for gg, _r in new_gen.values()) / sum(old_mw.values())) if sum(old_mw.values()) else 1.0
-    out_mpt, out_gen, out_col, out_f = [], [], [], []
-    gname = {}
+        nf_now += int(sum(fc.values()))
+    old_mw = sum(mw(g) for g in gens)
+
+    def one_mpt(nf_all, n_gsu_in, inv_in):
+        """One MPT's generators: {GEN: (row, feeder rows)}, [what]."""
+        if own and nf_all < len(own):
+            raise InputError("Scale up: %d feeders on an MPT are fewer than the %d generators with feeders on %s"
+                             % (nf_all, len(own), bname))
+        nfs = _split(nf_all, [max(mw(g), 1e-6) for g in own]) if own else []
+        for i in range(len(nfs)):                          # every generator at least one feeder
+            if nfs[i] == 0:
+                j = max(range(len(nfs)), key=lambda j: nfs[j])
+                nfs[i], nfs[j] = 1, nfs[j] - 1
+        out, did = {}, []
+        for (g, tpl), nf in zip(plan, nfs):
+            us = [num(r.get("units")) or 0 for r in tpl]
+            k0 = [i for i, u in enumerate(us) if u] or [len(tpl) - 1]
+            head = tpl[:k0[0]]                             # the home run: the sections before the first units
+            unit_secs = [tpl[i] for i in k0]
+            n_gsu = int(n_gsu_in or len(unit_secs))
+            units = num(g.get("units")) or 1.0
+            cnt = num(g.get("gsu_count")) or units
+            inv = int(inv_in or max(1, int(round(units / cnt))))
+            nu = nf * n_gsu * inv
+            gg = dict(g, units=nu, gsu_count=nf * n_gsu if g.get("gsu_mva") not in (None, "") else g.get("gsu_count"))
+            if g.get("gsu_mva") not in (None, ""):
+                gg["gsu_mva"] = round(num(g["gsu_mva"]) * cnt / units * inv, 4)
+            if g.get("dispatch_mw") not in (None, ""):
+                gg["dispatch_mw"] = round(num(g["dispatch_mw"]) * nu / units, 4)
+            rows = []
+            for j in range(nf):
+                secs = head + [unit_secs[min(i, len(unit_secs) - 1)] for i in range(n_gsu)]
+                for k, r in enumerate(secs):
+                    rows.append(dict(r, feeder="F%d" % (j + 1), copies=1, section=k + 1, from_section=None,
+                                     units=inv if k >= len(head) else None))
+            out[upper(g["name"])] = (gg, rows)
+            did.append("%d feeders x %d GSUs x %d inverters = %d units (%.1f MW), GSU %s MVA" % (
+                nf, n_gsu, inv, nu, mw(gg), _g(num(gg.get("gsu_mva")) or 0)))
+        for g in gens:
+            if upper(g["name"]) not in out:
+                out[upper(g["name"])] = (dict(g), [])
+        return out, did
+
+    pick = lambda vs, k: vs[min(k, len(vs) - 1)]
+    sets = [one_mpt(int(pick(per_mpt, k) or nf_now or 0), pick(gsus, k), pick(per_gsu, k)) for k in range(mpts)]
+    out_mpt, out_gen, out_col, out_f, gname, did = [], [], [], [], {}, []
+    total = 0.0
     for k in range(1, mpts + 1):
+        new_gen, dk = sets[k - 1]
+        mw_k = sum(mw(gg) for gg, _r in new_gen.values())
+        total += mw_k
+        ratio = mw_k / old_mw if old_mw else 1.0
         mn = bname if k == 1 else fresh("%s%d" % (m.group(1), int(m.group(2)) + k - 1) if m else "%s_%d" % (bname, k))
         r = dict(base, name=mn)
         for key in ("mva", "lv_mva", "tv_mva", "rate_mva", "base_hl_mva", "base_ht_mva", "base_lt_mva"):
@@ -5858,7 +5896,9 @@ def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None):
             con = g.get("connect")
             con = gname.get((upper(con), k), con) if upper(con) in shared_n else moved(con)
             out_gen.append(dict(gg, name=nm, connect=con))
-            out_f.extend(dict(r, collector=nm) for r in rows if upper(r.get("collector")) == upper(g["name"]))
+            out_f.extend(dict(fr, collector=nm) for fr in rows)
+        did.append("%s (%s MVA, %.1f MW): %s" % (mn, _g(num(r.get("mva")) or 0), mw_k, "; ".join(
+            "%s %s" % (gname[(upper(g["name"]), k)], x) for (g, _t), x in zip(plan, dk)) or "its shared collectors"))
     gens_id = set(id(g) for g in gens)
     d["mpt"] = out_mpt + [r for r in d["mpt"] if r is not base]
     d["generators"] = out_gen + [g for g in d.get("generators", []) if id(g) not in gens_id]
@@ -5872,15 +5912,41 @@ def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None):
             g = upper(r.get("generator"))
             rows.extend(dict(r, generator=gname[(g, k)]) for k in range(2, mpts + 1) if (g, k) in gname)
         d[key] = rows
-    total = sum(mw(gg) for gg, _r in new_gen.values()) * mpts
-    did.insert(0, "%d MPT(s) of %s MVA (copies of %s, which had %.1f MW), %d feeders on each: %.1f MW in all" % (
-        mpts, _g(num(out_mpt[0].get("mva")) or 0), bname, sum(old_mw.values()), per_mpt, total))
+    nfs = [int(pick(per_mpt, k) or nf_now or 0) for k in range(mpts)]
+    did.insert(0, "%d MPT(s), copies of %s (which had %.1f MW), feeders on each: %s -- %.1f MW in all" % (
+        mpts, bname, old_mw, ", ".join(str(x) for x in nfs) if len(set(nfs)) > 1 else nfs[0], total))
     pl = d.setdefault("plant", {})
-    if pl.get("tie_length") not in (None, "", 0):
-        old = int(num(pl.get("tie_parallel")) or 1)
-        pl["tie_parallel"] = max(1, int(math.ceil(old * total / max(sum(old_mw.values()), 1e-6) - 1e-9)))
-        if pl["tie_parallel"] != old:
-            did.append("gen-tie circuits: %d (were %d)" % (pl["tie_parallel"], old))
+    gt = dict((k, v) for k, v in pl.items() if k.startswith("tie_") and v not in (None, ""))
+    if upper(tie) not in ("PER_MPT", "SHARED"):
+        raise InputError("Scale up: gen-tie %r -- PER_MPT or SHARED" % tie)
+    per_len = num(gt.get("tie_length")) and not any(num(gt.get(k)) for k in ("tie_r_ohm", "tie_x_ohm", "tie_b_us"))
+    if mpts > 1 and upper(tie) == "PER_MPT" and gt and not num(base.get("tie_length")):
+        if not per_len:
+            raise InputError("Scale up: a gen-tie per MPT needs the plant's gen-tie as a length with R, X, B per "
+                             "length (Plant: Gen-tie ...); it has totals -- or choose one shared gen-tie")
+        b = num(gt.get("tie_b_per"))
+        if b is None and num(gt.get("tie_c_per")):        # uF -> uS
+            b = num(gt["tie_c_per"]) * 2.0 * math.pi * (num(pl.get("freq_hz")) or 60.0)
+        own_tie = {"tie_length": gt.get("tie_length"), "tie_unit": gt.get("tie_unit"), "tie_r_per": gt.get("tie_r_per"),
+                   "tie_x_per": gt.get("tie_x_per"), "tie_b_per": b, "tie_rate_mva": gt.get("tie_rate_mva")}
+        for r in out_mpt:                                  # a gen-tie of each MPT's own, POI to its HV
+            r.update(own_tie)
+        for k in list(pl):
+            if k.startswith("tie_"):
+                pl[k] = None
+        did.append("gen-tie: one per MPT, POI to each MPT, each as the plant's was (%s %s%s)%s" % (
+            _g(num(gt["tie_length"])), gt.get("tie_unit") or "km",
+            (", %s MVA" % _g(num(gt["tie_rate_mva"]))) if num(gt.get("tie_rate_mva")) else "",
+            (" -- %s circuits were one each" % _g(num(gt["tie_parallel"]))) if (num(gt.get("tie_parallel")) or 1) > 1
+            else ""))
+    elif gt:
+        if mpts > 1:
+            did.append("gen-tie: the plant's one, shared by the %d MPTs (as it was)" % mpts)
+        if num(gt.get("tie_rate_mva")):
+            cap = num(gt["tie_rate_mva"]) * (num(gt.get("tie_parallel")) or 1)
+            if total > cap:
+                did.append("the gen-tie (%s MVA) is below the plant's %.1f MW: Plant: Gen-tie circuits or rating"
+                           % (_g(cap), total))
     if shared:
         did.append("shared collector(s) %s copied as they are" % ", ".join(c["name"] for c in shared))
     for key, what in (("machines", "Machines"), ("bus_numbers", "Bus_Numbers")):
@@ -6782,17 +6848,25 @@ def gui(start=None):
             for i, txt in enumerate(("Number of MPTs", "Feeders per MPT", "GSUs per feeder", "Inverters per GSU")):
                 v = tk.StringVar()
                 ttk.Label(top, text=txt).grid(row=i + 1, column=0, sticky="w", padx=12, pady=3)
-                tk.Spinbox(top, from_=0, to=1000, textvariable=v, width=8).grid(row=i + 1, column=1, sticky="w",
-                                                                              padx=12)
+                ttk.Entry(top, textvariable=v, width=16).grid(row=i + 1, column=1, sticky="w", padx=12)
                 v.set("")
                 vs.append(v)
+            ttk.Label(top, text="Gen-tie (more than one MPT)").grid(row=5, column=0, sticky="w", padx=12, pady=3)
+            vt = tk.StringVar(value="one per MPT")
+            ttk.Combobox(top, textvariable=vt, values=["one per MPT", "one shared"], state="readonly",
+                         width=14).grid(row=5, column=1, sticky="w", padx=12)
+            ttk.Label(top, text="Feeders, GSUs and inverters: one number for every MPT, or one per MPT in turn -- "
+                                "12, 8, 10 (the last one goes on for the rest). Gen-tie: each MPT a tie of its own "
+                                "to the POI, or all of them on the plant's one gen-tie.", style="Hint.TLabel",
+                      wraplength=520).grid(row=6, column=0, columnspan=2, padx=12, sticky="w")
             got = {}
 
             def ok():
                 got["v"] = [v.get().strip() for v in vs]
+                got["tie"] = "SHARED" if vt.get() == "one shared" else "PER_MPT"
                 top.destroy()
             bb = ttk.Frame(top)
-            bb.grid(row=5, column=0, columnspan=2, pady=12)
+            bb.grid(row=7, column=0, columnspan=2, pady=12)
             ttk.Button(bb, text="Scale up", command=ok).pack(side="left", padx=4)
             ttk.Button(bb, text="Cancel", command=top.destroy).pack(side="left", padx=4)
             top.grab_set()
@@ -6800,9 +6874,11 @@ def gui(start=None):
             if "v" not in got:
                 return False
             try:
-                given = [int(x) if x else None for x in got["v"]]
-            except ValueError:
-                messagebox.showerror("Scale up", "Whole numbers, please: %s" % ", ".join(got["v"]), parent=root)
+                given = [scale_arg(x) for x in got["v"]] + [got["tie"]]
+                if isinstance(given[0], list):
+                    raise InputError("Scale up: one number of MPTs, please")
+            except InputError as e:
+                messagebox.showerror("Scale up", str(e), parent=root)
                 return False
         try:
             d, did = scale_plant(src, *given)
@@ -7065,18 +7141,21 @@ def main(argv=None):
     if "--scale" in argv:
         k = argv.index("--scale")
         try:
-            nums, src = [int(x) for x in argv[k + 1:k + 5]], os.path.abspath(argv[k + 5])
-        except (IndexError, ValueError):
+            nums, src = [scale_arg(x) for x in argv[k + 1:k + 5]], os.path.abspath(argv[k + 5])
+            if len(nums) < 4 or isinstance(nums[0], list):
+                raise IndexError
+        except (IndexError, InputError):
             print("[smib] *** --scale MPTS FEEDERS_PER_MPT GSUS_PER_FEEDER INVERTERS_PER_GSU input.xlsx|.json "
-                  "[output.xlsx]   (0 = as it is)")
+                  "[output.xlsx]   (0 = as it is; feeders, GSUs, inverters: one number, or one per MPT: 12,8,10)")
             return 2
         dst = (os.path.abspath(argv[k + 6]) if len(argv) > k + 6 else
-               os.path.splitext(src)[0] + "_scaled_%s.xlsx" % "_".join(str(x) for x in nums))
+               os.path.splitext(src)[0] + "_scaled_%s.xlsx" % "_".join(argv[k + 1:k + 5]).replace(",", "-"))
         if os.path.exists(dst):
             print("[smib] *** %s exists -- nothing is overwritten: give it another name" % dst)
             return 2
         try:
-            d, did = scale_plant(gui_save_data(gui_data(read_input(src))), *[x or None for x in nums])
+            tie = argv[argv.index("--tie") + 1].upper().replace("-", "_") if "--tie" in argv[:-1] else "PER_MPT"
+            d, did = scale_plant(gui_save_data(gui_data(read_input(src))), *nums, tie=tie)
         except InputError as e:
             print("[smib] *** %s" % e)
             return 2
