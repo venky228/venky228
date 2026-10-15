@@ -541,7 +541,9 @@ README = [
                    "(with PLNTBU1, REPC_B); WT3: + WTDTA1 WTARA1 WTPTA1 WTTQA1; SYNC: GENROU SEXS TGOV1. REECCU1, "
                    "REECDU1, PLNTBU1, REAX4BU1 (and REGCAU1, REPCAU1) are user models: the WECC user-model DLL must "
                    "be loaded for the PSS/E check (ADDLIB_IDV / DLLS in the script). The report lists every model's "
-                   "parameters with the values used."),
+                   "parameters with the values used. In the GUI, the Dyr_Params tab shows every model's parameters "
+                   "with the values the .dyr gets, a column per generator: double-click one to change it (it becomes "
+                   "a row here), clear it to go back to the default."),
     ("Dyr_Records", "Records of your own (vendor or user models), one per row, ending in /. {BUS} {ID} {MBASE} "
                     "{POI} {IB} {HV} {MV} and {<bus role>} are filled in. Type USER generators have only these. "
                     "Models in user DLLs: list the DLLs in DLLS in the script for the PSS/E check."),
@@ -3043,6 +3045,77 @@ def gen_chain(g, ctl):
     return chain
 
 
+def dyr_param_name(model, pname):
+    """A Dyr_Params parameter as its model names it -- its name in any case, an alias, ICONn / CONn -- or None."""
+    allp = DYR_LIB[model][2]
+    names = dict((p.upper(), p) for p in allp)
+    up = str(pname or "").strip().upper()
+    if up not in names and DYR_ALIAS.get(up, "").upper() in names:
+        up = DYR_ALIAS[up].upper()
+    pos = re.match(r"^(I?CON)\s*\(?\s*(\d+)\s*\)?$", up)
+    if up not in names and pos:
+        nic = DYR_LIB[model][1]
+        part = allp[:nic] if pos.group(1) == "ICON" else allp[nic:]
+        if 1 <= int(pos.group(2)) <= len(part):
+            return part[int(pos.group(2)) - 1]
+    return names.get(up)
+
+
+def dyr_table(inp):
+    """Every .dyr parameter as written, by model and parameter, for each generator (DETAILED: its machines
+       together), IB and PLANT -> (columns [name], rows [(model, param, position, {column: (text, how)})], notes);
+       how: "set" (a Dyr_Params row), "default", "auto" (from the plant data), "varies" (by machine)."""
+    log = Log(echo=False)
+    net = build_network(inp, log)
+    try:
+        operating_point(net, log)
+    except SolveError:
+        for g in net.gens:
+            g.setdefault("p", g["dispatch"])
+            g.setdefault("q", 0.0)
+    recs = dyr_models(net, inp)
+    over = dyr_params(net, inp)
+    fam = dict((g["name"], g.get("family", g["name"])) for g in net.gens)
+    cols = []
+    vals = collections.OrderedDict()                   # (model, param) -> {column: [(value, how) per machine]}
+    for name, model, pv in recs:
+        col = fam.get(name, name)
+        if col not in cols:
+            cols.append(col)
+        for p, v in pv:
+            how = "set" if p in over.get(name, {}).get(model, {}) else "default" if (
+                DYN_DEFAULTS[model].get(p) == v or _same(DYN_DEFAULTS[model].get(p), v)) else "auto"
+            vals.setdefault((model, p), collections.OrderedDict()).setdefault(col, []).append((v, how))
+    cols = [c for c in cols if c not in ("IB", "PLANT")] + [c for c in ("IB", "PLANT") if c in cols]
+    rows = []
+    for model, (_hdr, nic, names) in DYR_LIB.items():
+        for k, p in enumerate(names):
+            if (model, p) not in vals:
+                continue
+            cells = {}
+            for col, got in vals[(model, p)].items():
+                hows = set(h for _v, h in got)
+                how = "set" if "set" in hows else "auto" if "auto" in hows else "default"
+                if model == "REAX4BU1" and p in ("Kz", "Kw") and len(got) > 1:
+                    cells[col] = (_g(sum(float(v) for v, _h in got)), how)     # its share: the machines' sum
+                elif len(set(str(v) for v, _h in got)) > 1:
+                    nums = [float(v) for v, _h in got]
+                    cells[col] = ("%s .. %s" % (_g(min(nums)), _g(max(nums))), "varies")
+                else:
+                    v = got[0][0]
+                    cells[col] = (v if p == "CKT" else _g(float(v)) if k >= nic else "%d" % int(round(float(v))),
+                                  how)
+            rows.append((model, p, ("ICON%d" % (k + 1)) if k < nic else ("CON%d" % (k - nic + 1)), cells))
+    return cols, rows, [n for n in net.notes if "Dyr_Params" in n]
+
+
+def _same(a, b):
+    try:
+        return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)))
+    except (TypeError, ValueError):
+        return False
+
+
 def dyr_params(net, inp):
     """{GENERATOR, IB or PLANT: {MODEL: {param: value}}} from Dyr_Params; each name (or ICONn / CONn) checked
        against the model."""
@@ -3061,24 +3134,16 @@ def dyr_params(net, inp):
             raise InputError("%s: Model %r -- one of %s" % (w, r.get("model"), ", ".join(DYR_LIB)))
         pname = _txt(r.get("parameter")) or ""
         allp = DYR_LIB[model][2]
-        names = dict((p.upper(), p) for p in allp)
-        if pname.upper() not in names and DYR_ALIAS.get(pname.upper(), "").upper() in names:
-            pname = DYR_ALIAS[pname.upper()]
-        pos = re.match(r"^(I?CON)\s*\(?\s*(\d+)\s*\)?$", pname.upper())
-        if pname.upper() not in names and pos:
-            nic = DYR_LIB[model][1]
-            part = allp[:nic] if pos.group(1) == "ICON" else allp[nic:]
-            if 1 <= int(pos.group(2)) <= len(part):
-                pname = part[int(pos.group(2)) - 1]
-        if pname.upper() not in names:
+        pn = dyr_param_name(model, pname)
+        if pn is None:
             raise InputError("%s: %s has no parameter %r -- it has %s (or ICON1..%d, CON1..%d)"
                              % (w, model, pname, ", ".join(allp), DYR_LIB[model][1], len(allp) - DYR_LIB[model][1]))
         val = r.get("value")
-        if names[pname.upper()] == "CKT":
+        if pn == "CKT":
             val = _txt(val) or "1"
         else:
             val = _num(r, "value", w, required=True)
-        many, pn = gnames[gen], names[pname.upper()]
+        many = gnames[gen]
         for gname in many:
             v = val
             if model == "REAX4BU1" and pn in ("Kz", "Kw") and len(many) > 1:   # DETAILED: the share split
@@ -6012,6 +6077,7 @@ def gui(start=None):
                       style="Hint.TLabel").pack(side="right", padx=6)
             box = ttk.Frame(tab)
             box.pack(fill="both", expand=True)
+            self.tab, self.tools, self.box = tab, tools, box
             self.tree = ttk.Treeview(box, columns=self.keys, show="headings", selectmode="browse")
             ys = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
             xs = ttk.Scrollbar(box, orient="horizontal", command=self.tree.xview)
@@ -6256,6 +6322,179 @@ def gui(start=None):
 
     for sheet, key, cols in TABLES:
         app["grids"][key] = Grid(sheet, key, cols)
+
+    # ---------------------------------------------------------------- Dyr_Params: every value, editable
+    def dyr_all(grid):
+        """Above the Dyr_Params rows: every model's parameters as the .dyr gets them -- a column per generator (its
+           machines together), IB and PLANT -- each value editable: a change is a Dyr_Params row, a cleared one
+           goes back to the default."""
+        top = ttk.Frame(grid.tab)
+        top.pack(fill="both", expand=True, before=grid.tools)
+        bar = ttk.Frame(top, padding=(4, 4))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Refresh", command=lambda: fill()).pack(side="left", padx=2)
+        ttk.Label(bar, text="Search:").pack(side="left", padx=(12, 2))
+        find = tk.StringVar()
+        ttk.Entry(bar, textvariable=find, width=24).pack(side="left")
+        ttk.Label(bar, text="Every model's parameters as the .dyr gets them. Double-click a value to change it "
+                            "(* = your value, kept in the rows below); clear it to go back to the default.",
+                  style="Hint.TLabel").pack(side="left", padx=12)
+        state = {"cols": [], "rows": [], "edit": None}
+        msg = tk.StringVar()
+        ttk.Label(top, textvariable=msg, style="Help.TLabel", wraplength=1200, justify="left").pack(fill="x")
+        box = ttk.Frame(top)
+        box.pack(fill="both", expand=True)
+        tv = ttk.Treeview(box, show="headings", selectmode="browse")
+        ys = ttk.Scrollbar(box, orient="vertical", command=tv.yview)
+        xs = ttk.Scrollbar(box, orient="horizontal", command=tv.xview)
+        tv.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        tv.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+        tv.tag_configure("sec", background=light, font=("Segoe UI", 9, "bold"))
+        tv.tag_configure("set", background="#FFF2CC")
+        ttk.Label(grid.tab, text="Your values (saved in the project) -- the rows the table above writes:",
+                  style="Item.TLabel").pack(fill="x", padx=4, pady=(6, 0), before=grid.tools)
+        grid.box.pack_configure(expand=False, fill="x")
+        grid.tree.configure(height=6)
+        tv.bind("<<TreeviewOpen>>", lambda e: None)
+
+        def fill(*_a):
+            close(False)
+            try:
+                cols, rows, notes = dyr_table(read_input(save_temp()))
+            except (InputError, SolveError) as e:
+                msg.set("The inputs do not build yet, so the values cannot be shown: %s" % e)
+                tv.delete(*tv.get_children())
+                return
+            state["cols"], state["rows"] = cols, rows
+            heads = ["model", "param", "pos"] + ["g%d" % i for i in range(len(cols))] + ["doc"]
+            tv.configure(columns=heads)
+            for h, t, wd in zip(heads, ["Model", "Parameter", "Position"] + cols + ["Description"],
+                                [80, 100, 70] + [110] * len(cols) + [700]):
+                tv.heading(h, text=t)
+                tv.column(h, width=wd, minwidth=50, stretch=(h == "doc"), anchor="w")
+            tv.delete(*tv.get_children())
+            f = find.get().strip().lower()
+            last = None
+            for model, p, pos, cells in rows:
+                doc = _param_doc(p)
+                if f and not any(f in str(x).lower() for x in [model, p, pos, doc] + [c[0] for c in cells.values()]):
+                    continue
+                if model != last:
+                    tv.insert("", "end", iid="m|" + model, values=[model, MODEL_DOC.get(model, "")] + [""] * (
+                        len(cols) + 2), tags=("sec",))
+                    last = model
+                vals = [cells[c][0] + (" *" if cells[c][1] == "set" else " ~" if cells[c][1] == "varies" else "")
+                        if c in cells else "" for c in cols]
+                tv.insert("", "end", iid="p|%s|%s" % (model, p), values=[model, p, pos] + vals + [doc],
+                          tags=("set",) if any(c[1] == "set" for c in cells.values()) else ())
+            msg.set("%d parameters of %d models for %s.%s%s" % (
+                len(rows), len(set(r[0] for r in rows)), ", ".join(cols),
+                "  ~ = differs between the DETAILED machines (Machines)." if any(
+                    c[1] == "varies" for r in rows for c in r[3].values()) else "",
+                ("  " + " ".join(notes)) if notes else ""))
+
+        def close(keep):
+            ed = state["edit"]
+            if not ed:
+                return
+            state["edit"] = None
+            w, var, model, p, col = ed
+            text = var.get().strip()
+            w.destroy()
+            if keep:
+                put(model, p, col, text)
+
+        def put(model, p, col, text):
+            row = next((r for r in state["rows"] if r[0] == model and r[1] == p), None)
+            now = row[3].get(col) if row else None
+            if now is None:
+                return
+            if text and p != "CKT":
+                try:
+                    float(text)
+                except ValueError:
+                    messagebox.showerror("Dyr_Params", "%s %s: %r is not a number" % (model, p, text), parent=root)
+                    return
+            rows = data.setdefault("dyr_params", [])
+            same = [r for r in rows if str(r.get("generator") or "").strip().upper() == col.upper() and
+                    str(r.get("model") or "").strip().upper() == model and
+                    dyr_param_name(model, r.get("parameter")) == p]
+            if not text:
+                if not same:
+                    return
+                for r in same:
+                    rows.remove(r)
+            elif same:
+                if same[0].get("value") == text and len(same) == 1:
+                    return
+                same[0]["value"] = text
+                for r in same[1:]:
+                    rows.remove(r)
+            elif text == now[0] and now[1] != "set":
+                return
+            else:
+                rows.append({"generator": col, "model": model, "parameter": p, "value": text})
+            grid.refresh()
+            dirty()
+            fill()
+            iid = "p|%s|%s" % (model, p)
+            if tv.exists(iid):
+                tv.selection_set(iid)
+                tv.see(iid)
+            set_status("%s %s %s: %s" % (col, model, p, text or "back to its default"))
+
+        def edit(iid, colid):
+            close(True)
+            if not iid.startswith("p|"):
+                return
+            ci = int(colid.lstrip("#")) - 1 - 3
+            if not 0 <= ci < len(state["cols"]):
+                return
+            _x, model, p = iid.split("|")
+            col = state["cols"][ci]
+            row = next((r for r in state["rows"] if r[0] == model and r[1] == p), None)
+            if row is None:
+                return
+            if col not in row[3]:
+                set_status("%s has no %s (not in its model chain)" % (col, model))
+                return
+            tv.see(iid)
+            tv.update_idletasks()
+            bbox = tv.bbox(iid, colid)
+            if not bbox:
+                return
+            x, y, wd, ht = bbox
+            text, how = row[3][col]
+            var = tk.StringVar(value="" if how == "varies" else text)
+            w = tk.Entry(tv, textvariable=var, relief="solid", borderwidth=1, background="white")
+            w.place(x=x, y=y, width=max(wd, 90), height=ht)
+            w.focus_set()
+            w.select_range(0, "end")
+            state["edit"] = (w, var, model, p, col)
+            w.bind("<Return>", lambda e: close(True))
+            w.bind("<KP_Enter>", lambda e: close(True))
+            w.bind("<Escape>", lambda e: close(False))
+            w.bind("<FocusOut>", lambda e: close(True))
+
+        tv.bind("<Double-1>", lambda e: edit(tv.identify_row(e.y), tv.identify_column(e.x)))
+        tv.bind("<Button-1>", lambda e: close(True), add="+")
+        find.trace_add("write", fill) if hasattr(find, "trace_add") else find.trace("w", fill)
+
+        def shown(_e=None):
+            try:
+                if nb.tab(nb.select(), "text") == grid.sheet:
+                    fill()
+            except tk.TclError:
+                pass
+        nb.bind("<<NotebookTabChanged>>", shown, add="+")
+        app["dyr_all"] = {"fill": fill, "edit": edit, "close": close, "put": put, "tree": tv, "state": state,
+                          "msg": msg}
+
+    dyr_all(app["grids"]["dyr_params"])
 
     # ---------------------------------------------------------------- reference tabs
     def ref_tab(title, heads, widths, rows, sections=False, extra=None):
