@@ -347,6 +347,10 @@ GEN_COLS = [
     ("pscad_library", "PSCAD library", "vendor library .pslx (blank = none)", None, 18),
     ("pscad_definition", "PSCAD definition", "vendor model, library:name (blank = a source: network check)", None, 16),
     ("pscad_ac_port", "PSCAD AC port", "its AC port (blank = its 3-phase port)", None, 9),
+    ("pscad_source", "PSCAD source case", "a .pscx or .pslx (or a project open in PSCAD) with one UDM set up as "
+     "you want it (with PSCAD component ID)", None, 18),
+    ("pscad_component_id", "PSCAD component ID", "that UDM's ID in the source case: copied, with its settings, "
+     "to every GSU of this generator", None, 10),
     ("pscad_inv_at", "PSCAD inverter at", "LV: the inverter (your UDM or the stand-in source) on the GSU's LV side, "
      "the GSU built | MV: on its HV side, for a UDM with its GSU inside (blank = LV)", ["LV", "MV"], 8),
 ]
@@ -572,7 +576,12 @@ README = [
               "WECC equivalent as a pi section, or DETAILED: every feeder section, identical feeder copies lumped), "
               "the GSUs and, on each GSU's LV side, the inverter: your UDM (PSCAD library, definition and AC port "
               "in Generators) or a stand-in source at the solved voltage -- delete it and wire your UDM in its "
-              "place (the report and the build log list every inverter node). PSCAD inverter at MV: for a UDM "
+              "place (the report and the build log list every inverter node). Or set one UDM up in a case of its "
+              "own (a vendor's test case) and give that case and the UDM's component ID (its Properties) in "
+              "Generators: PSCAD source case, PSCAD component ID -- it is copied, with its settings, to every GSU "
+              "of that generator (every machine of the DETAILED model), its definition and the case's resources "
+              "(.lib, .obj) with it; PSCAD_Params rows ({UNITS}, {P_PU} ...) are set on each copy. PSCAD "
+              "inverter at MV: for a UDM "
               "with its GSU inside, the inverter on the GSU's HV side and no GSU drawn. It is drawn as a "
               "single-line diagram with wires, left to right from the grid; where PSCAD's R, L and C are "
               "single-phase, each is drawn three times between breakouts."),
@@ -1978,7 +1987,12 @@ def gen_data(r):
          "q_mode": _choice(r, "q_mode", w, ["share", "fixed"], "share"),
          "zsorce_x": _num(r, "zsorce_x", w), "wmod": _int(r, "wmod", w, None),
          "pscad": {"library": _txt(r.get("pscad_library")), "definition": _txt(r.get("pscad_definition")),
-                   "ac_port": _txt(r.get("pscad_ac_port")), "at": _choice(r, "pscad_inv_at", w, ["LV", "MV"], "LV")}}
+                   "ac_port": _txt(r.get("pscad_ac_port")), "at": _choice(r, "pscad_inv_at", w, ["LV", "MV"], "LV"),
+                   "source": _txt(r.get("pscad_source")), "iid": _int(r, "pscad_component_id", w, None, minimum=1)}}
+    ps = g["pscad"]
+    if bool(ps["source"]) != bool(ps["iid"]):
+        raise InputError("%s: %s and %s go together -- the case with the UDM set up, and its ID" % (
+            w, _label("pscad_source"), _label("pscad_component_id")))
     d = _num(r, "dispatch_mw", w)
     g["dispatch"] = g["pmax"] if d is None else d
     if g["dispatch"] > g["pmax"] + 1e-6 or g["dispatch"] < g["pmin"] - 1e-6:
@@ -1999,6 +2013,10 @@ def gen_data(r):
 
 def build_generator(net, g, feeders, cables, unit_mw, used, log):
     r, w, name = g["row"], g["where"], g["name"]
+    src = g["pscad"]["source"]
+    if src and os.path.splitext(src)[1] and not os.path.isfile(src):
+        net.notes.append("CHECK: %s: %s %s is not on this PC -- the PSCAD build looks for it there" % (
+            w, _label("pscad_source"), src))
     at = net.find(_txt(r.get("connect")), w + " Connect to")
     g["connect"] = at
     rows = feeders.get(name.upper())
@@ -3827,6 +3845,16 @@ def _inverter_comp(g, sl, net, x, y):
     ps = g["pscad"]
     what = "%s units, P %.3f MW, Q %.3f MVAr, V %.5f pu at %.4f deg (PSCAD angle)" % (
         _g(sl["units"]), sl["p"], sl["q"], sl["vm"], sl["ang"])
+    if ps["iid"]:                                       # the UDM set up in a case of its own: copied here
+        src = ps["source"]
+        sl["tag"], sl["model"] = sl["name"] + "_INV", "a copy of %s ID %d" % (os.path.basename(src), ps["iid"])
+        return {"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]] if ps["definition"] else [],
+                "library": src if os.path.splitext(src)[1].lower() in (".pscx", ".pslx") else ps["library"],
+                "copy_of": {"source": src, "iid": ps["iid"]},
+                "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6,
+                "note": "inverter: %s, its settings kept -- %s" % (sl["model"], what),
+                "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
+                           ["@dim3", "@first"]}]}
     if ps["definition"]:
         sl["tag"], sl["model"] = sl["name"] + "_INV", ps["definition"]
         return {"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
@@ -4335,6 +4363,119 @@ def _move(cmp, dx, dy):
     return True
 
 
+PI_HALF = 3                # a Coupled PI Section: its terminals this far either side of its middle (grid units)
+
+
+def pi_ports(cmp, c, reported, log, first):
+    """A Coupled PI Section's two ports where its symbol has them. PSCAD can report its ports where it does not
+       draw them, so they come from its drawn extent (its bounds): the symbol moved first to sit centred on its
+       place in the layout, its ports at its two ends on that row; PI_HALF either side of it where its bounds
+       cannot be read."""
+    got = None
+    for attempt in (0, 1):
+        try:
+            b = [float(v) for v in tuple(cmp.bounds)]
+        except Exception:
+            b = None
+        if not b or not (2 <= b[2] - b[0] <= 24 and 0 <= b[3] - b[1] <= 10):
+            break
+        xm, ym = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+        dx, dy = int(round(c["x"] - xm)), int(round(c["y"] - ym))
+        if attempt == 0 and (dx or dy) and _move(cmp, dx, dy):
+            if first:
+                log("    moved (%+d, %+d): its symbol centred on its place, (%d, %d)" % (dx, dy, c["x"], c["y"]))
+            continue
+        half = int(round((b[2] - b[0]) / 2.0))
+        got = (int(round(xm)) - half, int(round(xm)) + half, int(round(ym)))
+        break
+    if got is None:
+        try:
+            x, y = [int(v) for v in cmp.location]
+        except Exception:
+            x, y = c["x"], c["y"]
+        got = (x - PI_HALF, x + PI_HALF, y)
+    names = [p[0] for p in sorted(reported, key=lambda p: (p[1], p[2]))]
+    dim = max([p[3] for p in reported] or [3])
+    out = [(names[0] if names else "N1", got[0], got[2], dim),
+           (names[-1] if len(names) > 1 else "N2", got[1], got[2], dim)]
+    if first or sorted((p[1], p[2]) for p in reported) != sorted((p[1], p[2]) for p in out):
+        PI_NOTE.append("%s: PSCAD reports its ports at %s; drawn at (%d, %d), (%d, %d) -- wired there" % (
+            c["tag"], ", ".join("(%d, %d)" % (p[1], p[2]) for p in reported) or "none", out[0][1], out[0][2],
+            out[1][1], out[1][2]))
+    return out
+
+
+PI_NOTE = []               # the PI Sections whose ports PSCAD reports where it does not draw them
+COPIES = {}                # (source, ID) -> the first copy of it in this case: the rest are its clones
+RESOURCES = set()          # the source cases whose resources (.lib, .obj ...) this case has been given
+
+
+def _iid(cmp):
+    try:
+        return int(cmp.iid)
+    except Exception:
+        return id(cmp)
+
+
+def _defn_of(cmp):
+    try:
+        d = cmp.defn_name
+        return "%s:%s" % tuple(d) if isinstance(d, (tuple, list)) else str(d)
+    except Exception:
+        return "?"
+
+
+def copy_of(pscad, canvas, prj, c, libs, log):
+    """A component set up in another case (a vendor's test case, by its project and component ID): the first
+       copied there and pasted here with its definition, with that case's resources (.lib, .obj ...) added to this
+       one; the rest cloned from the first, its settings and all -> (component, its definition) or (None, None)."""
+    src, iid = c["copy_of"]["source"], int(c["copy_of"]["iid"])
+    key = (os.path.normcase(src), iid)
+    first = COPIES.get(key)
+    try:
+        if first is not None:
+            cmp = first.clone(c["x"], c["y"])
+        else:
+            name = (libs.get(os.path.normcase(os.path.abspath(src))) if os.path.splitext(src)[1] else None) or \
+                os.path.splitext(os.path.basename(src))[0]
+            sprj = pscad.project(name)
+            orig = sprj.component(iid)
+            if orig is None:
+                raise ValueError("no component with ID %d in %s" % (iid, name))
+            log("    %s: component %d is a %s -- copied here with its definition and settings" % (
+                name, iid, _defn_of(orig)))
+            here = set(_iid(x) for x in canvas.components())
+            orig.copy()
+            canvas.paste_transfer(c["x"] * 18, c["y"] * 18)
+            new = [x for x in canvas.components() if _iid(x) not in here]
+            if not new:
+                raise ValueError("nothing was pasted")
+            cmp = new[0]
+            try:
+                x, y = [int(v) for v in cmp.location]
+                _move(cmp, c["x"] - x, c["y"] - y)
+            except Exception:
+                pass
+            COPIES[key] = cmp
+            if key[0] not in RESOURCES:
+                RESOURCES.add(key[0])
+                try:
+                    res = [r.abspath for r in sprj.resources()]
+                except Exception:
+                    res = []
+                for path in res:
+                    try:
+                        prj.create_resource(path)
+                        log("    resource from %s added to this case: %s" % (name, path))
+                    except Exception as e:
+                        log("    CHECK: resource %s not added (%s) -- add it to this case by hand" % (path, e))
+    except Exception as e:
+        log("    CHECK: %s ID %d not copied: %s" % (src, iid, e))
+        return None, None
+    _made(cmp, c["x"], c["y"])
+    return cmp, _defn_of(cmp)
+
+
 def _delete(canvas, cmp):
     try:
         cmp.delete()
@@ -4666,12 +4807,14 @@ def main():
         log("")
         log("%s  (%s)  %s" % (c["tag"], c["kind"], c.get("note", "")))
         defns = list(c["defn"])
-        if c.get("library") and ":" not in defns[0]:
+        if c.get("library") and defns and ":" not in defns[0]:
             lib = libs.get(os.path.normcase(os.path.abspath(c["library"])))
             if lib:
                 defns.insert(0, "%s:%s" % (lib, defns[0]))
         cmp, used = None, None
-        for d in defns:
+        if c.get("copy_of"):
+            cmp, used = copy_of(pscad, canvas, prj, c, libs, log)
+        for d in (defns if cmp is None else []):
             try:
                 try:
                     cmp = canvas.create_component(d, c["x"], c["y"], c.get("orient", 0))
@@ -4687,7 +4830,9 @@ def main():
                 log("    (%s: %s)" % (d, e))
         if cmp is None:
             log("    CHECK: not created (%s) -- place it by hand and join it to %s"
-                % (" / ".join(defns), ", ".join(p["node"] for p in c["ports"])))
+                % (" / ".join(defns + (["a copy of %s ID %s" % (c["copy_of"]["source"], c["copy_of"]["iid"])]
+                                       if c.get("copy_of") else [])) or "nothing to make it from",
+                   ", ".join(p["node"] for p in c["ports"])))
             continue
         log("    %s at (%d, %d)" % (used, c["x"], c["y"]))
         first = used not in seen_defn
@@ -4715,6 +4860,8 @@ def main():
                                                               time.time() - T0))
             sys.stdout.flush()
         ports = eports(cmp)
+        if c["kind"] == "PI":                         # where its symbol has them
+            ports = pi_ports(cmp, c, ports, log, first)
         if any(p["node"] for p in c["ports"]) and len(ports) > len(c["ports"]) and "View" in str(seen_defn[used]):
             log("    (%d electrical ports: %s)" % (len(ports), ", ".join(p[0] for p in ports)))
         taken, picked = set(), []
@@ -4772,6 +4919,9 @@ def main():
     t_wired = time.time()
     made = len(made)
     log("nodes joined by wires: %d" % len([n for n in points if n != "GND"]))
+    if PI_NOTE:
+        log("PI Sections: %d whose ports PSCAD reports away from where it draws them -- wired to the drawn ends; %s"
+            % (len(PI_NOTE), PI_NOTE[0]))
     w, h = reach(canvas)
     if PAGE[0] and (w > PAGE[0] or h > PAGE[1]) and (w > NEED[0] or h > NEED[1]):    # past what the layout said
         page(canvas, w, h, log)
