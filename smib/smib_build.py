@@ -279,6 +279,8 @@ PLANT_FIELDS = [
     ("pscad_duration_s", "PSCAD duration", "s", "blank = 5", None),
     ("pscad_plot_step_us", "PSCAD plot step", "us", "blank = 100", None),
     ("pscad_meter", "PSCAD meter at POI", "", "YES = a multimeter between the grid and the POI", ["YES", "NO"]),
+    ("pscad_inv_meter", "PSCAD meter at each inverter", "", "YES = a multimeter between each inverter and its "
+     "GSU: P_, Q_, V_<unit> in MW, MVAr, kV (blank = YES)", ["YES", "NO"]),
     ("pscad_lines", "PSCAD lines as", "", "PI = the gen-tie, each collector and each feeder section one Coupled PI "
      "Section (R, X, B in pu, its charging inside); RLC = an R and an L, the charging a C at each end (blank = PI)",
      ["PI", "RLC"]),
@@ -2607,6 +2609,7 @@ def control(net, pl):
                   "duration_s": _num(pl, "pscad_duration_s", W, 5.0, positive=True),
                   "plot_step_us": _num(pl, "pscad_plot_step_us", W, 100.0, positive=True),
                   "meter": _choice(pl, "pscad_meter", W, ["YES", "NO"], "YES") == "YES",
+                  "inv_meter": _choice(pl, "pscad_inv_meter", W, ["YES", "NO"], "YES") == "YES",
                   "lines": _choice(pl, "pscad_lines", W, ["PI", "RLC"], "PI"),
                   "fault": None if _choice(pl, "pscad_fault", W, ["YES", "NO"], "YES") == "NO" else {
                       "t": _num(pl, "pscad_fault_s", W, None), "type": _choice(pl, "pscad_fault_type", W, FAULT_TYPES,
@@ -4059,11 +4062,39 @@ def _rlc(tag, kind, value, a, b, x, y, note=""):
             "ports": [{"node": _node(a), "pick": ["N1", "@first"]}, {"node": _node(b), "pick": ["N2", "@second"]}]}
 
 
-def _fp(what, names, value, desc, cat=None, pick=None, choice=None):
+def _fp(what, names, value, desc, cat=None, pick=None, choice=None, nope=None):
     """A parameter the build script finds in the component's form by its description (every word of desc in it,
-       every word of cat in its page's name) -- names: what it may be called where the form cannot be read; a
-       choice set by its text (pick: lists of words, the first list that matches) or by choice (its key's words)."""
-    return dict(_pp(what, names, value, choice), desc=desc, cat=cat, pick=pick)
+       none of nope, every word of cat in its page's name) -- names: what it may be called where the form cannot
+       be read; a choice set by its text (pick: lists of words, the first list that matches) or by choice (its
+       key's words)."""
+    return dict(_pp(what, names, value, choice), desc=desc, cat=cat, pick=pick, nope=nope)
+
+
+def _meter(tag, a, b, kv, sig, net, note):
+    """A multimeter between node a, where the power comes from, and node b, a on its right: mirrored, so the flow
+       a -> b reads positive (unmirrored it reads left to right). P, Q and RMS voltage as signals P_, Q_, V_<sig>
+       in MW, MVAr and kV (base 1 MVA, base kV its bus's), the RMS voltage shown digitally, an animated display,
+       0.02 s smoothing -- the other measurements off."""
+    cfg, yes, no = ["CONFIG"], [["YES"]], [["NO"]]
+    return {"tag": tag, "kind": "METER", "defn": ["master:multimeter"], "x": 0, "y": 0, "orient": 4, "note": note,
+            "params": [_fp("animated display", ["Dis", "Anim"], None, ["ANIMATED"], cfg, yes, ["YES"]),
+                       _fp("instantaneous V", ["MeasV"], None, ["INSTANTANEOUS", "VOLTAGE"], cfg, no, ["NO"]),
+                       _fp("instantaneous I", ["MeasI"], None, ["INSTANTANEOUS", "CURRENT"], cfg, no, ["NO"]),
+                       _fp("measure P", ["MeasP"], None, ["ACTIVE", "POWER"], cfg, yes, ["YES"], nope=["REACTIVE"]),
+                       _fp("measure Q", ["MeasQ"], None, ["REACTIVE", "POWER"], cfg, yes, ["YES"]),
+                       _fp("measure Vrms", ["RMS", "MeasRMS", "MeasVrms"], None, ["RMS", "VOLTAGE"], cfg,
+                           [["YES", "DIGITAL"], ["YES"]], ["YES"]),
+                       _fp("measure Irms", ["MeasIrms"], None, ["RMS", "CURRENT"], cfg, no, ["NO"]),
+                       _fp("phase angle", ["MeasPh"], None, ["PHASE", "ANGLE"], cfg, no, ["NO"]),
+                       _fp("smoothing", ["Ts", "Tsmooth"], "0.02 [s]", ["SMOOTHING"], cfg),
+                       _fp("frequency", ["Freq", "F"], "%s [Hz]" % _g(net.f), ["FREQUENCY"], cfg),
+                       _fp("base MVA", ["BaseS", "S"], "1.0 [MVA]", ["BASE", "MVA"], cfg),
+                       _fp("base kV", ["BaseV"], "%s [kV]" % _g(kv), ["BASE", "VOLTAGE"], cfg),
+                       _fp("P signal", ["P"], "P_" + sig, ["ACTIVE", "POWER"], ["SIGNAL"], nope=["REACTIVE"]),
+                       _fp("Q signal", ["Q"], "Q_" + sig, ["REACTIVE", "POWER"], ["SIGNAL"]),
+                       _fp("Vrms signal", ["Vrms"], "V_" + sig, ["RMS", "VOLTAGE"], ["SIGNAL"])],
+            "ports": [{"node": _node(b), "pick": ["@left", "@first"]},
+                      {"node": _node(a), "pick": ["@right", "@second"]}]}
 
 
 def _pi_comp(ln, net):
@@ -4118,7 +4149,8 @@ def _source(tag, name, kv, vpu, ang, f, x, y, node):
                        _pp("base kV", ["Vbase"], "%s [kV]" % _g(kv, 8)),
                        _pp("magnitude (pu)", ["Vpu"], "%s [pu]" % _g(vpu, 8)),
                        _pp("phase (deg)", ["Ph", "PhT", "Phase"], "%s [deg]" % _g(ang, 8))] + tiny,
-            "ports": [{"node": _node(node), "pick": ["@dim3", "@first"]}]}
+            "ports": [{"node": _node(node), "pick": ["@dim3", "@first"]},
+                      {"node": "GND", "pick": ["@rest"], "optional": True}]}       # its neutral, where it has one
 
 
 def _yd(w):
@@ -4162,15 +4194,10 @@ def pscad_model(net, inp):
     poi_m = "POI_M" if c["meter"] else "POI"
     comps.append(_rlc("GRID_L", "L", th["X"] / w, nxt, poi_m, nx(), y0, "grid Thevenin L (X %.4f ohm)" % th["X"]))
     if c["meter"]:
-        comps.append({"tag": "POI_METER", "kind": "METER", "defn": ["master:multimeter"], "x": nx(), "y": y0,
-                      "note": "P, Q, Vrms at the POI (grid side)",
-                      "params": [_pp("measure P", ["MeasP"], None, ["YES"]), _pp("P signal", ["P"], "P_POI"),
-                                 _pp("measure Q", ["MeasQ"], None, ["YES"]), _pp("Q signal", ["Q"], "Q_POI"),
-                                 _pp("measure Vrms", ["RMS", "MeasRMS", "MeasVrms"], None, ["YES"]),
-                                 _pp("Vrms signal", ["Vrms"], "V_POI"),
-                                 _pp("base kV", ["BaseV"], "%s [kV]" % _g(net.kv("POI")))],
-                      "ports": [{"node": "POI_M", "pick": ["@left", "@first"]},
-                                {"node": "POI", "pick": ["@right", "@second"]}]})
+        m = _meter("POI_METER", "POI", "POI_M", net.kv("POI"), "POI", net, "P, Q (MW, MVAr: the plant's export "
+                   "positive), Vrms (kV) at the POI (grid side)")
+        m["x"], m["y"] = nx(), y0
+        comps.append(m)
 
     flt = c["fault"]
     if flt:
@@ -4222,6 +4249,10 @@ def pscad_model(net, inp):
         first = len(comps)
         if g["gsu"] and id(g["gsu"]) not in inside:
             comps.append(_tx2_comp(g["gsu"], net, 0, 0))
+        if c["inv_meter"]:                               # its own P, Q, V: inverter to GSU positive
+            sl["term"] = sl["name"] + "_TERM"
+            comps.append(_meter(sl["name"] + "_PQ", sl["term"], sl["node"], sl["kv"], sl["name"], net,
+                                "P, Q (MW, MVAr: out of the inverter positive), Vrms (kV) of %s" % sl["name"]))
         comps.append(_inverter_comp(g, sl, net, 0, 0))
         comps[first]["hang"] = bool(g.get("family"))    # a DETAILED unit group: below its feeder node, always
         slots.append(sl)
@@ -4522,6 +4553,7 @@ def _sym_room(c, path, name, iid=None):
 def _inverter_comp(g, sl, net, x, y):
     """The inverter in its slot: the generator's vendor model (UDM), or a stand-in source holding the load flow."""
     ps = g["pscad"]
+    node = _node(sl.get("term", sl["node"]))           # its own node: past its meter, else its slot's
     what = "%s units, P %.3f MW, Q %.3f MVAr, V %.5f pu at %.4f deg (PSCAD angle)" % (
         _g(sl["units"]), sl["p"], sl["q"], sl["vm"], sl["ang"])
     src = ps["source"]
@@ -4534,7 +4566,7 @@ def _inverter_comp(g, sl, net, x, y):
              "library": src if os.path.splitext(src)[1].lower() in (".pscx", ".pslx") else ps["library"],
              "params": [], "lead": 6, "half": SYMBOL_HALF["VENDOR"], "note": "inverter: %s%s -- %s" % (
                  sl["model"], ", its settings kept" if ps["iid"] else "", what),
-             "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
+             "ports": [{"node": node, "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
                         ["@dim3", "@first"]}]}
         if ps["iid"]:
             c["copy_of"] = {"source": src, "iid": ps["iid"]}
@@ -4549,10 +4581,10 @@ def _inverter_comp(g, sl, net, x, y):
         return _sym_room({"tag": sl["tag"], "kind": "VENDOR", "defn": [ps["definition"]], "library": ps["library"],
                 "gen": g["name"], "slot": sl, "x": x, "y": y, "params": [], "lead": 6, "half": SYMBOL_HALF["VENDOR"],
                 "note": "inverter: vendor model %s -- %s" % (ps["definition"], what),
-                "ports": [{"node": _node(sl["node"]), "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
+                "ports": [{"node": node, "pick": ([ps["ac_port"]] if ps["ac_port"] else []) +
                            ["@dim3", "@first"]}]}, ps["library"], ps["definition"].split(":")[-1])
     sl["tag"], sl["model"] = sl["name"] + "_SRC", "stand-in source"
-    c = _source(sl["tag"], sl["name"], sl["kv"], sl["vm"], sl["ang"], net.f, x, y, sl["node"])
+    c = _source(sl["tag"], sl["name"], sl["kv"], sl["vm"], sl["ang"], net.f, x, y, node)
     c["lead"] = 6                                       # a wire of its own to its node: the node's name, a UDM's place
     c["orient"] = 4                                     # mirrored: its terminal faces the node (on its left)
     c["note"] += (" -- stand-in for the inverter (%s): holds the load flow; your UDM goes on node %s"
@@ -4645,7 +4677,8 @@ def pscad_spec(net, inp, comps):
             "settings": {"time_duration": c["duration_s"], "time_step": c["time_step_us"],
                          "sample_step": c["plot_step_us"], "description": ("%s %s" % (net.model, net.name))[:60]},
             "libraries": [l for k, l in enumerate(libs) if l and l not in libs[:k]],
-            "slots": [{"tag": sl["tag"], "node": _node(sl["node"]), "units": sl["units"], "p": sl["p"], "q": sl["q"],
+            "slots": [{"tag": sl["tag"], "node": _node(sl.get("term", sl["node"])), "units": sl["units"],
+                       "p": sl["p"], "q": sl["q"],
                        "vm": sl["vm"], "ang": sl["ang"], "model": sl["model"]} for sl in net.pscad_slots],
             "groups": [{"kind": gr["kind"], "a": _node(gr["a"]), "b": _node(gr["b"]),
                         "members": [[t, _node(i), _node(o)] for t, i, o in gr["members"]]} for gr in net.pscad_groups],
@@ -4933,7 +4966,8 @@ def form_pick(items, form, log):
         it = dict(it)
         if form and it.get("desc"):
             hit = next((f for f in form if all(_norm(w) in _norm(f[0]) for w in it.get("cat") or []) and
-                        all(_norm(w) in _norm(f[2]) for w in it["desc"])), None)
+                        all(_norm(w) in _norm(f[2]) for w in it["desc"]) and
+                        not any(_norm(w) in _norm(f[2]) for w in it.get("nope") or [])), None)
             if hit is None:
                 log("    CHECK: %-26s no parameter described as %r%s in its form" % (
                     it["what"], " ".join(it["desc"]), (" on page %s" % " ".join(it["cat"])) if it.get("cat") else ""))
@@ -5741,7 +5775,7 @@ def main():
             except Exception:
                 pass
         NAMES[used] = seen_defn[used]
-        if c["kind"] == "PI":                         # its parameters found by their descriptions in its form
+        if c["kind"] in ("PI", "METER"):              # its parameters found by their descriptions in its form
             if used not in FORMS:
                 FORMS[used] = form_of(definition(pscad, used))
                 if not FORMS[used]:
@@ -5768,6 +5802,8 @@ def main():
         else:
             for p in c["ports"]:
                 got = pick(ports, p["pick"], taken)
+                if got is None and p.get("optional"):
+                    continue
                 if got is None:
                     log("    CHECK: no port for node %s (ports: %s) -- join it by hand"
                         % (p["node"], ", ".join("%s@(%d,%d)" % (q[0], q[1], q[2]) for q in ports) or "none"))
