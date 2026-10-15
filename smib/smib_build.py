@@ -156,11 +156,14 @@ import zipfile
 import posixpath
 import collections
 import traceback
+import tempfile
 from xml.sax.saxutils import escape as _xml_escape
 
 # ============================================================================
 # SETTINGS
 # ============================================================================
+GUI = True                        # run with no file: the input window (each sheet a tab) | False: the workbook
+                                  # beside the script, as before
 INPUT_XLSX = ""                   # "" = the command line's, else the one beside this script | r"C:\...\SMIB.xlsx"
 OUT_DIR = ""                      # "" = SMIB_MODELS beside the workbook; a new <name>_<date_time> folder inside
 PSSE_CHECK = True                 # PSS/E found: the .raw read back and solved, the .sav saved, the .dyr run flat
@@ -2885,9 +2888,10 @@ def dyr_models(net, inp):
         }
         auto["REPCAU1"] = auto["REPCA1"]
         for m in over.get(g["name"], {}):
-            if m not in chain:
-                net.notes.append("NOTE: Dyr_Params for %s %s: %s is not in its model chain %s -- not used"
-                                 % (g["name"], m, m, "+".join(chain) or "(none: type USER)"))
+            note = "NOTE: Dyr_Params for %s %s: %s is not in its model chain %s -- not used" % (
+                g.get("family", g["name"]), m, m, "+".join(chain) or "(none: type USER)")
+            if m not in chain and note not in net.notes:
+                net.notes.append(note)
         for m in chain:
             out.append((g["name"], m, list(_merged(m, auto.get(m, {}), over[g["name"]][m]))))
         g["dyr"] = chain
@@ -5059,6 +5063,920 @@ def pick_input():
     return None
 
 
+# ============================================================================
+# THE GUI -- every input on a tab of its own, like the workbook's sheets (no Excel needed)
+# ============================================================================
+GUI_TEXT_KEYS = set(["name", "id", "vector", "gsu_vector", "cable", "feeder", "collector", "connect", "at", "bus",
+                     "record", "parameter", "generator", "model", "units_of", "poi_name", "pscad_library",
+                     "pscad_definition", "pscad_ac_port", "kind", "type", "pscad_libraries"])
+GUI_PROJECT = "SMIB_PROJECT.json"           # the project the GUI opens when it is beside the script
+
+
+def gui_data(inp):
+    """The GUI's copy of an input (a workbook read, a project, EXAMPLE): every value as text, blanks dropped."""
+    out = {"plant": dict((k, _txt(v)) for k, v in (inp.get("plant") or {}).items()
+                         if not k.startswith("_") and _txt(v) is not None)}
+    for _sheet, key, cols in TABLES:
+        rows = []
+        for r in inp.get(key) or []:
+            row = dict((c[0], _txt(r.get(c[0]))) for c in cols if _txt(r.get(c[0])) is not None)
+            if row:
+                rows.append(row)
+        out[key] = rows
+    return out
+
+
+def gui_value(key, s):
+    """A value typed in the GUI as the workbook holds it: a number where it reads as one (not names, ids ...)."""
+    if s is None or str(s).strip() == "":
+        return None
+    s = str(s).strip()
+    if key in GUI_TEXT_KEYS:
+        return s
+    try:
+        x = float(s)
+    except ValueError:
+        return s
+    return int(x) if x == int(x) and "." not in s and "e" not in s.lower() and abs(x) < 1e15 else x
+
+
+def gui_save_data(data):
+    """The project as written to its .json (and read back by read_input): typed values, empty rows left out."""
+    out = {"plant": dict((k, gui_value(k, v)) for k, v in data["plant"].items() if gui_value(k, v) is not None)}
+    for _sheet, key, cols in TABLES:
+        rows = []
+        for r in data.get(key, []):
+            row = dict((c[0], gui_value(c[0], r.get(c[0]))) for c in cols if gui_value(c[0], r.get(c[0])) is not None)
+            if row:
+                rows.append(row)
+        out[key] = rows
+    return out
+
+
+def _write_json(path, obj):
+    with io.open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(obj, indent=1))
+
+
+def _replace_file(path, write):
+    """write(tmp) then put it in place of `path` -- a save the user asked for (the project, an export)."""
+    tmp = path + ".saving"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    write(tmp)
+    os.replace(tmp, path)
+
+
+class _Queue(object):
+    """sys.stdout while a build runs on its thread: its lines go to the GUI's Output tab."""
+    def __init__(self, q):
+        self.q = q
+
+    def write(self, s):
+        if s:
+            self.q.put(s)
+        return len(s or "")
+
+    def flush(self):
+        pass
+
+
+def gui(start=None):
+    """The input GUI: the workbook's sheets as tabs, the project saved as .json, models built from it."""
+    try:
+        import tkinter as tk
+        from tkinter import ttk, filedialog, messagebox
+    except ImportError:
+        print("[smib] *** this Python has no tkinter (the GUI's library) -- use a python.org Python, or a workbook: "
+              "python %s --template SMIB_INPUT.xlsx" % os.path.basename(__file__))
+        return 2
+    import threading
+    import queue
+    import contextlib
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = tk.Tk()
+    root.title("SMIB plant model")
+    root.geometry("1280x800")
+    root.minsize(900, 560)
+    st = ttk.Style(root)
+    for theme in ("vista", "clam"):
+        if theme in st.theme_names():
+            st.theme_use(theme)
+            break
+    navy, light, input_bg, grey = "#1F3864", "#DDEBF7", "#FFF2CC", "#595959"
+    st.configure("Head.TLabel", background=navy, foreground="white", font=("Segoe UI", 13, "bold"), padding=(10, 6))
+    st.configure("Sub.TLabel", background=navy, foreground="#D9E1F2", font=("Segoe UI", 9, "italic"),
+                 padding=(10, 0, 10, 6))
+    st.configure("Section.TLabel", background=light, foreground=navy, font=("Segoe UI", 10, "bold"), padding=(6, 3))
+    st.configure("Item.TLabel", font=("Segoe UI", 9, "bold"))
+    st.configure("Hint.TLabel", foreground=grey, font=("Segoe UI", 8))
+    st.configure("Req.TLabel", foreground="#C00000", font=("Segoe UI", 8, "bold"))
+    st.configure("Tag.TLabel", foreground="#375623", font=("Segoe UI", 8))
+    st.configure("Help.TLabel", background="#F2F2F2", foreground="#262626", font=("Segoe UI", 9), padding=(8, 5))
+    st.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+    st.configure("TNotebook.Tab", padding=(5, 2), font=("Segoe UI", 9))
+    st.configure("Treeview", rowheight=22)
+    st.configure("Status.TLabel", background="#F2F2F2", padding=(8, 3))
+
+    app = {"path": None, "dirty": False, "running": False, "out": None, "grids": {}, "vars": {}, "q": queue.Queue()}
+    data = {"plant": {}}
+
+    # ---------------------------------------------------------------- header, toolbar, tabs, status
+    ttk.Label(root, text="SMIB PLANT MODEL  |  PSS/E and PSCAD from one set of inputs", style="Head.TLabel").pack(
+        fill="x")
+    ttk.Label(root, text="Each tab is a sheet of the input workbook. A blank cell takes its default; the line under "
+                         "each tab explains the field you are on.", style="Sub.TLabel").pack(fill="x")
+    bar = ttk.Frame(root, padding=(6, 4))
+    bar.pack(fill="x")
+    nb = ttk.Notebook(root)
+    nb.pack(fill="both", expand=True, padx=4, pady=(0, 2))
+    status = tk.StringVar()
+    ttk.Label(root, textvariable=status, style="Status.TLabel", anchor="w").pack(fill="x", side="bottom")
+
+    def set_status(msg):
+        status.set("%s%s   |   %s" % (app["path"] or "(project not saved yet)", "  *" if app["dirty"] else "",
+                                     " ".join(str(msg).split())))
+
+    def dirty(*_a):
+        if not app["dirty"]:
+            app["dirty"] = True
+            set_status("changed")
+
+    # ---------------------------------------------------------------- helpers
+    def scrolled(parent):
+        """A frame that scrolls (the Plant form)."""
+        outer = ttk.Frame(parent)
+        cv = tk.Canvas(outer, highlightthickness=0, background="white")
+        sb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+        inner = tk.Frame(cv, background="white")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        cv.configure(yscrollcommand=sb.set)
+        cv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        def wheel(e):
+            cv.yview_scroll(-1 if (getattr(e, "num", 0) == 4 or e.delta > 0) else 1, "units")
+        for w in (cv, inner):
+            w.bind("<Enter>", lambda e: (cv.bind_all("<MouseWheel>", wheel), cv.bind_all("<Button-4>", wheel),
+                                         cv.bind_all("<Button-5>", wheel)))
+            w.bind("<Leave>", lambda e: (cv.unbind_all("<MouseWheel>"), cv.unbind_all("<Button-4>"),
+                                         cv.unbind_all("<Button-5>")))
+        return outer, inner
+
+    def help_text(sheet, key, label, note, choices, unit=""):
+        bits = ["%s  (%s)" % (label, key)]
+        if unit:
+            bits.append("unit: %s" % unit)
+        b = "required" if key == "poi_kv" else _blank_means(note)
+        if b:
+            bits.append("blank = %s" % b)
+        if choices:
+            bits.append("choices: %s" % " | ".join(choices))
+        bits.append(_used_by(sheet, key))
+        return "   ".join(bits) + ("\n" + note.lstrip("# ") if note else "")
+
+    def bus_names():
+        """The bus names the current inputs give (for Connect to, At, Bus_Numbers)."""
+        names = ["IB", "POI", "HV"]
+        for r in data.get("mpt", []):
+            n = r.get("name")
+            if n:
+                names += [n, n + ":LV"] + ([n + ":TV"] if r.get("tv_kv") else []) + [n + ":HV", n + ":COLL"]
+        names += [r["name"] for r in data.get("collectors", []) if r.get("name")]
+        for r in data.get("generators", []):
+            if r.get("name"):
+                names += [r["name"], r["name"] + ":MV", r["name"] + ":LV"]
+        return names
+
+    def gen_names():
+        return [r["name"] for r in data.get("generators", []) if r.get("name")]
+
+    def choices_for(sheet, key, row):
+        """The drop-down list of a table cell: its column's choices, or names the inputs give."""
+        cols = dict((c[0], c) for c in dict((t[1], t[2]) for t in TABLES)[TABLE_KEY[sheet]])
+        c = cols[key]
+        if c[3]:
+            return [""] + list(c[3]), True
+        if (sheet, key) in (("Generators", "connect"), ("Collectors", "connect"), ("Loads_Shunts", "at"),
+                            ("Bus_Numbers", "bus")):
+            return bus_names(), False
+        if (sheet, key) in (("Feeders", "units_of"),) or (key == "generator" and sheet != "Dyr_Params"):
+            return gen_names(), False
+        if sheet == "Dyr_Params" and key == "generator":
+            return gen_names() + ["IB", "PLANT"], False
+        if sheet == "Feeders" and key == "collector":
+            return gen_names() + [r["name"] for r in data.get("collectors", []) if r.get("name")], False
+        if sheet == "Feeders" and key == "cable":
+            return [r["cable"] for r in data.get("cables", []) if r.get("cable")], False
+        if sheet == "Dyr_Params" and key == "model":
+            return list(DYR_LIB), False
+        if sheet == "Dyr_Params" and key == "parameter":
+            m = (row.get("model") or "").upper()
+            return (list(DYR_LIB[m][2]) if m in DYR_LIB else []), False
+        return None, False
+
+    TABLE_KEY = dict((t[0], t[1]) for t in TABLES)
+
+    # ---------------------------------------------------------------- Plant tab: a form in sections
+    plant_tab = ttk.Frame(nb)
+    nb.add(plant_tab, text="Plant")
+    outer, form = scrolled(plant_tab)
+    outer.pack(fill="both", expand=True)
+    plant_help = tk.StringVar(value="Click a field to see what it is.")
+    ttk.Label(plant_tab, textvariable=plant_help, style="Help.TLabel", wraplength=1200, justify="left").pack(
+        fill="x", side="bottom")
+    widgets = {}
+    row_i = [0]
+    for key, item, unit, note, choices in PLANT_FIELDS:
+        if key in PLANT_SECTIONS:
+            ttk.Label(form, text=PLANT_SECTIONS[key], style="Section.TLabel").grid(
+                row=row_i[0], column=0, columnspan=5, sticky="ew", pady=(8, 2))
+            row_i[0] += 1
+        var = tk.StringVar()
+        app["vars"][key] = var
+        ttk.Label(form, text=item, style="Item.TLabel", background="white").grid(row=row_i[0], column=0, sticky="w",
+                                                                               padx=(8, 4), pady=1)
+        if choices:
+            w = ttk.Combobox(form, textvariable=var, values=[""] + list(choices), state="readonly", width=26)
+        else:
+            w = tk.Entry(form, textvariable=var, width=30 if key != "pscad_libraries" else 60, background=input_bg,
+                         relief="solid", borderwidth=1)
+        w.grid(row=row_i[0], column=1, sticky="w", padx=2, pady=1)
+        widgets[key] = w
+        ttk.Label(form, text=unit, background="white").grid(row=row_i[0], column=2, sticky="w", padx=2)
+        blank = "required" if key == "poi_kv" else ("one of SCR, short-circuit MVA or R + X" if key == "grid_scr"
+                                                    else _blank_means(note))
+        ttk.Label(form, text=("blank = " + blank) if blank and not blank.startswith(("required", "one of")) else blank,
+                  style="Req.TLabel" if blank.startswith(("required", "one of")) else "Hint.TLabel",
+                  background="white").grid(row=row_i[0], column=3, sticky="w", padx=6)
+        ttk.Label(form, text=_used_by("Plant", key), style="Tag.TLabel", background="white").grid(
+            row=row_i[0], column=4, sticky="w", padx=6)
+        txt = help_text("Plant", key, item, note, choices, unit)
+        w.bind("<FocusIn>", lambda e, t=txt: plant_help.set(t))
+        var.trace_add("write", dirty) if hasattr(var, "trace_add") else var.trace("w", dirty)
+        row_i[0] += 1
+    form.columnconfigure(3, weight=1)
+
+    # ---------------------------------------------------------------- table tabs: a grid each, edited in place
+    class Grid(object):
+        def __init__(self, sheet, key, cols):
+            self.sheet, self.key, self.cols = sheet, key, cols
+            self.keys = [c[0] for c in cols]
+            self.edit_w = None
+            tab = ttk.Frame(nb)
+            nb.add(tab, text=sheet)
+            tools = ttk.Frame(tab, padding=(4, 4))
+            tools.pack(fill="x")
+            for txt, fn in (("Add row", self.add), ("Insert above", self.insert), ("Duplicate", self.duplicate),
+                            ("Delete", self.delete), ("Move up", lambda: self.move(-1)),
+                            ("Move down", lambda: self.move(1))):
+                ttk.Button(tools, text=txt, command=fn).pack(side="left", padx=2)
+            if sheet == "Bus_Numbers":
+                ttk.Button(tools, text="List this model's buses", command=self.fill_buses).pack(side="left", padx=12)
+            ttk.Label(tools, text="Double-click a cell (or press Enter) to edit; Tab moves on.",
+                      style="Hint.TLabel").pack(side="right", padx=6)
+            box = ttk.Frame(tab)
+            box.pack(fill="both", expand=True)
+            self.tree = ttk.Treeview(box, columns=self.keys, show="headings", selectmode="browse")
+            ys = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+            xs = ttk.Scrollbar(box, orient="horizontal", command=self.tree.xview)
+            self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+            self.tree.grid(row=0, column=0, sticky="nsew")
+            ys.grid(row=0, column=1, sticky="ns")
+            xs.grid(row=1, column=0, sticky="ew")
+            box.rowconfigure(0, weight=1)
+            box.columnconfigure(0, weight=1)
+            self.widths = []
+            for c in cols:
+                wpx = 700 if c[0] == "record" else max(70, int(c[4] * 8.5), len(c[1]) * 7 + 18)
+                self.widths.append(wpx)
+                self.tree.heading(c[0], text=c[1], command=lambda k=c[0]: self.show_help(k))
+                self.tree.column(c[0], width=wpx, minwidth=50, stretch=False)
+            self.tree.tag_configure("odd", background="#FFF9E6")
+            self.tree.tag_configure("even", background=input_bg)
+            self.help = tk.StringVar(value="Click a column title or a cell to see what the column is.")
+            ttk.Label(tab, textvariable=self.help, style="Help.TLabel", wraplength=1200, justify="left").pack(
+                fill="x", side="bottom")
+            self.col = 0
+            self.tree.bind("<Double-1>", self.on_double)
+            self.tree.bind("<Button-1>", self.on_click, add="+")
+            self.tree.bind("<Return>", lambda e: self.edit(self.current(), self.col))
+            self.tree.bind("<F2>", lambda e: self.edit(self.current(), self.col))
+            self.tree.bind("<Delete>", lambda e: self.clear_cell())
+            self.tree.bind("<Left>", lambda e: self.step_col(-1))
+            self.tree.bind("<Right>", lambda e: self.step_col(1))
+            self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_help(self.keys[self.col]))
+
+        @property
+        def rows(self):
+            return data.setdefault(self.key, [])
+
+        def refresh(self, select=None):
+            self.tree.delete(*self.tree.get_children())
+            for i, r in enumerate(self.rows):
+                self.tree.insert("", "end", iid=str(i), values=[r.get(k) or "" for k in self.keys],
+                                 tags=("odd" if i % 2 else "even",))
+            if select is not None and 0 <= select < len(self.rows):
+                self.tree.selection_set(str(select))
+                self.tree.focus(str(select))
+                self.tree.see(str(select))
+
+        def current(self):
+            sel = self.tree.selection()
+            return int(sel[0]) if sel else None
+
+        def show_help(self, key):
+            c = self.cols[self.keys.index(key)]
+            self.help.set(help_text(self.sheet, key, c[1], c[2] or "", c[3]))
+
+        def on_click(self, e):
+            self.close_edit(True)
+            if self.tree.identify_region(e.x, e.y) == "cell":
+                col = self.tree.identify_column(e.x)
+                self.col = int(col[1:]) - 1
+                self.show_help(self.keys[self.col])
+
+        def on_double(self, e):
+            if self.tree.identify_region(e.x, e.y) != "cell":
+                return
+            item = self.tree.identify_row(e.y)
+            self.col = int(self.tree.identify_column(e.x)[1:]) - 1
+            if item:
+                self.edit(int(item), self.col)
+
+        def step_col(self, d):
+            self.col = max(0, min(len(self.keys) - 1, self.col + d))
+            self.show_help(self.keys[self.col])
+            self.reveal(self.col)
+            return "break"
+
+        def reveal(self, ci):
+            """Scroll so that column ci shows."""
+            total = float(sum(self.widths))
+            left = sum(self.widths[:ci])
+            first, last = self.tree.xview()
+            if left / total < first or (left + self.widths[ci]) / total > last:
+                self.tree.xview_moveto(max(0.0, left / total - 0.02))
+
+        def edit(self, i, ci):
+            if i is None or not (0 <= i < len(self.rows)):
+                return
+            self.close_edit(True)
+            self.tree.see(str(i))
+            self.reveal(ci)
+            self.tree.update_idletasks()
+            bbox = self.tree.bbox(str(i), self.keys[ci])
+            if not bbox:
+                return
+            x, y, wd, ht = bbox
+            key = self.keys[ci]
+            row = self.rows[i]
+            var = tk.StringVar(value=row.get(key) or "")
+            values, fixed = choices_for(self.sheet, key, row)
+            if values is not None:
+                w = ttk.Combobox(self.tree, textvariable=var, values=values, state="readonly" if fixed else "normal")
+            else:
+                w = tk.Entry(self.tree, textvariable=var, relief="solid", borderwidth=1, background="white",
+                             font=("Consolas", 9) if key == "record" else None)
+            w.place(x=x, y=y, width=max(wd, 120 if values is not None else wd), height=ht)
+            w.focus_set()
+            if isinstance(w, tk.Entry):
+                w.select_range(0, "end")
+            self.edit_w = (w, var, i, ci)
+            w.bind("<Return>", lambda e: (self.close_edit(True), self.move_cell(1, 0)))
+            w.bind("<KP_Enter>", lambda e: (self.close_edit(True), self.move_cell(1, 0)))
+            w.bind("<Tab>", lambda e: (self.close_edit(True), self.move_cell(0, 1), "break")[-1])
+            w.bind("<ISO_Left_Tab>", lambda e: (self.close_edit(True), self.move_cell(0, -1), "break")[-1])
+            w.bind("<Shift-Tab>", lambda e: (self.close_edit(True), self.move_cell(0, -1), "break")[-1])
+            w.bind("<Escape>", lambda e: self.close_edit(False))
+            w.bind("<FocusOut>", lambda e: self.close_edit(True) if not isinstance(w, ttk.Combobox) else None)
+            if isinstance(w, ttk.Combobox):
+                w.bind("<<ComboboxSelected>>", lambda e: self.close_edit(True))
+            self.show_help(key)
+
+        def close_edit(self, keep):
+            if not self.edit_w:
+                return
+            w, var, i, ci = self.edit_w
+            self.edit_w = None
+            if keep and i < len(self.rows):
+                key = self.keys[ci]
+                v = var.get().strip()
+                if (self.rows[i].get(key) or "") != v:
+                    if v:
+                        self.rows[i][key] = v
+                    else:
+                        self.rows[i].pop(key, None)
+                    self.tree.set(str(i), key, v)
+                    dirty()
+            w.destroy()
+            self.tree.focus_set()
+
+        def move_cell(self, dr, dc):
+            i = self.current()
+            if i is None:
+                return
+            ci = self.col + dc
+            if ci >= len(self.keys):
+                ci, dr = 0, 1
+            if ci < 0:
+                ci, dr = len(self.keys) - 1, -1
+            i += dr
+            if i >= len(self.rows):
+                return
+            i = max(0, i)
+            self.col = ci
+            self.tree.selection_set(str(i))
+            self.tree.focus(str(i))
+            if dc:
+                self.edit(i, ci)
+
+        def clear_cell(self):
+            i = self.current()
+            if i is not None and self.rows[i].pop(self.keys[self.col], None) is not None:
+                self.tree.set(str(i), self.keys[self.col], "")
+                dirty()
+
+        def add(self):
+            self.close_edit(True)
+            self.rows.append({})
+            self.refresh(len(self.rows) - 1)
+            dirty()
+            self.col = 0
+            self.edit(len(self.rows) - 1, 0)
+
+        def insert(self):
+            i = self.current()
+            if i is None:
+                return self.add()
+            self.close_edit(True)
+            self.rows.insert(i, {})
+            self.refresh(i)
+            dirty()
+
+        def duplicate(self):
+            i = self.current()
+            if i is None:
+                return
+            self.close_edit(True)
+            self.rows.insert(i + 1, dict(self.rows[i]))
+            self.refresh(i + 1)
+            dirty()
+
+        def delete(self):
+            i = self.current()
+            if i is None:
+                return
+            self.close_edit(False)
+            label = self.rows[i].get(self.keys[0]) or "row %d" % (i + 1)
+            if not messagebox.askyesno("Delete row", "Delete %s from %s?" % (label, self.sheet), parent=root):
+                return
+            del self.rows[i]
+            self.refresh(min(i, len(self.rows) - 1))
+            dirty()
+
+        def move(self, d):
+            i = self.current()
+            if i is None or not 0 <= i + d < len(self.rows):
+                return
+            self.close_edit(True)
+            r = self.rows
+            r[i], r[i + d] = r[i + d], r[i]
+            self.refresh(i + d)
+            dirty()
+
+        def fill_buses(self):
+            try:
+                inp = read_input(save_temp())
+                net = build_network(inp, Log(echo=False))
+            except (InputError, SolveError) as e:
+                messagebox.showerror("Bus names", "The inputs do not build yet:\n\n%s" % e, parent=root)
+                return
+            have = set((r.get("bus") or "").upper() for r in self.rows)
+            for role in net.bus:
+                nm = role.replace("C:", "")
+                if nm.upper() not in have:
+                    self.rows.append({"bus": nm})
+            self.refresh()
+            dirty()
+
+    for sheet, key, cols in TABLES:
+        app["grids"][key] = Grid(sheet, key, cols)
+
+    # ---------------------------------------------------------------- reference tabs
+    def ref_tab(title, heads, widths, rows, sections=False, extra=None):
+        tab = ttk.Frame(nb)
+        nb.add(tab, text=title)
+        top = ttk.Frame(tab, padding=(4, 4))
+        top.pack(fill="x")
+        ttk.Label(top, text="Search:").pack(side="left")
+        find = tk.StringVar()
+        ttk.Entry(top, textvariable=find, width=40).pack(side="left", padx=4)
+        if extra:
+            extra(top)
+        box = ttk.Frame(tab)
+        box.pack(fill="both", expand=True)
+        tv = ttk.Treeview(box, columns=heads, show="headings")
+        ys = ttk.Scrollbar(box, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=ys.set)
+        tv.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+        for h, wd in zip(heads, widths):
+            tv.heading(h, text=h)
+            tv.column(h, width=wd, stretch=(h == heads[-1]))
+        tv.tag_configure("sec", background=light, font=("Segoe UI", 9, "bold"))
+
+        def fill(*_a):
+            tv.delete(*tv.get_children())
+            f = find.get().strip().lower()
+            for r in rows:
+                if r[0] == "#":
+                    if not f:
+                        tv.insert("", "end", values=r[1:], tags=("sec",))
+                    continue
+                if not f or any(f in str(x).lower() for x in r):
+                    tv.insert("", "end", values=r)
+        find.trace_add("write", fill) if hasattr(find, "trace_add") else find.trace("w", fill)
+        fill()
+        return tv
+
+    rrows = []
+    for key, item, unit, note, choices in PLANT_FIELDS:
+        rrows.append(["Plant", item, key, unit, "required" if key == "poi_kv" else _blank_means(note),
+                      " | ".join(choices or []), note, _used_by("Plant", key)])
+    for sheet, key, cols in TABLES:
+        for c in cols:
+            note = (c[2] or "").lstrip("# ")
+            rrows.append([sheet, c[1], c[0], "", _blank_means(note), " | ".join(c[3] or []), note,
+                          _used_by(sheet, c[0])])
+    for k, what in PSCAD_KEYS_DOC:
+        rrows.append(["PSCAD_Params", k, "", "", "", "", what, "PSCAD"])
+    ref_tab("Input_Reference", ["Sheet", "Field", "Key", "Unit", "Blank means", "Choices", "Description", "Used by"],
+            [95, 170, 120, 50, 140, 160, 520, 100], rrows)
+
+    drows = []
+    for model, (hdr, nic, names) in DYR_LIB.items():
+        drows.append(["#", model, "", "", "", "", MODEL_DOC.get(model, "")])
+        for k, nm in enumerate(names):
+            drows.append([model, ("ICON%d" % (k + 1)) if k < nic else ("CON%d" % (k - nic + 1)), nm,
+                          _txt(DYN_DEFAULTS[model].get(nm)) or "", "auto" if nm in AUTO_PARAMS.get(model, ()) else "",
+                          _param_doc(nm)])
+
+    def dm_extra(top):
+        ttk.Button(top, text="Add the selected parameter to Dyr_Params", command=lambda: add_param()).pack(
+            side="left", padx=12)
+    dm_tv = ref_tab("Dynamic_Models", ["Model", "Position", "Parameter", "Default", "Set by the script",
+                                       "Description"], [110, 80, 110, 80, 110, 600], drows, extra=dm_extra)
+
+    def add_param():
+        sel = dm_tv.selection()
+        if not sel:
+            return messagebox.showinfo("Dyr_Params", "Select a parameter first.", parent=root)
+        v = dm_tv.item(sel[0], "values")
+        if not v or v[0] not in DYR_LIB:
+            return
+        who = gen_names()[:1] or ["PLANT"]
+        if v[0] == "PLNTBU1":
+            who = ["PLANT"]
+        elif v[0] == "GENCLS":
+            who = ["IB"]
+        g = app["grids"]["dyr_params"]
+        g.rows.append({"generator": who[0], "model": v[0], "parameter": v[2], "value": v[3]})
+        g.refresh(len(g.rows) - 1)
+        dirty()
+        nb.select(nb.tabs()[[nb.tab(t, "text") for t in nb.tabs()].index("Dyr_Params")])
+        set_status("added %s %s to Dyr_Params -- set its Generator and Value" % (v[0], v[2]))
+
+    guide = ttk.Frame(nb)
+    nb.add(guide, text="README")
+    gt = tk.Text(guide, wrap="word", font=("Segoe UI", 10), padx=12, pady=10, relief="flat")
+    gs = ttk.Scrollbar(guide, orient="vertical", command=gt.yview)
+    gt.configure(yscrollcommand=gs.set)
+    gt.pack(side="left", fill="both", expand=True)
+    gs.pack(side="right", fill="y")
+    gt.tag_configure("h", font=("Segoe UI", 11, "bold"), foreground=navy, spacing1=8)
+    gt.insert("end", "USING THIS WINDOW\n", "h")
+    gt.insert("end", "Each tab is a sheet of the input workbook. Plant: one value per item. The other tabs: "
+                     "one row per item -- Add row, then double-click a cell (or select it and press Enter) to "
+                     "type; Tab moves to the next cell, Enter to the row below, Esc cancels. A blank cell takes "
+                     "the default shown in the help line. Model type (toolbar or Plant) chooses SMIB or DETAILED "
+                     "for PSS/E and PSCAD alike.\n"
+                     "Save the project (.json), then Build models: the .raw, .dyr, report and PSCAD build script "
+                     "go to SMIB_MODELS beside the project. Excel is optional: Open a workbook you have (it is "
+                     "imported), or export the project as one (File menu).\n")
+    for topic, text in README:
+        if topic:
+            gt.insert("end", topic + "\n", "h")
+        gt.insert("end", text + "\n")
+    gt.configure(state="disabled")
+
+    out_tab = ttk.Frame(nb)
+    nb.add(out_tab, text="Output")
+    ot = tk.Text(out_tab, wrap="none", font=("Consolas", 9), background="#FBFBFB")
+    oy = ttk.Scrollbar(out_tab, orient="vertical", command=ot.yview)
+    ox = ttk.Scrollbar(out_tab, orient="horizontal", command=ot.xview)
+    ot.configure(yscrollcommand=oy.set, xscrollcommand=ox.set)
+    ot.grid(row=0, column=0, sticky="nsew")
+    oy.grid(row=0, column=1, sticky="ns")
+    ox.grid(row=1, column=0, sticky="ew")
+    out_tab.rowconfigure(0, weight=1)
+    out_tab.columnconfigure(0, weight=1)
+    ot.tag_configure("bad", foreground="#C00000")
+    ot.tag_configure("note", foreground="#7F6000")
+
+    def out(text):
+        for ln in text.splitlines(True):
+            tag = "bad" if ("***" in ln or "CHECK" in ln or "Error" in ln) else ("note" if "NOTE" in ln else "")
+            ot.insert("end", ln, tag)
+        ot.see("end")
+
+    # ---------------------------------------------------------------- the data in and out of the widgets
+    def to_widgets():
+        for key, var in app["vars"].items():
+            var.set(data["plant"].get(key) or "")
+        for g in app["grids"].values():
+            g.refresh(0 if g.rows else None)
+        app["dirty"] = False
+
+    def from_widgets():
+        for g in app["grids"].values():
+            g.close_edit(True)
+        data["plant"] = dict((k, v.get().strip()) for k, v in app["vars"].items() if v.get().strip())
+
+    def load(inp, path, what):
+        new = gui_data(inp)
+        data.clear()
+        data.update(new)
+        app["path"] = path
+        to_widgets()
+        root.title("SMIB plant model -- %s" % (data["plant"].get("name") or "new"))
+        set_status(what)
+
+    def save_temp():
+        from_widgets()
+        d = tempfile.gettempdir()
+        p = os.path.join(d, "smib_check_inputs.json")
+        _replace_file(p, lambda t: _write_json(t, gui_save_data(data)))
+        return p
+
+    def ask_save_changes():
+        if not app["dirty"]:
+            return True
+        a = messagebox.askyesnocancel("Unsaved changes", "Save the changes to the project first?", parent=root)
+        if a is None:
+            return False
+        return save() if a else True
+
+    def save(as_new=False):
+        from_widgets()
+        path = app["path"] if app["path"] and app["path"].lower().endswith(".json") and not as_new else None
+        if not path:
+            path = filedialog.asksaveasfilename(parent=root, title="Save the project", defaultextension=".json",
+                                                initialdir=os.path.dirname(app["path"] or "") or here,
+                                                initialfile="%s.json" % (data["plant"].get("name") or "SMIB_PROJECT"),
+                                                filetypes=[("SMIB project", "*.json")])
+            if not path:
+                return False
+        _replace_file(path, lambda t: _write_json(t, gui_save_data(data)))
+        app["path"], app["dirty"] = path, False
+        set_status("saved")
+        return True
+
+    def open_any(path=None):
+        if not ask_save_changes():
+            return
+        path = path or filedialog.askopenfilename(parent=root, title="Open a project or a workbook", initialdir=here,
+                                                  filetypes=[("SMIB project or workbook", "*.json *.xlsx *.xlsm"),
+                                                             ("SMIB project", "*.json"), ("Workbook", "*.xlsx *.xlsm")])
+        if not path:
+            return
+        try:
+            inp = read_input(path)
+        except Exception as e:
+            return messagebox.showerror("Open", "%s:\n\n%s" % (path, e), parent=root)
+        load(inp, path if path.lower().endswith(".json") else None,
+             "opened %s" % path if path.lower().endswith(".json")
+             else "imported %s -- Save makes it a project (.json)" % path)
+        if inp.get("_unknown"):
+            out("[smib] not used from %s: %s\n" % (path, "; ".join(inp["_unknown"])))
+
+    def new(example):
+        if not ask_save_changes():
+            return
+        load(EXAMPLE if example else {"plant": {"model_type": "SMIB"}}, None,
+             "a new project from the example plant" if example else "a new, empty project")
+
+    def export_xlsx():
+        from_widgets()
+        path = filedialog.asksaveasfilename(parent=root, title="Export as a workbook", defaultextension=".xlsx",
+                                            initialdir=here, initialfile="%s.xlsx" % (data["plant"].get("name") or
+                                                                                      "SMIB_INPUT"),
+                                            filetypes=[("Workbook", "*.xlsx")])
+        if path:
+            _replace_file(path, lambda t: write_template(t, gui_save_data(data)))
+            set_status("exported %s" % path)
+
+    # ---------------------------------------------------------------- check and build, on a thread
+    def run(job, label):
+        if app["running"]:
+            return
+        app["running"] = True
+        for b in (b_check, b_build):
+            b.state(["disabled"])
+        nb.select(nb.tabs()[-1])
+        out("\n==== %s  %s ====\n" % (label, time.strftime("%H:%M:%S")))
+
+        def work():
+            res = {"ok": False}
+            try:
+                with contextlib.redirect_stdout(_Queue(app["q"])):
+                    res = job()
+            except InputError as e:
+                app["q"].put("[smib] *** input: %s\n" % e)
+                res = {"ok": False, "error": str(e)}
+            except SolveError as e:
+                app["q"].put("[smib] *** load flow: %s\n" % e)
+                res = {"ok": False, "error": str(e)}
+            except Exception:
+                app["q"].put(traceback.format_exc())
+                res = {"ok": False, "error": "an error -- see the Output tab"}
+            app["q"].put(("done", res))
+        threading.Thread(target=work).start()
+
+    def poll():
+        try:
+            while True:
+                m = app["q"].get_nowait()
+                if isinstance(m, tuple):
+                    finish(m[1])
+                else:
+                    out(m)
+        except queue.Empty:
+            pass
+        root.after(100, poll)
+
+    def finish(res):
+        app["running"] = False
+        for b in (b_check, b_build):
+            b.state(["!disabled"])
+        if res.get("out"):
+            app["out"] = res["out"]
+            b_open.state(["!disabled"])
+        if res.get("ok"):
+            set_status(res.get("msg", "done"))
+            if res.get("msg"):
+                messagebox.showinfo("SMIB", res["msg"], parent=root)
+        else:
+            err = res.get("error", "")
+            set_status("stopped: " + err[:120])
+            goto(err)
+            messagebox.showerror("SMIB", err or "stopped -- see the Output tab", parent=root)
+
+    def goto(err):
+        """Show the tab (and row) an input error names: 'Generators row 2 (BESS): ...', 'Plant: ...'."""
+        m = re.match(r"^(\w+) row (\d+)", err or "")
+        tabs = [nb.tab(t, "text") for t in nb.tabs()]
+        if m and m.group(1) in tabs:
+            nb.select(nb.tabs()[tabs.index(m.group(1))])
+            g = app["grids"].get(TABLE_KEY.get(m.group(1)))
+            if g:
+                n = int(m.group(2)) - 1                   # the n-th row with something in it
+                full = [i for i, r in enumerate(g.rows) if any(v for v in r.values()) and
+                        not str(r.get(g.keys[0]) or "").startswith("#")]
+                if 0 <= n < len(full):
+                    g.refresh(full[n])
+                named = [k for k, c in enumerate(g.cols) if c[1].lower() in err.lower()]
+                g.col = max(named, key=lambda k: len(g.cols[k][1])) if named else 0
+                g.tree.xview_moveto(0.0)
+                g.reveal(g.col)
+                g.show_help(g.keys[g.col])
+        elif (err or "").startswith("Plant"):
+            nb.select(nb.tabs()[0])
+            for key, item, _u2, _n, _c in PLANT_FIELDS:
+                if "'%s'" % item in err:
+                    widgets[key].focus_set()
+                    break
+
+    def check():
+        p = save_temp()
+
+        def job():
+            inp = read_input(p)
+            net = build_network(inp, Log())
+            operating_point(net, Log())
+            s = net.op["s_grid"]
+            for n in net.notes:
+                print("[smib] " + n)
+            msg = ("Inputs OK -- %s model: %d buses, %d machines; P at POI %.3f MW, Q %.3f MVAr, infinite bus %.5f pu"
+                   % (net.model, len(net.bus), len(net.gens), s.real, s.imag, net.op["e"]))
+            print("[smib] " + msg)
+            return {"ok": True, "msg": msg + ("" if not net.notes else "\n%d note(s) in the Output tab"
+                                                % len(net.notes))}
+        run(job, "CHECK")
+
+    def build_models():
+        if not save():
+            return
+        path = app["path"]
+
+        def job():
+            net, files = build(path, check=psse_var.get(), pscad=pscad_var.get())
+            out_dir = os.path.dirname(files["raw"])
+            return {"ok": True, "out": out_dir, "msg": "Models written to\n%s\n\n%s model, %d machines; the report: %s"
+                    % (out_dir, net.model, len(net.gens), os.path.basename(files["report"]))}
+        run(job, "BUILD")
+
+    def open_out():
+        p = app["out"]
+        if not p:
+            return
+        if sys.platform.startswith("win"):
+            os.startfile(p)                              # noqa
+        else:
+            subprocess.Popen(["xdg-open" if sys.platform != "darwin" else "open", p])
+
+    # ---------------------------------------------------------------- toolbar and menu
+    model_var = app["vars"]["model_type"]
+    psse_var, pscad_var = tk.BooleanVar(value=PSSE_CHECK), tk.BooleanVar(value=PSCAD_BUILD)
+    for txt, fn in (("New", lambda: new(True)), ("Open...", open_any), ("Save", save)):
+        ttk.Button(bar, text=txt, command=fn).pack(side="left", padx=2)
+    ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+    ttk.Label(bar, text="Model type:", style="Item.TLabel").pack(side="left")
+    ttk.Combobox(bar, textvariable=model_var, values=["SMIB", "DETAILED"], state="readonly", width=10).pack(
+        side="left", padx=4)
+    ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+    b_check = ttk.Button(bar, text="Check inputs", command=check)
+    b_check.pack(side="left", padx=2)
+    b_build = ttk.Button(bar, text="Build models", command=build_models)
+    b_build.pack(side="left", padx=2)
+    b_open = ttk.Button(bar, text="Open output folder", command=open_out)
+    b_open.pack(side="left", padx=2)
+    b_open.state(["disabled"])
+    ttk.Checkbutton(bar, text="PSS/E check", variable=psse_var).pack(side="left", padx=(12, 2))
+    ttk.Checkbutton(bar, text="PSCAD build", variable=pscad_var).pack(side="left", padx=2)
+
+    menu = tk.Menu(root)
+    fm = tk.Menu(menu, tearoff=0)
+    fm.add_command(label="New from the example plant", command=lambda: new(True))
+    fm.add_command(label="New, empty", command=lambda: new(False))
+    fm.add_command(label="Open project or workbook...", command=open_any)
+    fm.add_separator()
+    fm.add_command(label="Save project", command=save, accelerator="Ctrl+S")
+    fm.add_command(label="Save project as...", command=lambda: save(True))
+    fm.add_command(label="Export as an Excel workbook...", command=export_xlsx)
+    fm.add_separator()
+    fm.add_command(label="Exit", command=lambda: close())
+    menu.add_cascade(label="File", menu=fm)
+    rm = tk.Menu(menu, tearoff=0)
+    rm.add_command(label="Check inputs", command=check)
+    rm.add_command(label="Build models", command=build_models)
+    rm.add_command(label="Open output folder", command=open_out)
+    menu.add_cascade(label="Run", menu=rm)
+    root.config(menu=menu)
+    root.bind("<Control-s>", lambda e: save())
+
+    def close():
+        if app["running"] and not messagebox.askyesno("SMIB", "A build is running. Close anyway?", parent=root):
+            return
+        if ask_save_changes():
+            root.destroy()
+    root.protocol("WM_DELETE_WINDOW", close)
+
+    # ---------------------------------------------------------------- what it opens with
+    start = start or (os.path.join(here, GUI_PROJECT) if os.path.isfile(os.path.join(here, GUI_PROJECT)) else None)
+    if not start:
+        found = find_inputs([here])
+        start = found[0] if found else None
+    if start:
+        try:
+            load(read_input(start), start if start.lower().endswith(".json") else None,
+                 "opened %s" % start if start.lower().endswith(".json") else
+                 "imported %s -- Save makes it a project (.json)" % start)
+        except Exception as e:
+            load(EXAMPLE, None, "%s could not be read (%s) -- the example plant" % (start, e))
+    else:
+        load(EXAMPLE, None, "the example plant -- change it, Save, then Build models")
+    root.after(100, poll)
+    root.smib = {"data": data, "app": app, "nb": nb, "save": save, "check": check, "build": build_models,
+                 "open": open_any, "export": export_xlsx, "load": load, "vars": app["vars"], "grids": app["grids"],
+                 "new": new, "goto": goto, "from_widgets": from_widgets, "status": status, "psse": psse_var,
+                 "pscad": pscad_var, "ot": ot}               # the window's parts, for smib_build's own tests
+    root.mainloop()
+    return 0
+
+
+def _has_window():
+    """Whether this Python can open a window: tkinter, and a screen (Windows, or a display elsewhere)."""
+    try:
+        __import__("tkinter")
+    except ImportError:
+        return False
+    return sys.platform.startswith("win") or sys.platform == "darwin" or bool(os.environ.get("DISPLAY"))
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--psse-check" in argv:
@@ -5084,6 +6002,8 @@ def main(argv=None):
         print(__doc__)
         return 0
     files = [a for a in argv if not a.startswith("-")]
+    if "--gui" in argv or (GUI and not files and not INPUT_XLSX and _has_window()):
+        return gui(os.path.abspath(files[0]) if files else None)
     src = files[0] if files else INPUT_XLSX
     if not src:
         src = pick_input()
