@@ -126,6 +126,7 @@
                              equipment's own base, vector groups, initial values
 
    OUTPUT -- nothing that exists is ever overwritten
+     <name> = the plant's name and its model type: Hybrid_PV100_BESS100_SMIB, ..._DETAILED
      {OUT_DIR}\\<name>_<date_time>\\   <name>.raw / .dyr / .sav, <name>_REPORT.txt,
          <name>_PSCAD_DATA.txt, <name>_build_pscad.py, <name>_inputs.json, a copy
          of the workbook, _psse\\ (PSS/E's own output of the check run)
@@ -1786,6 +1787,7 @@ def build_network(inp, log):
     for g in gens:
         build_generator(net, g, feeders, cables, unit_mw, used, log)
     net.model = _choice(pl, "model_type", W, ["SMIB", "DETAILED"], "SMIB")
+    net.stem = "%s_%s" % (net.name, net.model)          # the output files' names: SMIB and DETAILED apart
     for g in gens:                                       # Units against the units its feeders carry
         on = [(c, res["N"].get(g["name"].upper(), 0)) for c, res in net.colls.items()
               if res["N"].get(g["name"].upper())]
@@ -3717,7 +3719,8 @@ def pscad_spec(net, inp, comps):
             cm["params"] = [_pp(p, [p], _fill_pscad(v, vals, w)) for p, v, w in params.get(cm["gen"], [])]
     c = net.ctl["pscad"]
     libs = list(c["libraries"]) + [cm["library"] for cm in comps if cm.get("library")]
-    return {"case": _safe_name(net.name, 30), "written": time.strftime("%Y-%m-%d %H:%M"),
+    return {"case": _safe_name(net.name, 29 - len(net.model)) + "_" + net.model,
+            "written": time.strftime("%Y-%m-%d %H:%M"),
             "settings": {"time_duration": c["duration_s"], "time_step": c["time_step_us"],
                          "sample_step": c["plot_step_us"], "description": ("%s %s" % (net.model, net.name))[:60]},
             "libraries": [l for k, l in enumerate(libs) if l and l not in libs[:k]],
@@ -4592,7 +4595,7 @@ def write_pscad(net, inp, out, log):
         for it in cm["params"]:                     # a missing optional one is not listed as a CHECK
             it["need"] = cm["kind"] == "VENDOR" or not (cm["kind"] == "METER" or it["what"] in optional or
                                                          it["what"].startswith("source impedance"))
-    path = os.path.join(out, net.name + "_build_pscad.py")
+    path = os.path.join(out, net.stem + "_build_pscad.py")
     text = (_BUILD_PSCAD.replace("@NAME@", net.name).replace("@DATE@", spec["written"])
             .replace("@FILE@", os.path.basename(path)).replace("@SPEC@", json.dumps(spec, indent=1)))
     _write_text(path, text)
@@ -5020,7 +5023,7 @@ def psse_check(net, recs, inp, files, out, here_only=False):
     """PSS/E's check of the models in `out`: in this Python when it has PSS/E's psspy (PSSE_VERSION), else -- not
        here_only -- in a Python that has one: this script again, with --psse-check <out>."""
     pre = Log(echo=False)
-    path = os.path.join(out, net.name + "_PSSE_CHECK.txt")
+    path = os.path.join(out, net.stem + "_PSSE_CHECK.txt")
     if not psse_start(pre) and not here_only:
         py = psse_python(pre)
         if py:
@@ -5033,8 +5036,8 @@ def psse_check(net, recs, inp, files, out, here_only=False):
             except (IOError, OSError):
                 log("*** the PSS/E check in %s left no %s (exit %s)" % (py, os.path.basename(path), rc))
             for k, ext in (("sav", ".sav"), ("raw_psse", "_psse%d.raw" % (PSSE_VERSION or 0)), ("snp", ".snp")):
-                if os.path.isfile(os.path.join(out, net.name + ext)):
-                    files[k] = os.path.join(out, net.name + ext)
+                if os.path.isfile(os.path.join(out, net.stem + ext)):
+                    files[k] = os.path.join(out, net.stem + ext)
             return log
     log = FileLog(path)
     log("PSS/E CHECK -- %s %s   %s" % (net.model, net.name, time.strftime("%Y-%m-%d %H:%M")))
@@ -5129,13 +5132,13 @@ def _psse_steps(net, recs, inp, files, out, work, log):
         log(w)
     if not worst and ok:
         log("PSS/E's solution is this script's (within %.2f MW, %.2f MVAr, %.4f pu)" % (TOL_MW, TOL_MVAR, TOL_V_PU))
-    sav = os.path.join(out, net.name + ".sav")
+    sav = os.path.join(out, net.stem + ".sav")
     ie = _ie(psspy.save(_new(sav)))
     log("saved %s: %s" % (os.path.basename(sav), "ok" if ie in (0, None) else "*** ierr %s" % ie))
     if ie in (0, None):
         files["sav"] = sav
     ver = (PSSE_RUNNING or (PSSE_VERSION or 0, 0))[0]
-    raw2 = os.path.join(out, "%s_psse%d.raw" % (net.name, ver))
+    raw2 = os.path.join(out, "%s_psse%d.raw" % (net.stem, ver))
     try:                                         # the case in this PSS/E's own .raw format
         ie = _ie(psspy.rawd_2(0, 1, [1, 1, 1, 0, 0, 0, 0], 0, _new(raw2)))
         log("wrote %s (PSS/E %d's own .raw): %s" % (os.path.basename(raw2), ver, "ok" if ie in (0, None)
@@ -5172,7 +5175,7 @@ def _psse_steps(net, recs, inp, files, out, work, log):
     log("dyre_new: %s" % ("ok" if ie in (0, None) else "*** ierr %s" % ie))
     if ie not in (0, None):
         return
-    snp = os.path.join(out, net.name + ".snp")
+    snp = os.path.join(out, net.stem + ".snp")
     try:                                         # the dynamics snapshot, with the .sav: the case to study from
         ie = _ie(psspy.snap([-1, -1, -1, -1, -1], _new(snp)))
         log("saved %s: %s" % (os.path.basename(snp), "ok" if ie in (0, None) else "*** ierr %s" % ie))
@@ -5185,7 +5188,7 @@ def _psse_steps(net, recs, inp, files, out, work, log):
     for g in net.gens:
         for code, q in ((2, "P"), (3, "Q"), (4, "V")):
             psspy.machine_array_channel([-1, code, num(g["bus"])], g["id"], "%s %s" % (q, g["name"]))
-    outf = os.path.join(work, net.name + "_flat.out")
+    outf = os.path.join(work, net.stem + "_flat.out")
     ie = _ie(psspy.strt_2([0, 1], outf))
     log("strt_2: %s" % ("ok" if ie in (0, None) else "*** ierr %s" % ie))
     if ie not in (0, None):
@@ -5294,26 +5297,26 @@ def build(src, out_dir=None, check=True, pscad=True):
     log("[smib] operating point: P at POI %.3f MW, Q %.3f MVAr, POI %.5f pu, infinite bus %.5f pu"
         % (s.real, s.imag, net.bus["POI"]["vm"], net.op["e"]))
     base = out_dir or OUT_DIR or os.path.join(os.path.dirname(os.path.abspath(src)), "SMIB_MODELS")
-    out = stem = os.path.join(base, "%s_%s" % (net.name, time.strftime("%Y%m%d_%H%M%S")))
+    out = stem = os.path.join(base, "%s_%s" % (net.stem, time.strftime("%Y%m%d_%H%M%S")))
     k = 2
     while os.path.exists(out):                   # a second run within the same second: a folder of its own
         out = "%s_%d" % (stem, k)
         k += 1
     os.makedirs(out)
-    files = {"raw": os.path.join(out, net.name + ".raw"), "dyr": os.path.join(out, net.name + ".dyr"),
-             "json": os.path.join(out, net.name + "_inputs.json")}
+    files = {"raw": os.path.join(out, net.stem + ".raw"), "dyr": os.path.join(out, net.stem + ".dyr"),
+             "json": os.path.join(out, net.stem + "_inputs.json")}
     try:
         write_raw(net, files["raw"])
         recs = write_dyr(net, inp, files["dyr"])
         comps, spec, files["pscad_build"] = write_pscad(net, inp, out, log)
-        files["pscad_data"] = os.path.join(out, net.name + "_PSCAD_DATA.txt")
+        files["pscad_data"] = os.path.join(out, net.stem + "_PSCAD_DATA.txt")
         _write_text(files["pscad_data"], pscad_data_text(net, comps, spec))
         clean = dict((k, v) for k, v in inp.items() if not k.startswith("_"))
         _write_text(files["json"], json.dumps(clean, indent=1, sort_keys=True, default=str))
         if src.lower().endswith((".xlsx", ".xlsm")):
             files["xlsx"] = os.path.join(out, os.path.basename(src))
             shutil.copy2(src, _new(files["xlsx"]))
-        files["report"] = os.path.join(out, net.name + "_REPORT.txt")
+        files["report"] = os.path.join(out, net.stem + "_REPORT.txt")
         net.notes[:] = list(collections.OrderedDict.fromkeys(net.notes))
         _write_text(files["report"], report_text(net, inp, recs, comps, files, src))
     except BaseException:
@@ -5350,7 +5353,7 @@ def psse_check_only(out):
     net = build_network(inp, quiet)
     operating_point(net, quiet)
     recs = dyr_models(net, inp)
-    files = {"raw": os.path.join(out, net.name + ".raw"), "dyr": os.path.join(out, net.name + ".dyr")}
+    files = {"raw": os.path.join(out, net.stem + ".raw"), "dyr": os.path.join(out, net.stem + ".dyr")}
     psse_check(net, recs, inp, files, out, here_only=True)
     return 0 if psspy is not None else 3
 
