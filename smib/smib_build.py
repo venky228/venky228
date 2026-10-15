@@ -118,12 +118,15 @@
                              source at the solved terminal voltage and angle
                              (the transformers' phase shifts included) -- a
                              check that PSCAD's network matches PSS/E's; delete
-                             it and connect a UDM to its node (a model of one
-                             unit through PSCAD's current scaler, as in its
-                             vendor's test case). A UDM with its GSU inside:
-                             PSCAD inverter at MV. A timed fault on the grid side
-                             of the POI (Plant: PSCAD fault ...). One wired
-                             single-line diagram, its page sized to fit. Every
+                             it and connect a UDM to its node. SMIB: a UDM is
+                             one unit, carried N times by PSCAD's current
+                             scaler beside it (its scale = the generator's
+                             units, as in vendors' test cases); DETAILED: no
+                             scaler. A meter at each inverter (P, Q, V). A UDM
+                             with its GSU inside: PSCAD inverter at MV. A timed
+                             fault on the grid side of the POI (Plant: PSCAD
+                             fault ...). One wired single-line diagram, nothing
+                             overlapping, its page sized to fit. Every
                              parameter it set, and any it could not, is listed
                              in its log, <name>_build_pscad_<date_time>.txt.
      <name>_PSCAD_DATA.txt   every PSCAD value: ohm, H, uF, kV, MVA, pu on the
@@ -1725,8 +1728,8 @@ def oem_model(path):
 
 def oem_symbol(path, name=None, iid=None):
     """The symbol of definition `name` -- or of the component with ID iid -- in an OEM's PSCAD file (.pscx /
-       .pslx), from its XML: {"w", "h": its extent, "ports": {name: (x, y)} electrical} in grid units from its
-       origin, or None."""
+       .pslx), from its XML: {"w", "h": its extent, "x0", "x1": its left and right, "ports": {name: (x, y)}
+       electrical, "texts": [(x, y, width)] centred} in grid units from its origin, or None."""
     import xml.etree.ElementTree as ET
     try:
         root = ET.parse(path).getroot()
@@ -1738,7 +1741,7 @@ def oem_symbol(path, name=None, iid=None):
     el = next((d for d in root.iter() if d.tag.lower() == "definition" and
                (d.get("name") or "").upper() == (name or "").upper()), None) if name else None
     g = el.find(".//graphics") if el is not None else None
-    xs, ys, ports = [], [], {}
+    xs, ys, ports, texts = [], [], {}, []
     for x in (g.iter() if g is not None else []):
         t, prm = x.tag.lower(), dict(((q.get("name") or "").lower(), q.get("value") or "") for q in x.iter("param"))
         try:
@@ -1754,6 +1757,7 @@ def oem_symbol(path, name=None, iid=None):
         elif "text" in (x.get("classid") or "").lower():
             w = len(x.get("text") or prm.get("text") or "") * NAME_CH / 2.0
             pts = [(gx - w, gy), (gx + w, gy)]
+            texts.append((gx, gy, 2.0 * w))
         else:
             pts = [(gx + float(v.get("x") or 0) / 18.0, gy + float(v.get("y") or 0) / 18.0) for v in x.iter("vertex")]
             if x.get("w") is not None:
@@ -1763,7 +1767,21 @@ def oem_symbol(path, name=None, iid=None):
         ys += [b for _a, b in pts]
     if not xs:
         return None
-    return {"w": max(xs) - min(xs), "h": max(ys) - min(ys), "ports": ports}
+    return {"w": max(xs) - min(xs), "h": max(ys) - min(ys), "x0": min(xs), "x1": max(xs), "ports": ports,
+            "texts": texts}
+
+
+def port_pad(sym, port=None):
+    """How far the text beside a vendor symbol's AC port (its name, as a rule) reaches past the port, away from
+       its box (grid units, whole): room its wire leaves for it."""
+    ps = sym.get("ports") or {}
+    p = (ps.get(port) or next(iter(ps.values()))) if ps else None
+    if p is None:
+        return 0
+    out = 1.0 if p[0] > (sym["x0"] + sym["x1"]) / 2.0 else -1.0
+    far = [(tx - p[0]) * out + tw / 2.0 for tx, ty, tw in sym.get("texts", []) if abs(ty - p[1]) <= 1.5 and
+           (tx - p[0]) * out > -tw / 2.0]
+    return int(math.ceil(max(far))) if far else 0
 
 
 def section_rxb(r, cab, f, w):
@@ -4071,10 +4089,10 @@ def _fp(what, names, value, desc, cat=None, pick=None, choice=None, nope=None):
 
 
 def _meter(tag, a, b, kv, sig, net, note):
-    """A multimeter between node a, where the power comes from, and node b, a on its right: mirrored, so the flow
-       a -> b reads positive (unmirrored it reads left to right). P, Q and RMS voltage as signals P_, Q_, V_<sig>
-       in MW, MVAr and kV (base 1 MVA, base kV its bus's), the RMS voltage shown digitally, an animated display,
-       0.02 s smoothing -- the other measurements off."""
+    """A multimeter between node a, where the power comes from, and node b: the flow a -> b reads positive -- it
+       reads left to right, mirrored right to left (turned by where a and b lie: _turn). P, Q and RMS voltage as
+       signals P_, Q_, V_<sig> in MW, MVAr and kV (base 1 MVA, base kV its bus's), the RMS voltage shown
+       digitally, an animated display, 0.02 s smoothing -- the other measurements off."""
     cfg, yes, no = ["CONFIG"], [["YES"]], [["NO"]]
     return {"tag": tag, "kind": "METER", "defn": ["master:multimeter"], "x": 0, "y": 0, "orient": 4, "note": note,
             "params": [_fp("animated display", ["Dis", "Anim"], None, ["ANIMATED"], cfg, yes, ["YES"]),
@@ -4093,8 +4111,48 @@ def _meter(tag, a, b, kv, sig, net, note):
                        _fp("P signal", ["P"], "P_" + sig, ["ACTIVE", "POWER"], ["SIGNAL"], nope=["REACTIVE"]),
                        _fp("Q signal", ["Q"], "Q_" + sig, ["REACTIVE", "POWER"], ["SIGNAL"]),
                        _fp("Vrms signal", ["Vrms"], "V_" + sig, ["RMS", "VOLTAGE"], ["SIGNAL"])],
-            "ports": [{"node": _node(b), "pick": ["@left", "@first"]},
-                      {"node": _node(a), "pick": ["@right", "@second"]}]}
+            "from_to": (a, b), "ports": _turn_ports(a, b, False)}
+
+
+def _scaled(net, inp, g, sl):
+    """The units a current scaler gives generator g's vendor model (UDM) of one unit: its slot's in the equivalent
+       (SMIB) model -- 0 (none) in the DETAILED model, for a stand-in source (it holds them all), for one unit, and
+       for a UDM whose PSCAD_Params give it {UNITS} (it counts them itself)."""
+    ps = g["pscad"]
+    if net.model != "SMIB" or not (ps["iid"] or ps["definition"]) or sl["units"] < 2:
+        return 0
+    mine = members(net)
+    if any("{UNITS}" in (_txt(r.get("value")) or "").upper() for r in inp["pscad_params"]
+           if g["name"] in mine.get((_txt(r.get("generator")) or "").upper(), [])):
+        net.notes.append("NOTE: PSCAD: %s's vendor model is given {UNITS} (PSCAD_Params): it counts its units "
+                         "itself -- no current scaler" % g["name"])
+        return 0
+    return int(round(sl["units"]))
+
+
+def _scaler(tag, a, b, n, note):
+    """PSCAD's current scaler between node a, one unit's (its UDM's), and node b, the network's: its network side
+       carries n times the current of its unit's side -- the unit's side on its left, mirrored on its right
+       (turned by where a and b lie: _turn)."""
+    return {"tag": tag, "kind": "SCALER", "defn": ["master:current_scaler"], "x": 0, "y": 0, "orient": 4,
+            "note": note, "params": [_pp("scale", ["G_CDCS"], "%d" % n), _pp("dimension", ["Dim"], "3")],
+            "from_to": (a, b), "ports": _turn_ports(a, b, False)}
+
+
+def _turn_ports(a, b, a_left):
+    """The two ends of a part that runs from node a to node b, a's on its left or on its right."""
+    left, right = (a, b) if a_left else (b, a)
+    return [{"node": _node(left), "pick": ["@left", "@first"]}, {"node": _node(right), "pick": ["@right", "@second"]}]
+
+
+def _turn(comps):
+    """Each meter and current scaler turned by where its two sides lie in the drawing: from (the UDM's side, the
+       plant's) on its left -- as drawn, left to right -- it is placed as it is; on its right, mirrored."""
+    for cm in comps:
+        if cm.get("from_to"):
+            a, b = cm["from_to"]
+            a_left = cm.get("in") == _node(a)
+            cm["orient"], cm["ports"] = (0 if a_left else 4), _turn_ports(a, b, a_left)
 
 
 def _pi_comp(ln, net):
@@ -4249,11 +4307,22 @@ def pscad_model(net, inp):
         first = len(comps)
         if g["gsu"] and id(g["gsu"]) not in inside:
             comps.append(_tx2_comp(g["gsu"], net, 0, 0))
+        sl["inv"] = sl["node"]                           # the inverter's node: past its meter and its scaler
         if c["inv_meter"]:                               # its own P, Q, V: inverter to GSU positive
             sl["term"] = sl["name"] + "_TERM"
-            comps.append(_meter(sl["name"] + "_PQ", sl["term"], sl["node"], sl["kv"], sl["name"], net,
-                                "P, Q (MW, MVAr: out of the inverter positive), Vrms (kV) of %s" % sl["name"]))
+            comps.append(_meter(sl["name"] + "_PQ", sl["term"], sl["inv"], sl["kv"], sl["name"], net,
+                                "P, Q (MW, MVAr: out of the inverter positive%s), Vrms (kV) of %s" % (
+                                    ", all %s units" % _g(sl["units"]) if sl["units"] != 1 else "", sl["name"])))
+            sl["inv"] = sl["term"]
+        n = _scaled(net, inp, g, sl)
+        if n:                                            # SMIB: one unit's UDM, its current n times over
+            sl["one"] = sl["name"] + "_UNIT"
+            comps.append(_scaler(sl["name"] + "_NX", sl["one"], sl["inv"], n, "%s units from one: the network "
+                                 "side carries %d x the current of the UDM's side" % (sl["name"], n)))
+            sl["inv"] = sl["one"]
         comps.append(_inverter_comp(g, sl, net, 0, 0))
+        if n:
+            sl["model"] += " -- one unit, x %d by %s_NX" % (n, sl["name"])
         comps[first]["hang"] = bool(g.get("family"))    # a DETAILED unit group: below its feeder node, always
         slots.append(sl)
     net.pscad_slots = slots
@@ -4296,6 +4365,7 @@ def pscad_model(net, inp):
         c3["x3"], c3["y3"] = c3["x"], c3["y"]          # where R, L and C are three-phase in this PSCAD
         c3["parts3"] = c3.pop("parts", {})
     comps, net.pscad_groups = pscad_layout(comps)
+    _turn(comps)
     net.pscad_comps = comps
     return comps
 
@@ -4308,7 +4378,7 @@ PSCAD_W3 = 8          # the same where PSCAD's R, L, C take the wire's three pha
 PSCAD_H3 = 10
 NAME_CH = 0.42        # a node name's width per character (grid units) at PSCAD's default zoom
 PSCAD_TALL = 720       # a drawing this tall (grid units) goes on in another column: PSCAD's largest page is 800
-SYMBOL_HALF = {"XFMR2": 4, "XFMR3": 4, "PI": 3, "METER": 2, "SOURCE": 3, "VENDOR": 3}   # half widths (grid units)
+SYMBOL_HALF = {"XFMR2": 4, "XFMR3": 4, "PI": 3, "METER": 2, "SCALER": 2, "SOURCE": 3, "VENDOR": 3}   # half widths
 
 
 def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PSCAD_PAD):
@@ -4368,8 +4438,8 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
         """c hanging off node frm (at x) on row y, then what lies beyond it -> (bottom, right). edge: the right
            edge of the symbol before it on its row: the wire between them long enough for frm's name."""
         x0 = x + (pad if rlc(c) and frm and not mid(frm) else 0) + c.get("lead", 0)
-        if edge is not None and frm and not rlc(c):
-            x0 = max(x0, edge + room(frm) + half(c) - cw // 2)
+        if edge is not None and frm and not rlc(c):          # and the text by a vendor model's port clear of it
+            x0 = max(x0, edge + room(frm) + 2 * c.get("pad_l", 0) + half(c) - cw // 2)
         put(c, x0 + cw // 2, y, frm)
         right, bottom = x0 + max(cw * c.get("room", 1), cw // 2 - half(c) + c.get("sym_w", 0) + 3), y
         far = [n for n in nodes[id(c)] if n != frm]
@@ -4541,19 +4611,22 @@ _SYMS = {}
 
 def _sym_room(c, path, name, iid=None):
     """Vendor model c given its symbol's width and height (grid units) where the OEM's file can be read, so the
-       layout leaves room for it -> c."""
+       layout leaves room for it -- and for the text beside its AC port, outside its wire's name -> c."""
     key = (path, name, iid)
     if key not in _SYMS:
         _SYMS[key] = oem_symbol(path, name, iid) if path and os.path.isfile(path) else None
-    if _SYMS[key]:
-        c["sym_w"], c["sym_h"] = int(math.ceil(_SYMS[key]["w"])), int(math.ceil(_SYMS[key]["h"]))
+    sym = _SYMS[key]
+    if sym:
+        c["sym_w"], c["sym_h"] = int(math.ceil(sym["w"])), int(math.ceil(sym["h"]))
+        ac = next((k for k in c["ports"][0]["pick"] if not k.startswith("@")), None) if c["ports"] else None
+        c["pad_l"] = port_pad(sym, ac)
     return c
 
 
 def _inverter_comp(g, sl, net, x, y):
     """The inverter in its slot: the generator's vendor model (UDM), or a stand-in source holding the load flow."""
     ps = g["pscad"]
-    node = _node(sl.get("term", sl["node"]))           # its own node: past its meter, else its slot's
+    node = _node(sl.get("inv", sl["node"]))            # its own node: past its meter and scaler, else its slot's
     what = "%s units, P %.3f MW, Q %.3f MVAr, V %.5f pu at %.4f deg (PSCAD angle)" % (
         _g(sl["units"]), sl["p"], sl["q"], sl["vm"], sl["ang"])
     src = ps["source"]
@@ -4677,12 +4750,12 @@ def pscad_spec(net, inp, comps):
             "settings": {"time_duration": c["duration_s"], "time_step": c["time_step_us"],
                          "sample_step": c["plot_step_us"], "description": ("%s %s" % (net.model, net.name))[:60]},
             "libraries": [l for k, l in enumerate(libs) if l and l not in libs[:k]],
-            "slots": [{"tag": sl["tag"], "node": _node(sl.get("term", sl["node"])), "units": sl["units"],
+            "slots": [{"tag": sl["tag"], "node": _node(sl.get("inv", sl["node"])), "units": sl["units"],
                        "p": sl["p"], "q": sl["q"],
                        "vm": sl["vm"], "ang": sl["ang"], "model": sl["model"]} for sl in net.pscad_slots],
             "groups": [{"kind": gr["kind"], "a": _node(gr["a"]), "b": _node(gr["b"]),
                         "members": [[t, _node(i), _node(o)] for t, i, o in gr["members"]]} for gr in net.pscad_groups],
-            "components": [dict((k, v) for k, v in cm.items() if k not in ("value", "unit", "slot", "gen"))
+            "components": [dict((k, v) for k, v in cm.items() if k not in ("value", "unit", "slot", "gen", "from_to"))
                            for cm in comps]}
 
 
@@ -4739,16 +4812,28 @@ def _free(stem, ext):
 
 
 def eports(cmp):
-    """[(name, x, y, dim)] of the component's electrical ports (grid units, after rotation)."""
+    """[(name, x, y, dim)] of the component's electrical ports (grid units, after rotation): every one, as PSCAD
+       lists them -- ports() keeps one of two that share a name, as a meter's two ends can -- the second of a
+       name as name#2."""
     try:
-        ports = cmp.ports()
+        raw = list(cmp._ports())
     except Exception:
-        return []
-    out = []
-    for name, p in ports.items():
         try:
-            if int(p[4]) == 3:
-                out.append((str(name), int(p[0]), int(p[1]), int(p[3])))
+            raw = list(cmp.ports().values())
+        except Exception:
+            return []
+    out, names = [], set()
+    for p in raw:
+        try:
+            if int(p[4]) not in (3, 4):               # electrical, or one end of a short (a meter's)
+                continue
+            name = str(p[2]).split(":")[0]
+            nm, k = name, 1
+            while nm in names:
+                k += 1
+                nm = "%s#%d" % (name, k)
+            names.add(nm)
+            out.append((nm, int(p[0]), int(p[1]), int(p[3])))
         except Exception:
             pass
     return out
@@ -4794,7 +4879,7 @@ def pick(ports, picks, taken):
             continue
         if not k.startswith("@"):
             for p in free:
-                if p[0].upper() == k.upper():
+                if p[0].split("#")[0].upper() == k.upper():
                     return p
             continue
         if not free:
@@ -5129,6 +5214,43 @@ def pi_ports(cmp, c, reported, log, first):
 
 
 PI_NOTE = []               # the PI Sections whose ports PSCAD reports where it does not draw them
+METER_NOTE = []            # the meters (and current scalers) PSCAD reports one end of
+
+
+def two_ends(cmp, c, ports):
+    """A meter's or a current scaler's two ends: where PSCAD reports one only, the other opposite it, about the
+       middle of its symbol (of its place, where its extent cannot be read)."""
+    if len(ports) != 1:
+        return ports
+    b = _box(cmp)
+    try:
+        mid = (b[0] + b[2]) / 2.0 if b else float(tuple(cmp.location)[0])
+    except Exception:
+        mid = c["x"]
+    p = ports[0]
+    x = int(round(2 * mid - p[1]))
+    if x == p[1]:
+        return ports
+    q = (p[0] + "#2", x, p[2], p[3])
+    METER_NOTE.append("%s: PSCAD reports one end, %s at (%d, %d) -- the other taken at (%d, %d)" % (
+        c["tag"], p[0], p[1], p[2], q[1], q[2]))
+    return sorted([p, q], key=lambda r: r[1])
+
+
+def on_row(cmp, c, ports, log, first):
+    """A two-ended part whose ends PSCAD puts off its place (the current scaler's: a grid unit above it, not
+       about its middle) moved so that they lie on its row, about its place -> its ports."""
+    if len(ports) != 2 or ports[0][2] != ports[1][2]:
+        return ports
+    dx = int(c["x"] - (ports[0][1] + ports[1][1]) // 2)
+    dy = int(c["y"] - ports[0][2])
+    if (dx or dy) and _move(cmp, dx, dy):
+        if first:
+            log("    moved (%+d, %+d): its ends on its row, about its place" % (dx, dy))
+        return [(p[0], p[1] + dx, p[2] + dy, p[3]) for p in ports]
+    return ports
+
+
 PORT_NOTE = {}             # the vendor models whose AC port PSCAD reports where their symbol does not draw it
 DEFN_XML = {}              # "case:name" -> its definition's XML (an OEM's, or read from PSCAD)
 MIRRORED = set()           # the vendor models mirrored here: their symbol had the AC port on its right
@@ -5196,7 +5318,7 @@ def _on_edge(b, x, y):
 
 def udm_port(pscad, cmp, c, used, p):
     """Port p (name, x, y, dim) as PSCAD reports it -- or where the vendor model's symbol draws it, when PSCAD
-       reports it off the symbol's outline and its definition draws it once, on it."""
+       reports it off the symbol's outline and its definition draws it once, within the symbol."""
     b = _box(cmp)
     if c.get("copy_of") or b is None or _on_edge(b, p[1], p[2]):
         return p
@@ -5209,7 +5331,7 @@ def udm_port(pscad, cmp, c, used, p):
         return p
     sx, sy = spots[0]
     d = (int(round(lx + (-sx if c["tag"] in MIRRORED else sx))), int(round(ly + sy)))
-    if d == (p[1], p[2]) or not _on_edge(b, d[0], d[1]):
+    if d == (p[1], p[2]) or not (b[0] - 0.5 <= d[0] <= b[2] + 0.5 and b[1] - 0.5 <= d[1] <= b[3] + 0.5):
         return p
     PORT_NOTE[c["tag"]] = "%s: PSCAD reports its port %s at (%d, %d); its symbol draws it at (%d, %d) -- wired " \
         "there" % (c["tag"], p[0], p[1], p[2], d[0], d[1])
@@ -5223,10 +5345,16 @@ def udm_fit(pscad, canvas, cmp, c, used, ports, log, first):
     if p is None:
         return ports
 
-    def now(name):
+    def now(name):                                            # its ports, and the port as PSCAD reports it
         got = eports(cmp)
-        q = next((x for x in got if x[0] == name), None)
-        return got, (udm_port(pscad, cmp, c, used, q) if q is not None else None)
+        return got, next((x for x in got if x[0] == name), None)
+
+    def x_at():
+        try:
+            return float(tuple(cmp.location)[0])
+        except Exception:
+            return None
+    p0, x0 = p, x_at()
     p = udm_port(pscad, cmp, c, used, p)
     b = _box(cmp)
     if b is not None and p[1] > (b[0] + b[2]) / 2.0:          # on its right, away from its GSU: mirrored
@@ -5234,8 +5362,13 @@ def udm_fit(pscad, canvas, cmp, c, used, ports, log, first):
             if not _mirror(canvas, cmp, how):
                 continue
             MIRRORED.symmetric_difference_update([c["tag"]])
-            got, q = now(p[0])
-            b2 = _box(cmp)
+            got, q0 = now(p[0])
+            x1, b2 = x_at(), _box(cmp)
+            if q0 is not None and None not in (x0, x1) and q0[1] != x1 and p0[1] != x0:
+                turned = (q0[1] - x1) * (p0[1] - x0) < 0          # as reported: across its middle
+            else:
+                turned = q0 is not None and b2 is not None and q0[1] < (b2[0] + b2[2]) / 2.0
+            q = udm_port(pscad, cmp, c, used, q0) if turned else None
             if q is not None and b2 is not None and q[1] < (b2[0] + b2[2]) / 2.0:
                 ports, p, b = got, q, b2
                 if first:
@@ -5253,7 +5386,7 @@ def udm_fit(pscad, canvas, cmp, c, used, ports, log, first):
     if (dx or dy) and _move(cmp, dx, dy):
         got, q = now(p[0])
         if q is not None:
-            ports, p = got, q
+            ports, p = got, udm_port(pscad, cmp, c, used, q)
         if first:
             log("    moved (%+d, %+d): its AC port %s at the end of its lead, (%d, %d)" % (dx, dy, p[0], p[1], p[2]))
     return [p if x[0] == p[0] else x for x in ports]
@@ -5545,7 +5678,7 @@ def phase_group(canvas, g, made, spec_of, points, log):
     for k in range(3):                               # fanning out: the bottom phase turns first
         wire(canvas, (sx, one[k][2]), (sx + 3 - k, one[k][2]), (sx + 3 - k, ins[k][2]), (ins[k][1], ins[k][2]))
     points.setdefault(g["a"], []).append((tri[1], tri[2], "breakout", tri[0],
-                                          spec_of[g["members"][0][0]].get("parts", {}).get(g["a"], 0)))
+                                          spec_of[g["members"][0][0]].get("parts", {}).get(g["a"], 0), tri[1] + 1))
     _trace("comp", role="breakout", group=g["members"][0][0], side="in", ports=[tri] + one)
     if g["kind"] == "series":
         outs, sx = [rows[k][-1][2] for k in range(3)], oneo[0][1]
@@ -5553,7 +5686,8 @@ def phase_group(canvas, g, made, spec_of, points, log):
             wire(canvas, (outs[k][1], outs[k][2]), (sx - 3 + k, outs[k][2]), (sx - 3 + k, oneo[k][2]),
                  (sx, oneo[k][2]))
         points.setdefault(g["b"], []).append((tro[1], tro[2], "breakout", tro[0],
-                                              spec_of[g["members"][-1][0]].get("parts", {}).get(g["b"], 0)))
+                                              spec_of[g["members"][-1][0]].get("parts", {}).get(g["b"], 0),
+                                              tro[1] - 1))
         _trace("comp", role="breakout", group=g["members"][0][0], side="out", ports=[tro] + oneo)
     else:
         for k in range(3):
@@ -5562,26 +5696,35 @@ def phase_group(canvas, g, made, spec_of, points, log):
     return added
 
 
+TRUNK_OFF = 2             # a trunk this far right of the part whose right end it leaves: clear of its symbol
+
+
 def plan(points):
     """Each node's wires: from its leftmost port along its row to what carries on, and down a trunk to what hangs
-       below -> {node: [(a, b) ...]}."""
+       below -- the trunk TRUNK_OFF right of a part's right end, clear of its symbol -> {node: [(a, b) ...]}."""
     out = {}
     for node in sorted(points):
         pts = sorted(set((p[0], p[1]) for p in points[node]))
         if node == "GND" or len(pts) < 2:
             continue
         ax, ay = pts[0]
+        off = [q for q in pts[1:] if q[1] != ay]
+        row = [q for q in pts[1:] if q[1] == ay]
+        tx = ax                                       # the trunk
+        if off and all(q[0] > ax + TRUNK_OFF for q in pts[1:]) and \
+                any(len(p) > 5 and p[5] < ax and (p[0], p[1]) == (ax, ay) for p in points[node]):
+            tx = ax + TRUNK_OFF
+            row = sorted(row + [(tx, ay)])
         segs, prev = [], (ax, ay)
-        for q in [q for q in pts[1:] if q[1] == ay]:
+        for q in row:
             segs.append((prev, q))
             prev = q
-        off = [q for q in pts[1:] if q[1] != ay]
         if off:
             ys = sorted(set([ay] + [q[1] for q in off]))
             for y1, y2 in zip(ys, ys[1:]):
-                segs.append(((ax, y1), (ax, y2)))
+                segs.append(((tx, y1), (tx, y2)))
             for y in sorted(set(q[1] for q in off)):
-                prev = (ax, y)
+                prev = (tx, y)
                 for q in sorted(q for q in off if q[1] == y):
                     if q != prev:
                         segs.append((prev, q))
@@ -5791,6 +5934,10 @@ def main():
             ports = pi_ports(cmp, c, ports, log, first)
         elif c["kind"] == "VENDOR":                   # its AC port facing its GSU, at the end of its lead
             ports = udm_fit(pscad, canvas, cmp, c, used, ports, log, first)
+        elif c["kind"] == "METER":
+            ports = two_ends(cmp, c, ports)
+        elif c["kind"] == "SCALER":
+            ports = on_row(cmp, c, two_ends(cmp, c, ports), log, first)
         if any(p["node"] for p in c["ports"]) and len(ports) > len(c["ports"]) and "View" in str(seen_defn[used]):
             log("    (%d electrical ports: %s)" % (len(ports), ", ".join(p[0] for p in ports)))
         taken, picked = set(), []
@@ -5840,7 +5987,8 @@ def main():
     for c in SPEC["components"]:
         if c["tag"] in made and c["tag"] not in grouped:
             for node, q in made[c["tag"]][2]:
-                points.setdefault(node, []).append((q[1], q[2], c["tag"], q[0], c.get("parts", {}).get(node, 0)))
+                points.setdefault(node, []).append((q[1], q[2], c["tag"], q[0], c.get("parts", {}).get(node, 0),
+                                                    c["x"]))
     for c in SPEC["components"]:
         if c.get("drives") and c["tag"] in made and c["drives"] in made:
             link(canvas, made[c["tag"]][0], made[c["drives"]][0], "%s -> %s" % (c["tag"], c["drives"]), log)
@@ -5858,6 +6006,9 @@ def main():
             "drawn port; %s" % (len(PORT_NOTE), PORT_NOTE[sorted(PORT_NOTE)[0]]))
     if MIRRORED:
         log("vendor models mirrored to face their GSU (their symbol has the AC port on its right): %d" % len(MIRRORED))
+    if METER_NOTE:
+        log("meters, current scalers: %d whose second end PSCAD does not report -- taken opposite the first, "
+            "about the symbol's middle; %s" % (len(METER_NOTE), METER_NOTE[0]))
     w, h = reach(canvas)
     if PAGE[0] and (w > PAGE[0] or h > PAGE[1]) and (w > NEED[0] or h > NEED[1]):    # past what the layout said
         page(canvas, w, h, log)
@@ -5892,7 +6043,7 @@ if __name__ == "__main__":
 def write_pscad(net, inp, out, log):
     comps = pscad_model(net, inp)
     spec = pscad_spec(net, inp, comps)
-    optional = ("base kV", "magnitude (pu)", "name", "view", "no-load losses (pu)", "base frequency")
+    optional = ("base kV", "magnitude (pu)", "name", "view", "no-load losses (pu)", "base frequency", "dimension")
     for cm in spec["components"]:
         for it in cm["params"]:                     # a missing optional one is not listed as a CHECK
             it["need"] = cm["kind"] == "VENDOR" or not (cm["kind"] == "METER" or it["what"] in optional or
@@ -5912,10 +6063,17 @@ def pscad_slot_lines(net, ind):
                                                               "angle", "model")]
     for sl in net.pscad_slots:
         L.append(ind + "  %-24s %-24s %6s %10.3f %10.3f %9.5f %10.4f  %s%s" % (
-            sl["tag"], _node(sl["node"]), _g(sl["units"]), sl["p"], sl["q"], sl["vm"], sl["ang"], sl["model"],
-            "  (GSU inside: on its HV side)" if sl["at"] == "MV" else ""))
-    L.append(ind + "  A vendor model of one unit: wire it as in its vendor's test case -- the model, PSCAD's current "
-                   "scaler (master:current_scaler, its scale = the units above), then the node.")
+            sl["tag"], _node(sl.get("inv", sl["node"])), _g(sl["units"]), sl["p"], sl["q"], sl["vm"], sl["ang"],
+            sl["model"], "  (GSU inside: on its HV side)" if sl["at"] == "MV" else ""))
+    if any(sl.get("one") for sl in net.pscad_slots):
+        L.append(ind + "  A vendor model is one unit: PSCAD's current scaler beside it (master:current_scaler, "
+                       "<name>_NX, its scale the units above) carries them all, as in vendors' test cases.")
+    elif net.model == "SMIB":
+        L.append(ind + "  A vendor model (Generators: PSCAD definition) is one unit: it gets PSCAD's current scaler "
+                       "beside it, its scale the units above, as in vendors' test cases.")
+    else:
+        L.append(ind + "  DETAILED: no current scaler -- a vendor model stands for its slot's units by itself "
+                       "(PSCAD_Params {UNITS}, where it has a setting for them).")
     flt = next((c for c in getattr(net, "pscad_comps", []) if c["kind"] == "FAULT"), None)
     if flt:
         L.append(ind + "POI_FAULT: %s (its timing: POI_FAULT_TIMER)" % flt["note"])
@@ -8339,8 +8497,8 @@ def gui(start=None):
         def job():
             net, files = build(path, check=psse_var.get(), pscad=pscad_var.get())
             out_dir = files["dir"]
-            made = [w for k, w in (("raw", "PSSE\\ .raw"), ("dyr", "PSSE\\ .dyr"), ("pscad_build", "PSCAD\\ model"))
-                    if files.get(k)]
+            made = [w for k, w in (("raw", "PSSE\\ .raw"), ("dyr", "PSSE\\ .dyr"), ("epc", "PSLF\\ .epc"),
+                                   ("dyd", "PSLF\\ .dyd"), ("pscad_build", "PSCAD\\ model")) if files.get(k)]
             return {"ok": True, "out": out_dir, "msg": "Models written to\n%s\n\n%s model, %d machines: %s; the "
                     "report: %s" % (out_dir, net.model, len(net.gens), ", ".join(made),
                                     os.path.basename(files["report"]))}
