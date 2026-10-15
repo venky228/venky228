@@ -238,15 +238,17 @@ PLANT_FIELDS = [
     ("tie_length", "Gen-tie length", "", "POI to the substation HV bus; blank = no gen-tie (the MPTs on the POI bus)",
      None),
     ("tie_unit", "Gen-tie length unit", "", "km, mi, kft, m, ft (blank = km)", LEN_UNITS),
-    ("tie_r_per", "Gen-tie R per length", "ohm", "one circuit, per length unit", None),
-    ("tie_x_per", "Gen-tie X per length", "ohm", "one circuit, per length unit", None),
-    ("tie_b_per", "Gen-tie B per length", "uS", "one circuit, per length unit (total charging)", None),
+    ("tie_per_unit", "Gen-tie values per", "", "the length R, X, B, C below are per: km, mi, kft, m, ft (blank = "
+     "the Gen-tie length unit)", LEN_UNITS),
+    ("tie_r_per", "Gen-tie R per length", "ohm", "one circuit (blank = a typical overhead line of the POI kV)", None),
+    ("tie_x_per", "Gen-tie X per length", "ohm", "one circuit (blank = typical)", None),
+    ("tie_b_per", "Gen-tie B per length", "uS", "one circuit, total charging (blank = typical)", None),
     ("tie_c_per", "Gen-tie C per length", "uF", "instead of B", None),
     ("tie_r_ohm", "Gen-tie R total", "ohm", "instead of per length (one circuit)", None),
     ("tie_x_ohm", "Gen-tie X total", "ohm", "", None),
     ("tie_b_us", "Gen-tie B total", "uS", "", None),
     ("tie_parallel", "Gen-tie circuits", "", "identical circuits in parallel (blank = 1)", None),
-    ("tie_rate_mva", "Gen-tie rating", "MVA", "one circuit", None),
+    ("tie_rate_mva", "Gen-tie rating", "MVA", "one circuit (blank = typical for the POI kV)", None),
     ("control_mode", "Control mode", "", "Q: Q at the POI | PF: power factor at the POI | V: the plant holds the POI "
      "voltage with the grid at Grid voltage", ["Q", "PF", "V"]),
     ("v_poi_pu", "POI voltage", "pu", "the POI voltage the plant holds (blank = 1.0)", None),
@@ -301,10 +303,11 @@ MPT_COLS = [
     ("rate_mva", "Rating MVA", "blank = MVA", None, 8),
     ("tie_length", "Tie length", "a line of its own from HV to this MPT (blank = none)", None, 9),
     ("tie_unit", "Tie length unit", "", LEN_UNITS, 7),
-    ("tie_r_per", "Tie R per length", "ohm", None, 8),
-    ("tie_x_per", "Tie X per length", "ohm", None, 8),
-    ("tie_b_per", "Tie B per length", "uS", None, 8),
-    ("tie_rate_mva", "Tie rating MVA", "", None, 8),
+    ("tie_per_unit", "Tie values per", "the length R, X, B are per (blank = Tie length unit)", LEN_UNITS, 7),
+    ("tie_r_per", "Tie R per length", "ohm (blank = a typical overhead line of the HV kV)", None, 8),
+    ("tie_x_per", "Tie X per length", "ohm (blank = typical)", None, 8),
+    ("tie_b_per", "Tie B per length", "uS (blank = typical)", None, 8),
+    ("tie_rate_mva", "Tie rating MVA", "blank = typical", None, 8),
 ]
 
 GEN_COLS = [
@@ -461,7 +464,8 @@ EXAMPLE = {
         "name": "Hybrid_PV100_BESS100", "model_type": "SMIB", "sbase_mva": 100.0, "out_raw": "YES",
         "out_dyr": "YES", "out_pscad": "YES", "freq_hz": 60.0, "first_bus": 1000,
         "poi_kv": 230.0, "poi_name": "POI", "grid_scr": 3.0, "grid_x_r": 10.0,
-        "tie_length": 5.0, "tie_unit": "km", "tie_r_per": 0.0720, "tie_x_per": 0.4950, "tie_b_per": 3.35,
+        "tie_length": 5.0, "tie_unit": "km", "tie_per_unit": "km", "tie_r_per": 0.0720, "tie_x_per": 0.4950,
+        "tie_b_per": 3.35,
         "tie_parallel": 1, "tie_rate_mva": 400.0,
         "control_mode": "Q", "v_poi_pu": 1.0, "q_poi_mvar": 0.0, "pf_poi": 1.0, "v_grid_pu": 1.0,
         "plant_ctrl": "REPC_B", "regc_repc": "standard",
@@ -1432,32 +1436,84 @@ class Net(object):
         return self.bus[self.alias.get(role.upper(), role)]["kv"]
 
 
+# typical overhead lines, one circuit, positive sequence, at 60 Hz -- what blank gen-tie values take:
+# (kV class, R ohm/km at 75 C, X ohm/km, B uS/km, rating MVA, conductor)
+OHL_TYPICAL = [
+    (34.5, 0.14, 0.42, 3.9, 35.0, "477 kcmil ACSR"),
+    (69.0, 0.21, 0.48, 3.4, 70.0, "336 kcmil ACSR"),
+    (115.0, 0.14, 0.48, 3.5, 130.0, "477 kcmil ACSR"),
+    (138.0, 0.085, 0.49, 3.4, 215.0, "795 kcmil ACSR"),
+    (161.0, 0.085, 0.50, 3.3, 250.0, "795 kcmil ACSR"),
+    (230.0, 0.072, 0.495, 3.35, 400.0, "795 kcmil ACSR"),
+    (345.0, 0.034, 0.37, 4.5, 1200.0, "2 x 954 kcmil ACSR"),
+    (500.0, 0.020, 0.33, 5.0, 2500.0, "3 x 954 kcmil ACSR"),
+    (765.0, 0.011, 0.27, 6.2, 4000.0, "4 x 1351 kcmil ACSR"),
+]
+
+
+def ohl_typical(kv, f):
+    """The typical overhead line nearest kv -> {kv, r, x, b (per km, at f), rate, cond}."""
+    t = min(OHL_TYPICAL, key=lambda t: abs(math.log(kv / t[0])))
+    return {"kv": t[0], "r": t[1], "x": t[2] * f / 60.0, "b": t[3] * f / 60.0, "rate": t[4], "cond": t[5]}
+
+
 def line_data(d, prefix, kv, sb, f, where):
-    """A line from <prefix>length / _unit / _r_per ... (or _r_ohm ... totals): None when none is given.
-       r, x, b in pu on sb at kv for one circuit; R, X (ohm), B (uS) one circuit; count circuits."""
+    """A line from <prefix>length / _unit / _r_per ... (or _r_ohm ... totals): None when none is given. The per
+       length values are per <prefix>per_unit (blank = the length's unit); blank ones take a typical overhead line
+       of its kV (OHL_TYPICAL), and ones far from it are CHECKed (a unit mixed up).
+       r, x, b in pu on sb at kv for one circuit; R, X (ohm), B (uS) one circuit; count circuits; notes."""
     g = lambda k: d.get(prefix + k)
     length = _num(d, prefix + "length", where)
     totals = any(g(k) not in (None, "") for k in ("r_ohm", "x_ohm"))
     if not totals and not length:
         return None
     unit = _choice(d, prefix + "unit", where, LEN_UNITS, "km")
+    per_unit = _choice(d, prefix + "per_unit", where, LEN_UNITS, None) or unit
+    km = (length or 0.0) * LEN_KM[unit]
+    typ, notes, used = ohl_typical(kv, f), [], []
     if totals:
         R = _num(d, prefix + "r_ohm", where, 0.0)
         X = _num(d, prefix + "x_ohm", where, 0.0)
         B = _num(d, prefix + "b_us", where, 0.0)
     else:
-        R = _num(d, prefix + "r_per", where, required=True) * length
-        X = _num(d, prefix + "x_per", where, required=True) * length
-        b = _num(d, prefix + "b_per", where)
-        c = _num(d, prefix + "c_per", where)
-        B = (b if b is not None else (2.0 * math.pi * f * c if c is not None else 0.0)) * length
+        def per_km(key, typical, what):
+            v = _num(d, prefix + key, where)
+            if v is None:
+                used.append(what)
+                return typical
+            return v / LEN_KM[per_unit]               # per <per_unit> -> per km
+        r_km, x_km = per_km("r_per", typ["r"], "R"), per_km("x_per", typ["x"], "X")
+        b, c = _num(d, prefix + "b_per", where), _num(d, prefix + "c_per", where)
+        if b is None and c is None:
+            used.append("B")
+            b_km = typ["b"]
+        else:
+            b_km = (b if b is not None else 2.0 * math.pi * f * c) / LEN_KM[per_unit]
+        R, X, B = r_km * km, x_km * km, b_km * km
+        if used:
+            notes.append("NOTE: %s: %s per length not given -- a typical %g kV overhead line (%s, one circuit): R %g, "
+                         "X %g ohm/km, B %g uS/km" % (where, ", ".join(used), typ["kv"], typ["cond"], typ["r"],
+                                                      round(typ["x"], 4), round(typ["b"], 4)))
     if abs(complex(R, X)) < 1e-9:
         raise InputError("%s: the line has no impedance" % where)
+    if km > 0:                                        # far from a line of its kV: a unit mixed up?
+        for what, v, t in (("R", R / km, typ["r"]), ("X", X / km, typ["x"]), ("B", B / km, typ["b"])):
+            if v > 0 and not 0.2 <= v / t <= 5.0:
+                msg = "%s: %s %.4g %s/km is %s a typical %g kV line's %.4g -- %s" % (
+                    where, what, v, "uS" if what == "B" else "ohm", "%.0f times" % (v / t) if v > t else
+                    "1/%.0f of" % (t / v), typ["kv"], t, "are the R, X, B per %s? ('values per' unit: the length "
+                    "they are per%s)" % (per_unit, "" if totals else ", now %s" % per_unit) if not totals else
+                    "check the totals and the length")
+                if not 0.02 <= v / t <= 50.0:
+                    raise InputError(msg)
+                notes.append("CHECK: " + msg)
+    rate = _num(d, prefix + "rate_mva", where, None)
+    if rate is None:
+        rate = typ["rate"]
+        notes.append("NOTE: %s: rating not given -- %g MVA, a typical %g kV line's" % (where, rate, typ["kv"]))
     zb = kv * kv / sb
-    km = (length or 0.0) * LEN_KM[unit]
     return {"r": R / zb, "x": X / zb, "b": B * 1e-6 * zb, "R": R, "X": X, "B": B, "km": km,
-            "count": _int(d, prefix + "parallel", where, 1, minimum=1), "rate": _num(d, prefix + "rate_mva", where, 0.0),
-            "kv": kv}
+            "count": _int(d, prefix + "parallel", where, 1, minimum=1), "rate": rate, "kv": kv, "notes": notes}
 
 
 def tx_rx(z_pct, x_r, load_loss_kw, mva, where, what):
@@ -1850,6 +1906,7 @@ def build_network(inp, log):
 
     tie = line_data(pl, "tie_", poi_kv, sb, f, "Plant (gen-tie)")
     if tie:
+        net.notes.extend(tie["notes"])
         net.add_bus("HV", poi_kv, W)
         add_line(net, "POI", "HV", tie, "GEN-TIE", "GENTIE", "Plant (gen-tie)")
     else:
@@ -1974,6 +2031,7 @@ def build_mpt(net, r, f):
     hv = net.find("HV", w)
     tie = line_data(r, "tie_", net.kv("HV"), net.sb, f, w + " tie")
     if tie:
+        net.notes.extend(tie["notes"])
         hv = net.add_bus(name + ":HV", net.kv("HV"), w)
         add_line(net, net.find("HV", w), hv, tie, name + "-TIE", "TIE", w)
     else:
@@ -6224,7 +6282,8 @@ def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None, tie="PER
         b = num(gt.get("tie_b_per"))
         if b is None and num(gt.get("tie_c_per")):        # uF -> uS
             b = num(gt["tie_c_per"]) * 2.0 * math.pi * (num(pl.get("freq_hz")) or 60.0)
-        own_tie = {"tie_length": gt.get("tie_length"), "tie_unit": gt.get("tie_unit"), "tie_r_per": gt.get("tie_r_per"),
+        own_tie = {"tie_length": gt.get("tie_length"), "tie_unit": gt.get("tie_unit"),
+                   "tie_per_unit": gt.get("tie_per_unit"), "tie_r_per": gt.get("tie_r_per"),
                    "tie_x_per": gt.get("tie_x_per"), "tie_b_per": b, "tie_rate_mva": gt.get("tie_rate_mva")}
         for r in out_mpt:                                  # a gen-tie of each MPT's own, POI to its HV
             r.update(own_tie)
