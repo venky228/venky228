@@ -281,9 +281,10 @@ PLANT_FIELDS = [
 # table sheets: (key, column, note, choices, width)
 MPT_COLS = [
     ("name", "Name", "# MPT name. Its buses: <name> or <name>:LV (LV winding), <name>:TV (tertiary)", None, 11),
+    ("windings", "Windings", "2 or 3 (blank = 3 when TV kV is given, else 2)", ["2", "3"], 7),
     ("hv_kv", "HV kV", "", None, 7),
     ("lv_kv", "LV kV", "", None, 7),
-    ("tv_kv", "TV kV", "tertiary / 2nd LV winding; blank = two windings", None, 9),
+    ("tv_kv", "TV kV", "tertiary / 2nd LV winding (Windings 3; blank = the LV kV, a split LV winding)", None, 9),
     ("mva", "MVA", "the rating (3 windings: HV winding)", None, 8),
     ("lv_mva", "LV MVA", "3 windings", None, 7),
     ("tv_mva", "TV MVA", "3 windings", None, 7),
@@ -474,7 +475,7 @@ EXAMPLE = {
         "pscad_fault": "YES", "pscad_fault_dur_s": 0.15, "pscad_fault_type": "ABCG", "pscad_fault_ohm": 0.01,
     },
     "mpt": [
-        {"name": "MPT1", "hv_kv": 230.0, "lv_kv": 34.5, "mva": 225.0, "z_hl_pct": 10.0, "x_r": 45.0,
+        {"name": "MPT1", "windings": "2", "hv_kv": 230.0, "lv_kv": 34.5, "mva": 225.0, "z_hl_pct": 10.0, "x_r": 45.0,
          "vector": "YNd1", "tap": 1.0, "count": 1, "rate_mva": 225.0},
     ],
     "generators": [
@@ -2016,6 +2017,19 @@ def build_network(inp, log):
     return net
 
 
+def _windings(r, w):
+    """An MPT's Windings: 2, 3 or None (blank: 3 when it has a TV kV)."""
+    v = r.get("windings")
+    if v is None or str(v).strip() == "":
+        return None
+    t = re.sub(r"[\s_-]", "", str(v).upper())
+    for n, words in ((2, ("2", "2.0", "2W", "TWO", "2WINDING", "2WINDINGS", "TWOWINDING")),
+                     (3, ("3", "3.0", "3W", "THREE", "3WINDING", "3WINDINGS", "THREEWINDING"))):
+        if t in words:
+            return n
+    raise InputError("%s: Windings %r -- 2 or 3" % (w, v))
+
+
 def build_mpt(net, r, f):
     w = r["_where"]
     name = _txt(r.get("name"))
@@ -2026,6 +2040,27 @@ def build_mpt(net, r, f):
     kv2 = _num(r, "lv_kv", w, required=True, positive=True)
     kv3 = _num(r, "tv_kv", w, None, positive=True)
     mva = _num(r, "mva", w, required=True, positive=True)
+    nw = _windings(r, w)
+    vector = _txt(r.get("vector"))
+    vm = _VG.match((vector or "").replace(" ", ""))
+    turns = re.findall(r"(yn|y|d|zn|z)(\d{1,2})", vm.group(2)) if vm else []
+    if nw == 2 and kv3 is not None:
+        net.notes.append("NOTE: %s: Windings 2 -- its TV kV (and the other three-winding values) not used" % w)
+        kv3 = None
+    if nw == 3 and kv3 is None:
+        kv3 = kv2
+        net.notes.append("NOTE: %s: Windings 3, no TV kV -- the TV winding at the LV's %g kV (a split LV winding)"
+                         % (w, kv2))
+    if kv3 is not None and len(turns) == 1:            # a two-winding group: the TV winding as the LV one
+        vector = vector.replace(" ", "") + "".join(turns[0])
+        net.notes.append("NOTE: %s: vector group %s for three windings -- %s (the TV winding as the LV one)"
+                         % (w, _txt(r.get("vector")), vector))
+    if kv3 is None and len(turns) == 2:
+        if nw is None:
+            raise InputError("%s: vector group %s has three windings -- set Windings 3 (and TV kV), or a "
+                             "two-winding group (YNd1 ...)" % (w, vector))
+        vector = vector.replace(" ", "")[:len(vector.replace(" ", "")) - len("".join(turns[1]))]
+        net.notes.append("NOTE: %s: Windings 2 -- vector group %s for its two windings" % (w, vector))
     tap = _num(r, "tap", w, 1.0, positive=True)
     count = _int(r, "count", w, 1, minimum=1)
     hv = net.find("HV", w)
@@ -2039,7 +2074,7 @@ def build_mpt(net, r, f):
     if abs(kv1 / net.kv("HV") - 1.0) > 0.05:
         net.notes.append("CHECK: %s: HV %.4g kV on the %.4g kV HV bus" % (w, kv1, net.kv("HV")))
     lv = net.add_bus(name + ":LV", kv2, w, aliases=(name,))
-    common = {"name": name, "kind": "MPT", "tap": tap, "count": count, "where": w, "vector": _txt(r.get("vector")),
+    common = {"name": name, "kind": "MPT", "tap": tap, "count": count, "where": w, "vector": vector,
               "nll_pct": _num(r, "nll_pct", w, 0.0), "im_pct": _num(r, "im_pct", w, 0.0),
               "x_r": _num(r, "x_r", w)}
     if kv3 is None:
