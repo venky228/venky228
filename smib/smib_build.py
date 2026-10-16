@@ -606,8 +606,11 @@ README = [
                      "and PSCAD angle, {P_INV_MW} {Q_INV_MVAR} {V_INV_PU} at the inverters' own terminals (a UDM on "
                      "the MV side), {FREQ} -- e.g. Ninv = {UNITS}, Vt0 = {V_PU}. In the GUI, the PSCAD_Params tab "
                      "shows each vendor model's parameters, read from its definition in its file, a column per "
-                     "generator: double-click one to change it (a choice from its list), clear it to go back to "
-                     "the model's own."),
+                     "generator -- and, picked under Definition, those of the parts inside it (its controller ...) "
+                     "and its signals set by a constant, slider or switch (FreqDroop ...): double-click one to "
+                     "change it (a choice from its list), clear it to go back to the model's own. A part's "
+                     "setting is Part/Setting (Controller4/UFLevel1), a signal's its source's Value "
+                     "(var_switch#5/Value); they change a copy of the definition of the generator's own."),
     ("PSCAD", "The .pscx is built in the same run when PSCAD 5 and its Python library mhi.pscad (pip install "
               "mhi.pscad) are on the PC; otherwise run <name>_build_pscad.py where they are. "
               "The case holds the grid (source and Thevenin impedance), the gen-tie, the MPTs, each collector (the "
@@ -1787,10 +1790,11 @@ def port_pad(sym, port=None):
     return int(math.ceil(max(far))) if far else 0
 
 
-def udm_form(path, name=None, iid=None):
+def udm_form(path, name=None, iid=None, library=False):
     """The parameters of definition `name` -- or of the component with ID iid, with the values it has there -- in
        an OEM's PSCAD file (.pscx / .pslx), from its XML -> {"defn": its name, "params": [{name, desc, type, unit,
-       min, max, default, choices, cat, help}], "placed": {name: value} of the component iid}, or None."""
+       min, max, default, choices, cat, help}], "placed": {name: value} of the component iid, "parts": the parts
+       inside it with settings of their own (udm_parts)}, or None."""
     import xml.etree.ElementTree as ET
     try:
         root = ET.parse(path).getroot()
@@ -1806,8 +1810,21 @@ def udm_form(path, name=None, iid=None):
             if q.get("name") and q.get("name") not in placed:
                 placed[q.get("name")] = q.get("value") or ""
     name = (name or "").split(":")[-1]
-    el = next((d for d in root.iter() if d.tag.lower() == "definition" and
-               (d.get("name") or "").upper() == name.upper()), None) if name else None
+    defs = dict(((d.get("name") or "").upper(), d) for d in root.iter() if d.tag.lower() == "definition" and
+                d.get("name"))
+    el = defs.get(name.upper()) if name else None
+    out = _form_params(el)
+    if out is None:
+        return None
+    scope = root.get("name") or os.path.splitext(os.path.basename(path))[0]
+    return {"defn": el.get("name"), "params": out, "placed": placed,
+            "parts": udm_parts(defs, scope, el.get("name"), library),
+            "signals": udm_signals(defs, scope, el.get("name"))}
+
+
+def _form_params(el):
+    """A definition's form: its parameters [{name, desc, type, unit, min, max, default, choices, cat, help}], or
+       None where it has no form."""
     form = el.find(".//form") if el is not None else None
     if form is None:
         return None
@@ -1823,7 +1840,110 @@ def udm_form(path, name=None, iid=None):
                         "default": (val.text or "").strip() if val is not None and val.text else "",
                         "choices": [(c.text or "").strip() for c in x.iter("choice")], "cat": cat.get("name") or "",
                         "help": (hlp.text or "").strip() if hlp is not None and hlp.text else ""})
-    return {"defn": el.get("name"), "params": out, "placed": placed}
+    return out
+
+
+def part_steps(el):
+    """The parts placed in a definition's schematic, each with the name it goes by in a path: its definition's
+       name -- name#k, k counting from 1, where it has more than one of them -> [(name, element)]."""
+    sch = el.find("schematic") if el is not None else None
+    users = list(sch.iter("User")) if sch is not None else []
+    short = [(u.get("defn") or "").split(":")[-1] for u in users]
+    many = collections.Counter(x.upper() for x in short)
+    seen, out = collections.Counter(), []
+    for u, sh in zip(users, short):
+        seen[sh.upper()] += 1
+        out.append((sh if many[sh.upper()] == 1 else "%s#%d" % (sh, seen[sh.upper()]), u))
+    return out
+
+
+def udm_signals(defs, scope, name, prefix="", depth=0):
+    """The signals set inside definition `name` by a value of their own -- a constant, a slider or a switch wired
+       to the signal's data label -- at any depth: [{signal, path (var_switch#2 ...; inside a part:
+       Controller4/const#1), defn, value, min, max, label}] -- the value is the part's Value."""
+    out, el = [], defs.get((name or "").upper())
+    sch = el.find("schematic") if el is not None else None
+    if sch is None or depth > 8:
+        return out
+    up = {}
+
+    def top(a):
+        up.setdefault(a, a)
+        while up[a] != a:
+            up[a] = up[up[a]]
+            a = up[a]
+        return a
+    for w in sch.iter("Wire"):
+        try:
+            x0, y0 = int(w.get("x")), int(w.get("y"))
+            vs = [(x0 + int(v.get("x")), y0 + int(v.get("y"))) for v in w.iter("vertex")]
+        except (TypeError, ValueError):
+            continue
+        for a, b2 in zip(vs, vs[1:]):
+            ra, rb = top(a), top(b2)
+            if ra != rb:
+                up[ra] = rb
+    names = collections.defaultdict(list)
+    for u in sch.iter("User"):
+        if (u.get("defn") or "").lower() == "master:datalabel":
+            nm = next((q.get("value") for q in u.iter("param") if q.get("name") == "Name"), None)
+            try:
+                if nm:
+                    names[top((int(u.get("x")), int(u.get("y"))))].append(nm)
+            except (TypeError, ValueError):
+                pass
+    for step, u in part_steps(el):
+        d = (u.get("defn") or "").split(":", 1)
+        prm = collections.OrderedDict()
+        for q in u.iter("param"):
+            if q.get("name") and q.get("name") not in prm:
+                prm[q.get("name")] = q.get("value") or ""
+        if len(d) == 2 and d[0].upper() == scope.upper() and d[1].upper() in defs:
+            out += udm_signals(defs, scope, d[1], prefix + step + "/", depth + 1)
+            continue
+        if d[0].lower() != "master" or "Value" not in prm:
+            continue
+        try:
+            x, y, o = int(u.get("x")), int(u.get("y")), int(u.get("orient") or 0)
+        except (TypeError, ValueError):
+            continue
+        dx = -36 if o & 4 else 36                    # its output, two grid units out (as drawn: rotated, mirrored)
+        tips = [(dx, 0)] if o % 4 == 0 else [(-dx, 0)] if o % 4 == 2 else [(0, 36), (0, -36)]
+        got = []
+        for tx, ty in tips:
+            got += [n for n in names.get(top((x + tx, y + ty)), []) if n not in got]
+        for sig in got:
+            out.append({"signal": sig, "path": prefix + step, "defn": u.get("defn"), "value": prm["Value"],
+                        "min": prm.get("Min"), "max": prm.get("Max"), "label": prm.get("Name") or ""})
+    return out
+
+
+def udm_parts(defs, scope, name, library=False, prefix="", depth=0):
+    """The parts inside definition `name` with settings of their own, at any depth: [{path (Controller4; a part
+       inside it Controller4/PWM#2), defn, params}] -- each made from one of the file's own definitions, with its
+       form and the values that part has; with library, the master library's parts too, their values as they
+       stand. defs: {NAME: definition element}."""
+    out = []
+    if depth > 8:
+        return out
+    for step, u in part_steps(defs.get((name or "").upper())):
+        vals = collections.OrderedDict()
+        for q in u.iter("param"):
+            if q.get("name") and q.get("name") not in vals:
+                vals[q.get("name")] = q.get("value") or ""
+        d = (u.get("defn") or "").split(":", 1)
+        mine = len(d) == 2 and d[0].upper() == scope.upper() and d[1].upper() in defs
+        if mine:
+            form = _form_params(defs[d[1].upper()]) or []
+            if form:
+                out.append({"path": prefix + step, "defn": d[1],
+                            "params": [dict(q, default=vals.get(q["name"], q["default"])) for q in form]})
+            out += udm_parts(defs, scope, d[1], library, prefix + step + "/", depth + 1)
+        elif library and vals:
+            out.append({"path": prefix + step, "defn": u.get("defn") or "", "params": [
+                {"name": k, "desc": "", "type": "", "unit": "", "min": None, "max": None, "default": v, "choices": [],
+                 "cat": "", "help": ""} for k, v in vals.items()]})
+    return out
 
 
 def udm_choice(p, v):
@@ -1834,17 +1954,25 @@ def udm_choice(p, v):
 
 def udm_doc(p):
     """A vendor model's parameter as its form has it: its type, unit, range or choices, its page and help."""
-    rng = ("%s .. %s" % (p["min"], p["max"])) if p["min"] not in (None, "") and p["max"] not in (None, "") and \
-        p["min"] != p["max"] else ""
+    def real(v):
+        try:
+            return abs(float(v)) < 1e9                # not one of the forms' "no limit" (1E+308, 2147483647)
+        except (TypeError, ValueError):
+            return False
+    rng = ("%s .. %s" % (p["min"], p["max"])) if real(p["min"]) and real(p["max"]) and p["min"] != p["max"] else ""
     what = " | ".join(p["choices"]) if p["choices"] else " ".join(x for x in (p["type"], p["unit"], rng) if x)
     return "%s%s%s" % (what, ("   [%s]" % p["cat"]) if p["cat"] else "", ("   " + p["help"]) if p["help"] else "")
 
 
-def udm_check(p, text, where):
+def udm_check(p, text, where, part=False):
     """A value typed for a vendor model's parameter p -> the value kept (a choice's code: 0, not 0 = 250 kW); an
        InputError where it cannot be: a choice it does not have, a number outside its range, a {KEY} that is
-       not one."""
+       not one -- or any {KEY} for a part inside it (part: its settings are in the definition, one for all the
+       generator's inverters)."""
     text = str(text).strip()
+    if part and "{" in text:
+        raise InputError("%s: a part inside the vendor model takes a value, not %s -- its settings are in the "
+                         "definition, one for all of the generator's inverters" % (where, text))
     if p["type"].upper() == "CHOICE":
         code = text.split("=")[0].strip()
         if p["choices"] and code not in [c.split("=")[0].strip() for c in p["choices"]]:
@@ -1863,10 +1991,12 @@ def udm_check(p, text, where):
     return text
 
 
-def udm_table(data):
+def udm_table(data, library=False):
     """What the PSCAD_Params tab shows: each generator's vendor model (UDM) parameters, read from its definition,
-       with the value its PSCAD model gets -> ([generators with one], [{defn, src, params: [(param, {generator:
-       (value, how)})]}], notes); how: set (a PSCAD_Params row), case (the copied component's own), default."""
+       and those of the parts inside it (Controller4 ...), with the value its PSCAD model gets -> ([generators with
+       one], [{label, defn, src, part, params: [(key, {p, key, cells: {generator: (value, how)}})]}], notes); key:
+       the parameter (Pref1), a part's with its path (Controller4/UFLevel1); how: set (a PSCAD_Params row), case
+       (the copied component's own), default (the definition's, or as the part has it)."""
     gens, secs, notes = [], collections.OrderedDict(), []
     rows = data.get("pscad_params") or []
     for r in data.get("generators") or []:
@@ -1875,29 +2005,42 @@ def udm_table(data):
         if not nm or not (dn or iid):
             continue
         src = _txt(r.get("pscad_source")) or _txt(r.get("pscad_library"))
-        form = udm_form(src, dn, iid) if src and os.path.isfile(src) else None
+        form = udm_form(src, dn, iid, library) if src and os.path.isfile(src) else None
         if form is None:
             notes.append("%s: %s cannot be read here -- type its parameters in the rows below" % (
                 nm, src or "no PSCAD source case / library given"))
             continue
         gens.append(nm)
-        sec = secs.setdefault((form["defn"].upper(), os.path.normcase(os.path.abspath(src))),
-                              {"defn": form["defn"], "src": src, "params": collections.OrderedDict()})
-        mine = [x for x in rows if (_txt(x.get("generator")) or "").upper() == nm.upper()]
-        names = set(q["name"].upper() for q in form["params"])
-        for x in mine:
-            if (_txt(x.get("parameter")) or "").upper() not in names:
-                notes.append("%s: %s is not a parameter of %s -- left out of the table; the build lists it as a "
-                             "CHECK" % (nm, _txt(x.get("parameter")), form["defn"]))
-        for q in form["params"]:
-            ent = sec["params"].setdefault(q["name"], {"p": q, "cells": {}})
-            got = [x for x in mine if (_txt(x.get("parameter")) or "").upper() == q["name"].upper()]
-            if got:
-                ent["cells"][nm] = (_txt(got[-1].get("value")) or "", "set")
-            elif q["name"] in form["placed"]:
-                ent["cells"][nm] = (form["placed"][q["name"]], "case")
-            else:
-                ent["cells"][nm] = (q["default"], "default")
+        mine = dict(((_txt(x.get("parameter")) or "").upper(), _txt(x.get("value")) or "") for x in rows
+                    if (_txt(x.get("generator")) or "").upper() == nm.upper())
+        where = os.path.normcase(os.path.abspath(src))
+        known = set()
+        sigs = [{"path": "", "defn": "signals", "signals": True, "params": [
+            {"name": x["signal"], "key": x["path"] + "/Value", "desc": "%s (%s%s)" % (
+                x["path"], x["defn"].split(":")[-1], (" " + x["label"]) if x["label"] else ""),
+             "type": "Real", "unit": "", "min": x["min"], "max": x["max"], "default": x["value"], "choices": [],
+             "cat": "", "help": ""} for x in form["signals"]]}] if form["signals"] else []
+        for part in [{"path": "", "defn": form["defn"], "params": form["params"]}] + form["parts"] + sigs:
+            sec = secs.setdefault((form["defn"].upper(), where, part["path"].upper(), part.get("signals", False)), {
+                "label": form["defn"] + ("  >  signals" if part.get("signals") else "  >  " + part["path"].replace(
+                    "/", "  >  ") if part["path"] else "  (the UDM)"),
+                "defn": part["defn"], "src": src, "part": part["path"] or ("signals" if part.get("signals") else ""),
+                "params": collections.OrderedDict()})
+            for q in part["params"]:
+                key = q.get("key") or (part["path"] + "/" if part["path"] else "") + q["name"]
+                known.add(key.upper())
+                ent = sec["params"].setdefault(key, {"p": q, "key": key, "cells": {}})
+                if key.upper() in mine:
+                    ent["cells"][nm] = (mine[key.upper()], "set")
+                elif not part["path"] and q["name"] in form["placed"]:
+                    ent["cells"][nm] = (form["placed"][q["name"]], "case")
+                else:
+                    ent["cells"][nm] = (q["default"], "default")
+        parts = set(q["path"].upper() for q in form["parts"])
+        for k in mine:
+            if k not in known and ("/" not in k or library or k.rsplit("/", 1)[0] in parts):
+                notes.append("%s: %s is not a parameter of %s -- the build lists it as a CHECK" % (
+                    nm, k, form["defn"]))
     return gens, [dict(v, params=list(v["params"].items())) for v in secs.values()], notes
 
 
@@ -4870,6 +5013,37 @@ def _fill_pscad(text, vals, where):
     return re.sub(r"\{([A-Za-z_]+)\}", rep, text)
 
 
+def udm_inner(net, cm, inner, where):
+    """Settings of parts inside vendor model cm's definition (Controller4/UFLevel1 ...): the build script changes
+       them in a copy of the definition of the generator's own (<definition>_<generator>) -- a UDM to be copied
+       from a case is made from its definition instead, the copied component's own values set on it."""
+    g = next(x for x in net.gens if x["name"] == cm["gen"])
+    fam, ps = g.get("family", g["name"]), g["pscad"]
+    for v, w in zip(inner.values(), where):
+        if "{" in str(v):
+            raise InputError("%s: %s -- a part inside the vendor model takes a value, not a {KEY}: its settings are "
+                             "in the definition, one for all of %s's inverters" % (w, v, fam))
+    src = ps["source"] or ps["library"]
+    if cm.get("copy_of"):
+        form = udm_form(src, None, ps["iid"]) if src and os.path.isfile(src) else None
+        if form is None:
+            raise InputError("%s: settings of parts inside its vendor model need its definition -- %s ID %s cannot "
+                             "be read here" % (where[0], src, ps["iid"]))
+        cm.pop("copy_of")
+        cm["defn_from"] = {"source": src, "definition": form["defn"]}
+        own = set(q["name"] for q in form["params"])
+        cm["params"] = [_pp(k, [k], v) for k, v in form["placed"].items() if k in own and
+                        not any(it["names"][0].upper() == k.upper() for it in cm["params"])] + cm["params"]
+        note = "NOTE: PSCAD: %s: its UDM made from its definition %s (not copied: parts inside it changed), the " \
+               "copied component's own values set on it" % (fam, form["defn"])
+        if note not in net.notes:
+            net.notes.append(note)
+    if not cm.get("defn_from"):
+        raise InputError("%s: settings of parts inside its vendor model need its definition in a file (Generators: "
+                         "PSCAD source case or library, and definition)" % where[0])
+    cm["defn_from"].update(inner=dict(inner), tag=_safe_name(fam, 12))
+
+
 def pscad_spec(net, inp, comps):
     params = collections.defaultdict(list)
     for r in inp["pscad_params"]:
@@ -4887,7 +5061,11 @@ def pscad_spec(net, inp, comps):
     for cm in comps:
         if cm["kind"] == "VENDOR":
             vals = slot_values(cm["slot"], net)
-            cm["params"] = [_pp(p, [p], _fill_pscad(v, vals, w)) for p, v, w in params.get(cm["gen"], [])]
+            mine = params.get(cm["gen"], [])
+            cm["params"] = [_pp(p, [p], _fill_pscad(v, vals, w)) for p, v, w in mine if "/" not in p]
+            inner = collections.OrderedDict((p, v) for p, v, w in mine if "/" in p)
+            if inner:
+                udm_inner(net, cm, inner, [w for p, v, w in mine if "/" in p])
     c = net.ctl["pscad"]
     libs = list(c["libraries"]) + [cm["library"] for cm in comps if cm.get("library")]
     return {"case": _safe_name(net.name, 29 - len(net.model)) + "_" + net.model,
@@ -5553,11 +5731,69 @@ def oem_definitions(path):
     return scope, defs
 
 
-def import_definition(pscad, prj, case, src, name, log):
+ADDED = set()              # (OEM file, definition) added to this case
+
+
+def part_in(el, step):
+    """The part `step` placed in definition el's schematic -- by its definition's name, name#k (k from 1) where it
+       has more than one, as the GUI names them -- or None."""
+    sch = el.find("schematic") if el is not None else None
+    users = list(sch.iter("User")) if sch is not None else []
+    nm, _h, k = step.partition("#")
+    hits = [u for u in users if (u.get("defn") or "").split(":")[-1].upper() == nm.upper()]
+    try:
+        k = int(k) if k else (1 if len(hits) == 1 else 0)
+    except ValueError:
+        return None
+    return hits[k - 1] if 0 < k <= len(hits) else None
+
+
+def edit_parts(defs, scope, top, edits, tag, log):
+    """Settings of parts inside definition `top` changed -- edits {"Controller4/UFLevel1": "57" ...}, a part inside
+       a part as Controller4/PI#2/Kp -- in copies of the definitions they are in, named <name>_<tag>, each copy
+       used in its place -> (the definitions with the copies, the name of top's copy)."""
+    import copy as copies_of
+    defs, copies = dict(defs), {}
+
+    def own(n):
+        if n not in copies:
+            el = copies_of.deepcopy(defs[n])
+            copies[n] = "%s_%s" % (n, tag)
+            el.set("name", copies[n])
+            defs[copies[n]] = el
+        return copies[n]
+    top2 = own(top)
+    for path, value in edits.items():
+        steps, cur, part = path.split("/"), top2, None
+        for i, st in enumerate(steps[:-1]):
+            part = part_in(defs[cur], st)
+            if part is None:
+                log("    CHECK: %s: no part %s inside %s -- not set" % (path, st, cur))
+                break
+            if i < len(steps) - 2:                    # a part inside it: in a copy of its definition
+                d = (part.get("defn") or "").split(":", 1)
+                if len(d) < 2 or d[0].upper() != scope.upper() or d[1] not in defs:
+                    log("    CHECK: %s: %s is not one of the file's own definitions -- not set" % (path, st))
+                    part = None
+                    break
+                cur = d[1] if d[1] in copies.values() else own(d[1])
+                part.set("defn", "%s:%s" % (scope, cur))
+        if part is None:
+            continue
+        q = next((x for x in part.iter("param") if (x.get("name") or "").upper() == steps[-1].upper()), None)
+        if q is None:
+            log("    CHECK: %s: %s has no setting %s -- not set" % (path, steps[-2], steps[-1]))
+            continue
+        log("    %s = %s (was %s)" % (path, value, q.get("value")))
+        q.set("value", str(value))
+    return defs, top2
+
+
+def import_definition(pscad, prj, case, src, name, log, edits=None, tag=None):
     """The OEM's definition `name` -- and the definitions of its own it uses, those first -- added to this case's
        definitions from the OEM's file -> "case:name", or None. Its project's resources (.lib, .obj ...) come
-       with it."""
-    key = (os.path.normcase(os.path.abspath(src)), name.upper())
+       with it. edits: settings of parts inside it, in a copy of it of the generator's own, <name>_<tag>."""
+    key = (os.path.normcase(os.path.abspath(src)), name.upper(), tag if edits else None)
     if key in IMPORTED:
         return IMPORTED[key]
     IMPORTED[key] = None
@@ -5570,6 +5806,10 @@ def import_definition(pscad, prj, case, src, name, log):
     if found is None:
         log("CHECK: %s has no definition %s -- it has %s" % (os.path.basename(src), name, ", ".join(sorted(defs))))
         return None
+    if edits:
+        log("definition %s for %s: a copy of its own, %s_%s, with %d setting(s) of parts inside it changed:" % (
+            found, tag, found, tag, len(edits)))
+        defs, found = edit_parts(defs, scope, found, edits, tag, log)
     order, seen = [], set()
 
     def visit(n):
@@ -5584,9 +5824,12 @@ def import_definition(pscad, prj, case, src, name, log):
     visit(found)
     pat = re.compile(r'((?:defn|name)=")%s:' % re.escape(scope), re.I)
     for n in order:
+        if (key[0], n) in ADDED:                      # one another UDM from this file uses too: there already
+            continue
         text = pat.sub(r"\g<1>%s:" % case, ET.tostring(defs[n], encoding="unicode"))
         try:
             prj.create_definition(text)
+            ADDED.add((key[0], n))
             log("definition %s from %s added to this case%s" % (
                 n, os.path.basename(src), "" if n == found else " (%s uses it)" % found))
         except Exception as e:
@@ -6012,7 +6255,7 @@ def main():
     for c in SPEC["components"]:                      # an OEM's UDM: its definition added to this case
         f = c.get("defn_from")
         if f:
-            got = import_definition(pscad, prj, case, f["source"], f["definition"], log)
+            got = import_definition(pscad, prj, case, f["source"], f["definition"], log, f.get("inner"), f.get("tag"))
             if got:
                 c["defn"] = [got] + [d for d in c["defn"] if d != got]
     seen_defn = {}
@@ -8273,13 +8516,18 @@ def gui(start=None):
         bar = ttk.Frame(top, padding=(4, 4))
         bar.pack(fill="x")
         ttk.Button(bar, text="Refresh", command=lambda: fill()).pack(side="left", padx=2)
-        ttk.Label(bar, text="Search:").pack(side="left", padx=(12, 2))
+        ttk.Label(bar, text="Definition:").pack(side="left", padx=(12, 2))
+        which = tk.StringVar()
+        pick = ttk.Combobox(bar, textvariable=which, state="readonly", width=44)
+        pick.pack(side="left")
+        pick.bind("<<ComboboxSelected>>", lambda _e: fill())
+        lib = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="library parts too", variable=lib, command=lambda: fill()).pack(side="left", padx=8)
+        ttk.Label(bar, text="Search:").pack(side="left", padx=(8, 2))
         find = tk.StringVar()
-        ttk.Entry(bar, textvariable=find, width=24).pack(side="left")
-        ttk.Label(bar, text="Each vendor model's parameters, from its definition. Double-click a value to change it "
-                            "(* = your value, kept in the rows below; {P_PU} {UNITS} ... filled in for each "
-                            "inverter); clear it to go back to the model's own.",
-                  style="Hint.TLabel").pack(side="left", padx=12)
+        ttk.Entry(bar, textvariable=find, width=18).pack(side="left")
+        ttk.Label(bar, text="Double-click a value to change it (* = yours, kept in the rows below); clear it to go "
+                            "back to the model's own.", style="Hint.TLabel").pack(side="left", padx=10)
         state = {"cols": [], "secs": [], "edit": None}
         msg = tk.StringVar()
         ttk.Label(top, textvariable=msg, style="Help.TLabel", wraplength=1200, justify="left").pack(fill="x")
@@ -8310,18 +8558,24 @@ def gui(start=None):
 
         def fill(*_a):
             close(False)
-            cols, secs, notes = udm_table(data)
+            cols, secs, notes = udm_table(data, lib.get())
             state["cols"], state["secs"] = cols, secs
+            labels = [x["label"] for x in secs]
+            pick.configure(values=(["All"] + labels) if labels else [])
+            if which.get() not in ["All"] + labels:
+                which.set(labels[0] if labels else "")
             heads = ["param", "what"] + ["g%d" % i for i in range(len(cols))] + ["doc"]
             tv.configure(columns=heads)
             for h, t, wd in zip(heads, ["Parameter", "Description"] + cols + ["Type, range or choices"],
-                                [110, 170] + [170] * len(cols) + [700]):
+                                [150, 190] + [160] * len(cols) + [700]):
                 tv.heading(h, text=t)
                 tv.column(h, width=wd, minwidth=50, stretch=(h == "doc"), anchor="w")
             tv.delete(*tv.get_children())
             f = find.get().strip().lower()
             n = 0
             for k, sec in enumerate(secs):
+                if which.get() not in ("All", sec["label"]):
+                    continue
                 rows = [(nm, e) for nm, e in sec["params"] if not f or any(
                     f in str(x).lower() for x in [nm, e["p"]["desc"], udm_doc(e["p"])] +
                     [c[0] for c in e["cells"].values()])]
@@ -8329,18 +8583,21 @@ def gui(start=None):
                     continue
                 users = [c for c in cols if any(c in e["cells"] for _nm, e in sec["params"])]
                 tv.insert("", "end", iid="s|%d" % k, values=[sec["defn"], ""] + [""] * len(cols) + [
-                    "%s from %s -- for %s" % (sec["defn"], sec["src"], ", ".join(users))], tags=("sec",))
+                    "%s -- from %s, for %s%s" % (sec["label"], sec["src"], ", ".join(users), (
+                        "; a change gives a generator its own copy of the UDM's definition" if sec["part"] else ""))],
+                    tags=("sec",))
                 for nm, e in rows:
                     vals = []
                     for c in cols:
                         v, how = e["cells"].get(c, ("", None))
                         vals.append("" if how is None else (udm_choice(e["p"], v) if e["p"]["choices"] else v) +
                                     (" *" if how == "set" else ""))
-                    tv.insert("", "end", iid="p|%d|%s" % (k, nm), values=[nm, e["p"]["desc"]] + vals +
+                    tv.insert("", "end", iid="p|%d|%s" % (k, nm), values=[e["p"]["name"], e["p"]["desc"]] + vals +
                               [udm_doc(e["p"])], tags=("set",) if any(
                                   c[1] == "set" for c in e["cells"].values()) else ())
                     n += 1
-            msg.set(("%d parameters of %d vendor model(s), for %s." % (n, len(secs), ", ".join(cols)) if cols else
+            msg.set(("%d parameters shown -- %d definition(s) and parts, for %s." % (n, len(secs), ", ".join(cols))
+                     if cols else
                      "No generator has a vendor model (UDM) yet: Generators, Pick UDM from OEM model... -- its "
                      "parameters show here.") + ("  " + "  ".join(notes) if notes else ""))
 
@@ -8359,14 +8616,14 @@ def gui(start=None):
             sec, e = entry(iid)
             if e is None or col not in e["cells"]:
                 return
-            p = e["p"]
+            p, key = e["p"], e["key"]
             rows = data.setdefault("pscad_params", [])
             same = [r for r in rows if (_txt(r.get("generator")) or "").upper() == col.upper() and
-                    (_txt(r.get("parameter")) or "").upper() == p["name"].upper()]
+                    (_txt(r.get("parameter")) or "").upper() == key.upper()]
             now, how = e["cells"][col]
             if text:
                 try:
-                    text = udm_check(p, text, "%s %s" % (col, p["name"]))
+                    text = udm_check(p, text, "%s %s" % (col, key), part="/" in key)
                 except InputError as ex:
                     messagebox.showerror("PSCAD_Params", str(ex), parent=root)
                     return
@@ -8384,14 +8641,14 @@ def gui(start=None):
             elif text == now:
                 return
             else:
-                rows.append({"generator": col, "parameter": p["name"], "value": text})
+                rows.append({"generator": col, "parameter": key, "value": text})
             grid.refresh()
             dirty()
             fill()
             if tv.exists(iid):
                 tv.selection_set(iid)
                 tv.see(iid)
-            set_status("%s %s: %s" % (col, p["name"], (udm_choice(p, text) if p["choices"] else text) if text else
+            set_status("%s %s: %s" % (col, key, (udm_choice(p, text) if p["choices"] else text) if text else
                                       "back to the model's own"))
 
         def edit(iid, colid):
@@ -8442,7 +8699,7 @@ def gui(start=None):
                 pass
         nb.bind("<<NotebookTabChanged>>", shown, add="+")
         app["pscad_all"] = {"fill": fill, "edit": edit, "close": close, "put": put, "tree": tv, "state": state,
-                            "msg": msg}
+                            "msg": msg, "which": which, "pick": pick, "lib": lib}
 
     pscad_all(app["grids"]["pscad_params"])
 
