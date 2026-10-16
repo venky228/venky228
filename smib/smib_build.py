@@ -158,7 +158,11 @@
      Units per GSU, rounded up); a GSU far above or below the units on it is
      CHECKed. An MPT's MVA blank is the units' MVA on it (Unit MVA x Units,
      through shared collectors too), following them; one far from it is
-     CHECKed. The GUI's GSUs page (Size GSUs from the units) and MPT page
+     CHECKed. A three-winding MPT's blanks: TV kV the LV's (a split LV winding),
+     LV and TV MVA its MVA shared out by the units on each (none on the TV:
+     MVA/2 on a split LV winding, MVA/3 a tertiary), Z HV-TV = Z HV-LV, Z LV-TV
+     = 1.8 x Z HV-LV (a split LV winding's) -- the GUI shows each in brackets.
+     The GUI's GSUs page (Size GSUs from the units) and MPT page
      (Size MPTs from the generators) suggest both and set the ones ticked.
      Feeders: an MPT's are those of the generators on it (and the shared
      collectors), each generator's its feeder x Copies -- the GUI shows them
@@ -260,7 +264,10 @@ REGCB_XE = 0.15                   # REGC_B: the converter's coupling reactance X
 LEN_UNITS = ["km", "mi", "kft", "m", "ft"]
 FEEDER_UNITS = ["ft", "kft", "m", "km", "mi"]    # a length's unit, ft first: feeders, the gen-tie, an MPT's tie
 FEEDER_UNIT = "ft"                               # what a blank length unit is (older files: km -- FORMAT)
-FORMAT = 3       # what blanks mean in a project: 1 km lengths, Qmax from PF | 2 feeders ft | 3 ties ft, Qmax from MVA
+FORMAT = 4       # what blanks mean in a project: 1 km lengths, Qmax from PF | 2 feeders ft | 3 ties ft, Qmax from MVA |
+                 # 4 a three-winding MPT's LV / TV MVA from the units on each (before: its MVA)
+SPLIT_LT = 1.8   # a three-winding MPT's Z LV-TV, blank: this x its Z HV-LV -- a split LV winding's, the two LV
+                 # windings well apart (each about its HV-LV impedance from HV, a little of it shared)
 LEN_KM = {"km": 1.0, "mi": 1.609344, "kft": 0.3048, "m": 0.001, "ft": 0.0003048}
 GEN_TYPES = ["PV", "BESS", "WT4", "WT3", "SYNC", "USER"]
 # the electrical control models (REEC) each inverter type takes; the first is its default
@@ -382,16 +389,18 @@ MPT_COLS = [
     ("tv_kv", "TV kV", "tertiary / 2nd LV winding (Windings 3; blank = the LV kV, a split LV winding)", None, 9),
     ("mva", "MVA", "the rating (3 windings: HV winding; blank = the MVA of the units on it, following them)", None,
      8),
-    ("lv_mva", "LV MVA", "3 windings", None, 7),
-    ("tv_mva", "TV MVA", "3 windings", None, 7),
+    ("lv_mva", "LV MVA", "3 windings (blank = MVA x the LV units' share of the units on LV and TV -- none on TV: "
+     "MVA)", None, 7),
+    ("tv_mva", "TV MVA", "3 windings (blank = MVA x the TV units' share -- none on it: MVA/2 on a split LV winding "
+     "(TV kV the LV's), MVA/3 a tertiary)", None, 7),
     ("rate_mva", "Rate A MVA", "normal rating: PSS/E RATEA, PSLF rate1 (blank = MVA; 3 windings: the HV winding's, "
      "the LV and TV windings' their MVA)", None, 8),
     ("rate_b_mva", "Rate B MVA", "emergency rating: RATEB, rate2 (blank = Rate A; 3 windings: the HV winding's, the "
      "LV and TV windings' in proportion)", None, 8),
     ("rate_c_mva", "Rate C MVA", "RATEC, rate3 (blank = Rate B; 3 windings: as Rate B)", None, 8),
     ("z_hl_pct", "Z HV-LV %", "on its base MVA", None, 8),
-    ("z_ht_pct", "Z HV-TV %", "3 windings", None, 8),
-    ("z_lt_pct", "Z LV-TV %", "3 windings", None, 8),
+    ("z_ht_pct", "Z HV-TV %", "3 windings, on its base MVA (blank = Z HV-LV)", None, 8),
+    ("z_lt_pct", "Z LV-TV %", "3 windings, on its base MVA (blank = 1.8 x Z HV-LV, a split LV winding's)", None, 8),
     ("base_hl_mva", "Z HV-LV base MVA", "blank = MVA", None, 9),
     ("base_ht_mva", "Z HV-TV base MVA", "blank = MVA", None, 9),
     ("base_lt_mva", "Z LV-TV base MVA", "blank = MVA", None, 9),
@@ -733,8 +742,9 @@ README = [
          "controller for the whole plant (hybrid PV + BESS): PLNTBU1 at the POI, and on each generator a REAX4BU1 "
          "that takes its share of the plant's Q (Qmax / sum of Qmax) and P (Pmax / sum of Pmax). REGC_A / REPC_A "
          "records: standard = REGCA1 / REPCA1 from the PSS/E library; USRMDL = REGCAU1 / REPCAU1."),
-    ("MPT", "One row per main power transformer; HV winding first. Three windings: TV kV, the three impedances "
-            "and their bases. Parallel units: identical units in parallel. Tie: a line of its own from HV to it. "
+    ("MPT", "One row per main power transformer; HV winding first. Three windings: TV kV (blank: the LV's, a split "
+            "LV winding), the LV and TV MVA (blank: the MVA shared out by the units on each), the three impedances "
+            "(Z HV-TV blank: Z HV-LV; Z LV-TV blank: 1.8 x Z HV-LV, a split LV winding's) and their bases. Parallel units: identical units in parallel. Tie: a line of its own from HV to it. "
             "MVA blank: the MVA of the units on it (Unit MVA x Units), following them -- the GUI's Size MPTs from "
             "the generators suggests a rating. Rate A, B, C: its normal and emergency ratings (PSS/E RATEA, RATEB, "
             "RATEC; PSLF rate1, rate2, rate3)."),
@@ -1163,6 +1173,11 @@ def parse_workbook(book, path, keep_comments=False):
                 inp["_unknown"].append("%s: column '%s'" % (sheet, h))
             else:
                 colmap[i] = kk
+        if key == "mpt":                             # its notes row (the template's): no LV MVA default before 4
+            notes = rows[hrow + 1] if hrow + 1 < len(rows) and rows[hrow + 1] and _skip(rows[hrow + 1]) else []
+            said = [str(notes[i]) for i, kk in colmap.items() if kk == "lv_mva" and i < len(notes) and notes[i]]
+            if said and "blank" not in said[0]:
+                fmt = min(fmt, 3)
         if key == "feeders":                         # its notes row (the template's): what a blank unit meant
             notes = rows[hrow + 1] if hrow + 1 < len(rows) and rows[hrow + 1] and _skip(rows[hrow + 1]) else []
             said = [str(notes[i]) for i, kk in colmap.items() if kk == "unit" and i < len(notes) and notes[i]]
@@ -3005,17 +3020,33 @@ def build_mpt(net, r, f, loads=None):
         _unused(net.notes, r, ("load_loss_kw",), w, "three windings: each R from its X/R (the load loss is for two)")
         tv = net.add_bus(name + ":TV", kv3, w)
         d = dict(common)
+        split = abs(kv3 - kv2) <= 1e-9 * kv2
+        dl, dt = mpt_windings(mva, on, split)
+        mva2, mva3 = _num(r, "lv_mva", w, None, positive=True), _num(r, "tv_mva", w, None, positive=True)
+        z12 = _num(r, "z_hl_pct", w, required=True, positive=True)
+        b12, b13, b23 = [_num(r, k, w, mva, positive=True) for k in ("base_hl_mva", "base_ht_mva", "base_lt_mva")]
+        z13, z23 = _num(r, "z_ht_pct", w, None, positive=True), _num(r, "z_lt_pct", w, None, positive=True)
+        said = []
+        if mva2 is None or mva3 is None:
+            how = ("the MVA shared out by the units on each (%s)" % gens if on["lv"] > 0 and on["tv"] > 0 else
+                   "nothing on %s: %s" % ("either" if on["lv"] + on["tv"] <= 0 else "TV" if on["tv"] <= 0 else "LV",
+                                          "MVA/2, a split LV winding" if split else "MVA/3, a tertiary"))
+            said.append("%s (%s)" % (" and ".join("%s MVA %s" % (wd, fm(x)) for wd, x, v in (
+                ("LV", dl, mva2), ("TV", dt, mva3)) if v is None), how))
+        if z13 is None:
+            z13 = z12 * b13 / b12
+            said.append("Z HV-TV %s %% (Z HV-LV's)" % fm(z13))
+        if z23 is None:
+            z23 = SPLIT_LT * z12 * b23 / b12
+            said.append("Z LV-TV %s %% (%g x Z HV-LV, a split LV winding's)" % (fm(z23), SPLIT_LT))
+        if said:
+            net.notes.append("NOTE: %s: three windings, blank -- %s; give the nameplate's" % (w, "; ".join(said)))
         d.update({"hv": hv, "lv": lv, "tv": tv, "kv1": kv1, "kv2": kv2, "kv3": kv3, "mva1": mva,
-                  "mva2": _num(r, "lv_mva", w, mva, positive=True), "mva3": _num(r, "tv_mva", w, mva, positive=True),
-                  "z12": _num(r, "z_hl_pct", w, required=True, positive=True),
-                  "z13": _num(r, "z_ht_pct", w, required=True, positive=True),
-                  "z23": _num(r, "z_lt_pct", w, required=True, positive=True),
-                  "base12": _num(r, "base_hl_mva", w, mva, positive=True),
-                  "base13": _num(r, "base_ht_mva", w, mva, positive=True),
-                  "base23": _num(r, "base_lt_mva", w, mva, positive=True),
+                  "mva2": dl if mva2 is None else mva2, "mva3": dt if mva3 is None else mva3,
+                  "z12": z12, "z13": z13, "z23": z23, "base12": b12, "base13": b13, "base23": b23,
                   "rate": rates[0], "rate_b": rates[1], "rate_c": rates[2]})
-        for k, x, wd in (("mva2", on["lv"], "LV"), ("mva3", on["tv"], "TV")):
-            if x > d[k] * count * 1.02:
+        for k, x, wd, v in (("mva2", on["lv"], "LV", mva2), ("mva3", on["tv"], "TV", mva3)):
+            if v is not None and x > d[k] * count * 1.02:
                 net.notes.append("CHECK: %s: the units on its %s winding are %s MVA, above its %s MVA" % (
                     w, wd, fm(x), fm(d[k] * count)))
         add_tx3(net, d)
@@ -3284,6 +3315,61 @@ def feeder_lines(data):
         by.setdefault(on.get(nm.upper(), ("not on an MPT",))[0], []).append((sum(k for _f, k, _u in fs), txt))
     return ["   %s: %d feeder%s -- %s" % (m, sum(k for k, _t in v), "" if sum(k for k, _t in v) == 1 else "s",
                                          "; ".join(t for _k, t in v)) for m, v in by.items() if v]
+
+
+def mpt_blanks(r, loads):
+    """What an MPT row's blank cells come to as the build takes them -> {key: value}: Windings, MVA (the units on
+       it), Rate A / B / C and, three windings, TV kV, LV / TV MVA, Z HV-TV, Z LV-TV -- {} as far as it does not read
+       yet (the GUI shows them in brackets)."""
+    out, w = {}, "MPT"
+    try:
+        on = (loads or {}).get((_txt(r.get("name")) or "").upper()) or {"lv": 0.0, "tv": 0.0}
+        count = _int(r, "count", w, 1, minimum=1)
+        mva = _num(r, "mva", w, None, positive=True)
+        if mva is None and on["lv"] + on["tv"] > 0:
+            mva = out["mva"] = (on["lv"] + on["tv"]) / count
+        nw = _windings(r, w)
+        kv2, kv3 = _num(r, "lv_kv", w, None, positive=True), _num(r, "tv_kv", w, None, positive=True)
+        three = nw == 3 or (nw is None and kv3 is not None)
+        if nw is None:
+            out["windings"] = "3" if three else "2"
+        if mva:
+            a, b, c = _abc(r, ("rate_mva", "rate_b_mva", "rate_c_mva"), w, mva)
+            for k, x in (("rate_mva", a), ("rate_b_mva", b), ("rate_c_mva", c)):
+                if _txt(r.get(k)) is None and x:
+                    out[k] = x
+        if not three:
+            return out
+        if kv3 is None and kv2:
+            kv3 = out["tv_kv"] = kv2
+        if mva and kv2 and kv3:
+            dl, dt = mpt_windings(mva, on, abs(kv3 - kv2) <= 1e-9 * kv2)
+            for k, x in (("lv_mva", dl), ("tv_mva", dt)):
+                if _txt(r.get(k)) is None:
+                    out[k] = x
+        z12 = _num(r, "z_hl_pct", w, None, positive=True)
+        if z12 and mva:
+            b12, b13, b23 = [_num(r, k, w, mva, positive=True) for k in ("base_hl_mva", "base_ht_mva", "base_lt_mva")]
+            if _txt(r.get("z_ht_pct")) is None:
+                out["z_ht_pct"] = z12 * b13 / b12
+            if _txt(r.get("z_lt_pct")) is None:
+                out["z_lt_pct"] = SPLIT_LT * z12 * b23 / b12
+    except (InputError, ValueError, TypeError, ZeroDivisionError):
+        pass
+    return out
+
+
+def mpt_windings(mva, on, split):
+    """A three-winding MPT's LV and TV winding MVA where blank: its MVA shared out by the units' MVA on each winding
+       (on: mpt_loads'); a winding with none on it MVA/2 on a split LV winding (TV kV the LV's), MVA/3 a tertiary --
+       the LV winding all of it when the TV has none (or neither has any)."""
+    a, b = (on or {}).get("lv", 0.0), (on or {}).get("tv", 0.0)
+    none = mva * (0.5 if split else 1.0 / 3.0)
+    if b <= 0:
+        return mva, none
+    if a <= 0:
+        return none, mva
+    return mva * a / (a + b), mva * b / (a + b)
 
 
 def nice_mva(x):
@@ -8358,6 +8444,33 @@ def _old_blanks(inp, fmt):
         if q:
             said.append("NOTE: Generators %s: Unit PF 0.95 written in -- a blank Unit Qmax came from Unit PF (blank "
                         "0.95) when this file was saved; now, with Unit MVA given, from MVA and Pmax" % ", ".join(q))
+    if fmt < 4:
+        loads, done = None, []
+        for r in inp.get("mpt") or []:
+            try:
+                nw = _windings(r, "MPT")
+            except InputError:
+                continue
+            if nw != 3 and not (nw is None and _txt(r.get("tv_kv")) is not None):
+                continue
+            keys = [k for k in ("lv_mva", "tv_mva") if _txt(r.get(k)) is None]
+            if not keys:
+                continue
+            try:
+                m = _num(r, "mva", "MPT", None, positive=True)
+                if m is None:
+                    loads = mpt_loads(inp) if loads is None else loads
+                    on = loads.get((_txt(r.get("name")) or "").upper()) or {"lv": 0.0, "tv": 0.0}
+                    m = (on["lv"] + on["tv"]) / _int(r, "count", "MPT", 1, minimum=1) or None
+            except InputError:
+                m = None
+            if m:
+                for k in keys:
+                    r[k] = round(m, 6)
+                done.append("%s (%s MVA)" % (_txt(r.get("name")) or "?", "%.6g" % m))
+        if done:
+            said.append("NOTE: MPT %s: LV / TV MVA blank, written in as the MPT's MVA -- what a blank meant when this "
+                        "file was saved (now: the MVA shared out by the units on each winding)" % ", ".join(done))
 
 
 def _format_of(inp):
@@ -9411,13 +9524,17 @@ def gui(start=None):
             return data.setdefault(self.key, [])
 
         def shown(self, r):
-            """A row's cells as shown: a blank model choice as the one the build takes, in brackets."""
+            """A row's cells as shown: a blank model choice as the one the build takes, in brackets -- an MPT's blank
+               windings, MVA and three-winding values too."""
             out = []
+            dflt = mpt_blanks(r, mpt_loads(data)) if self.sheet == "MPT" else {}
             for k in self.keys:
                 v = r.get(k) or ""
                 if not v and self.sheet == "Generators" and k in MODEL_CHOICE:
                     ok = MODEL_CHOICE[k][0].get((r.get("type") or "").upper())
                     v = "(%s)" % ok[0] if ok else ""
+                if not v and k in dflt:
+                    v = "(%s)" % ("%.6g" % dflt[k] if isinstance(dflt[k], float) else dflt[k])
                 out.append(v)
             return out
 
