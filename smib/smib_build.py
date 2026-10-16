@@ -143,6 +143,19 @@
      largest page -- is a CHECK or WARNING: in the report, and listed by the
      GUI's Check inputs.
 
+   SIZES AND RATINGS
+     GSUs: Units per GSU (the units on one GSU) sets the GSU count (Units /
+     Units per GSU, rounded up); a GSU far above or below the units on it is
+     CHECKed. An MPT's MVA blank is the units' MVA on it (Unit MVA x Units,
+     through shared collectors too), following them; one far from it is
+     CHECKed. The GUI's GSUs page (Size GSUs from the units) and MPT page
+     (Size MPTs from the generators) suggest both and set the ones ticked.
+     Rate A, B, C (PSS/E RATEA/B/C, PSLF rate1/2/3; B blank = A, C blank =
+     B): an MPT's (three windings: the HV winding's, the LV and TV windings'
+     their MVA, B and C in proportion), one GSU's (x the GSUs), one cable's
+     (x a section's parallel cables; DETAILED: x its feeder copies; a
+     collector equivalent: its sections from the collector bus together).
+
    OUTPUT -- nothing that exists is ever overwritten
      <name> = the plant's name and its model type: Hybrid_PV100_BESS100_SMIB, ..._DETAILED
      Models\\Detailed_Models\\ (DETAILED) or Models\\Equivalent_Models\\ (SMIB),
@@ -322,9 +335,15 @@ MPT_COLS = [
     ("hv_kv", "HV kV", "", None, 7),
     ("lv_kv", "LV kV", "", None, 7),
     ("tv_kv", "TV kV", "tertiary / 2nd LV winding (Windings 3; blank = the LV kV, a split LV winding)", None, 9),
-    ("mva", "MVA", "the rating (3 windings: HV winding)", None, 8),
+    ("mva", "MVA", "the rating (3 windings: HV winding; blank = the MVA of the units on it, following them)", None,
+     8),
     ("lv_mva", "LV MVA", "3 windings", None, 7),
     ("tv_mva", "TV MVA", "3 windings", None, 7),
+    ("rate_mva", "Rate A MVA", "normal rating: PSS/E RATEA, PSLF rate1 (blank = MVA; 3 windings: the HV winding's, "
+     "the LV and TV windings' their MVA)", None, 8),
+    ("rate_b_mva", "Rate B MVA", "emergency rating: RATEB, rate2 (blank = Rate A; 3 windings: the HV winding's, the "
+     "LV and TV windings' in proportion)", None, 8),
+    ("rate_c_mva", "Rate C MVA", "RATEC, rate3 (blank = Rate B; 3 windings: as Rate B)", None, 8),
     ("z_hl_pct", "Z HV-LV %", "on its base MVA", None, 8),
     ("z_ht_pct", "Z HV-TV %", "3 windings", None, 8),
     ("z_lt_pct", "Z LV-TV %", "3 windings", None, 8),
@@ -338,7 +357,6 @@ MPT_COLS = [
     ("count", "Parallel units", "identical units (blank = 1)", None, 8),
     ("nll_pct", "No-load loss %", "of MVA (blank = 0)", None, 8),
     ("im_pct", "Magnetising current %", "of MVA (blank = 0)", None, 10),
-    ("rate_mva", "Rating MVA", "blank = MVA", None, 8),
     ("tie_length", "Tie length", "a line of its own from HV to this MPT (blank = none)", None, 9),
     ("tie_unit", "Tie length unit", "", LEN_UNITS, 7),
     ("tie_per_unit", "Tie values per", "the length R, X, B are per (blank = km or mi, whichever matches a line of "
@@ -369,8 +387,13 @@ GEN_COLS = [
      ["share", "fixed"], 7),
     ("fixed_q_mvar", "Fixed Q MVAr", "Q mode fixed (blank = 0)", None, 8),
     ("fixed_pf", "Fixed PF", "Q mode fixed, instead of Fixed Q (+ lagging)", None, 7),
-    ("gsu_count", "GSU count", "blank = Units", None, 6),
+    ("gsu_units", "Units per GSU", "the units on one GSU (blank = Units / GSU count; both blank: 1)", None, 6),
+    ("gsu_count", "GSU count", "blank = Units / Units per GSU, rounded up (that blank too: Units, a GSU each)", None,
+     6),
     ("gsu_mva", "GSU MVA", "one GSU; blank = no GSU (units on the MV bus)", None, 7),
+    ("gsu_rate_a_mva", "GSU Rate A MVA", "one GSU's normal rating: RATEA, rate1 (blank = GSU MVA)", None, 7),
+    ("gsu_rate_b_mva", "GSU Rate B MVA", "one GSU's emergency rating: RATEB, rate2 (blank = Rate A)", None, 7),
+    ("gsu_rate_c_mva", "GSU Rate C MVA", "one GSU's: RATEC, rate3 (blank = Rate B)", None, 7),
     ("gsu_hv_kv", "GSU HV kV", "", None, 7),
     ("gsu_lv_kv", "GSU LV kV", "", None, 7),
     ("gsu_z_pct", "GSU Z %", "on GSU MVA", None, 7),
@@ -430,6 +453,10 @@ CABLE_COLS = [
     ("x_per", "X per length", "ohm", None, 9),
     ("c_per", "C per length", "uF", None, 9),
     ("b_per", "B per length", "uS, instead of C", None, 9),
+    ("rate_a_mva", "Rate A MVA", "one cable's normal rating at its collector's kV (sqrt(3) x kV x amps / 1000): "
+     "RATEA, rate1 -- a section's: x its parallel cables (blank = none)", None, 9),
+    ("rate_b_mva", "Rate B MVA", "one cable's emergency rating: RATEB, rate2 (blank = Rate A)", None, 9),
+    ("rate_c_mva", "Rate C MVA", "one cable's: RATEC, rate3 (blank = Rate B)", None, 9),
 ]
 
 COLLECTOR_COLS = [
@@ -490,13 +517,14 @@ SIMPLE = {  # the GUI's simple view: these fields only (All fields: every one; a
               "tie_unit", "tie_per_unit", "tie_r_per", "tie_x_per", "tie_b_per", "control_mode", "v_poi_pu",
               "q_poi_mvar", "pf_poi", "v_grid_pu", "p_poi_mw", "plant_ctrl", "pscad_duration_s", "pscad_fault",
               "pscad_fault_s", "pscad_fault_dur_s", "pscad_fault_type", "pscad_fault_ohm"),
-    "MPT": ("name", "windings", "hv_kv", "lv_kv", "tv_kv", "mva", "lv_mva", "tv_mva", "rate_mva", "count",
+    "MPT": ("name", "windings", "hv_kv", "lv_kv", "tv_kv", "mva", "lv_mva", "tv_mva", "rate_mva", "rate_b_mva",
+            "rate_c_mva", "count",
             "z_hl_pct", "z_ht_pct", "z_lt_pct", "x_r", "vector", "tap"),
     "Generators": ("name", "type", "connect", "units", "unit_mva", "unit_pmax_mw", "unit_pmin_mw", "unit_qmax_mvar",
                    "unit_qmin_mvar", "kv", "dispatch_mw", "collector", "regc", "reec", "pscad_definition",
                    "pscad_source"),
-    "GSUs": ("name", "units", "gsu_count", "gsu_mva", "gsu_hv_kv", "gsu_lv_kv", "gsu_z_pct", "gsu_x_r", "gsu_vector",
-             "gsu_tap"),
+    "GSUs": ("name", "units", "gsu_units", "gsu_count", "gsu_mva", "gsu_rate_a_mva", "gsu_rate_b_mva", "gsu_rate_c_mva",
+             "gsu_hv_kv", "gsu_lv_kv", "gsu_z_pct", "gsu_x_r", "gsu_vector", "gsu_tap"),
     "Feeders": ("collector", "feeder", "section", "cable", "length", "unit", "units", "units_of"),
 }
 SIMPLE_TABS = ("Plant", "MPT", "Generators", "GSUs", "Feeders", "Cables", "Dyr_Params", "PSCAD_Params", "Output")
@@ -539,10 +567,15 @@ SUGGEST = {  # the GUI's drop-down of typical values where a field has no list o
     "MPT.z_hl_pct": ("8", "9", "10", "12"), "MPT.x_r": ("30", "40", "45", "50"), "MPT.tap": _TAPS,
     "MPT.count": _N, "Generators.id": ("1", "2", "3"), "Generators.units": _N, "Generators.kv": _LV,
     "Generators.unit_pf": ("0.9", "0.95", "1"), "Generators.fixed_pf": ("0.9", "0.95", "1", "-0.95"),
-    "Generators.gsu_count": _N, "Generators.gsu_hv_kv": _MV, "Generators.gsu_lv_kv": _LV,
+    "Generators.gsu_count": _N, "Generators.gsu_units": ("1", "2", "4", "8", "10", "16", "20"),
+    "Generators.gsu_hv_kv": _MV, "Generators.gsu_lv_kv": _LV,
     "Generators.gsu_z_pct": ("5.75", "6", "6.5", "8"), "Generators.gsu_x_r": ("6", "8", "10"),
     "Generators.gsu_vector": ("Dyn1", "Dyn11", "YNd1", "YNd11", "Dy1", "Dy11", "YNyn0"), "Generators.gsu_tap": _TAPS,
     "Generators.wmod": ("0", "1"), "Feeders.copies": _N, "Feeders.parallel": _N, "Machines.id": ("1", "2", "3"),
+}
+
+COL_ALIASES = {  # a column's title before it was renamed: still read from older workbooks
+    "MPT": (("Rating MVA", "rate_mva"),),
 }
 
 TABLES = [  # (sheet, input key, columns)
@@ -644,9 +677,13 @@ README = [
          "that takes its share of the plant's Q (Qmax / sum of Qmax) and P (Pmax / sum of Pmax). REGC_A / REPC_A "
          "records: standard = REGCA1 / REPCA1 from the PSS/E library; USRMDL = REGCAU1 / REPCAU1."),
     ("MPT", "One row per main power transformer; HV winding first. Three windings: TV kV, the three impedances "
-            "and their bases. Parallel units: identical units in parallel. Tie: a line of its own from HV to it."),
+            "and their bases. Parallel units: identical units in parallel. Tie: a line of its own from HV to it. "
+            "MVA blank: the MVA of the units on it (Unit MVA x Units), following them -- the GUI's Size MPTs from "
+            "the generators suggests a rating. Rate A, B, C: its normal and emergency ratings (PSS/E RATEA, RATEB, "
+            "RATEC; PSLF rate1, rate2, rate3)."),
     ("Generators", "One row per generator (PV, BESS, wind, synchronous ...): the units (count and one unit's "
-                   "data; the model is their aggregate), its GSU (one GSU's data and the count), its collector "
+                   "data; the model is their aggregate), its GSU (one GSU's data, and Units per GSU or the GSU "
+                   "count -- the GUI's GSUs page: Size GSUs from the units; Rate A, B, C one GSU's), its collector "
                    "(FEEDERS: the WECC equivalent of its rows in Feeders; EQUIVALENT: R X B given; NONE), how it "
                    "shares the POI's Q, its electrical control model in the .dyr (REEC_A: REECA1, PV and wind; "
                    "REEC_C: REECCU1, BESS; REEC_D: REECDU1, PV, BESS and WT4) and its PSCAD model (vendor library "
@@ -659,7 +696,9 @@ README = [
                 "section i. R ohm, X ohm, B uS: a section's own values (its parallel cables together) in place of "
                 "Cable x Length -- the GUI's Fill R, X, B from cables shows them to change; Clear R, X, B goes "
                 "back. A section with R and X needs no cable."),
-    ("Cables", "Cable data per length (R, X in ohm; C in uF or B in uS) and the length unit they are per."),
+    ("Cables", "Cable data per length (R, X in ohm; C in uF or B in uS) and the length unit they are per; Rate A, "
+               "B, C one cable's ratings in MVA at its collector's kV (sqrt(3) x kV x amps / 1000): a section's x its "
+               "parallel cables, a collector equivalent's its sections from the collector bus together."),
     ("Collectors", "Collector systems shared by more than one generator: name and the bus it starts from. Their "
                    "Feeders rows say whose units each section carries (Units of); the generators on it Connect to "
                    "its name."),
@@ -790,6 +829,48 @@ def _int(row, key, where, default=None, required=False, minimum=None):
     if minimum is not None and x < minimum:
         raise InputError("%s: %s = %d is below %d" % (where, _label(key, where), x, minimum))
     return x
+
+
+def _abc(row, keys, where, a=None, notes=None):
+    """Rate A, B and C (MVA) from a row's three fields -> (A, B, C): A blank = a, B blank = A, C blank = B; none
+       below 0. notes: a B or C given below the one before it, or given with no Rate A, is CHECKed there."""
+    got = [_num(row, k, where) for k in keys]
+    for k, v in zip(keys, got):
+        if v is not None and v < 0:
+            raise InputError("%s: %s must be 0 or more (it is %.6g)" % (where, _label(k, where), v))
+    ra = a if got[0] is None else got[0]
+    rb = ra if got[1] is None else got[1]
+    rc = rb if got[2] is None else got[2]
+    if notes is not None:
+        for (k0, v0), (k1, v1) in (((keys[0], ra), (keys[1], got[1])), ((keys[1], rb), (keys[2], got[2]))):
+            if v1 and v0 and v1 < v0 - 1e-9:
+                notes.append("CHECK: %s: %s %.6g is below %s %.6g -- B and C are the emergency ratings, at or above "
+                             "A" % (where, _label(k1, where), v1, _label(k0, where), v0))
+        if not ra and (got[1] or got[2]):
+            notes.append("CHECK: %s: %s blank or 0, %s given -- no normal rating (PSS/E RATEA 0)" % (
+                where, _label(keys[0], where), " and ".join(_label(k, where) for k, v in zip(keys[1:], got[1:])
+                                                             if v)))
+    return ra or 0.0, rb or 0.0, rc or 0.0
+
+
+def _rabc(x):
+    """A branch's (or a transformer's first winding's) Rate A, B, C: B blank = A, C blank = B."""
+    a = x["rate"] or 0.0
+    b = x.get("rate_b")
+    b = a if b is None else b
+    c = x.get("rate_c")
+    return a, b, b if c is None else c
+
+
+def _rabc3(t):
+    """A three-winding transformer's Rate A, B, C for each winding: the HV winding's as given; the LV and TV
+       windings' A their MVA, B and C in proportion (the HV winding's B / A, C / A)."""
+    a, b, c = _rabc(t)
+    out = [(a, b, c)]
+    for k in ("mva2", "mva3"):
+        m = t.get(k) or 0.0
+        out.append((m, m * b / a, m * c / a) if a else (m, m, m))
+    return out
 
 
 def _choice(row, key, where, choices, default):
@@ -1002,6 +1083,8 @@ def parse_workbook(book, path, keep_comments=False):
         for c in cols:
             names[_key(c[1])] = c[0]
             names[_key(c[0])] = c[0]
+        for old, k in COL_ALIASES.get(sheet, ()):
+            names.setdefault(_key(old), k)
         head, hrow = None, 0
         for k, r in enumerate(rows):
             if r and any(x is not None for x in r):
@@ -1344,6 +1427,8 @@ def _says_more(note, v):
 
 
 def _used_by(sheet, key):
+    if re.match(r"^(gsu_|tie_)?rate(_[abc])?_mva$", key):            # ratings: the load-flow cases only
+        return "PSS/E + PSLF"
     if sheet == "Dyr_Records" or key in ("regc_repc", "wmod"):
         return "PSS/E"
     if sheet == "Dyr_Params" or key in ("plant_ctrl", "regc", "reec", "zsorce_x"):
@@ -1790,7 +1875,8 @@ def add_tx2(net, d):
     vg = vector_group(d.get("vector"), 2, w)
     t = dict(d)
     t.update({"r_own": r, "x_own": x, "r": r * k, "x": x * k, "windv1": d["kv1"] * d["tap"], "windv2": d["kv2"],
-              "nomv1": kvb1, "nomv2": kvb2, "vg": vg, "rate": d.get("rate") or d["mva"]})
+              "nomv1": kvb1, "nomv2": kvb2, "vg": vg,
+              "rate": d["mva"] if d.get("rate") is None else d["rate"]})
     t["mag_g"], t["mag_b"] = _mag(d.get("nll_pct"), d.get("im_pct"), d["mva"], net.sb, d["kv1"], kvb1)
     for side, kvr, kvb in (("HV", d["kv1"], kvb1), ("LV", d["kv2"], kvb2)):
         if abs(kvr / kvb - 1.0) > KV_OFF:
@@ -1856,8 +1942,12 @@ def read_cables(rows, log=None):
         c = _num(r, "c_per", w)
         if b is not None and c is not None and log:
             log("NOTE: %s: cable %s has both B and C -- B used" % (w, name))
+        notes = []
+        rates = _abc(r, ("rate_a_mva", "rate_b_mva", "rate_c_mva"), "%s (cable %s)" % (w, name), 0.0, notes)
+        for m in notes if log else ():
+            log(m)
         out[name.upper()] = {"name": name, "unit": unit, "r": _num(r, "r_per", w, required=True),
-                             "x": _num(r, "x_per", w, required=True), "b": b, "c": c, "where": w}
+                             "x": _num(r, "x_per", w, required=True), "b": b, "c": c, "where": w, "rates": rates}
     return out
 
 
@@ -2328,6 +2418,11 @@ def section_rxb(r, cab, f, w):
     return cab["r"] * per / par, cab["x"] * per / par, bper * per * par
 
 
+def _sum_rates(rates):
+    """Branches side by side: their Rate A, B, C added -- each 0 (none) where one of them has none."""
+    return tuple(sum(x[i] for x in rates) if rates and all(x[i] > 0 for x in rates) else 0.0 for i in range(3))
+
+
 def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
     """The WECC equivalent of collector `cname` from its Feeders rows.
        unit_mw: {GENERATOR (upper): MW of one unit}; own_gen: whose units a row without 'Units of' carries
@@ -2373,6 +2468,7 @@ def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
                      "parallel": _int(r, "parallel", w, 1, minimum=1), "units": collections.OrderedDict(),
                      "where": w}
                 s["R"], s["X"], s["B"] = section_rxb(r, cab, f, w) if need else (0.0, 0.0, 0.0)
+                s["rates"] = tuple(x * s["parallel"] for x in cab["rates"]) if cab else (0.0, 0.0, 0.0)
                 s["given"] = ""
                 for k, fld in (("r_ohm", "R"), ("x_ohm", "X"), ("b_us", "B")):
                     if given[k] is not None:
@@ -2447,12 +2543,14 @@ def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
             counts[g] = counts.get(g, 0) + copies * k
         out.append({"name": fname, "copies": copies, "sections": [secs[n] for n in order], "kids": kids,
                     "W": wf, "N": nf, "km": sum(secs[n]["length"] * LEN_KM[secs[n]["unit"]] for n in order),
-                    "z_own": (zf / wf ** 2) if wf else 0j, "b_own": bf, "where": where})
+                    "z_own": (zf / wf ** 2) if wf else 0j, "b_own": bf, "where": where,
+                    "rates": _sum_rates([secs[n]["rates"] for n in kids[0]])})
     if not W > 0:
         raise InputError("collector %s: its feeders carry no units" % cname)
     z = sum_zw2 / (W * W)
     res = {"name": cname, "kv": kv, "r": z.real, "x": z.imag, "b": sum_b, "R": z.real * zb, "X": z.imag * zb,
-           "B": sum_b / zb * 1e6, "W": W, "N": counts, "feeders": out, "_mw": dict(unit_mw)}
+           "B": sum_b / zb * 1e6, "W": W, "N": counts, "feeders": out, "_mw": dict(unit_mw),
+           "rates": _sum_rates([tuple(fd["copies"] * x for x in fd["rates"]) for fd in out])}
     try:
         res["check"] = wecc_check(res, sb)
     except (OverflowError, ZeroDivisionError, ValueError):     # feeders far too long for their load
@@ -2550,8 +2648,9 @@ def build_network(inp, log):
     else:
         net.add_alias("HV", "POI", W)
 
+    loads = mpt_loads(inp)
     for r in inp["mpt"]:
-        build_mpt(net, r, f)
+        build_mpt(net, r, f, loads)
 
     cables = read_cables(inp["cables"], net.notes.append)
     feeders = collections.OrderedDict()
@@ -2587,7 +2686,8 @@ def build_network(inp, log):
         net.colls[cname] = res
         net.add_bus("C:" + cname, net.kv(at), w, aliases=(cname,))
         add_line(net, at, "C:" + cname, {"r": res["r"], "x": res["x"], "b": res["b"], "R": res["R"],
-                                           "X": res["X"], "B": res["B"], "count": 1, "rate": 0.0, "kv": net.kv(at),
+                                           "X": res["X"], "B": res["B"], "count": 1, "rate": res["rates"][0],
+                                           "rate_b": res["rates"][1], "rate_c": res["rates"][2], "kv": net.kv(at),
                                            "km": 0.0, "w_mw": res["W"]}, cname, "COLLECTOR", w)
 
     for g in gens:
@@ -2680,7 +2780,9 @@ def _windings(r, w):
     raise InputError("%s: Windings %r -- 2 or 3" % (w, v))
 
 
-def build_mpt(net, r, f):
+def build_mpt(net, r, f, loads=None):
+    """An MPT row -> its transformer. loads (mpt_loads): the units' MVA on each MPT -- a blank MVA takes it, and
+       an MVA far from it is CHECKed."""
     w = r["_where"]
     name = _txt(r.get("name"))
     if not name:
@@ -2689,7 +2791,31 @@ def build_mpt(net, r, f):
     kv1 = _num(r, "hv_kv", w, required=True, positive=True)
     kv2 = _num(r, "lv_kv", w, required=True, positive=True)
     kv3 = _num(r, "tv_kv", w, None, positive=True)
-    mva = _num(r, "mva", w, required=True, positive=True)
+    count = _int(r, "count", w, 1, minimum=1)
+    on = (loads or {}).get(name.upper()) or {"lv": 0.0, "tv": 0.0, "gens": []}
+    units = on["lv"] + on["tv"]
+    fm = lambda x: "%.6g" % x
+    gens = " + ".join("%s %s%s" % (g, fm(x), " on TV" if wd == "TV" else "") for g, x, wd in on["gens"])
+    mva = _num(r, "mva", w, None, positive=True)
+    if mva is None:
+        if not units > 0:
+            raise InputError("%s: %s is missing -- blank takes the MVA of the units on it, and no generator is on %s"
+                             % (w, _label("mva", w), name))
+        mva = units / count
+        net.notes.append("NOTE: %s: %s blank -- %s MVA, the units on it (%s)%s" % (
+            w, _label("mva", w), fm(mva), gens, (", over its %d parallel units" % count) if count > 1 else ""))
+    elif units > 0:                                  # the rating against what it carries
+        cap = mva * count
+        if units > cap * 1.02:
+            net.notes.append("CHECK: %s: the units on it are %s MVA (%s), above its %s MVA" % (
+                w, fm(units), gens, fm(cap)))
+        elif cap > 2.0 * units:
+            stiff = _txt(r.get("base_hl_mva")) is None
+            net.notes.append("CHECK: %s: %s MVA for %s MVA of units on it (%s: %.0f %%) -- %sgive its nameplate MVA "
+                             "(blank = the units' MVA; GUI: MPT page, Size MPTs from the generators)" % (
+                                 w, fm(cap), fm(units), gens, 100.0 * units / cap,
+                                 "its Z %% is on its MVA: %.3g times as stiff as an MPT sized for them; " % (
+                                     cap / units) if stiff else ""))
     nw = _windings(r, w)
     vector = _txt(r.get("vector"))
     vm = _VG.match((vector or "").replace(" ", ""))
@@ -2711,7 +2837,7 @@ def build_mpt(net, r, f):
         vector = vector.replace(" ", "")[:len(vector.replace(" ", "")) - len("".join(turns[1]))]
         net.notes.append("NOTE: %s: Windings 2 -- vector group %s for its two windings" % (w, vector))
     tap = _num(r, "tap", w, 1.0, positive=True)
-    count = _int(r, "count", w, 1, minimum=1)
+    rates = _abc(r, ("rate_mva", "rate_b_mva", "rate_c_mva"), w, mva, net.notes)
     hv = net.find("HV", w)
     tie = line_data(r, "tie_", net.kv("HV"), net.sb, f, w + " tie", net.notes)
     if tie:
@@ -2741,7 +2867,7 @@ def build_mpt(net, r, f):
         d = dict(common)
         d.update({"hv": hv, "lv": lv, "mva": mva, "z_pct": z,
                   "load_loss_kw": _num(r, "load_loss_kw", w), "kv1": kv1, "kv2": kv2,
-                  "rate": _num(r, "rate_mva", w, mva)})
+                  "rate": rates[0], "rate_b": rates[1], "rate_c": rates[2]})
         add_tx2(net, d)
     else:
         _unused(net.notes, r, ("load_loss_kw",), w, "three windings: each R from its X/R (the load loss is for two)")
@@ -2755,7 +2881,11 @@ def build_mpt(net, r, f):
                   "base12": _num(r, "base_hl_mva", w, mva, positive=True),
                   "base13": _num(r, "base_ht_mva", w, mva, positive=True),
                   "base23": _num(r, "base_lt_mva", w, mva, positive=True),
-                  "rate": _num(r, "rate_mva", w, mva)})
+                  "rate": rates[0], "rate_b": rates[1], "rate_c": rates[2]})
+        for k, x, wd in (("mva2", on["lv"], "LV"), ("mva3", on["tv"], "TV")):
+            if x > d[k] * count * 1.02:
+                net.notes.append("CHECK: %s: the units on its %s winding are %s MVA, above its %s MVA" % (
+                    w, wd, fm(x), fm(d[k] * count)))
         add_tx3(net, d)
 
 
@@ -2787,15 +2917,19 @@ def unit_rating(r, w):
     return n, pmax, pmin, pf, qmax, qmin, s
 
 
+def _rows(data, key):
+    """A table's rows as the build takes them: those starting with # left out (the GUI keeps them, set aside)."""
+    cols = dict((t[1], t[2]) for t in TABLES)[key]
+    return [r for r in data.get(key) or [] if not _skip([r.get(c[0]) for c in cols])]
+
+
 def plant_totals(data):
     """What the Generators rows add up to for the whole plant, and what each MPT carries -> (plant line, [MPT
        lines], {"pmax": MW, "dispatch": MW}) -- a generator whose row does not read yet is left out, named."""
     f = lambda x: "%.6g" % (x + 0.0)
     mva = pmax = pmin = qmax = qmin = disp = 0.0
-    units, bad, on = 0, [], collections.defaultdict(list)
-    colls = dict(((_txt(c.get("name")) or "").upper(), (_txt(c.get("connect")) or "").upper())
-                 for c in data.get("collectors") or [])
-    for r in data.get("generators") or []:
+    units, bad = 0, []
+    for r in _rows(data, "generators"):
         if not any(v not in (None, "") for v in r.values()):
             continue
         nm = _txt(r.get("name")) or "?"
@@ -2808,27 +2942,123 @@ def plant_totals(data):
         units += n
         mva, pmax, pmin, qmax, qmin = mva + n * s, pmax + n * p1, pmin + n * p0, qmax + n * q1, qmin + n * q0
         disp += n * p1 if d is None else d
-        to = (_txt(r.get("connect")) or "").upper()
-        to = colls.get(to, to)
-        on[to.split(":")[0]].append((nm, n * s))
     line = "Whole plant (from Generators): %s MVA, %d units  |  P %s to %s MW, dispatch %s MW  |  Q %s to %s MVAr" % (
         f(mva), units, f(pmin), f(pmax), f(disp), f(qmin), f(qmax)) + (
         ("   (%s not counted: its row does not read yet)" % ", ".join(bad)) if bad else "")
-    mpts = []
-    for m in data.get("mpt") or []:
+    mpts, loads = [], mpt_loads(data)
+    for m in _rows(data, "mpt"):
         nm = _txt(m.get("name"))
         if not nm:
             continue
         try:
-            rate = _num(m, "mva", nm)
+            rate, cnt = _num(m, "mva", nm, None, positive=True), _int(m, "count", nm, 1, minimum=1)
         except InputError:
-            rate = None
-        gs = on.get(nm.upper(), [])
-        tot = sum(x for _g, x in gs)
-        mpts.append("%s%s: carries %s = %s MVA%s" % (
-            nm, (" %s MVA" % f(rate)) if rate else "", " + ".join(g for g, _x in gs) or "no generator", f(tot),
-            (" (%.0f %% of its rating)" % (100.0 * tot / rate)) if rate and gs else ""))
+            rate, cnt = None, 1
+        e = loads.get(nm.upper()) or {"lv": 0.0, "tv": 0.0, "gens": []}
+        tot = e["lv"] + e["tv"]
+        gs = " + ".join("%s %s%s" % (g, f(x), " on TV" if wd == "TV" else "") for g, x, wd in e["gens"])
+        size = ("%d x %s" % (cnt, f(rate)) if cnt > 1 else f(rate)) if rate else ""
+        if not tot:
+            mpts.append("%s%s: no generator on it%s" % (nm, (" %s MVA" % size) if rate else "",
+                                                        "" if rate else " (MVA blank: give one)"))
+        elif rate is None:
+            mpts.append("%s: MVA blank = the units on it, %s MVA (%s)%s" % (
+                nm, f(tot / cnt), gs, (", over %d parallel units" % cnt) if cnt > 1 else ""))
+        else:
+            mpts.append("%s %s MVA: carries %s = %s MVA (%.0f %% of its rating)%s" % (
+                nm, size, gs, f(tot), 100.0 * tot / (rate * cnt),
+                (" -- sized for them: %s MVA (Size MPTs from the generators)" % f(nice_mva(tot / cnt)))
+                if tot > 1.02 * rate * cnt or rate * cnt > 2.0 * tot else ""))
     return line, mpts, {"pmax": pmax, "dispatch": disp}
+
+
+def _same(v, x):
+    """Whether a cell's value is the number x."""
+    try:
+        return abs(float(v) - x) <= 1e-9 * max(1.0, abs(x))
+    except (TypeError, ValueError):
+        return False
+
+
+def nice_mva(x):
+    """A transformer rating at or above x MVA: 0.05 MVA steps below 1, 0.25 to 10, 1 to 50, 5 to 200, then 10."""
+    for top, step in ((1.0, 0.05), (10.0, 0.25), (50.0, 1.0), (200.0, 5.0), (float("inf"), 10.0)):
+        if x <= top + 1e-9:
+            return round(math.ceil(x / step - 1e-9) * step, 4)
+
+
+def mpt_loads(data):
+    """The units' MVA on each MPT winding, from the Generators rows (through a shared collector, or another
+       generator's bus, to where it connects) -> {MPT name (upper): {"lv": MVA, "tv": MVA, "gens": [(generator,
+       its units' MVA, "LV" or "TV")]}} -- a generator whose row does not read yet, or on no MPT, is left out."""
+    mpts = set((_txt(m.get("name")) or "").upper() for m in _rows(data, "mpt"))
+    via = {}
+    for k in ("collectors", "generators"):
+        for c in _rows(data, k):
+            nm = (_txt(c.get("name")) or "").upper()
+            if nm and nm not in mpts:
+                via.setdefault(nm, (_txt(c.get("connect")) or "").upper())
+    out = {}
+    for r in _rows(data, "generators"):
+        nm = _txt(r.get("name"))
+        if not nm:
+            continue
+        try:
+            n, _p1, _p0, _pf, _q1, _q0, s1 = unit_rating(r, nm)
+        except InputError:
+            continue
+        name, _c, wind = (_txt(r.get("connect")) or "").upper().partition(":")
+        seen = set()
+        while name not in mpts and name in via and name not in seen:
+            seen.add(name)
+            name, _c, wind = via[name].partition(":")
+        if name in mpts and wind in ("", "LV", "TV"):          # MPT1:HV -- beside it, not through it
+            e = out.setdefault(name, {"lv": 0.0, "tv": 0.0, "gens": []})
+            e["tv" if wind == "TV" else "lv"] += n * s1
+            e["gens"].append((nm, n * s1, wind or "LV"))
+    return out
+
+
+def gsu_split(r, w, n):
+    """A Generators row's GSUs for its n units -> (GSU count, the units on one GSU): GSU count blank = Units /
+       Units per GSU, rounded up (that blank too: 1, a GSU per unit); a GSU count given: the units shared by its
+       GSUs (Units per GSU only checks it)."""
+    per = _int(r, "gsu_units", w, None, minimum=1)
+    cnt = _int(r, "gsu_count", w, None, minimum=1)
+    if cnt is None:
+        per = min(per or 1, n)
+        return int(math.ceil(n / float(per) - 1e-9)), per
+    return cnt, n / float(cnt)
+
+
+def gsu_sizing(r, per):
+    """A Generators row's GSUs with `per` of its units on each -> (GSU count, the units' MVA on one GSU, a GSU
+       rating for them: that MVA rounded up, or the GSU MVA given where it carries them without being twice their
+       MVA)."""
+    w = _txt(r.get("name")) or "a generator"
+    n, _p1, _p0, _pf, _q1, _q0, s1 = unit_rating(r, w)
+    per = max(1, min(int(per), n))
+    load = per * s1
+    have = _num(r, "gsu_mva", w, None, positive=True)
+    keep = have if have and load <= have * 1.02 and have <= 2.0 * load else None
+    return int(math.ceil(n / float(per) - 1e-9)), round(load, 6), keep or nice_mva(load)
+
+
+def gsu_per_now(r):
+    """The units on one GSU as a Generators row has them now (for the GUI to start from): Units per GSU, else
+       Units / GSU count, else what one GSU's MVA carries, else 1."""
+    w = _txt(r.get("name")) or "a generator"
+    n, _p1, _p0, _pf, _q1, _q0, s1 = unit_rating(r, w)
+    per = _int(r, "gsu_units", w, None, minimum=1)
+    cnt = _int(r, "gsu_count", w, None, minimum=1)
+    have = _num(r, "gsu_mva", w, None, positive=True)
+    if per:
+        return min(per, n)
+    if cnt:
+        return max(1, min(n, int(math.ceil(n / float(cnt) - 1e-9))))
+    if have:
+        return max(1, min(n, int(have / s1 + 1e-9)))
+    return 1
 
 
 def unit_totals(r):
@@ -2844,7 +3074,7 @@ def unit_totals(r):
         w, n, f(s), f(n * s), f(n * pmin), f(n * pmax), f(n * qmin), f(n * qmax))
     try:
         gm = _num(r, "gsu_mva", w, None, positive=True)
-        cnt = _int(r, "gsu_count", w, n, minimum=1)
+        cnt, _per = gsu_split(r, w, n)
     except InputError:
         gm = None
     if gm:
@@ -2959,7 +3189,8 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
         res.update({"root": at, "own": name, "end": mv})
         net.colls[name] = res
         line = {"r": res["r"], "x": res["x"], "b": res["b"], "R": res["R"], "X": res["X"], "B": res["B"],
-                "count": 1, "rate": 0.0, "kv": kv, "km": 0.0, "w_mw": res["W"]}
+                "count": 1, "rate": res["rates"][0], "rate_b": res["rates"][1], "rate_c": res["rates"][2], "kv": kv,
+                "km": 0.0, "w_mw": res["W"]}
     elif mode == "EQUIVALENT":
         if rows:
             raise InputError("%s: Collector EQUIVALENT, but Feeders has rows for %s" % (w, name))
@@ -2993,28 +3224,42 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
         if kvt0 and abs(kvt0 / kv2 - 1.0) > KV_OFF:
             raise InputError("%s: 'Terminal kV' %.4g kV, but 'GSU LV kV' is %.4g kV -- the voltages do not match"
                              % (w, kvt0, kv2))
-        cnt = _int(r, "gsu_count", w, g["n"], minimum=1)
+        cnt, per = gsu_split(r, w, g["n"])
         x_r = _num(r, "gsu_x_r", w)
         if x_r is None:
             x_r = 8.0
             net.notes.append("CHECK: %s: GSU X/R not given -- 8 used" % w)
         lv = net.add_bus(name + ":LV", kv2, w, aliases=(name,))
+        ra, rb, rc = _abc(r, ("gsu_rate_a_mva", "gsu_rate_b_mva", "gsu_rate_c_mva"), w, gsu_mva, net.notes)
         g["gsu"] = add_tx2(net, {"name": name + "-GSU", "kind": "GSU", "hv": net.alias[mv.upper()], "lv": lv,
                                   "mva": cnt * gsu_mva, "unit_mva": gsu_mva, "units": cnt,
                                   "z_pct": _num(r, "gsu_z_pct", w, required=True, positive=True), "x_r": x_r,
                                   "load_loss_kw": None, "kv1": kv1, "kv2": kv2,
                                   "tap": _num(r, "gsu_tap", w, 1.0, positive=True), "vector": _txt(r.get("gsu_vector")),
-                                  "nll_pct": 0.0, "im_pct": 0.0, "rate": cnt * gsu_mva, "count": 1, "where": w})
-        if g["mbase"] > cnt * gsu_mva * 1.02:
-            net.notes.append("CHECK: %s: units %.1f MVA behind GSUs of %.1f MVA" % (w, g["mbase"], cnt * gsu_mva))
-        elif cnt * gsu_mva > 2.0 * g["mbase"]:           # their impedance on their MVA: far too stiff a GSU
-            net.notes.append("CHECK: %s: GSUs %d x %s MVA = %s MVA for units of %s MVA in all%s -- the GSU's Z is on "
-                             "its MVA: give %s" % (
-                                 w, cnt, _g(gsu_mva), _g(cnt * gsu_mva), _g(g["mbase"]),
-                                 " ('GSU count' blank: one GSU per unit)" if _txt(r.get("gsu_count")) is None else "",
-                                 "'GSU count', the GSUs there are" if _txt(r.get("gsu_count")) is None else
-                                 "the GSUs' count and MVA as they are"))
+                                  "nll_pct": 0.0, "im_pct": 0.0, "rate": cnt * ra, "rate_b": cnt * rb,
+                                  "rate_c": cnt * rc, "count": 1, "where": w})
+        given = _int(r, "gsu_units", w, None, minimum=1)
+        if given is not None and _txt(r.get("gsu_count")) is not None:
+            need = int(math.ceil(g["n"] / float(min(given, g["n"])) - 1e-9))
+            if need != cnt:
+                net.notes.append("CHECK: %s: 'GSU count' %d, but 'Units per GSU' %d puts its %d units on %d GSUs -- "
+                                 "the GSU count is used (give one of the two)" % (w, cnt, given, g["n"], need))
+        fm = lambda x: "%.6g" % x
+        each = per * g["unit"]["mva"]                  # the units' MVA on one GSU (a GSU count given: on average)
+        on = ("one unit of %s MVA" % fm(each)) if per == 1 else "%s units of %s MVA = %s MVA%s" % (
+            fm(per), fm(g["unit"]["mva"]), fm(each), "" if per == int(per) else " on average")
+        everything = "%d GSUs, %s MVA, for units of %s MVA in all" % (cnt, fm(cnt * gsu_mva), fm(g["mbase"]))
+        if each > gsu_mva * 1.02:
+            net.notes.append("CHECK: %s: each GSU carries %s, above its %s MVA (%s)" % (w, on, fm(gsu_mva), everything))
+        elif gsu_mva > 2.0 * each:                     # their impedance on their MVA: far too stiff a GSU
+            blank = _txt(r.get("gsu_count")) is None and given is None
+            net.notes.append("CHECK: %s: GSU %s MVA for %s on each (%s%s) -- its Z %% is on its MVA: give %s" % (
+                w, fm(gsu_mva), on, everything, "; 'GSU count' and 'Units per GSU' blank: a GSU per unit" if blank
+                else "", "'Units per GSU', the units on one GSU (GUI: GSUs page, Size GSUs from the units)" if blank
+                else "the GSUs' count and MVA as they are"))
     else:
+        _unused(net.notes, r, [c[0] for c in GEN_COLS if c[0].startswith("gsu_") and c[0] != "gsu_mva"], w,
+                "no GSU: 'GSU MVA' is blank (its units on the MV bus)", {"gsu_tap": 1.0})
         g["gsu"] = None
         lv = net.alias[mv.upper()]
         net.add_alias(name + ":LV", lv, w)
@@ -3077,8 +3322,10 @@ def one_feeder_per_generator(net):
         name = "_".join(real.get(n, n) for n in who) + "-COLL"
         if any(ln["name"].upper() == name.upper() for ln in net.lines):
             name = _node(root) + "_" + name
+        ra, rb, rc = _sum_rates([_rabc(ln) for ln in lns])
         merged = {"r": z.real, "x": z.imag, "b": sum(ln["b"] for ln in lns), "R": Z.real, "X": Z.imag,
-                  "B": sum(ln["B"] for ln in lns), "count": 1, "rate": 0.0, "kv": net.kv(root), "km": 0.0, "w_mw": W,
+                  "B": sum(ln["B"] for ln in lns), "count": 1, "rate": ra, "rate_b": rb, "rate_c": rc,
+                  "kv": net.kv(root), "km": 0.0, "w_mw": W,
                   "fr": root, "to": end, "name": name, "kind": "COLLECTOR", "where": "Plant (SMIB)",
                   "of": [(ln["name"], ln["w_mw"]) for ln in lns]}
         net.lines.insert(k, merged)
@@ -3146,9 +3393,10 @@ def expand_collectors(net):
                 a = root if sc["from"] == 0 else nodes[(fd["name"], sc["from"])]
                 b = nodes[(fd["name"], sc["num"])]
                 add_line(net, a, b, {"r": sc["z"].real / n, "x": sc["z"].imag / n, "b": sc["b"] * n,
-                                     "R": sc["R"] / n, "X": sc["X"] / n, "B": sc["B"] * n, "count": 1, "rate": 0.0,
-                                     "kv": kv, "km": sc["length"] * LEN_KM[sc["unit"]], "copies": n},
-                         b, "SECTION", sc["where"])
+                                     "R": sc["R"] / n, "X": sc["X"] / n, "B": sc["B"] * n, "count": 1,
+                                     "rate": sc["rates"][0] * n, "rate_b": sc["rates"][1] * n,
+                                     "rate_c": sc["rates"][2] * n, "kv": kv, "km": sc["length"] * LEN_KM[sc["unit"]],
+                                     "copies": n}, b, "SECTION", sc["where"])
                 for G, cnt in sc["units"].items():
                     g = gby[G]
                     pre = _node(g["name"]) + ("_" + _node(cname) if len(carriers[G]) > 1 else "")
@@ -3248,7 +3496,8 @@ def _unit_group(net, g, name, units, at, where):
         d = dict((key, g["gsu"].get(key)) for key in ("kind", "z_pct", "x_r", "load_loss_kw", "kv1", "kv2", "tap",
                                                        "vector", "nll_pct", "im_pct", "unit_mva"))
         d.update({"name": name + "-GSU", "hv": at, "lv": lv, "mva": g["gsu"]["mva"] * k,
-                  "units": g["gsu"]["units"] * k, "rate": g["gsu"]["rate"] * k, "count": 1, "where": where})
+                  "units": g["gsu"]["units"] * k, "rate": g["gsu"]["rate"] * k, "rate_b": g["gsu"]["rate_b"] * k,
+                  "rate_c": g["gsu"]["rate_c"] * k, "count": 1, "where": where})
         u["gsu"], u["bus"] = add_tx2(net, d), lv
     else:
         u["gsu"], u["bus"] = None, at
@@ -3964,8 +4213,8 @@ def write_raw(net, path):
         for c in range(ln["count"]):
             L.append("%7d,%7d,'%-2s',%12s,%12s,%12s,%9.2f,%9.2f,%9.2f, 0.00000, 0.00000, 0.00000, 0.00000,1,1,"
                      "%8.3f,   1,1.0000"
-                     % (_num_of(net, ln["fr"]), _num_of(net, ln["to"]), str(c + 1), _g(ln["r"], 7), _g(ln["x"], 7),
-                        _g(ln["b"], 7), ln["rate"], ln["rate"], ln["rate"], ln["km"]))
+                     % ((_num_of(net, ln["fr"]), _num_of(net, ln["to"]), str(c + 1), _g(ln["r"], 7), _g(ln["x"], 7),
+                         _g(ln["b"], 7)) + _rabc(ln) + (ln["km"],)))
     L.append("0 / END OF BRANCH DATA, BEGIN TRANSFORMER DATA")
     for t in net.tx2:
         for c in range(t["count"]):
@@ -3975,7 +4224,7 @@ def write_raw(net, path):
             L.append("%12s,%12s,%10.3f" % (_g(t["r"], 7), _g(t["x"], 7), t["mva"]))
             w1 = t["windv1"] / t["nomv1"]
             L.append("%10.7f,%10.4f,   0.000,%9.2f,%9.2f,%9.2f, 0,      0, 1.10000, 0.90000,1.10000,0.90000,  33, 0, "
-                     "0.00000, 0.00000,  0.000" % (w1, t["nomv1"], t["rate"], t["rate"], t["rate"]))
+                     "0.00000, 0.00000,  0.000" % ((w1, t["nomv1"]) + _rabc(t)))
             L.append("%10.7f,%10.4f" % (t["windv2"] / t["nomv2"], t["nomv2"]))
     for t in net.tx3:
         for c in range(t["count"]):
@@ -3986,11 +4235,10 @@ def write_raw(net, path):
             L.append("%12s,%12s,%10.3f,%12s,%12s,%10.3f,%12s,%12s,%10.3f,%9.5f,%10.4f"
                      % (_g(t["r12"], 7), _g(t["x12"], 7), t["s12"], _g(t["r23"], 7), _g(t["x23"], 7), t["s23"],
                         _g(t["r31"], 7), _g(t["x31"], 7), t["s31"], t.get("vstar", 1.0), t.get("astar", 0.0)))
-            rates = [t["rate"], t["mva2"], t["mva3"]]
+            rates = _rabc3(t)
             for w in range(3):
                 L.append("%10.7f,%10.4f,   0.000,%9.2f,%9.2f,%9.2f, 0,      0, 1.10000, 0.90000,1.10000,0.90000,  33, 0, "
-                         "0.00000, 0.00000,  0.000" % (t["windv"][w] / t["nomv"][w], t["nomv"][w], rates[w], rates[w],
-                                                      rates[w]))
+                         "0.00000, 0.00000,  0.000" % ((t["windv"][w] / t["nomv"][w], t["nomv"][w]) + rates[w]))
     L.append("0 / END OF TRANSFORMER DATA, BEGIN AREA DATA")
     L.append("   1,%7d,     0.000,    10.000,'SMIB        '" % _num_of(net, "IB"))
     for sec in ("AREA DATA, BEGIN TWO-TERMINAL DC DATA", "TWO-TERMINAL DC DATA, BEGIN VSC DC LINE DATA",
@@ -4037,8 +4285,8 @@ def _pf(v, fmt="%.8f"):
 
 def _tx_lines(net, t, hv, lv, tv, ck, z, ratio, rates):
     """A transformer's six lines: z [(r, x)] for ps, pt, ts in pu on the system base -- its tbase (as PSLF's own
-       cases have it: the same whichever base PSLF's units flags name); ratio (tap, ftaps, ftapt); rates (rate1 of
-       each winding)."""
+       cases have it: the same whichever base PSLF's units flags name); ratio (tap, ftaps, ftapt); rates (rate1,
+       rate2, rate3 of each winding)."""
     (rps, xps), (rpt, xpt), (rts, xts) = z
     tap, ftaps, ftapt = ratio
     gmag, bmag = t["mag_g"], t["mag_b"]
@@ -4048,14 +4296,14 @@ def _tx_lines(net, t, hv, lv, tv, ck, z, ratio, rates):
         '%s     %s  %s   " " :   1  1 %s  0 %s %s    1    1 %12.6f %.6e %.6e %.6e %.6e %.6e %.6e /' % (
             _pref(net, hv), _pref(net, lv), _pq(ck, 2), _pref(net, None), _pref(net, None), _pref(net, tv),
             tbases[0], rps, xps, rpt, xpt, rts, xts),
-        ' %f %f %f  0.000000 %.6e %.6e %8.1f    0.0    0.0    0.0 0.000  %f  %f  1.100000  0.900000  0.006250  %f  '
+        ' %f %f %f  0.000000 %.6e %.6e %8.1f %6.1f %6.1f    0.0 0.000  %f  %f  1.100000  0.900000  0.006250  %f  '
         '1.000000  %f  %f %s   0 1     0.0    0.0    0.0    0.0 /' % (
-            net.kv(hv), net.kv(lv), kvt, gmag, bmag, rates[0], max(1.1, tap), min(0.9, tap), tap, ftaps, ftapt,
-            EPC_DATES),
+            (net.kv(hv), net.kv(lv), kvt, gmag, bmag) + tuple(rates[0]) + (max(1.1, tap), min(0.9, tap), tap, ftaps,
+                                                                             ftapt, EPC_DATES)),
         '   1 1.000   0 1.000   0 1.000   0 1.000   0 0.000   0 0.000   0 0.000   0 0.000  0 /',
-        '   %f   %f  0.000000  0.000000 %8.1f %6.1f    0.0 %8.1f %6.1f    0.0 0.000 0.000  0  0  0 0.0000 0.0000 0  '
+        '   %f   %f  0.000000  0.000000 %8.1f %6.1f %6.1f %8.1f %6.1f %6.1f 0.000 0.000  0  0  0 0.0000 0.0000 0  '
         '0  0   0.000000   0.000000  0.000000  0.000000  " "   0.000000 /' % (
-            tbases[1], tbases[2], rates[1], 0.0, rates[2], 0.0),
+            (tbases[1], tbases[2]) + tuple(rates[1]) + tuple(rates[2])),
         "   " + "    ".join(["0.00"] * 13) + "/",
         "   " + "    ".join(["0.00"] * 9)]
 
@@ -4099,9 +4347,9 @@ def write_epc(net, path):
              "st resist   react   charge   rate1  rate2  rate3  rate4 aloss  lngth " % nbr)
     for ln in net.lines:
         for c in range(ln["count"]):
-            L.append('%s     %s  %s   1 " "  :  1 %s %s %s %7.2f    0.00    0.00    0.00 0.000    0.000 /' % (
-                _pref(net, ln["fr"]), _pref(net, ln["to"]), _pq(str(c + 1), 2), _pf(ln["r"]), _pf(ln["x"]),
-                _pf(ln["b"]), ln["rate"]))
+            L.append('%s     %s  %s   1 " "  :  1 %s %s %s %7.2f %7.2f %7.2f    0.00 0.000    0.000 /' % (
+                (_pref(net, ln["fr"]), _pref(net, ln["to"]), _pq(str(c + 1), 2), _pf(ln["r"]), _pf(ln["x"]),
+                 _pf(ln["b"])) + _rabc(ln)))
             L.append('   1    1  0.000000  0.000000  0.000000 %s   0 1  0    0.00    0.00    0.00    0.00   1 1.000   '
                      '0 0.000   0 0.000   0 0.000   0 0.000   0 0.000   0 0.000   0 0.000  0 0  0  0  0  0.000   '
                      '0.000000  0.000000  " "     0.00    0.00    0.00    0.00 ' % EPC_DATES)
@@ -4115,13 +4363,13 @@ def write_epc(net, path):
         for c in range(t["count"]):
             L.extend(_tx_lines(net, t, t["hv"], t["lv"], None, str(c + 1),
                                [(t["r"] * k, t["x"] * k), (0.0, 0.0), (0.0, 0.0)], (t1 / t2, 1.0, 1.0),
-                               (t["rate"], 0.0, 0.0)))
+                               (_rabc(t), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))))
     for t in net.tx3:
         tk = [t["windv"][w] / net.kv(role) for w, role in enumerate((t["hv"], t["lv"], t["tv"]))]
         z = [(t["r" + p] * sb / t["s" + p], t["x" + p] * sb / t["s" + p]) for p in ("12", "31", "23")]
         for c in range(t["count"]):
             L.extend(_tx_lines(net, t, t["hv"], t["lv"], t["tv"], str(c + 1), z, (tk[0], tk[1], tk[2]),
-                               (t["rate"], t["mva2"] or 0.0, t["mva3"] or 0.0)))
+                               _rabc3(t)))
     L.append("generator data  [%4d]         id   ------------long_id_------------    st ---no--     reg_name           "
              "prf  qrf  ar zone   pgen   pmax   pmin   qgen   qmax   qmin   mbase  cmp_r cmp_x gen_r gen_x           "
              "hbus                         tbus                date_in date_out pid N" % (len(net.gens) + 1))
@@ -7006,11 +7254,12 @@ def report_text(net, inp, recs, comps, files, src):
         L.append("   %7d  %-12s %9.4f  %-14s %10.6f %10.4f %11.4f" % (b["num"], b["name"], b["kv"], role, b["vm"],
                                                                      b["va"], b["va"] + shift.get(role, 0.0)))
     L += ["", "3. EQUIPMENT (pu on the system base %.0f MVA unless said)" % sb]
+    rates = lambda x: ("Rate A/B/C %s MVA" % "/".join("%.6g" % v for v in x)) if any(x) else "no rating"
     for ln in net.lines:
-        L.append("   %-12s %-9s %s - %s  %d circuit(s)%s: R %.5f X %.5f ohm B %.3f uS each = r %.6f x %.6f b %.6f pu"
-                 % (ln["name"], ln["kind"], ln["fr"], ln["to"], ln["count"],
-                    (", %.3f km" % ln["km"]) if ln.get("km") else "", ln["R"], ln["X"], ln["B"], ln["r"], ln["x"],
-                    ln["b"]))
+        L.append("   %-12s %-9s %s - %s  %d circuit(s)%s: R %.5f X %.5f ohm B %.3f uS each = r %.6f x %.6f b %.6f pu, "
+                 "%s" % (ln["name"], ln["kind"], ln["fr"], ln["to"], ln["count"],
+                         (", %.3f km" % ln["km"]) if ln.get("km") else "", ln["R"], ln["X"], ln["B"], ln["r"],
+                         ln["x"], ln["b"], rates(_rabc(ln))))
     for t in net.tx2:
         L.append("   %-12s %-9s %s - %s  %s%.2f MVA %.4g/%.4g kV tap %.4f %s: Z %.4f%% X/R %s (own base) -> r %.6f "
                  "x %.6f pu on %.2f MVA" % (t["name"], t["kind"], t["hv"], t["lv"],
@@ -7019,10 +7268,11 @@ def report_text(net, inp, recs, comps, files, src):
                                              else ""), t["mva"], t["kv1"], t["kv2"], t["tap"], t["vg"]["text"],
                                             100.0 * math.hypot(t["r_own"], t["x_own"]),
                                             _g(t["x_own"] / t["r_own"], 4) if t["r_own"] else "inf", t["r"], t["x"],
-                                            t["mva"]))
+                                            t["mva"]) + ", " + rates(_rabc(t)))
     for t in net.tx3:
-        L.append("   %-12s MPT(3W)  %s - %s - %s  %.4g/%.4g/%.4g kV tap %.4f %s" % (
-            t["name"], t["hv"], t["lv"], t["tv"], t["kv1"], t["kv2"], t["kv3"], t["tap"], t["vg"]["text"]))
+        L.append("   %-12s MPT(3W)  %s - %s - %s  %.4g/%.4g/%.4g kV tap %.4f %s  (HV, LV, TV: %s)" % (
+            t["name"], t["hv"], t["lv"], t["tv"], t["kv1"], t["kv2"], t["kv3"], t["tap"], t["vg"]["text"],
+            "; ".join(rates(x) for x in _rabc3(t))))
         for p, lab in (("12", "HV-LV"), ("31", "HV-TV"), ("23", "LV-TV")):
             r, x, base = t["own"][p][3], t["own"][p][4], t["own"][p][2]
             L.append("        %s Z %.4f%% on %.2f MVA (r %.6f x %.6f)" % (lab, 100.0 * math.hypot(r, x), base, r, x))
@@ -8012,12 +8262,18 @@ def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None, tie="PER
             unit_secs = [tpl[i] for i in k0]
             n_gsu = int(n_gsu_in or len(unit_secs))
             units = num(g.get("units")) or 1.0
-            cnt = num(g.get("gsu_count")) or units
+            per = num(g.get("gsu_units")) if not num(g.get("gsu_count")) else None
+            cnt = num(g.get("gsu_count")) or (math.ceil(units / per - 1e-9) if per else units)
             inv = int(inv_in or max(1, int(round(units / cnt))))
             nu = nf * n_gsu * inv
             gg = dict(g, units=nu, gsu_count=nf * n_gsu if g.get("gsu_mva") not in (None, "") else g.get("gsu_count"))
-            if g.get("gsu_mva") not in (None, ""):
-                gg["gsu_mva"] = round(num(g["gsu_mva"]) * cnt / units * inv, 4)
+            if num(g.get("gsu_units")):
+                gg["gsu_units"] = inv
+            if g.get("gsu_mva") not in (None, ""):          # its GSU MVA per inverter kept (Units per GSU: by design)
+                gg["gsu_mva"] = round(num(g["gsu_mva"]) * (1.0 / per if per else cnt / units) * inv, 4)
+                for k in ("gsu_rate_a_mva", "gsu_rate_b_mva", "gsu_rate_c_mva"):   # in step with the GSU's MVA
+                    if num(g.get(k)) is not None:
+                        gg[k] = round(num(g[k]) * gg["gsu_mva"] / num(g["gsu_mva"]), 4)
             if g.get("dispatch_mw") not in (None, ""):
                 gg["dispatch_mw"] = round(num(g["dispatch_mw"]) * nu / units, 4)
             rows = []
@@ -8045,7 +8301,8 @@ def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None, tie="PER
         ratio = mw_k / old_mw if old_mw else 1.0
         mn = bname if k == 1 else fresh("%s%d" % (m.group(1), int(m.group(2)) + k - 1) if m else "%s_%d" % (bname, k))
         r = dict(base, name=mn)
-        for key in ("mva", "lv_mva", "tv_mva", "rate_mva", "base_hl_mva", "base_ht_mva", "base_lt_mva"):
+        for key in ("mva", "lv_mva", "tv_mva", "rate_mva", "rate_b_mva", "rate_c_mva", "base_hl_mva", "base_ht_mva",
+                    "base_lt_mva"):
             if num(r.get(key)):
                 r[key] = round(num(r[key]) * ratio, 1)
         out_mpt.append(r)
@@ -8491,8 +8748,15 @@ def gui(start=None):
                             ("Move down", lambda: self.move(1))) if not fixed else ():
                 ttk.Button(tools, text=txt, command=fn).pack(side="left", padx=2)
             if fixed:
-                ttk.Label(tools, text="One row per generator -- add, remove and rename them on the Generators page.",
+                ttk.Label(tools, text="One row per generator -- add, remove and rename them on the Generators page "
+                                      "(Units: here or there, the same value).",
                           style="Item.TLabel").pack(side="left", padx=4, pady=4)
+            if self.page == "GSUs":
+                ttk.Button(tools, text="Size GSUs from the units...", command=self.size_gsus).pack(side="left",
+                                                                                                padx=12)
+            if sheet == "MPT":
+                ttk.Button(tools, text="Size MPTs from the generators...", command=self.size_mpts).pack(
+                    side="left", padx=12)
             if sheet == "Bus_Numbers":
                 ttk.Button(tools, text="List this model's buses", command=self.fill_buses).pack(side="left", padx=12)
             if sheet == "Machines":
@@ -8562,22 +8826,30 @@ def gui(start=None):
 
         def sums(self):
             if self.page == "GSUs":
-                lines = []
-                for r in self.rows:
+                lines, f = [], lambda x: "%.6g" % x
+                for r in _rows(data, "generators"):
                     nm = _txt(r.get("name"))
                     if not nm:
                         continue
                     try:
-                        n = _int(r, "units", nm, 0) or 0
-                        mva, cnt = _num(r, "gsu_mva", nm), _int(r, "gsu_count", nm, n)
+                        n, _p1, _p0, _pf, _q1, _q0, s1 = unit_rating(r, nm)
+                        mva = _num(r, "gsu_mva", nm, None, positive=True)
+                        cnt, per = gsu_split(r, nm, n)
                         z, hv, lv = _num(r, "gsu_z_pct", nm), _txt(r.get("gsu_hv_kv")), _txt(r.get("gsu_lv_kv"))
                     except InputError as e:
                         lines.append("   %s: %s" % (nm, str(e).split(": ", 1)[-1]))
                         continue
-                    lines.append("   %s: %s" % (nm, ("%d x %s MVA = %s MVA, %s / %s kV%s" % (
-                        cnt, "%.6g" % mva, "%.6g" % (cnt * mva), hv or "?", lv or "the terminal's",
-                        (", Z %s %%" % ("%.6g" % z)) if z is not None else "")) if mva else
-                        "no GSU (its units on the MV bus)"))
+                    if not mva:
+                        lines.append("   %s: no GSU (its units on the MV bus)" % nm)
+                        continue
+                    each = per * s1
+                    lines.append("   %s: %d x %s MVA = %s MVA, %s / %s kV%s  |  on each: %s unit%s of %s MVA = %s MVA "
+                                 "(%.0f %% of a GSU)%s" % (
+                                     nm, cnt, f(mva), f(cnt * mva), hv or "?", lv or "the terminal's",
+                                     (", Z %s %%" % f(z)) if z is not None else "", f(per), "" if per == 1 else "s",
+                                     f(s1), f(each), 100.0 * each / mva,
+                                     " -- above its rating" if each > mva * 1.02 else
+                                     " -- far above them: Size GSUs from the units" if mva > 2.0 * each else ""))
                 self.total.set(("GSUs -- each generator's, as the models take them:\n" + "\n".join(lines))
                                if lines else "")
                 return
@@ -8669,7 +8941,7 @@ def gui(start=None):
         def edit(self, i, ci):
             if i is None or not (0 <= i < len(self.rows)):
                 return
-            if self.fixed and self.keys[ci] in ("name", "units"):
+            if self.fixed and self.keys[ci] == "name":
                 set_status("%s is set on the Generators page" % self.cols[ci][1])
                 return
             self.close_edit(True)
@@ -9007,6 +9279,242 @@ def gui(start=None):
                     self.rows.append({"bus": nm})
             self.refresh()
             dirty()
+
+        def sizing_dialog(self, title, intro, heads):
+            """A sizing dialog's frame: its title, what it does, a table of rows under these headings (filled by
+               the caller) and its buttons -> (top, table, buttons frame)."""
+            top = tk.Toplevel(root)
+            top.title(title)
+            top.transient(root)
+            ttk.Label(top, text=intro, wraplength=900, justify="left").pack(fill="x", padx=10, pady=(10, 6))
+            tab = ttk.Frame(top)
+            tab.pack(fill="both", expand=True, padx=10)
+            for c, h in enumerate(heads):
+                ttk.Label(tab, text=h, style="Item.TLabel").grid(row=0, column=c, sticky="w", padx=4, pady=(0, 4))
+            bb = ttk.Frame(top)
+            bb.pack(pady=10)
+            return top, tab, bb
+
+        def size_gsus(self):
+            """Each generator's GSUs from its units: how many share one GSU -> the GSU count (left blank: it
+               follows Units) and a GSU MVA for them (the nameplate given where it carries them, else their MVA
+               rounded up) -- shown first, set only for the generators ticked."""
+            self.close_edit(True)
+            f = lambda x: "%.6g" % x
+            top, tab, bb = self.sizing_dialog(
+                "Size the GSUs from the units",
+                "For each generator: how many of its units share one GSU. The GSU count follows -- Units / units per "
+                "GSU, rounded up ('GSU count' is left blank, so it keeps following Units). The GSU MVA: the one you "
+                "gave where it carries those units (up to twice their MVA), else their MVA rounded up. Change any "
+                "value; the ticked generators are set.",
+                ("Generator", "Its units", "Units per GSU", "GSU MVA (one)", "Then"))
+            rows = []
+            for i, r in enumerate(self.rows):
+                nm = _txt(r.get("name"))
+                if not nm or nm.startswith("#"):
+                    continue
+                k = len(rows) + 1
+                try:
+                    n, _p1, _p0, _pf, _q1, _q0, s1 = unit_rating(r, nm)
+                    per0 = gsu_per_now(r)
+                    _cnt, _load, mva0 = gsu_sizing(r, per0)
+                    have = _num(r, "gsu_mva", nm, None, positive=True)
+                except InputError as e:
+                    ttk.Label(tab, text=nm).grid(row=k, column=0, sticky="w", padx=4)
+                    ttk.Label(tab, text="does not read yet: %s" % str(e).split(": ", 1)[-1], style="Req.TLabel",
+                              wraplength=600).grid(row=k, column=1, columnspan=4, sticky="w", padx=4)
+                    rows.append(None)
+                    continue
+                use = tk.BooleanVar(value=bool(have) and (have > 2.0 * per0 * s1 or per0 * s1 > have * 1.02 or
+                                                          _txt(r.get("gsu_units")) is None))
+                per, mva, then = tk.StringVar(value=str(per0)), tk.StringVar(value=f(mva0)), tk.StringVar()
+                ttk.Checkbutton(tab, text=nm, variable=use).grid(row=k, column=0, sticky="w", padx=4, pady=2)
+                ttk.Label(tab, text="%d x %s MVA = %s MVA" % (n, f(s1), f(n * s1))).grid(row=k, column=1, sticky="w",
+                                                                                        padx=4)
+                tk.Spinbox(tab, from_=1, to=n, textvariable=per, width=6).grid(row=k, column=2, sticky="w", padx=4)
+                ttk.Entry(tab, textvariable=mva, width=9).grid(row=k, column=3, sticky="w", padx=4)
+                ttk.Label(tab, textvariable=then, wraplength=520, justify="left").grid(row=k, column=4, sticky="w",
+                                                                                      padx=4)
+                row = {"i": i, "name": nm, "n": n, "s1": s1, "have": have, "use": use, "per": per, "mva": mva,
+                       "then": then, "last": per0}
+
+                def show(*_a, row=row):
+                    try:
+                        p_ = max(1, min(int(float(row["per"].get())), row["n"]))
+                    except ValueError:
+                        return row["then"].set("units per GSU: a whole number, 1 to %d" % row["n"])
+                    if p_ != row["last"]:                 # a new split: its MVA suggested again
+                        row["last"] = p_
+                        row["mva"].set(f(gsu_sizing(self.rows[row["i"]], p_)[2]))
+                    try:
+                        m_ = float(row["mva"].get())
+                    except ValueError:
+                        return row["then"].set("GSU MVA: a number")
+                    cnt = int(math.ceil(row["n"] / float(p_) - 1e-9))
+                    last = row["n"] - (cnt - 1) * p_
+                    load = p_ * row["s1"]
+                    row["then"].set("%d GSU%s x %s MVA = %s MVA (%s unit%s on each%s): %s MVA on one, %.0f %%%s%s" % (
+                        cnt, "" if cnt == 1 else "s", f(m_), f(cnt * m_), p_, "" if p_ == 1 else "s",
+                        (", %d on the last" % last) if last != p_ else "", f(load), 100.0 * load / m_ if m_ else 0,
+                        " -- above its MVA" if load > m_ * 1.02 else " -- far above them" if m_ > 2 * load else "",
+                        "" if row["have"] else "  (no GSU now: it needs GSU kV and Z % too)"))
+                for v in (per, mva):
+                    v.trace_add("write", show) if hasattr(v, "trace_add") else v.trace("w", show)
+                show()
+                rows.append(row)
+
+            def ok():
+                done, bad = [], []
+                for row in rows:
+                    if row is None or not row["use"].get():
+                        continue
+                    try:
+                        p_ = int(float(row["per"].get()))
+                        m_ = float(row["mva"].get())
+                        if not (1 <= p_ and m_ > 0):
+                            raise ValueError
+                    except ValueError:
+                        bad.append(row["name"])
+                        continue
+                    r = self.rows[row["i"]]
+                    r["gsu_units"], r["gsu_mva"] = str(min(p_, row["n"])), f(m_)
+                    r.pop("gsu_count", None)               # blank: it follows Units / Units per GSU
+                    cnt = int(math.ceil(row["n"] / float(min(p_, row["n"])) - 1e-9))
+                    done.append("%s %d x %s MVA (%d units on each)" % (row["name"], cnt, f(m_), min(p_, row["n"])))
+                if bad:
+                    return messagebox.showerror("Size GSUs", "Units per GSU (1 or more) and GSU MVA (above 0) for "
+                                                "%s" % ", ".join(bad), parent=top)
+                top.destroy()
+                if done:
+                    for g in app["grids"].values():
+                        if g.key == self.key:
+                            g.refresh(self.current())
+                    dirty()
+                set_status(("GSUs set: %s -- 'GSU count' blank: it follows Units" % "; ".join(done)) if done else
+                           "GSUs: nothing ticked, nothing changed")
+            ttk.Button(bb, text="Set the ticked GSUs", command=ok).pack(side="left", padx=4)
+            ttk.Button(bb, text="Cancel", command=top.destroy).pack(side="left", padx=4)
+            app["size_dialog"] = {"top": top, "rows": rows, "ok": ok}
+            top.grab_set()
+            root.wait_window(top)
+            app["size_dialog"] = None
+
+        def size_mpts(self):
+            """Each MPT's MVA from the units on it (Unit MVA x Units, through shared collectors too), rounded up;
+               three windings: its LV and TV windings' too -- shown first, set only for the MPTs ticked. A Rate A
+               or Z base given as the old MVA is cleared (blank: it follows the MVA)."""
+            self.close_edit(True)
+            f = lambda x: "%.6g" % x
+            loads = mpt_loads(data)
+            top, tab, bb = self.sizing_dialog(
+                "Size the MPTs from the generators",
+                "Each MPT's MVA from the units on it (their Unit MVA x Units; through shared collectors too), rounded "
+                "up -- over its parallel units; three windings: its LV and TV windings' from the units on each. "
+                "Change any value; the ticked MPTs are set. Or leave an MPT's MVA blank: the build takes the units' "
+                "MVA, and it follows any change to the generators.",
+                ("MPT", "The units on it", "MVA now", "MVA", "LV MVA", "TV MVA", "Then"))
+            rows = []
+            for i, r in enumerate(self.rows):
+                nm = _txt(r.get("name"))
+                if not nm or nm.startswith("#"):
+                    continue
+                k = len(rows) + 1
+                e = loads.get(nm.upper()) or {"lv": 0.0, "tv": 0.0, "gens": []}
+                try:
+                    cnt = _int(r, "count", nm, 1, minimum=1)
+                    now = _num(r, "mva", nm, None, positive=True)
+                    three = _windings(r, nm) == 3 or (_windings(r, nm) is None and _txt(r.get("tv_kv")) is not None)
+                except InputError as x:
+                    ttk.Label(tab, text=nm).grid(row=k, column=0, sticky="w", padx=4)
+                    ttk.Label(tab, text="does not read yet: %s" % str(x).split(": ", 1)[-1], style="Req.TLabel",
+                              wraplength=600).grid(row=k, column=1, columnspan=6, sticky="w", padx=4)
+                    rows.append(None)
+                    continue
+                tot = e["lv"] + e["tv"]
+                use = tk.BooleanVar(value=bool(tot) and now is not None and (now * cnt > 2.0 * tot or
+                                                                             tot > 1.02 * now * cnt))
+                ttk.Checkbutton(tab, text=nm, variable=use).grid(row=k, column=0, sticky="w", padx=4, pady=2)
+                ttk.Label(tab, text=("%s = %s MVA" % (" + ".join("%s %s%s" % (g, f(x), " (TV)" if wd == "TV" else "")
+                                                              for g, x, wd in e["gens"]), f(tot))) if tot else
+                          "no generator on it", wraplength=260, justify="left").grid(row=k, column=1, sticky="w",
+                                                                                     padx=4)
+                ttk.Label(tab, text=("%d x %s" % (cnt, f(now)) if cnt > 1 else f(now)) if now else "blank").grid(
+                    row=k, column=2, sticky="w", padx=4)
+                mva = tk.StringVar(value=f(nice_mva(tot / cnt)) if tot else (_txt(r.get("mva")) or ""))
+                lv = tk.StringVar(value=(f(nice_mva(e["lv"] / cnt)) if e["lv"] else (_txt(r.get("lv_mva")) or ""))
+                                  if three else "")
+                tv = tk.StringVar(value=(f(nice_mva(e["tv"] / cnt)) if e["tv"] else (_txt(r.get("tv_mva")) or ""))
+                                  if three else "")
+                ttk.Entry(tab, textvariable=mva, width=9).grid(row=k, column=3, sticky="w", padx=4)
+                for c, v in ((4, lv), (5, tv)):
+                    ttk.Entry(tab, textvariable=v, width=8, state="normal" if three else "disabled").grid(
+                        row=k, column=c, sticky="w", padx=4)
+                then = tk.StringVar()
+                ttk.Label(tab, textvariable=then, wraplength=380, justify="left").grid(row=k, column=6, sticky="w",
+                                                                                      padx=4)
+                row = {"i": i, "name": nm, "cnt": cnt, "now": now, "tot": tot, "three": three, "use": use,
+                       "mva": mva, "lv": lv, "tv": tv, "then": then}
+
+                def show(*_a, row=row):
+                    try:
+                        m_ = float(row["mva"].get())
+                    except ValueError:
+                        return row["then"].set("MVA: a number (or untick it)")
+                    cap = m_ * row["cnt"]
+                    r_ = self.rows[row["i"]]
+                    follow = [lab for key, lab in (("rate_mva", "Rate A"), ("base_hl_mva", "Z HV-LV base"),
+                                                   ("base_ht_mva", "Z HV-TV base"), ("base_lt_mva", "Z LV-TV base"))
+                              if row["now"] and _txt(r_.get(key)) and _same(r_.get(key), row["now"])]
+                    keep = [lab for key, lab in (("rate_b_mva", "Rate B"), ("rate_c_mva", "Rate C"))
+                            if _txt(r_.get(key))]
+                    row["then"].set("%s MVA%s%s%s%s" % (
+                        f(cap), (" for %s MVA of units: %.0f %%" % (f(row["tot"]), 100.0 * row["tot"] / cap))
+                        if row["tot"] and cap else "",
+                        (" (%d x %s)" % (row["cnt"], f(m_))) if row["cnt"] > 1 else "",
+                        ("; %s as the old MVA: cleared, it follows" % ", ".join(follow)) if follow else "",
+                        ("; %s kept as given" % ", ".join(keep)) if keep else ""))
+                mva.trace_add("write", show) if hasattr(mva, "trace_add") else mva.trace("w", show)
+                show()
+                rows.append(row)
+
+            def ok():
+                done, bad = [], []
+                for row in rows:
+                    if row is None or not row["use"].get():
+                        continue
+                    try:
+                        vals = [float(row[k].get()) if row[k].get().strip() else None for k in ("mva", "lv", "tv")]
+                        if vals[0] is None or any(v is not None and not v > 0 for v in vals):
+                            raise ValueError
+                    except ValueError:
+                        bad.append(row["name"])
+                        continue
+                    r = self.rows[row["i"]]
+                    for key in ("rate_mva", "base_hl_mva", "base_ht_mva", "base_lt_mva"):   # they follow the MVA
+                        if row["now"] and _txt(r.get(key)) and _same(r.get(key), row["now"]):
+                            r.pop(key)
+                    r["mva"] = f(vals[0])
+                    if row["three"]:
+                        for key, v in (("lv_mva", vals[1]), ("tv_mva", vals[2])):
+                            if v is None:
+                                r.pop(key, None)
+                            else:
+                                r[key] = f(v)
+                    done.append("%s %s MVA" % (row["name"], f(vals[0])))
+                if bad:
+                    return messagebox.showerror("Size MPTs", "MVA (above 0) for %s -- or untick it" % ", ".join(bad),
+                                                parent=top)
+                top.destroy()
+                if done:
+                    self.refresh(self.current())
+                    dirty()
+                set_status(("MPTs set: %s" % "; ".join(done)) if done else "MPTs: nothing ticked, nothing changed")
+            ttk.Button(bb, text="Set the ticked MPTs", command=ok).pack(side="left", padx=4)
+            ttk.Button(bb, text="Cancel", command=top.destroy).pack(side="left", padx=4)
+            app["size_dialog"] = {"top": top, "rows": rows, "ok": ok}
+            top.grab_set()
+            root.wait_window(top)
+            app["size_dialog"] = None
 
     for sheet, key, cols in TABLES:
         app["grids"][key] = Grid(sheet, key, cols)
