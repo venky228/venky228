@@ -514,8 +514,8 @@ CABLE_COLS = [
     ("unit", "Length unit", "the values are per (blank = km)", LEN_UNITS, 7),
     ("r_per", "R per length", "ohm, at operating temperature", None, 9),
     ("x_per", "X per length", "ohm", None, 9),
-    ("c_per", "C per length", "uF", None, 9),
-    ("b_per", "B per length", "uS, instead of C", None, 9),
+    ("b_per", "B per length", "uS, the charging susceptance (GUI: Cables page, C to B)", None, 9),
+    ("c_per", "C per length", "uF, instead of B (B = 2 pi f C)", None, 9),
     ("rate_a_mva", "Rate A MVA", "one cable's normal rating at its collector's kV (sqrt(3) x kV x amps / 1000): "
      "RATEA, rate1 -- a section's: x its parallel cables (blank = none)", None, 9),
     ("rate_b_mva", "Rate B MVA", "one cable's emergency rating: RATEB, rate2 (blank = Rate A)", None, 9),
@@ -590,6 +590,7 @@ SIMPLE = {  # the GUI's simple view: these fields only (All fields: every one; a
     "GSUs": ("name", "units", "gsu_units", "gsu_count", "gsu_mva", "gsu_rate_a_mva", "gsu_rate_b_mva", "gsu_rate_c_mva",
              "gsu_hv_kv", "gsu_lv_kv", "gsu_z_pct", "gsu_x_r", "gsu_vector", "gsu_tap"),
     "Feeders": ("collector", "feeder", "copies", "section", "cable", "length", "unit", "units", "units_of"),
+    "Cables": ("cable", "unit", "r_per", "x_per", "b_per", "rate_a_mva", "rate_b_mva", "rate_c_mva"),
 }
 SIMPLE_TABS = ("Plant", "MPT", "Generators", "GSUs", "Feeders", "Cables", "Dyr_Params", "PSCAD_Params", "Output")
 _is = lambda key, v: lambda r: (_txt(r.get(key)) or "").upper() == v
@@ -699,10 +700,10 @@ EXAMPLE = {
                  "unit": "ft", "units": u}
                 for gen, secs in (("PV", _PV_FEEDER), ("BESS", _BESS_FEEDER)) for k, (c, ln, u) in enumerate(secs)],
     "cables": [
-        {"cable": "1000AL", "unit": "km", "r_per": 0.0460, "x_per": 0.1050, "c_per": 0.390},
-        {"cable": "500AL", "unit": "km", "r_per": 0.0900, "x_per": 0.1180, "c_per": 0.300},
-        {"cable": "4/0AL", "unit": "km", "r_per": 0.2010, "x_per": 0.1330, "c_per": 0.220},
-        {"cable": "1/0AL", "unit": "km", "r_per": 0.4040, "x_per": 0.1480, "c_per": 0.170},
+        {"cable": "1000AL", "unit": "km", "r_per": 0.0460, "x_per": 0.1050, "b_per": 147.027},
+        {"cable": "500AL", "unit": "km", "r_per": 0.0900, "x_per": 0.1180, "b_per": 113.097},
+        {"cable": "4/0AL", "unit": "km", "r_per": 0.2010, "x_per": 0.1330, "b_per": 82.938},
+        {"cable": "1/0AL", "unit": "km", "r_per": 0.4040, "x_per": 0.1480, "b_per": 64.0885},
     ],
     "collectors": [],
     "loads_shunts": [{"kind": "LOAD", "at": "MPT1", "mw": 1.0, "mvar": 0.3, "name": "AUX"}],
@@ -765,7 +766,8 @@ README = [
                 "section i. R ohm, X ohm, B uS: a section's own values (its parallel cables together) in place of "
                 "Cable x Length -- the GUI's Fill R, X, B from cables shows them to change; Clear R, X, B goes "
                 "back. A section with R and X needs no cable."),
-    ("Cables", "Cable data per length (R, X in ohm; C in uF or B in uS) and the length unit they are per; Rate A, "
+    ("Cables", "Cable data per length (R, X in ohm; B in uS, or C in uF instead -- the GUI's C to B turns C into B) "
+               "and the length unit they are per; Rate A, "
                "B, C one cable's ratings in MVA at its collector's kV (sqrt(3) x kV x amps / 1000): a section's x its "
                "parallel cables, a collector equivalent's its sections from the collector bus together."),
     ("Collectors", "Collector systems shared by more than one generator: name and the bus it starts from. Their "
@@ -3315,6 +3317,18 @@ def feeder_lines(data):
         by.setdefault(on.get(nm.upper(), ("not on an MPT",))[0], []).append((sum(k for _f, k, _u in fs), txt))
     return ["   %s: %d feeder%s -- %s" % (m, sum(k for k, _t in v), "" if sum(k for k, _t in v) == 1 else "s",
                                          "; ".join(t for _k, t in v)) for m, v in by.items() if v]
+
+
+def cable_b(r, data):
+    """A Cables row's blank B per length as the build takes it from its C (2 pi f C) -> {"b_per": B} or {}."""
+    try:
+        c = _txt(r.get("c_per"))
+        if c is None or _txt(r.get("b_per")) is not None:
+            return {}
+        return {"b_per": 2.0 * math.pi * (_cell_num((data or {}).get("plant") or {}, "freq_hz", 60.0) or 60.0) *
+                float(c)}
+    except (ValueError, TypeError):
+        return {}
 
 
 def mpt_blanks(r, loads):
@@ -9470,6 +9484,8 @@ def gui(start=None):
             if sheet == "Feeders":
                 acts += [("Fill R, X, B from cables", self.fill_rxb), ("Clear R, X, B", self.clear_rxb),
                          ("Lengths in ft", self.lengths_in)]
+            if sheet == "Cables":
+                acts.append(("C to B", self.c_to_b))
             if sheet == "Generators" and not fixed:
                 acts.append(("Pick UDM from OEM model...", self.pick_udm))
             if acts:
@@ -9527,7 +9543,8 @@ def gui(start=None):
             """A row's cells as shown: a blank model choice as the one the build takes, in brackets -- an MPT's blank
                windings, MVA and three-winding values too."""
             out = []
-            dflt = mpt_blanks(r, mpt_loads(data)) if self.sheet == "MPT" else {}
+            dflt = mpt_blanks(r, mpt_loads(data)) if self.sheet == "MPT" else cable_b(r, data) if \
+                self.sheet == "Cables" else {}
             for k in self.keys:
                 v = r.get(k) or ""
                 if not v and self.sheet == "Generators" and k in MODEL_CHOICE:
@@ -9851,6 +9868,31 @@ def gui(start=None):
                 dirty()
             set_status("%d R / X / B cell(s) filled from the cables -- change any; a filled value no longer follows "
                        "its cable and length (Clear R, X, B)" % n)
+
+        def c_to_b(self):
+            """Every cable's C per length as B per length (B = 2 pi f C, the Plant's frequency), C cleared; a row
+               with both: its B kept, its C cleared."""
+            self.close_edit(True)
+            f = _cell_num(data.get("plant") or {}, "freq_hz", 60.0) or 60.0
+            n, bad = 0, []
+            for i, r in enumerate(self.rows):
+                c = _txt(r.get("c_per"))
+                if c is None:
+                    continue
+                try:
+                    x = float(c)
+                except ValueError:
+                    bad.append(str(i + 1))
+                    continue
+                if _txt(r.get("b_per")) is None:
+                    r["b_per"] = _g(2.0 * math.pi * f * x, 6)
+                r.pop("c_per", None)
+                n += 1
+            self.refresh(self.current())
+            if n:
+                dirty()
+            set_status("%d cable(s): C per length now B per length (B = 2 pi x %g Hz x C)%s" % (
+                n, f, ("; rows %s: C is no number, left as it is" % ", ".join(bad)) if bad else ""))
 
         def lengths_in(self, unit="ft"):
             """Every Feeders row's length in `unit`, the same length: its value converted, its Length unit set."""
