@@ -87,7 +87,9 @@
                                        POI and REAX4BU1 on each generator
                                        (hybrid plants: PV + BESS)
                     WT3      + WTDTA1, WTARA1, WTPTA1, WTTQA1
-                    SYNC     GENROU + SEXS + TGOV1
+                    SYNC     GENROU + SEXS + TGOV1 (Machine, Exciter, Governor
+                             model: GENSAL; IEEET1, ESST1A, EXST1; HYGOV, GAST,
+                             IEEEG1; NONE)
                   REECCU1, REECDU1, PLNTBU1, REAX4BU1, REGCAU1 and REPCAU1
                   are USRMDL / USRBUS records (PSS/E 34 / 35 layouts): the
                   WECC user-model DLL must be loaded (ADDLIB_IDV / DLLS).
@@ -265,6 +267,10 @@ GEN_TYPES = ["PV", "BESS", "WT4", "WT3", "SYNC", "USER"]
 REEC_OK = {"PV": ("REEC_A", "REEC_D"), "WT4": ("REEC_A", "REEC_D"), "WT3": ("REEC_A",),
            "BESS": ("REEC_C", "REEC_D")}
 REGC_OK = {"PV": ("REGC_A", "REGC_B"), "WT4": ("REGC_A", "REGC_B"), "BESS": ("REGC_A", "REGC_B"), "WT3": ("REGC_A",)}
+# a synchronous machine's dynamic models (type SYNC), the first its default
+SYNC_MACHINES = ["GENROU", "GENSAL"]
+SYNC_EXCITERS = ["SEXS", "IEEET1", "ESST1A", "EXST1", "NONE"]
+SYNC_GOVERNORS = ["TGOV1", "HYGOV", "GAST", "IEEEG1", "NONE"]
 MODEL_CHOICE = {                  # what each choice is for: the GUI lists a generator's own (by its Type), the first
     "regc": (REGC_OK, collections.OrderedDict([       # its default
         ("REGC_A", "current source -- the standard"),
@@ -273,6 +279,21 @@ MODEL_CHOICE = {                  # what each choice is for: the GUI lists a gen
         ("REEC_A", "solar, wind -- WECC's standard"),
         ("REEC_C", "battery -- with its state of charge"),
         ("REEC_D", "solar, battery, wind -- the newest: voltage-dependent limits, momentary cessation")])),
+    "sync_machine": ({"SYNC": tuple(SYNC_MACHINES)}, collections.OrderedDict([
+        ("GENROU", "round rotor -- steam and gas turbine units"),
+        ("GENSAL", "salient pole -- hydro units")])),
+    "sync_exciter": ({"SYNC": tuple(SYNC_EXCITERS)}, collections.OrderedDict([
+        ("SEXS", "simplified excitation system"),
+        ("IEEET1", "IEEE type 1: a DC exciter (older units)"),
+        ("ESST1A", "static, fed from its terminals (IEEE ST1A) -- most new units"),
+        ("EXST1", "static, fed from its terminals (IEEE ST1, the older form)"),
+        ("NONE", "none: its field voltage stays as it starts")])),
+    "sync_governor": ({"SYNC": tuple(SYNC_GOVERNORS)}, collections.OrderedDict([
+        ("TGOV1", "steam turbine"),
+        ("HYGOV", "hydro turbine, with its penstock"),
+        ("GAST", "gas turbine"),
+        ("IEEEG1", "steam turbine, IEEE type 1: its stages (HP, IP, LP)"),
+        ("NONE", "none: its mechanical power stays as it starts")])),
 }
 
 # Plant sheet (Item | Value | Unit | Notes): (key, item, unit, note, choices)
@@ -443,6 +464,12 @@ GEN_COLS = [
     ("reec", "Electrical control", "REEC_A: PV, WT | REEC_C: BESS (state of charge) | REEC_D: PV, BESS, WT4, the "
      "newest (voltage-dependent limits, momentary cessation) -- .dyr and .dyd alike (blank = REEC_A, BESS REEC_C)",
      ["REEC_A", "REEC_C", "REEC_D"], 9),
+    ("sync_machine", "Machine model", "SYNC: GENROU round rotor (steam, gas) | GENSAL salient pole (hydro) (blank = "
+     "GENROU)", SYNC_MACHINES, 9),
+    ("sync_exciter", "Exciter model", "SYNC: SEXS simplified | IEEET1 DC (IEEE type 1) | ESST1A static, bus-fed | EXST1 "
+     "static (older form) | NONE: constant field voltage (blank = SEXS)", SYNC_EXCITERS, 9),
+    ("sync_governor", "Governor model", "SYNC: TGOV1 steam | HYGOV hydro | GAST gas | IEEEG1 steam, multi-stage | "
+     "NONE: constant mechanical power (blank = TGOV1)", SYNC_GOVERNORS, 9),
     ("pscad_library", "PSCAD library", "vendor library .pslx (blank = none)", None, 18),
     ("pscad_definition", "PSCAD definition", "vendor model, library:name (blank = a source: network check)", None, 16),
     ("pscad_ac_port", "PSCAD AC port", "its AC port (blank = its 3-phase port)", None, 9),
@@ -522,7 +549,8 @@ MACHINE_COLS = [
 DYRP_COLS = [
     ("generator", "Generator", "# IB: the infinite bus | PLANT: the plant controller (REPC_B)", None, 11),
     ("model", "Model", "REGCA1 (REGCAU1) | REECA1 REECCU1 REECDU1 | REPCA1 (REPCAU1) or REAX4BU1 | PLANT: PLNTBU1 | "
-     "WT3: + WTDTA1 WTARA1 WTPTA1 WTTQA1 | SYNC: GENROU SEXS TGOV1 | IB: GENCLS", None, 9),
+     "WT3: + WTDTA1 WTARA1 WTPTA1 WTTQA1 | SYNC: its machine (GENROU, GENSAL), exciter (SEXS, IEEET1, ESST1A, "
+     "EXST1), governor (TGOV1, HYGOV, GAST, IEEEG1) | IB: GENCLS", None, 9),
     ("parameter", "Parameter", "PSS/E name (the report lists them all) or position: ICON2, CON14", None, 10),
     ("value", "Value", "", None, 9),
 ]
@@ -562,6 +590,8 @@ SHOW_WITH = {  # the simple view: a column it hides, shown where a row's other v
     ("Generators", "coll_r"): _is("collector", "EQUIVALENT"), ("Generators", "coll_x"): _is("collector", "EQUIVALENT"),
     ("Generators", "coll_b"): _is("collector", "EQUIVALENT"),
     ("Generators", "coll_units"): _is("collector", "EQUIVALENT"),
+    ("Generators", "sync_machine"): _is("type", "SYNC"), ("Generators", "sync_exciter"): _is("type", "SYNC"),
+    ("Generators", "sync_governor"): _is("type", "SYNC"),
 }
 PAGE_COLS = {  # pages that show part of a sheet, in either view: the Generators sheet as its generators and its GSUs
     "Generators": tuple(c[0] for c in GEN_COLS if not c[0].startswith("gsu_")),
@@ -741,7 +771,8 @@ README = [
     ("Dyr_Params", "Any parameter of the WECC-approved generic models, by generator, model and PSS/E name or "
                    "position (ICON2, CON14) -- IB for the infinite bus, PLANT for the plant controller. Inverters: "
                    "REGCA1 (REGC_A) + REECA1 / REECCU1 / REECDU1 (REEC_A / C / D) + REPCA1 (REPC_A) or REAX4BU1 "
-                   "(with PLNTBU1, REPC_B); WT3: + WTDTA1 WTARA1 WTPTA1 WTTQA1; SYNC: GENROU SEXS TGOV1. REECCU1, "
+                   "(with PLNTBU1, REPC_B); WT3: + WTDTA1 WTARA1 WTPTA1 WTTQA1; SYNC: its Machine, Exciter and "
+                   "Governor models (Generators; blank: GENROU SEXS TGOV1). REECCU1, "
                    "REECDU1, PLNTBU1, REAX4BU1 (and REGCAU1, REPCAU1) are user models: the WECC user-model DLL must "
                    "be loaded for the PSS/E check (ADDLIB_IDV / DLLS in the script). The report lists every model's "
                    "parameters with the values used. In the GUI, the Dyr_Params tab shows every model's parameters "
@@ -1338,8 +1369,16 @@ MODEL_DOC = {
     "PLNTBU1": "plant controller REPC_B, one for the whole plant at the POI (Plant controller REPC_B)",
     "REAX4BU1": "REPC_B's auxiliary model on each generator: its share of the plant's P and Q",
     "WTDTA1": "WT3 drive train", "WTARA1": "WT3 aerodynamics", "WTPTA1": "WT3 pitch control",
-    "WTTQA1": "WT3 torque control", "GENROU": "synchronous machine, round rotor (type SYNC)",
-    "SEXS": "simplified excitation system (type SYNC)", "TGOV1": "steam turbine-governor (type SYNC)"}
+    "WTTQA1": "WT3 torque control", "GENROU": "synchronous machine, round rotor (type SYNC; Machine model)",
+    "SEXS": "simplified excitation system (type SYNC; Exciter model)",
+    "TGOV1": "steam turbine-governor (type SYNC; Governor model)",
+    "GENSAL": "synchronous machine, salient pole: hydro (type SYNC; Machine model)",
+    "IEEET1": "IEEE type 1 excitation system: a DC exciter (type SYNC; Exciter model)",
+    "ESST1A": "IEEE ST1A static excitation system, fed from the terminals (type SYNC; Exciter model)",
+    "EXST1": "IEEE ST1 static excitation system, the older form (type SYNC; Exciter model)",
+    "HYGOV": "hydro turbine-governor with its penstock (type SYNC; Governor model)",
+    "GAST": "gas turbine-governor (type SYNC; Governor model)",
+    "IEEEG1": "IEEE type 1 steam turbine-governor, its stages (type SYNC; Governor model)"}
 
 AUTO_PARAMS = {"REECA1": ("QMax", "QMin", "PMAX", "PMIN", "PFLAG"), "REECCU1": ("QMax", "QMin", "PMAX", "PMIN"),
                "REECDU1": ("QMax", "QMin", "PMAX", "PMIN", "Ke"),
@@ -1347,7 +1386,7 @@ AUTO_PARAMS = {"REECA1": ("QMax", "QMin", "PMAX", "PMIN", "PFLAG"), "REECCU1": (
                "REPCAU1": ("BUSR", "BUS1", "BUS2", "CKT", "Qmax", "Qmin", "Pmax", "Pmin", "Dup"),
                "PLNTBU1": ("BUSR", "BUS1", "BUS2", "CKT", "Qmax", "Qmin", "Pmax", "Pmin", "Dup", "MVAbase"),
                "REAX4BU1": ("PCBUS", "Kz", "Kw", "Qmax", "Qmin", "Pmax", "Pmin"), "WTTQA1": ("TRATE",),
-               "TGOV1": ("VMAX",)}
+               "TGOV1": ("VMAX",), "GAST": ("VMAX",), "IEEEG1": ("PMAX",), "HYGOV": ("GMAX",)}
 
 PARAM_DOC = {
     "H": "inertia constant (s; 0 = infinite bus)", "D": "damping (pu)",
@@ -1420,7 +1459,47 @@ PARAM_DOC = {
     "T2": "T2 (s)", "T3": "T3 (s)", "Dt": "turbine damping (pu)"}
 
 
-def _param_doc(name):
+_EXC = {"TR": "voltage measurement time constant (s)", "KA": "voltage regulator gain", "TA": "regulator time constant "
+        "(s)", "VRMAX": "regulator output, upper (pu)", "VRMIN": "regulator output, lower (pu)", "KF": "rate feedback "
+        "gain", "TF": "rate feedback time constant (s)", "TB": "lag time constant (s)", "TC": "lead time constant (s)",
+        "VIMAX": "regulator input error, upper (pu)", "VIMIN": "regulator input error, lower (pu)",
+        "KC": "rectifier loading factor (commutating reactance)"}
+PARAM_DOC_OF = {  # a model's own meaning of a name other models use otherwise
+    "IEEET1": dict(_EXC, KE="exciter constant (self-excited field)", TE="exciter time constant (s)",
+                   Switch="0 (PSS/E's switch, not used)", E1="field voltage of the first saturation point (pu)",
+                   SE1="saturation at E1", E2="field voltage of the second saturation point (pu)",
+                   SE2="saturation at E2"),
+    "ESST1A": dict(_EXC, UEL="where the underexcitation limiter acts: 1, 2 or 3", VOS="where the stabilizer acts: 1 "
+                   "or 2", TC1="second lead time constant (s)", TB1="second lag time constant (s)",
+                   VAMAX="amplifier output, upper (pu)", VAMIN="amplifier output, lower (pu)",
+                   KLR="field current limiter gain", ILR="field current limit (pu)"),
+    "EXST1": dict(_EXC),
+    "HYGOV": {"R": "permanent droop (pu)", "r": "temporary droop (pu)", "Tr": "governor time constant (s)",
+              "Tf": "filter time constant (s)", "Tg": "gate servo time constant (s)",
+              "VELM": "gate velocity limit (pu/s)", "GMAX": "gate opening, upper (pu)",
+              "GMIN": "gate opening, lower (pu)", "TW": "water inertia time constant (s)", "At": "turbine gain",
+              "Dturb": "turbine damping (pu)", "qNL": "no-load flow (pu)"},
+    "GAST": {"R": "droop (pu)", "T1": "fuel valve time constant (s)", "T2": "fuel system time constant (s)",
+             "T3": "load limit time constant (s)", "AT": "load limit (ambient temperature) (pu)",
+             "KT": "load limit feedback gain", "VMAX": "fuel valve, upper (pu)", "VMIN": "fuel valve, lower (pu)",
+             "Dturb": "turbine damping (pu)"},
+    "IEEEG1": dict([("IBUS", "a cross-compound unit's low-pressure machine bus (0 = none)"),
+                    ("M", "its machine (0 = none)"), ("K", "governor gain, 1 / droop"),
+                    ("T1", "governor lag time constant (s)"), ("T2", "governor lead time constant (s)"),
+                    ("T3", "valve positioner time constant (s)"), ("Uo", "valve opening rate (pu/s)"),
+                    ("Uc", "valve closing rate (pu/s, negative)"), ("PMAX", "valve opening, upper (pu)"),
+                    ("PMIN", "valve opening, lower (pu)")] +
+                   [("T%d" % k, "stage %d time constant (s)" % (k - 3)) for k in (4, 5, 6, 7)] +
+                   [("K%d" % k, "stage %d's share of its power%s" % ((k + 1) // 2, " (high-pressure machine)" if k % 2
+                                                                     else " (low-pressure machine)"))
+                    for k in range(1, 9)]),
+    "GENSAL": {"Tqopp": "T''qo (s)", "Xq": "Xq (pu)", "Xdpp": "X''d (pu)"},
+}
+
+
+def _param_doc(name, model=None):
+    if name in PARAM_DOC_OF.get(model, {}):
+        return PARAM_DOC_OF[model][name]
     m = re.match(r"^(V|I)(q|p)(\d+)$", name)
     if m:
         return "%s current limit curve (%s), point %s: %s" % (
@@ -1656,7 +1735,7 @@ def write_template(path, data=None, roles=None):
             pos = ("ICON%d" % (k + 1)) if k < nic else ("CON%d" % (k - nic + 1))
             rows.append([(model, XS_CELL), (pos, XS_CELL), (nm, XS_ITEM), (DYN_DEFAULTS[model].get(nm), XS_CELL),
                          ("auto" if nm in AUTO_PARAMS.get(model, ()) else "", XS_TAG if nm in
-                          AUTO_PARAMS.get(model, ()) else XS_CELL), (_param_doc(nm), XS_CELL)])
+                          AUTO_PARAMS.get(model, ()) else XS_CELL), (_param_doc(nm, model), XS_CELL)])
     sheets.append(("Dynamic_Models", _xl_sheet(rows, [11, 9, 13, 11, 14, 78], (0, 3), merges=merges, heights=hts,
                                                tab=_TAB_REF, fit=True)))
     write_xlsx(path, sheets)
@@ -2737,6 +2816,11 @@ def build_network(inp, log):
 
     for g in gens:
         build_generator(net, g, feeders, cables, unit_mw, used, log)
+    if outputs(inp)["dyd"]:                          # said now (Check inputs), as the .dyd will say it
+        for g in gens:
+            for m in [m for m in g["sync"] if m in PSLF_NAME] if g["type"] == "SYNC" else ():
+                net.notes.append("CHECK: PSLF .dyd: %s %s (PSS/E %s) not written -- add it by hand" % (
+                    g["name"], PSLF_NAME[m], m))
     net.model = _choice(pl, "model_type", W, ["SMIB", "DETAILED"], "SMIB")
     net.stem = "%s_%s" % (net.name, net.model)          # the output files' names: SMIB and DETAILED apart
     for g in gens:                                       # Units against the units its feeders carry
@@ -3485,6 +3569,14 @@ def gen_data(r):
                                                                                     " or ".join(REEC_OK[typ])))
     elif reec:
         raise InputError("%s: Electrical control %s -- only inverters take one (PV, BESS, WT4, WT3)" % (w, reec))
+    sync = tuple(_choice(r, k, w, ok, None) for k, ok in (("sync_machine", SYNC_MACHINES),
+                                                          ("sync_exciter", SYNC_EXCITERS),
+                                                          ("sync_governor", SYNC_GOVERNORS)))
+    if typ == "SYNC":
+        sync = tuple(v or ok[0] for v, ok in zip(sync, (SYNC_MACHINES, SYNC_EXCITERS, SYNC_GOVERNORS)))
+    elif any(sync):
+        raise InputError("%s: %s -- only a synchronous machine (Type SYNC) takes one" % (w, ", ".join(
+            "%s %s" % (_label(k, w), v) for k, v in zip(("sync_machine", "sync_exciter", "sync_governor"), sync) if v)))
     regc = _choice(r, "regc", w, ["REGC_A", "REGC_B"], None)
     if typ in REGC_OK:
         regc = regc or "REGC_A"
@@ -3494,7 +3586,8 @@ def gen_data(r):
     elif regc:
         raise InputError("%s: Converter model %s -- only inverters take one (PV, BESS, WT4, WT3)" % (w, regc))
     n, pmax, pmin, pf, qmax, qmin, s = unit_rating(r, w)
-    g = {"name": name, "type": typ, "reec": reec, "regc": regc, "id": (_txt(r.get("id")) or "1")[:2], "row": r,
+    g = {"name": name, "type": typ, "reec": reec, "regc": regc, "sync": sync, "id": (_txt(r.get("id")) or "1")[:2],
+         "row": r,
          "where": w, "n": n,
          "unit": {"mva": s, "pmax": pmax, "pmin": pmin, "qmax": qmax, "qmin": qmin, "pf": pf},
          "mbase": n * s, "pmax": n * pmax, "pmin": n * pmin, "qmax": n * qmax, "qmin": n * qmin,
@@ -4574,7 +4667,7 @@ def raw_gen(net, g, poi):
         net.notes.append("CHECK: %s: REGC_B with ZSORCE X blank -- Xe %g pu on MBASE used: set the converter's own "
                          "coupling reactance (Generators: ZSORCE X)" % (g.get("family", g["name"]), zx))
     elif zx is None:
-        zx = DYN_DEFAULTS["GENROU"]["Xdpp"] if g["type"] == "SYNC" else IBR_ZSORCE_X
+        zx = DYN_DEFAULTS[(g.get("sync") or SYNC_DEFAULT)[0]]["Xdpp"] if g["type"] == "SYNC" else IBR_ZSORCE_X
     wmod = g["wmod"] if g["wmod"] is not None else (0 if g["type"] == "SYNC" else 1)
     g["zx"], g["wmod_used"], g["ireg"], g["vs"] = zx, wmod, ireg, vs
     return qt, qb, vs, ireg, rmp, zx, wmod
@@ -4845,6 +4938,9 @@ PSLF_DYD = {
                                  "S1", "S12", 0.0, 0.0, 0.0, 0.0]),
     "SEXS": ("sexs", None, ["TA_TB", "TB", "K", "TE", "EMIN", "EMAX", 1.0, 0.0, -999.0, 999.0, 0.0]),
     "TGOV1": ("tgov1", "mwcap", ["R", "T1", "VMAX", "VMIN", "T2", "T3", "Dt"]),
+    "GENSAL": ("gensal", "mva", ["Tdop", "Tdopp", "Tqopp", "H", "D", "Xd", "Xq", "Xdp", "Xdpp", "Xl", "S1", "S12", 0.0,
+                                 0.0, 0.0, 0.0]),                            # .. ra rcomp xcomp accel
+    "GAST": ("gast", "mwcap", ["R", "T1", "T2", "T3", "AT", "KT", "VMAX", "VMIN", "Dturb"]),       # AT: PSLF's lmax
     # PSLF's reec_d: its six flags (vcmpflag first) after tpord, then rc xc tr1 kc ke, vblkh before vblkl, tblkdelay,
     # the two ten-point VDL tables
     "REECDU1": ("reec_d", None, [0.0, "Vdip", "Vup", "Trv", "dbd1", "dbd2", "Kqv", "Iqh1", "Iql1", "Vref0", "Iqfrz",
@@ -4867,7 +4963,8 @@ PSLF_DYD = {
     "WTTQA1": ("wtgq_a", None, [0.0, "Kip", "Kpp", "Tp", "Twref", "Temax", "Temin", "p1", "spd1", "p2", "spd2", "p3",
                                 "spd3", "p4", "spd4", "TFLAG"]),
 }
-PSLF_NAME = {}                             # PSS/E models PSLF has, their parameter order not here yet
+PSLF_NAME = {"IEEET1": "ieeet1", "ESST1A": "esst1a", "EXST1": "exst1", "HYGOV": "hygov",   # PSLF has them; their
+             "IEEEG1": "ieeeg1"}                                          # parameter order not here yet
 PSLF_DYD["REGCAU1"], PSLF_DYD["REPCAU1"] = PSLF_DYD["REGCA1"], PSLF_DYD["REPCA1"]
 
 
@@ -4964,7 +5061,9 @@ def write_dyd(net, recs, path):
 #                REEC_C  REECCU1   BESS             REPC_B  REAX4BU1 on the generator and one PLNTBU1 (a USRBUS
 #                REEC_D  REECDU1   PV, BESS, WT4            record) at the POI for the plant
 #              REGCAU1 / REPCAU1 for REGCA1 / REPCA1 with Plant 'REGC_A / REPC_A records' USRMDL
-#   WT3        + WTDTA1 WTARA1 WTPTA1 WTTQA1        SYNC  GENROU + SEXS + TGOV1
+#   WT3        + WTDTA1 WTARA1 WTPTA1 WTTQA1        SYNC  its Machine, Exciter and Governor models (blank:
+#                                                         GENROU + SEXS + TGOV1; GENSAL, IEEET1, ESST1A, EXST1,
+#                                                         HYGOV, GAST, IEEEG1, or NONE for exciter / governor)
 # REECCU1, REECDU1, REAX4BU1, PLNTBU1, REGCAU1, REPCAU1 are user models (USRMDL / USRBUS): the WECC user-model DLL
 # must be loaded (ADDLIB_IDV / DLLS).
 # model: (USRMDL / USRBUS header IC IT NI NC NS NV, or None for a standard record; number of ICONs; names in record
@@ -5017,6 +5116,16 @@ DYR_LIB = collections.OrderedDict([
                           "S12"])),
     ("SEXS", (None, 0, ["TA_TB", "TB", "K", "TE", "EMIN", "EMAX"])),
     ("TGOV1", (None, 0, ["R", "T1", "VMAX", "VMIN", "T2", "T3", "Dt"])),
+    ("GENSAL", (None, 0, ["Tdop", "Tdopp", "Tqopp", "H", "D", "Xd", "Xq", "Xdp", "Xdpp", "Xl", "S1", "S12"])),
+    ("IEEET1", (None, 0, ["TR", "KA", "TA", "VRMAX", "VRMIN", "KE", "TE", "KF", "TF", "Switch", "E1", "SE1", "E2",
+                          "SE2"])),
+    ("ESST1A", (None, 2, ["UEL", "VOS", "TR", "VIMAX", "VIMIN", "TC", "TB", "TC1", "TB1", "KA", "TA", "VAMAX",
+                          "VAMIN", "VRMAX", "VRMIN", "KC", "KF", "TF", "KLR", "ILR"])),
+    ("EXST1", (None, 0, ["TR", "VIMAX", "VIMIN", "TC", "TB", "KA", "TA", "VRMAX", "VRMIN", "KC", "KF", "TF"])),
+    ("HYGOV", (None, 0, ["R", "r", "Tr", "Tf", "Tg", "VELM", "GMAX", "GMIN", "TW", "At", "Dturb", "qNL"])),
+    ("GAST", (None, 0, ["R", "T1", "T2", "T3", "AT", "KT", "VMAX", "VMIN", "Dturb"])),
+    ("IEEEG1", (None, 2, ["IBUS", "M", "K", "T1", "T2", "T3", "Uo", "Uc", "PMAX", "PMIN", "T4", "K1", "K2", "T5", "K3",
+                          "K4", "T6", "K5", "K6", "T7", "K7", "K8"])),
     ("LHVRT", (None, 0, _LHVRT)),
     ("LHFRT", (None, 0, _LHFRT)),
 ])
@@ -5068,6 +5177,21 @@ DYN_DEFAULTS = {
                "Xdp": 0.3, "Xqp": 0.55, "Xdpp": 0.25, "Xl": 0.15, "S1": 0.1, "S12": 0.3},
     "SEXS": {"TA_TB": 0.1, "TB": 10.0, "K": 100.0, "TE": 0.05, "EMIN": 0.0, "EMAX": 5.0},
     "TGOV1": {"R": 0.05, "T1": 0.5, "VMAX": 1.05, "VMIN": 0.0, "T2": 1.0, "T3": 1.0, "Dt": 0.0},
+    "GENSAL": {"Tdop": 5.0, "Tdopp": 0.05, "Tqopp": 0.1, "H": 3.0, "D": 0.0, "Xd": 1.0, "Xq": 0.6, "Xdp": 0.3,
+               "Xdpp": 0.2, "Xl": 0.15, "S1": 0.1, "S12": 0.3},
+    "IEEET1": {"TR": 0.0, "KA": 400.0, "TA": 0.04, "VRMAX": 7.3, "VRMIN": -7.3, "KE": 1.0, "TE": 0.8, "KF": 0.03,
+               "TF": 1.0, "Switch": 0, "E1": 3.0, "SE1": 0.1, "E2": 4.0, "SE2": 0.3},
+    "ESST1A": {"UEL": 1, "VOS": 1, "TR": 0.02, "VIMAX": 999.0, "VIMIN": -999.0, "TC": 1.0, "TB": 1.0, "TC1": 0.0,
+               "TB1": 0.0, "KA": 210.0, "TA": 0.0, "VAMAX": 999.0, "VAMIN": -999.0, "VRMAX": 6.43, "VRMIN": -6.0,
+               "KC": 0.038, "KF": 0.0, "TF": 1.0, "KLR": 4.54, "ILR": 4.4},
+    "EXST1": {"TR": 0.02, "VIMAX": 0.2, "VIMIN": -0.2, "TC": 1.0, "TB": 10.0, "KA": 200.0, "TA": 0.02, "VRMAX": 5.0,
+              "VRMIN": -5.0, "KC": 0.05, "KF": 0.0, "TF": 1.0},
+    "HYGOV": {"R": 0.05, "r": 0.3, "Tr": 5.0, "Tf": 0.05, "Tg": 0.5, "VELM": 0.2, "GMAX": 1.0, "GMIN": 0.0, "TW": 1.0,
+              "At": 1.2, "Dturb": 0.5, "qNL": 0.08},
+    "GAST": {"R": 0.05, "T1": 0.4, "T2": 0.1, "T3": 3.0, "AT": 1.0, "KT": 2.0, "VMAX": 1.0, "VMIN": 0.0, "Dturb": 0.0},
+    "IEEEG1": {"IBUS": 0, "M": 0, "K": 20.0, "T1": 0.0, "T2": 0.0, "T3": 0.1, "Uo": 0.5, "Uc": -0.5, "PMAX": 1.0,
+               "PMIN": 0.0, "T4": 0.3, "K1": 0.3, "K2": 0.0, "T5": 7.0, "K3": 0.4, "K4": 0.0, "T6": 0.6, "K5": 0.3,
+               "K6": 0.0, "T7": 0.0, "K7": 0.0, "K8": 0.0},
 }
 
 DYN_DEFAULTS["REGCAU1"] = dict(DYN_DEFAULTS["REGCA1"])
@@ -5098,6 +5222,7 @@ for _k, (_vq, _vp) in enumerate(zip((0.0, 0.3, 0.4, 0.6, 0.8, 0.9, 1.0, 1.1, 1.2
                                     "Vp%d" % (_k + 1): _vp, "Ip%d" % (_k + 1): 1.1})
 
 REEC_MODEL = {"REEC_A": "REECA1", "REEC_C": "REECCU1", "REEC_D": "REECDU1"}
+SYNC_DEFAULT = (SYNC_MACHINES[0], SYNC_EXCITERS[0], SYNC_GOVERNORS[0])
 PLANT_CTRL_TYPES = ("PV", "BESS", "WT4")   # REPC_B's REAX4BU1 is for type 4 machines (WT3 keeps a REPCA1)
 
 
@@ -5108,8 +5233,8 @@ def on_plntbu1(g, ctl):
 
 def gen_chain(g, ctl):
     """Generator g's .dyr models: its type, Electrical control and the Plant's controller choices."""
-    if g["type"] == "SYNC":
-        return ["GENROU", "SEXS", "TGOV1"]
+    if g["type"] == "SYNC":                      # its machine, exciter and governor (NONE: left out)
+        return [m for m in g.get("sync") or SYNC_DEFAULT if m != "NONE"]
     if g["type"] == "USER":
         return []
     usr = ctl.get("regc_repc") == "USRMDL"
@@ -5292,6 +5417,9 @@ def dyr_models(net, inp):
                          "Pmax": pmax, "Pmin": pmin},
             "WTTQA1": {"TRATE": g["pmax"]},
             "TGOV1": {"VMAX": max(1.05, g["p"] / mb + 0.05)},
+            "GAST": {"VMAX": max(1.0, g["p"] / mb + 0.05)},
+            "IEEEG1": {"PMAX": max(1.0, g["p"] / mb + 0.05)},
+            "HYGOV": {"GMAX": max(1.0, g["p"] / mb / DYN_DEFAULTS["HYGOV"]["At"] + DYN_DEFAULTS["HYGOV"]["qNL"] + 0.05)},
         }
         auto["REPCAU1"] = auto["REPCA1"]
         prot = list(PSLF_ONLY) if g["type"] in REGC_OK else []
@@ -10240,7 +10368,7 @@ def gui(start=None):
             f = find.get().strip().lower()
             last = None
             for model, p, pos, cells in rows:
-                doc = _param_doc(p)
+                doc = _param_doc(p, model)
                 if f and not any(f in str(x).lower() for x in [model, p, pos, doc] + [c[0] for c in cells.values()]):
                     continue
                 if model != last:
@@ -10665,7 +10793,7 @@ def gui(start=None):
         for k, nm in enumerate(names):
             drows.append([model, ("ICON%d" % (k + 1)) if k < nic else ("CON%d" % (k - nic + 1)), nm,
                           _txt(DYN_DEFAULTS[model].get(nm)) or "", "auto" if nm in AUTO_PARAMS.get(model, ()) else "",
-                          _param_doc(nm)])
+                          _param_doc(nm, model)])
 
     def dm_extra(top):
         ttk.Button(top, text="Add the selected parameter to Dyr_Params", command=lambda: add_param()).pack(
