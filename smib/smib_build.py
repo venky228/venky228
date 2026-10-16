@@ -150,6 +150,13 @@
      through shared collectors too), following them; one far from it is
      CHECKed. The GUI's GSUs page (Size GSUs from the units) and MPT page
      (Size MPTs from the generators) suggest both and set the ones ticked.
+     Feeders: an MPT's are those of the generators on it (and the shared
+     collectors), each generator's its feeder x Copies -- the GUI shows them
+     on the MPT and Feeders pages. Feeders on each MPT (either page) sets how
+     many feeders each generator has, its units spread over them (an MPT's
+     number shared out by MW); a generator's Units changed in the GUI: its
+     feeders follow -- Copies of its feeder as drawn, the units left over on
+     one more (a feeder's sections with no units at them or beyond left out).
      Rate A, B, C (PSS/E RATEA/B/C, PSLF rate1/2/3; B blank = A, C blank =
      B): an MPT's (three windings: the HV winding's, the LV and TV windings'
      their MVA, B and C in proportion), one GSU's (x the GSUs), one cable's
@@ -236,6 +243,8 @@ REGCB_XE = 0.15                   # REGC_B: the converter's coupling reactance X
 # THE INPUT WORKBOOK -- its sheets and columns, and the example it is written with
 # ============================================================================
 LEN_UNITS = ["km", "mi", "kft", "m", "ft"]
+FEEDER_UNITS = ["ft", "kft", "m", "km", "mi"]    # a feeder section's length: blank = ft (older files: km)
+FEEDER_UNIT = "ft"
 LEN_KM = {"km": 1.0, "mi": 1.609344, "kft": 0.3048, "m": 0.001, "ft": 0.0003048}
 GEN_TYPES = ["PV", "BESS", "WT4", "WT3", "SYNC", "USER"]
 # the electrical control models (REEC) each inverter type takes; the first is its default
@@ -431,13 +440,14 @@ GEN_COLS = [
 FEEDER_COLS = [
     ("collector", "Collector", "# the generator (its own collector) or a shared collector", None, 11),
     ("feeder", "Feeder", "feeder name", None, 8),
-    ("copies", "Copies", "identical feeders (blank = 1)", None, 6),
+    ("copies", "Copies", "identical feeders: how many of this feeder (blank = 1) -- an MPT's feeders are those of the "
+     "generators on it (GUI: MPT or Feeders page, Feeders on each MPT)", None, 6),
     ("section", "Section", "1, 2, 3 ... from the collector bus out", None, 7),
     ("from_section", "From section", "blank = the one before (daisy chain) | 0 = the collector bus | n = a lateral "
      "off the end of section n", None, 9),
     ("cable", "Cable", "from Cables", None, 9),
     ("length", "Length", "", None, 7),
-    ("unit", "Length unit", "blank = km", LEN_UNITS, 7),
+    ("unit", "Length unit", "blank = ft", FEEDER_UNITS, 7),
     ("units", "Units at end", "units tapped at the far end", None, 7),
     ("units_of", "Units of", "shared collectors: whose units (repeat the section for another generator's)", None, 10),
     ("parallel", "Parallel cables", "blank = 1", None, 7),
@@ -448,7 +458,7 @@ FEEDER_COLS = [
 
 CABLE_COLS = [
     ("cable", "Cable", "# cable type", None, 11),
-    ("unit", "Length unit", "the values are per", LEN_UNITS, 7),
+    ("unit", "Length unit", "the values are per (blank = km)", LEN_UNITS, 7),
     ("r_per", "R per length", "ohm, at operating temperature", None, 9),
     ("x_per", "X per length", "ohm", None, 9),
     ("c_per", "C per length", "uF", None, 9),
@@ -525,7 +535,7 @@ SIMPLE = {  # the GUI's simple view: these fields only (All fields: every one; a
                    "pscad_source"),
     "GSUs": ("name", "units", "gsu_units", "gsu_count", "gsu_mva", "gsu_rate_a_mva", "gsu_rate_b_mva", "gsu_rate_c_mva",
              "gsu_hv_kv", "gsu_lv_kv", "gsu_z_pct", "gsu_x_r", "gsu_vector", "gsu_tap"),
-    "Feeders": ("collector", "feeder", "section", "cable", "length", "unit", "units", "units_of"),
+    "Feeders": ("collector", "feeder", "copies", "section", "cable", "length", "unit", "units", "units_of"),
 }
 SIMPLE_TABS = ("Plant", "MPT", "Generators", "GSUs", "Feeders", "Cables", "Dyr_Params", "PSCAD_Params", "Output")
 _is = lambda key, v: lambda r: (_txt(r.get(key)) or "").upper() == v
@@ -592,10 +602,10 @@ TABLES = [  # (sheet, input key, columns)
     ("PSCAD_Params", "pscad_params", PSCADP_COLS),
 ]
 
-_PV_FEEDER = [("1000AL", 1.60, 0), ("500AL", 0.40, 1), ("500AL", 0.40, 1), ("4/0AL", 0.40, 1),
-              ("4/0AL", 0.40, 1), ("1/0AL", 0.40, 1)]
-_BESS_FEEDER = [("1000AL", 0.80, 0), ("500AL", 0.15, 1), ("500AL", 0.15, 1), ("4/0AL", 0.15, 1),
-                ("4/0AL", 0.15, 1), ("1/0AL", 0.15, 1)]
+_PV_FEEDER = [("1000AL", 5250, 0), ("500AL", 1300, 1), ("500AL", 1300, 1), ("4/0AL", 1300, 1),
+              ("4/0AL", 1300, 1), ("1/0AL", 1300, 1)]                     # lengths in ft
+_BESS_FEEDER = [("1000AL", 2600, 0), ("500AL", 500, 1), ("500AL", 500, 1), ("4/0AL", 500, 1),
+                ("4/0AL", 500, 1), ("1/0AL", 500, 1)]
 
 # the example: a hybrid plant -- 100 MW PV (25 x 4.0 MW) and 100 MW BESS (25 x 4.0 MW) on one 230/34.5 kV MPT,
 # five identical feeders each, one plant controller (REPC_B: PLNTBU1 + REAX4BU1); PSCAD: the collectors section
@@ -630,7 +640,7 @@ EXAMPLE = {
          "gsu_x_r": 7.0, "gsu_vector": "YNd1", "collector": "FEEDERS", "reec": "REEC_C", "pscad_inv_at": "LV"},
     ],
     "feeders": [{"collector": gen, "feeder": "F", "copies": 5, "section": k + 1, "cable": c, "length": ln,
-                 "unit": "km", "units": u}
+                 "unit": "ft", "units": u}
                 for gen, secs in (("PV", _PV_FEEDER), ("BESS", _BESS_FEEDER)) for k, (c, ln, u) in enumerate(secs)],
     "cables": [
         {"cable": "1000AL", "unit": "km", "r_per": 0.0460, "x_per": 0.1050, "c_per": 0.390},
@@ -692,6 +702,8 @@ README = [
     ("Feeders", "The collector feeders section by section from the collector bus out: cable, length and the units "
                 "tapped at the section's far end. A daisy chain needs no From section; a lateral names the section "
                 "it leaves from (its far end); 0 = straight from the collector bus. Copies: identical feeders. "
+                "The feeders on an MPT: those of the generators on it -- the GUI's Feeders on each MPT sets how many "
+                "each has (its units spread over them), and they follow a generator's Units when it changes. "
                 "WECC equivalent: Zeq = sum(Zi Wi^2) / W^2, Beq = sum(Bi), Wi = MW of the units downstream of "
                 "section i. R ohm, X ohm, B uS: a section's own values (its parallel cables together) in place of "
                 "Cable x Length -- the GUI's Fill R, X, B from cables shows them to change; Clear R, X, B goes "
@@ -1101,6 +1113,10 @@ def parse_workbook(book, path, keep_comments=False):
                 inp["_unknown"].append("%s: column '%s'" % (sheet, h))
             else:
                 colmap[i] = kk
+        if key == "feeders":                         # its notes row (the template's): what a blank unit meant
+            notes = rows[hrow + 1] if hrow + 1 < len(rows) and rows[hrow + 1] and _skip(rows[hrow + 1]) else []
+            said = [str(notes[i]) for i, kk in colmap.items() if kk == "unit" and i < len(notes) and notes[i]]
+            inp["_feeder_unit"] = "km" if said and "blank = km" in said[0] else FEEDER_UNIT
         for k in range(hrow + 1, len(rows)):
             r = rows[k]
             if not r or _skip(r) and (not keep_comments or k == hrow + 1 or all(x is None for x in r)):
@@ -1110,6 +1126,7 @@ def parse_workbook(book, path, keep_comments=False):
                 d[kk] = r[i] if i < len(r) else None
             if any(v is not None for kk, v in d.items() if kk != "_where"):
                 inp[key].append(d)
+    _feeder_units(inp, inp.pop("_feeder_unit", FEEDER_UNIT))
     return inp
 
 
@@ -2412,8 +2429,8 @@ def section_rxb(r, cab, f, w):
     """A feeder section's R, X (ohm) and B (uS) from its cable's data, length and parallel cables -- what blank
        R ohm / X ohm / B uS cells take."""
     par = _int(r, "parallel", w, 1, minimum=1)
-    per = _num(r, "length", w, required=True, positive=True) * LEN_KM[_choice(r, "unit", w, LEN_UNITS, "km")] / \
-        LEN_KM[cab["unit"]]
+    unit = _choice(r, "unit", w, LEN_UNITS, FEEDER_UNIT)
+    per = _num(r, "length", w, required=True, positive=True) * LEN_KM[unit] / LEN_KM[cab["unit"]]
     bper = cab["b"] if cab["b"] is not None else (2.0 * math.pi * f * cab["c"] if cab["c"] is not None else 0.0)
     return cab["r"] * per / par, cab["x"] * per / par, bper * per * par
 
@@ -2464,11 +2481,16 @@ def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
                 s = {"num": num, "from": _int(r, "from_section", w, None, minimum=0),
                      "cable": cab["name"] if cab else "(R X B)",
                      "length": _num(r, "length", w, required=need, positive=need) or 0.0,
-                     "unit": _choice(r, "unit", w, LEN_UNITS, "km"),
+                     "unit": _choice(r, "unit", w, LEN_UNITS, FEEDER_UNIT),
                      "parallel": _int(r, "parallel", w, 1, minimum=1), "units": collections.OrderedDict(),
                      "where": w}
                 s["R"], s["X"], s["B"] = section_rxb(r, cab, f, w) if need else (0.0, 0.0, 0.0)
                 s["rates"] = tuple(x * s["parallel"] for x in cab["rates"]) if cab else (0.0, 0.0, 0.0)
+                km = s["length"] * LEN_KM[s["unit"]]
+                if 0 < km < 0.003:                   # a few feet: a length meant in km or mi, its unit blank?
+                    log("CHECK: %s: section %d of feeder %s is %s %s (%.2f ft) -- a few feet: is its Length unit "
+                        "right (blank = %s)?" % (w, num, fname, _g(s["length"]), s["unit"], km / LEN_KM["ft"],
+                                                 FEEDER_UNIT))
                 s["given"] = ""
                 for k, fld in (("r_ohm", "R"), ("x_ohm", "X"), ("b_us", "B")):
                     if given[k] is not None:
@@ -2699,10 +2721,12 @@ def build_network(inp, log):
               if res["N"].get(g["name"].upper())]
         n = sum(k for _c, k in on)
         if on and n != g["n"]:
-            net.notes.append("CHECK: %s: the feeders carry %d of its units (%s), Units says %d -- %s" % (
-                g["where"], n, ", ".join("%d on %s" % (k, c) for c, k in on), g["n"],
-                "the equivalent weighs the feeders' units; the machine has %d" % g["n"] if net.model == "SMIB" else
-                "DETAILED: its unit groups have the feeders' %d units (P and MVA in proportion)" % n))
+            net.notes.append("CHECK: %s: the feeders carry %d of its units (%s), Units says %d -- %s; GUI: Feeders "
+                             "on each MPT (MPT or Feeders page) puts its Units on its feeders" % (
+                                 g["where"], n, ", ".join("%d on %s" % (k, c) for c, k in on), g["n"],
+                                 "the equivalent weighs the feeders' units; the machine has %d" % g["n"]
+                                 if net.model == "SMIB" else "DETAILED: its unit groups have the feeders' %d units (P "
+                                 "and MVA in proportion)" % n))
         ends = [net.colls[c]["end"] for c, _k in on]
         if on and g["mv"] not in ends:
             net.notes.append("CHECK: %s: %s has units on %s, but its GSU is at %s -- connect it to its collector "
@@ -2761,6 +2785,7 @@ def build_network(inp, log):
     thevenin(net, pl, gens)
     control(net, pl)
     number_buses(net, pl, inp["bus_numbers"])
+    net.notes.extend(inp.get("_said", []))
     for u in inp.get("_unknown", []):
         net.notes.append("NOTE: not used -- %s%s" % (u, " (Plant: Model type, SMIB or DETAILED, now sets PSS/E and "
                                                         "PSCAD alike)" if "PSCAD COLLECTOR" in u.upper() else ""))
@@ -2945,7 +2970,7 @@ def plant_totals(data):
     line = "Whole plant (from Generators): %s MVA, %d units  |  P %s to %s MW, dispatch %s MW  |  Q %s to %s MVAr" % (
         f(mva), units, f(pmin), f(pmax), f(disp), f(qmin), f(qmax)) + (
         ("   (%s not counted: its row does not read yet)" % ", ".join(bad)) if bad else "")
-    mpts, loads = [], mpt_loads(data)
+    mpts, loads, fon = [], mpt_loads(data), feeders_on_mpts(data)
     for m in _rows(data, "mpt"):
         nm = _txt(m.get("name"))
         if not nm:
@@ -2969,15 +2994,42 @@ def plant_totals(data):
                 nm, size, gs, f(tot), 100.0 * tot / (rate * cnt),
                 (" -- sized for them: %s MVA (Size MPTs from the generators)" % f(nice_mva(tot / cnt)))
                 if tot > 1.02 * rate * cnt or rate * cnt > 2.0 * tot else ""))
+        fd = fon.get(nm.upper())
+        if fd:
+            mpts[-1] += "; %d feeder%s (%s)" % (sum(k for _g, k, _u, _s in fd), "" if sum(
+                k for _g, k, _u, _s in fd) == 1 else "s", ", ".join("%s %d" % (g, k) for g, k, _u, _s in fd))
     return line, mpts, {"pmax": pmax, "dispatch": disp}
 
 
-def _same(v, x):
-    """Whether a cell's value is the number x."""
-    try:
-        return abs(float(v) - x) <= 1e-9 * max(1.0, abs(x))
-    except (TypeError, ValueError):
-        return False
+def feeder_lines(data):
+    """The Feeders page's live lines: each MPT's feeders, generator by generator -- its feeders (x copies), the
+       units on each and on them all against its Units."""
+    on, lay = mpt_of(data), feeder_layout(data)
+    shared = set((_txt(c.get("name")) or "").upper() for c in _rows(data, "collectors"))
+    units = {}
+    for r in _rows(data, "generators"):
+        nm = _txt(r.get("name"))
+        if nm:
+            try:
+                units[nm.upper()] = _int(r, "units", nm)
+            except InputError:
+                units[nm.upper()] = None
+    names = [_txt(r.get("name")) for r in _rows(data, "generators")] + [_txt(c.get("name"))
+                                                                         for c in _rows(data, "collectors")]
+    by = collections.OrderedDict((((_txt(m.get("name")) or "").upper()), []) for m in _rows(data, "mpt"))
+    for nm in names:
+        if not nm or nm.upper() not in lay or (nm.upper() in units and nm.upper() in shared):
+            continue
+        fs = lay[nm.upper()]
+        tot = sum(k * u for _f, k, u in fs)
+        u = units.get(nm.upper())
+        of = (" = %d of its %d units" % (tot, u) + ("" if tot == u else " -- Units says %d" % u)) if u else ""
+        txt = "%s%s %d (%s%s)" % (nm, " (shared)" if nm.upper() in shared else "", sum(k for _f, k, _u in fs),
+                                  ", ".join("%s x %d: %d units each" % (f, k, n) for f, k, n in fs),
+                                  "" if nm.upper() in shared else of)
+        by.setdefault(on.get(nm.upper(), ("not on an MPT",))[0], []).append((sum(k for _f, k, _u in fs), txt))
+    return ["   %s: %d feeder%s -- %s" % (m, sum(k for k, _t in v), "" if sum(k for k, _t in v) == 1 else "s",
+                                         "; ".join(t for _k, t in v)) for m, v in by.items() if v]
 
 
 def nice_mva(x):
@@ -2987,10 +3039,10 @@ def nice_mva(x):
             return round(math.ceil(x / step - 1e-9) * step, 4)
 
 
-def mpt_loads(data):
-    """The units' MVA on each MPT winding, from the Generators rows (through a shared collector, or another
-       generator's bus, to where it connects) -> {MPT name (upper): {"lv": MVA, "tv": MVA, "gens": [(generator,
-       its units' MVA, "LV" or "TV")]}} -- a generator whose row does not read yet, or on no MPT, is left out."""
+def mpt_of(data):
+    """The MPT each generator and shared collector is on: {name (upper): (MPT name (upper), "LV" or "TV")} --
+       through shared collectors and other generators' buses to where it connects; one beside an MPT (MPT1:HV,
+       HV, POI) left out."""
     mpts = set((_txt(m.get("name")) or "").upper() for m in _rows(data, "mpt"))
     via = {}
     for k in ("collectors", "generators"):
@@ -2999,24 +3051,184 @@ def mpt_loads(data):
             if nm and nm not in mpts:
                 via.setdefault(nm, (_txt(c.get("connect")) or "").upper())
     out = {}
+    for nm, to in via.items():
+        name, _c, wind = to.partition(":")
+        seen = set([nm])
+        while name not in mpts and name in via and name not in seen:
+            seen.add(name)
+            name, _c, wind = via[name].partition(":")
+        if name in mpts and wind in ("", "LV", "TV"):          # MPT1:HV -- beside it, not through it
+            out[nm] = (name, wind or "LV")
+    return out
+
+
+def mpt_loads(data):
+    """The units' MVA on each MPT winding, from the Generators rows (through a shared collector, or another
+       generator's bus, to where it connects) -> {MPT name (upper): {"lv": MVA, "tv": MVA, "gens": [(generator,
+       its units' MVA, "LV" or "TV")]}} -- a generator whose row does not read yet, or on no MPT, is left out."""
+    on, out = mpt_of(data), {}
     for r in _rows(data, "generators"):
         nm = _txt(r.get("name"))
-        if not nm:
+        if not nm or nm.upper() not in on:
             continue
         try:
             n, _p1, _p0, _pf, _q1, _q0, s1 = unit_rating(r, nm)
         except InputError:
             continue
-        name, _c, wind = (_txt(r.get("connect")) or "").upper().partition(":")
-        seen = set()
-        while name not in mpts and name in via and name not in seen:
-            seen.add(name)
-            name, _c, wind = via[name].partition(":")
-        if name in mpts and wind in ("", "LV", "TV"):          # MPT1:HV -- beside it, not through it
-            e = out.setdefault(name, {"lv": 0.0, "tv": 0.0, "gens": []})
-            e["tv" if wind == "TV" else "lv"] += n * s1
-            e["gens"].append((nm, n * s1, wind or "LV"))
+        name, wind = on[nm.upper()]
+        e = out.setdefault(name, {"lv": 0.0, "tv": 0.0, "gens": []})
+        e["tv" if wind == "TV" else "lv"] += n * s1
+        e["gens"].append((nm, n * s1, wind))
     return out
+
+
+def _feeders_of(rows):
+    """One collector's Feeders rows -> {feeder name: its rows} in order (a blank Feeder: the row above's)."""
+    out, spelt, fname = collections.OrderedDict(), {}, "F1"
+    for r in rows:
+        f = _txt(r.get("feeder"))
+        if f:
+            fname = spelt.setdefault(f.upper(), f)
+        out.setdefault(fname, []).append(r)
+    return out
+
+
+def _cell_num(r, k, default=0.0):
+    """A cell as a number, for what the GUI shows live: default where it is blank or does not read."""
+    try:
+        v = _num(r, k, "", None)
+    except InputError:
+        return default
+    return default if v is None else v
+
+
+def feeder_layout(data):
+    """Each collector's feeders as the Feeders rows have them -> {collector (upper): [(feeder, copies, units on
+       one)]} -- copies: the largest given on its rows (blank 1)."""
+    rows = collections.OrderedDict()
+    for r in _rows(data, "feeders"):
+        c = _txt(r.get("collector"))
+        if c:
+            rows.setdefault(c.upper(), []).append(r)
+    out = {}
+    for c, rs in rows.items():
+        out[c] = [(f, max([int(_cell_num(r, "copies", 1)) for r in frows] + [1]),
+                   int(sum(_cell_num(r, "units") for r in frows))) for f, frows in _feeders_of(rs).items()]
+    return out
+
+
+def feeders_on_mpts(data):
+    """The feeders on each MPT -> {MPT name (upper): [(generator or shared collector, its feeders, its units on
+       them, shared)]} -- a generator's own collector and the shared collectors on it."""
+    on, lay, out = mpt_of(data), feeder_layout(data), collections.OrderedDict()
+    shared = set((_txt(c.get("name")) or "").upper() for c in _rows(data, "collectors"))
+    names = [(_txt(r.get("name")), False) for r in _rows(data, "generators")] + \
+        [(_txt(c.get("name")), True) for c in _rows(data, "collectors")]
+    for nm, sh in names:
+        if not nm or nm.upper() not in on or nm.upper() not in lay or (not sh and nm.upper() in shared):
+            continue
+        fs = lay[nm.upper()]
+        out.setdefault(on[nm.upper()][0], []).append((nm, sum(k for _f, k, _u in fs), sum(k * u for _f, k, u in fs),
+                                                      sh))
+    return out
+
+
+def feeders_needed(data, gen):
+    """A generator's own feeders against its Units -> (feeders now, the units on them, the most on one, the
+       feeders its Units need at that many on each) -- None: no feeders of its own, or its row does not read."""
+    gr = next((r for r in _rows(data, "generators") if (_txt(r.get("name")) or "").upper() == gen.upper()), None)
+    fs = feeder_layout(data).get(gen.upper())
+    shared = set((_txt(c.get("name")) or "").upper() for c in _rows(data, "collectors"))
+    if gr is None or not fs or gen.upper() in shared:
+        return None
+    try:
+        units = _int(gr, "units", gen, required=True, minimum=1)
+    except InputError:
+        return None
+    most = max(u for _f, _c, u in fs)
+    return (sum(c for _f, c, _u in fs), sum(c * u for _f, c, u in fs), most,
+            min(units, int(math.ceil(units / float(most) - 1e-9))) if most > 0 else min(units, 1))
+
+
+def set_feeders(data, gen, n=None):
+    """Generator gen's own collector reshaped, its units on it -> (the Feeders rows as they would be, what that is).
+       Its feeders must be alike: each one's sections those of its fullest feeder (the design: the most units on
+       one), the same cables and lengths -- a shorter one: its first sections.
+         n given: n feeders, Units / n on each -- where it does not divide, one more on the first ones (a second
+           group); on each feeder over the sections the design has units on, one more on the nearest.
+         n None: its Units follow the design -- as many full feeders as it has units for, each as designed (only
+           its Copies change), and the units left over on one more feeder; fewer units than one feeder has: an
+           error (the design would be lost -- n given reshapes it).
+       A feeder's sections with no units at them or beyond are not needed: left out, said."""
+    gr = next((r for r in _rows(data, "generators") if (_txt(r.get("name")) or "").upper() == gen.upper()), None)
+    if gr is None:
+        raise InputError("Feeders: no generator %s" % gen)
+    nm = _txt(gr.get("name"))
+    units = _int(gr, "units", "Generators (%s)" % nm, required=True, minimum=1)
+    rows = list(data.get("feeders") or [])
+    cols = [c[0] for c in FEEDER_COLS]
+    mine = [i for i, r in enumerate(rows) if (_txt(r.get("collector")) or "").upper() == nm.upper() and
+            not _skip([r.get(c) for c in cols])]
+    if not mine:
+        raise InputError("%s: no Feeders rows -- give its first feeder's sections on the Feeders page" % nm)
+    feeders = _feeders_of([rows[i] for i in mine])
+    look = lambda r: tuple(_txt(r.get(k)) or "" for k in ("section", "from_section", "cable", "length", "unit",
+                                                          "parallel", "r_ohm", "x_ohm", "b_us"))
+    name = max(feeders, key=lambda f: (sum(_cell_num(r, "units") for r in feeders[f]), len(feeders[f])))
+    first = feeders[name]
+    if any(not set(look(r) for r in f) <= set(look(r) for r in first) for f in feeders.values()):
+        raise InputError("%s: its feeders %s are not alike (their sections, cables or lengths differ) -- set their "
+                         "Copies on the Feeders page" % (nm, ", ".join(feeders)))
+    other = next((f for f in feeders if f != name), name + "_2")
+    at = [j for j, r in enumerate(first) if _cell_num(r, "units") > 0] or [len(first) - 1]
+    nums, up = [], {}                                # each section's: where it starts (its From section)
+    for j, r in enumerate(first):
+        num = int(_cell_num(r, "section", (nums[-1] if nums else 0) + 1))
+        fr = _cell_num(r, "from_section", None)
+        up[j] = int(fr) if fr is not None else max([x for x in nums if x < num] or [0])
+        nums.append(num)
+    spread = lambda u: dict((j, u // len(at) + (1 if q < u % len(at) else 0)) for q, j in enumerate(at))
+    if n is None:                                    # the design kept: its full feeders, the rest on one more
+        each = int(sum(_cell_num(r, "units") for r in first)) or units
+        full, left = divmod(units, each)
+        if not full:
+            raise InputError("%s: Units %d is fewer than the %d units on one of its feeders -- its feeders stay as "
+                             "they are: Feeders on each MPT (MPT or Feeders page) sets them" % (nm, units, each))
+        groups = [(name, full, each, dict((j, int(_cell_num(r, "units"))) for j, r in enumerate(first)))] + \
+            ([(other, 1, left, spread(left))] if left else [])
+        n = full + (1 if left else 0)
+    else:
+        n = int(n)
+        if not 1 <= n <= units:
+            raise InputError("%s: %d feeders for its %d units -- 1 to %d" % (nm, n, units, units))
+        per, extra = divmod(units, n)
+        groups = [(name, extra, per + 1, spread(per + 1)), (other, n - extra, per, spread(per))] if extra else \
+            [(name, n, per, spread(per))]
+    new, said = [], []
+    for fname, cps, u, on in groups:
+        down = dict((j, on.get(j, 0)) for j in range(len(first)))      # the units at and beyond each section
+        for j in reversed(range(len(first))):
+            if up[j] in nums:
+                down[nums.index(up[j])] += down[j]
+        cut = [nums[j] for j in range(len(first)) if not down[j]]
+        for j, r in enumerate(first):
+            if not down[j]:                          # no units at it or beyond: no cable there
+                continue
+            d = dict(r, feeder=fname, copies=str(cps))
+            if on.get(j):
+                d["units"] = str(on[j])
+            else:
+                d.pop("units", None)
+            new.append(d)
+        said.append("%d x %s: %d units each (%s on its sections%s)" % (
+            cps, fname, u, ", ".join(str(on[j]) for j in sorted(on) if on[j]),
+            "; section%s %s not needed" % ("" if len(cut) == 1 else "s", ", ".join(str(x) for x in cut))
+            if cut else ""))
+    mine = set(mine)
+    k = min(mine)
+    out = [r for i, r in enumerate(rows[:k]) if i not in mine] + new + [r for i, r in enumerate(rows) if i > k and
+                                                                      i not in mine]
+    return out, "%s: %d feeder%s -- %s" % (nm, n, "" if n == 1 else "s", "; ".join(said))
 
 
 def gsu_split(r, w, n):
@@ -4068,10 +4280,23 @@ def operating_point(net, log):
     if not ok or dv > 1e-6:
         net.notes.append("WARNING: the load flow from the infinite bus does not reproduce the POI voltage (%s)" % dv)
     flows(net, idx2, V2, Y2)
+    chg = collections.OrderedDict()                  # the cables' and lines' charging, by kind, at their kV
+    for ln in net.lines:
+        if ln["kind"] != "GRID":
+            k = {"SECTION": "collectors", "COLLECTOR": "collectors", "GENTIE": "gen-tie", "TIE": "MPT ties"}.get(
+                ln["kind"], ln["kind"].lower())
+            chg[k] = chg.get(k, 0.0) + ln["B"] * 1e-6 * ln["kv"] ** 2 * ln["count"]
     for g in net.gens:
         if g["q_mode"] == "share" and not (g["qmin"] - 1e-3 <= g["q"] <= g["qmax"] + 1e-3):
+            why = ""
+            if g["q"] < g["qmin"] and sum(chg.values()) > 0.01:      # the charging is what it would have to take
+                why = "; the plant's cables make %.2f MVAr of charging (%s), the generators take %.2f MVAr at " \
+                      "most -- fewer or shorter feeders (Feeders on each MPT), their real cables, or another POI " \
+                      "target" % (sum(chg.values()), ", ".join("%s %.2f" % kv for kv in chg.items()),
+                                  -sum(x["qmin"] for x in net.gens if x["q_mode"] == "share"))
             net.notes.append("CHECK: %s needs Q %.2f MVAr, outside its %.2f .. %.2f MVAr -- the POI target is "
-                             "beyond the plant (PSS/E will hold the limit)" % (g["name"], g["q"], g["qmin"], g["qmax"]))
+                             "beyond the plant (PSS/E will hold the limit)%s" % (g["name"], g["q"], g["qmin"],
+                                                                                 g["qmax"], why))
         vt = net.bus[g["bus"]]["vm"]
         if not 0.9 <= vt <= 1.1:
             net.notes.append("WARNING: %s terminal voltage %.4f pu -- outside 0.9 .. 1.1: check the transformers' kV "
@@ -4129,9 +4354,19 @@ def flows(net, idx, V, Y):
         out.append({"name": t["name"], "kind": t["kind"], "a": t["hv"], "b": t["lv"] + "/" + t["tv"], "s1": ss[0],
                     "s2": ss[1] + ss[2], "s3": ss, "rate": rate,
                     "load": (abs(ss[0]) / rate * 100.0) if rate else None})
+    gsu_of = dict((g["gsu"]["name"], g) for g in net.gens if g.get("gsu"))
     for f in out:
         if f["load"] is not None and f["load"] > 100.0:
-            net.notes.append("CHECK: %s loaded to %.1f %% of %.1f MVA" % (f["name"], f["load"], f["rate"]))
+            sx = max((f["s1"], f["s2"]), key=abs)
+            g = gsu_of.get(f["name"])
+            why = ""
+            if g and g["q_mode"] == "share" and not (g["qmin"] - 1e-3 <= g["q"] <= g["qmax"] + 1e-3):
+                ql = min(max(g["q"], g["qmin"]), g["qmax"])          # the Q it has: its limit
+                why = " -- %s is asked for Q %.2f MVAr, beyond its %.2f .. %.2f (see 'needs Q'); at %.2f MVAr about " \
+                      "%.0f %%" % (g["name"], g["q"], g["qmin"], g["qmax"], ql,
+                                   abs(complex(g["p"], ql)) / f["rate"] * 100.0)
+            net.notes.append("CHECK: %s loaded to %.1f %% of %.1f MVA: %.2f MVA through it, P %.2f MW and Q %.2f MVAr%s"
+                             % (f["name"], f["load"], f["rate"], abs(sx), abs(sx.real), abs(sx.imag), why))
     for t in net.tx3:                                      # its LV and TV windings against their own MVA
         f = next((x for x in out if x["name"] == t["name"] and "s3" in x), None)
         for w, key in ((1, "mva2"), (2, "mva3")):
@@ -7783,6 +8018,20 @@ def _psse_steps(net, recs, inp, files, out, work, log):
 # ============================================================================
 # MAIN
 # ============================================================================
+def _feeder_units(inp, blank):
+    """Feeders rows with a length and no Length unit: the unit a blank meant in the file they come from, written in
+       -- ft now (FEEDER_UNIT); km in projects and workbooks from before (said)."""
+    n = 0
+    for r in inp.get("feeders") or []:
+        if _txt(r.get("length")) is not None and _txt(r.get("unit")) is None:
+            r["unit"] = blank
+            n += 1
+    if n and blank != FEEDER_UNIT:
+        inp.setdefault("_said", []).append(
+            "NOTE: Feeders: %d row(s) with no Length unit read as %s -- a blank meant %s when this file was saved "
+            "(now %s); they say %s from now on" % (n, blank, blank, FEEDER_UNIT, blank))
+
+
 def read_input(path, keep_comments=False):
     """A project (.json) or workbook read -> the inputs. keep_comments (the GUI): the rows starting with # (set
        aside) kept as they are, so a save keeps them -- the build skips them."""
@@ -7816,6 +8065,7 @@ def read_input(path, keep_comments=False):
             for k, r in enumerate(inp[key]):
                 r.setdefault("_where", "%s row %d" % (sheet, k + 1))
         inp["_source"], inp["_unknown"] = path, unknown
+        _feeder_units(inp, _txt(inp.get("_feeder_unit")) or "km")      # no mark: saved when a blank meant km
         return inp
     return parse_workbook(read_xlsx(path), path, keep_comments)
 
@@ -7976,6 +8226,7 @@ def _build_case(inp, src, out_dir, check, pscad, log):
         else:
             comps = []
         clean = dict((k, v) for k, v in inp.items() if not k.startswith("_"))
+        clean["_feeder_unit"] = FEEDER_UNIT
         _write_text(files["json"], json.dumps(clean, indent=1, sort_keys=True, default=str))
         if src.lower().endswith((".xlsx", ".xlsm")):
             files["xlsx"] = os.path.join(out, os.path.basename(src))
@@ -8431,6 +8682,7 @@ def gui_save_data(data):
             if row:
                 rows.append(row)
         out[key] = rows
+    out["_feeder_unit"] = FEEDER_UNIT                # what a blank Length unit means in it (before: km)
     return out
 
 
@@ -8751,26 +9003,27 @@ def gui(start=None):
                 ttk.Label(tools, text="One row per generator -- add, remove and rename them on the Generators page "
                                       "(Units: here or there, the same value).",
                           style="Item.TLabel").pack(side="left", padx=4, pady=4)
+            acts = []                                    # this page's own actions: a row of their own
             if self.page == "GSUs":
-                ttk.Button(tools, text="Size GSUs from the units...", command=self.size_gsus).pack(side="left",
-                                                                                                padx=12)
+                acts.append(("Size GSUs from the units...", self.size_gsus))
             if sheet == "MPT":
-                ttk.Button(tools, text="Size MPTs from the generators...", command=self.size_mpts).pack(
-                    side="left", padx=12)
+                acts.append(("Size MPTs from the generators...", self.size_mpts))
+            if sheet in ("MPT", "Feeders"):
+                acts.append(("Feeders on each MPT...", self.set_feeder_counts))
             if sheet == "Bus_Numbers":
-                ttk.Button(tools, text="List this model's buses", command=self.fill_buses).pack(side="left", padx=12)
+                acts.append(("List this model's buses", self.fill_buses))
             if sheet == "Machines":
-                ttk.Button(tools, text="List the DETAILED machines", command=self.fill_machines).pack(side="left",
-                                                                                                     padx=12)
+                acts.append(("List the DETAILED machines", self.fill_machines))
             if sheet == "Feeders":
-                ttk.Button(tools, text="Fill R, X, B from cables", command=self.fill_rxb).pack(side="left",
-                                                                                            padx=(12, 2))
-                ttk.Button(tools, text="Clear R, X, B", command=self.clear_rxb).pack(side="left", padx=2)
+                acts += [("Fill R, X, B from cables", self.fill_rxb), ("Clear R, X, B", self.clear_rxb),
+                         ("Lengths in ft", self.lengths_in)]
             if sheet == "Generators" and not fixed:
-                ttk.Button(tools, text="Pick UDM from OEM model...", command=self.pick_udm).pack(
-                    side="left", padx=12)
-            ttk.Label(tools, text="Double-click a cell (or press Enter) to edit; Tab moves on.",
-                      style="Hint.TLabel").pack(side="right", padx=6)
+                acts.append(("Pick UDM from OEM model...", self.pick_udm))
+            if acts:
+                bar = ttk.Frame(tab, padding=(4, 0, 4, 4))
+                bar.pack(fill="x")
+                for txt, fn in acts:
+                    ttk.Button(bar, text=txt, command=fn).pack(side="left", padx=2)
             box = ttk.Frame(tab)
             box.pack(fill="both", expand=True)
             self.tab, self.tools, self.box = tab, tools, box
@@ -8792,13 +9045,17 @@ def gui(start=None):
                 self.tree.column(c[0], width=wpx, minwidth=50, stretch=False)
             self.tree.tag_configure("odd", background="#FFF9E6")
             self.tree.tag_configure("even", background=input_bg)
-            self.help = tk.StringVar(value="Click a column title or a cell to see what the column is.")
-            ttk.Label(tab, textvariable=self.help, style="Help.TLabel", wraplength=1200, justify="left").pack(
-                fill="x", side="bottom")
-            self.total = tk.StringVar()                  # Generators, GSUs, MPT: what they add up to, live
-            if self.page in ("Generators", "GSUs", "MPT"):
-                ttk.Label(tab, textvariable=self.total, style="Total.TLabel", wraplength=1200, justify="left").pack(
-                    fill="x", side="bottom", padx=8, pady=(4, 2))
+            self.help = tk.StringVar(value="Click a column title or a cell to see what the column is; double-click a "
+                                           "cell (or press Enter) to edit it, Tab moves on.")
+            wrap = lambda e: e.widget.configure(wraplength=max(300, e.width - 12))    # wrapped at the page's width
+            hl = ttk.Label(tab, textvariable=self.help, style="Help.TLabel", wraplength=1200, justify="left")
+            hl.pack(fill="x", side="bottom")
+            hl.bind("<Configure>", wrap)
+            self.total = tk.StringVar()                  # Generators, GSUs, MPT, Feeders: what they add up to, live
+            if self.page in ("Generators", "GSUs", "MPT", "Feeders"):
+                tl = ttk.Label(tab, textvariable=self.total, style="Total.TLabel", wraplength=1200, justify="left")
+                tl.pack(fill="x", side="bottom", padx=8, pady=(4, 2))
+                tl.bind("<Configure>", wrap)
             self.col = 0
             self.tree.bind("<Double-1>", self.on_double)
             self.tree.bind("<Button-1>", self.on_click, add="+")
@@ -8857,7 +9114,7 @@ def gui(start=None):
                 rows = [r for r in self.rows if any(v not in (None, "") for v in r.values())]
                 self.total.set("Totals -- units x one unit, as the models take them:\n" +
                                "\n".join("   " + unit_totals(r) for r in rows) if rows else "")
-            if self.sheet in ("Generators", "MPT", "Collectors"):
+            if self.sheet in ("Generators", "MPT", "Collectors", "Feeders"):
                 live_totals()
 
         def refresh(self, select=None):
@@ -9013,6 +9270,8 @@ def gui(start=None):
                             if g is not self:
                                 g.refresh()
                         set_status("%s renamed %s: %d place(s) using it changed too" % (was, v, n))
+                    said = feeders_follow(self.rows[i], was, v) if self.sheet == "Generators" and \
+                        key == "units" else None                          # its feeders follow its Units
                     if self.sheet == "Generators" and key == "type":       # model choices its Type does not take
                         gone, lab = [], dict((c[0], c[1]) for c in self.cols)
                         for k, (ok, _doc) in MODEL_CHOICE.items():
@@ -9025,6 +9284,8 @@ def gui(start=None):
                     self.tree.item(str(i), values=self.shown(self.rows[i]))
                     self.sums()
                     dirty()
+                    if said:
+                        set_status(said)
             w.destroy()
             self.tree.focus_set()
 
@@ -9130,6 +9391,33 @@ def gui(start=None):
                 dirty()
             set_status("%d R / X / B cell(s) filled from the cables -- change any; a filled value no longer follows "
                        "its cable and length (Clear R, X, B)" % n)
+
+        def lengths_in(self, unit="ft"):
+            """Every Feeders row's length in `unit`, the same length: its value converted, its Length unit set."""
+            self.close_edit(True)
+            n, bad = 0, []
+            for i, r in enumerate(self.rows):
+                v, u = _txt(r.get("length")), (_txt(r.get("unit")) or FEEDER_UNIT).lower()
+                if v is None:
+                    continue
+                try:
+                    x = float(v)
+                except ValueError:
+                    bad.append(str(i + 1))
+                    continue
+                if u not in LEN_KM:
+                    bad.append(str(i + 1))
+                    continue
+                if u == unit and _txt(r.get("unit")) == unit:
+                    continue
+                r["length"], r["unit"] = "%.6g" % (x * LEN_KM[u] / LEN_KM[unit]), unit
+                n += 1
+            self.refresh(self.current())
+            if n:
+                dirty()
+            set_status("%d feeder length(s) now in %s -- the same lengths%s" % (
+                n, unit, ("; rows %s left as they are (a length or unit that does not read)" % ", ".join(bad))
+                if bad else ""))
 
         def clear_rxb(self):
             n = 0
@@ -9393,6 +9681,166 @@ def gui(start=None):
                 set_status(("GSUs set: %s -- 'GSU count' blank: it follows Units" % "; ".join(done)) if done else
                            "GSUs: nothing ticked, nothing changed")
             ttk.Button(bb, text="Set the ticked GSUs", command=ok).pack(side="left", padx=4)
+            ttk.Button(bb, text="Cancel", command=top.destroy).pack(side="left", padx=4)
+            app["size_dialog"] = {"top": top, "rows": rows, "ok": ok}
+            top.grab_set()
+            root.wait_window(top)
+            app["size_dialog"] = None
+
+        def set_feeder_counts(self):
+            """How many identical feeders each generator has on its MPT -- its units spread over them, section by
+               section as its first feeder has them (set_feeders); an MPT's number shared out to its generators by
+               their MW. Only those changed (or whose feeders do not carry its Units) are set."""
+            self.close_edit(True)
+            on, lay = mpt_of(data), feeder_layout(data)
+            shared = set((_txt(c.get("name")) or "").upper() for c in _rows(data, "collectors"))
+            order = [(_txt(m.get("name")) or "").upper() for m in _rows(data, "mpt")]
+            groups = collections.OrderedDict((m, []) for m in order if m)
+            for r in _rows(data, "generators"):
+                nm = _txt(r.get("name"))
+                if nm:
+                    groups.setdefault(on.get(nm.upper(), ("not on an MPT",))[0], []).append(r)
+            top, tab, bb = self.sizing_dialog(
+                "Feeders on each MPT",
+                "How many identical feeders each generator has: its units are spread over them (Units / feeders on "
+                "each, one more on the first feeders where it does not divide), section by section as its feeder "
+                "has them -- its sections, cables and lengths kept; a section with no units at it or beyond is not "
+                "needed. An MPT's number is shared out to its generators by their MW; change any generator's. Only "
+                "the ones changed are set. A shared collector, or feeders not alike: their Copies on the Feeders "
+                "page. (Change a generator's Units and its feeders follow by themselves: Copies of its feeder as "
+                "drawn, the units left over on one more.)",
+                ("MPT / generator", "Now", "Feeders", "Then"))
+            rows, k, busy = [], 1, []
+            for m, gl in groups.items():
+                if not gl:
+                    continue
+                mv, mthen = tk.StringVar(), tk.StringVar()
+                ttk.Label(tab, text=m, style="Item.TLabel").grid(row=k, column=0, sticky="w", padx=4, pady=(6, 2))
+                ttk.Label(tab, textvariable=mthen, style="Hint.TLabel").grid(row=k, column=1, sticky="w", padx=4)
+                msp = tk.Spinbox(tab, from_=1, to=9999, textvariable=mv, width=6)
+                msp.grid(row=k, column=2, sticky="w", padx=4)
+                ttk.Label(tab, text="shared out by MW", style="Hint.TLabel").grid(row=k, column=3, sticky="w", padx=4)
+                k += 1
+                mine = []
+                for r in gl:
+                    nm = _txt(r.get("name"))
+                    fs = lay.get(nm.upper())
+                    ttk.Label(tab, text="   " + nm).grid(row=k, column=0, sticky="w", padx=4)
+                    try:
+                        u = _int(r, "units", nm, required=True, minimum=1)
+                        mw = u * max(abs(_num(r, "unit_pmax_mw", nm, 0.0)), 1e-6)
+                    except InputError as x:
+                        u, mw, fs = None, 0.0, None
+                        why = "does not read yet: %s" % str(x).split(": ", 1)[-1]
+                    else:
+                        why = None
+                    if fs and nm.upper() not in shared:
+                        now = sum(c for _f, c, _n in fs)
+                        carried = sum(c * n for _f, c, n in fs)
+                        try:
+                            set_feeders(data, nm, now)
+                        except InputError as x:
+                            why = str(x).split(": ", 1)[-1]
+                    elif why is None:
+                        why = "no feeders of its own (Collector EQUIVALENT or NONE, or a shared collector's)"
+                    if why:
+                        ttk.Label(tab, text=why, style="Hint.TLabel", wraplength=560, justify="left").grid(
+                            row=k, column=1, columnspan=3, sticky="w", padx=4)
+                        k += 1
+                        continue
+                    ttk.Label(tab, text="%s = %d of its %d units" % (", ".join("%s x %d: %d each" % (f, c, n_)
+                                                                              for f, c, n_ in fs), carried, u)).grid(
+                        row=k, column=1, sticky="w", padx=4)
+                    need = feeders_needed(data, nm)
+                    v, then = tk.StringVar(value=str(now if carried == u or not need else need[3])), tk.StringVar()
+                    tk.Spinbox(tab, from_=1, to=u, textvariable=v, width=6).grid(row=k, column=2, sticky="w", padx=4)
+                    ttk.Label(tab, textvariable=then, wraplength=560, justify="left").grid(row=k, column=3, sticky="w",
+                                                                                          padx=4)
+                    row = {"name": nm, "now": now, "ok": carried == u, "u": u, "mw": mw, "v": v, "then": then,
+                           "mpt": mv}
+                    mine.append(row)
+                    rows.append(row)
+                    k += 1
+
+                def per_mpt(*_a, mine=mine, mv=mv, mthen=mthen):
+                    if busy or not mine:
+                        return
+                    try:
+                        n = int(float(mv.get()))
+                    except ValueError:
+                        return
+                    n = max(n, len(mine))
+                    busy.append(1)
+                    try:
+                        for row, x in zip(mine, _split(n, [r_["mw"] for r_ in mine])):
+                            row["v"].set(str(max(1, min(x, row["u"]))))
+                    finally:
+                        busy.pop()
+                    show_mpt(mine, mv, mthen)
+
+                def show_mpt(mine, mv, mthen):
+                    now = sum(r_["now"] for r_ in mine)
+                    mthen.set("now %d feeder%s" % (now, "" if now == 1 else "s"))
+                mv.trace_add("write", per_mpt) if hasattr(mv, "trace_add") else mv.trace("w", per_mpt)
+                for row in mine:
+                    def show(*_a, row=row, mine=mine, mv=mv):
+                        try:
+                            n = int(float(row["v"].get()))
+                        except ValueError:
+                            return row["then"].set("a whole number, 1 to %d" % row["u"])
+                        if n == row["now"] and row["ok"]:
+                            row["then"].set("as it is")
+                        else:
+                            try:
+                                row["then"].set(set_feeders(data, row["name"], n)[1].split(" -- ", 1)[-1])
+                            except InputError as x:
+                                row["then"].set(str(x).split(": ", 1)[-1])
+                        if not busy:
+                            busy.append(1)
+                            try:
+                                tot = 0
+                                for r_ in mine:
+                                    try:
+                                        tot += int(float(r_["v"].get()))
+                                    except ValueError:
+                                        pass
+                                mv.set(str(tot))
+                            finally:
+                                busy.pop()
+                    row["v"].trace_add("write", show) if hasattr(row["v"], "trace_add") else row["v"].trace("w", show)
+                    show()
+                show_mpt(mine, mv, mthen)
+                if not mine:
+                    mv.set("")
+                    msp.configure(state="disabled")
+
+            def ok():
+                done, bad = [], []
+                for row in rows:
+                    try:
+                        n = int(float(row["v"].get()))
+                    except ValueError:
+                        bad.append("%s: a whole number" % row["name"])
+                        continue
+                    if n == row["now"] and row["ok"]:
+                        continue
+                    try:
+                        data["feeders"], said = set_feeders(data, row["name"], n)
+                    except InputError as x:
+                        bad.append(str(x))
+                        continue
+                    done.append(said)
+                if bad:
+                    return messagebox.showerror("Feeders on each MPT", "\n".join(bad), parent=top)
+                top.destroy()
+                if done:
+                    for g in app["grids"].values():
+                        if g.key == "feeders":
+                            g.refresh()
+                    live_totals()
+                    dirty()
+                set_status(("Feeders set: %s" % " | ".join(done)) if done else "Feeders: nothing changed")
+            ttk.Button(bb, text="Set the feeders", command=ok).pack(side="left", padx=4)
             ttk.Button(bb, text="Cancel", command=top.destroy).pack(side="left", padx=4)
             app["size_dialog"] = {"top": top, "rows": rows, "ok": ok}
             top.grab_set()
@@ -10141,6 +10589,9 @@ def gui(start=None):
         load(inp, path if path.lower().endswith(".json") else None,
              "opened %s" % path if path.lower().endswith(".json")
              else "imported %s -- Save makes it a project (.json)" % path)
+        for m in inp.get("_said", []):
+            out("[smib] %s\n" % m)
+            set_status(m)
         if inp.get("_unknown"):
             out("[smib] not used from %s: %s\n" % (path, "; ".join(inp["_unknown"])))
             messagebox.showwarning("Open", "%d item(s) in this file are not inputs of this version -- they are not "
@@ -10411,6 +10862,10 @@ def gui(start=None):
         g = app["grids"].get("mpt")
         if g is not None:
             g.total.set(("Generators on each MPT:   " + "   |   ".join(mpts)) if mpts else "")
+        g = app["grids"].get("feeders")
+        if g is not None:
+            fl = feeder_lines(data)
+            g.total.set(("Feeders on each MPT (Copies: identical feeders):\n" + "\n".join(fl)) if fl else "")
         for k, txt in (("scr_base_mw", "blank = %s MW, the generators' Pmax" % ("%.6g" % tot["pmax"])),
                        ("p_poi_mw", "blank = each generator at its dispatch: %s MW in all" % (
                            "%.6g" % tot["dispatch"]))):
@@ -10418,6 +10873,32 @@ def gui(start=None):
                 hints[k][0].configure(text=txt)
         if "req_live" in app:                         # the SCR's short-circuit MVA: on the generators' Pmax
             app["req_live"]()
+
+    def feeders_follow(r, was, v):
+        """A generator's Units changed: its own feeders follow when they carried its Units before -- as many
+           feeders as its units need at the units on each it had (the GSU count follows the same way) -> what
+           was done, or None."""
+        nm = _txt(r.get("name"))
+        try:
+            old, new = int(float(was)), int(float(v))
+        except (TypeError, ValueError):
+            return None
+        need = feeders_needed(data, nm) if nm else None
+        if not need or new < 1:
+            return None
+        if need[1] == new:
+            return None
+        if need[1] != old:
+            return "%s: Units %d -- its feeders carry %d units: Feeders on each MPT (MPT or Feeders page) spreads " \
+                   "its Units over them" % (nm, new, need[1])
+        try:
+            data["feeders"], said = set_feeders(data, nm)
+        except InputError as e:
+            return str(e)
+        for g in app["grids"].values():
+            if g.key == "feeders":
+                g.refresh()
+        return "Units %d -- its feeders follow: %s" % (new, said)
 
     def grid_says(v):
         """What the grid fields make of the POI, live: the short-circuit MVA of each SCR given (SCR x SCR base),
