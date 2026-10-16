@@ -5946,7 +5946,7 @@ def pi_ports(cmp, c, reported, log, first):
     dim = max([p[3] for p in reported] or [3])
     out = [(names[0] if names else "N1", got[0], got[2], dim),
            (names[-1] if len(names) > 1 else "N2", got[1], got[2], dim)]
-    if first or sorted((p[1], p[2]) for p in reported) != sorted((p[1], p[2]) for p in out):
+    if sorted((p[1], p[2]) for p in reported) != sorted((p[1], p[2]) for p in out):
         PI_NOTE.append("%s: PSCAD reports its ports at %s; drawn at (%d, %d), (%d, %d) -- wired there" % (
             c["tag"], ", ".join("(%d, %d)" % (p[1], p[2]) for p in reported) or "none", out[0][1], out[0][2],
             out[1][1], out[1][2]))
@@ -6578,6 +6578,13 @@ def join(canvas, points, log):
             pts.append((pts[0][0] - max(4, int(len(n) * 0.42 + 2.5)), pts[0][1], "name", "", 0))
     points = split
     wires = plan(points)
+    split_up = set(n.split("@")[0] for n in points if "@" in n)    # nodes in columns joined by their labels
+
+    def name_it(node, x, y):
+        if not label(canvas, x, y, node.split("@")[0]):
+            log("CHECK: node %s: its node label could not be placed at (%d, %d)%s" % (
+                node.split("@")[0], x, y, " -- its parts in other columns are not joined: join them by hand"
+                if node.split("@")[0] in split_up else ""))
     for node in sorted(points):
         if node == "GND":
             continue
@@ -6595,11 +6602,11 @@ def join(canvas, points, log):
         except Exception as e:
             log("CHECK: node %s: no wires (%s) -- node labels instead" % (node, e))
             for (x, y) in sorted(set((p[0], p[1]) for p in points[node])):
-                label(canvas, x, y, node.split("@")[0])
+                name_it(node, x, y)
             continue
         if not node.endswith("_RL"):
             x, y = at[1] if at else wires[node][0][0]
-            label(canvas, x, y, node.split("@")[0])
+            name_it(node, x, y)
 
 
 def main():
