@@ -157,6 +157,11 @@
      number shared out by MW); a generator's Units changed in the GUI: its
      feeders follow -- Copies of its feeder as drawn, the units left over on
      one more (a feeder's sections with no units at them or beyond left out).
+     Lengths: a blank length unit is ft -- feeders, the gen-tie, an MPT's own
+     tie (files saved before: km, written in and said). Unit Qmax blank: the
+     MVA left at full P, sqrt(Unit MVA^2 - P^2), when Unit MVA is given (Unit
+     PF given: from it; files saved before: Unit PF 0.95 written in); in the
+     GUI a Unit Qmax on that circle follows a change of Unit MVA or P.
      Rate A, B, C (PSS/E RATEA/B/C, PSLF rate1/2/3; B blank = A, C blank =
      B): an MPT's (three windings: the HV winding's, the LV and TV windings'
      their MVA, B and C in proportion), one GSU's (x the GSUs), one cable's
@@ -243,8 +248,9 @@ REGCB_XE = 0.15                   # REGC_B: the converter's coupling reactance X
 # THE INPUT WORKBOOK -- its sheets and columns, and the example it is written with
 # ============================================================================
 LEN_UNITS = ["km", "mi", "kft", "m", "ft"]
-FEEDER_UNITS = ["ft", "kft", "m", "km", "mi"]    # a feeder section's length: blank = ft (older files: km)
-FEEDER_UNIT = "ft"
+FEEDER_UNITS = ["ft", "kft", "m", "km", "mi"]    # a length's unit, ft first: feeders, the gen-tie, an MPT's tie
+FEEDER_UNIT = "ft"                               # what a blank length unit is (older files: km -- FORMAT)
+FORMAT = 3       # what blanks mean in a project: 1 km lengths, Qmax from PF | 2 feeders ft | 3 ties ft, Qmax from MVA
 LEN_KM = {"km": 1.0, "mi": 1.609344, "kft": 0.3048, "m": 0.001, "ft": 0.0003048}
 GEN_TYPES = ["PV", "BESS", "WT4", "WT3", "SYNC", "USER"]
 # the electrical control models (REEC) each inverter type takes; the first is its default
@@ -287,7 +293,7 @@ PLANT_FIELDS = [
     ("grid_x_pu", "Grid X", "pu", "instead of the SCR: Thevenin X on the system base", None),
     ("tie_length", "Gen-tie length", "", "POI to the substation HV bus; blank = no gen-tie (the MPTs on the POI bus)",
      None),
-    ("tie_unit", "Gen-tie length unit", "", "km, mi, kft, m, ft (blank = km)", LEN_UNITS),
+    ("tie_unit", "Gen-tie length unit", "", "ft, kft, m, km, mi (blank = ft)", FEEDER_UNITS),
     ("tie_per_unit", "Gen-tie values per", "", "the length R, X, B, C below are per: km, mi, kft, m, ft (blank = "
      "km or mi, whichever matches a line of the POI kV)", LEN_UNITS),
     ("tie_r_per", "Gen-tie R per length", "ohm", "one circuit (blank = a typical overhead line of the POI kV)", None),
@@ -367,7 +373,7 @@ MPT_COLS = [
     ("nll_pct", "No-load loss %", "of MVA (blank = 0)", None, 8),
     ("im_pct", "Magnetising current %", "of MVA (blank = 0)", None, 10),
     ("tie_length", "Tie length", "a line of its own from HV to this MPT (blank = none)", None, 9),
-    ("tie_unit", "Tie length unit", "", LEN_UNITS, 7),
+    ("tie_unit", "Tie length unit", "blank = ft", FEEDER_UNITS, 7),
     ("tie_per_unit", "Tie values per", "the length R, X, B are per (blank = km or mi, whichever matches a line of "
      "its kV)", LEN_UNITS, 7),
     ("tie_r_per", "Tie R per length", "ohm (blank = a typical overhead line of the HV kV)", None, 8),
@@ -386,9 +392,11 @@ GEN_COLS = [
     ("unit_mva", "Unit MVA", "one unit (blank = from P and Q)", None, 7),
     ("unit_pmax_mw", "Unit Pmax MW", "", None, 7),
     ("unit_pmin_mw", "Unit Pmin MW", "BESS charging: negative (blank = 0)", None, 8),
-    ("unit_qmax_mvar", "Unit Qmax MVAr", "blank = from Unit PF", None, 8),
+    ("unit_qmax_mvar", "Unit Qmax MVAr", "blank = the MVA left at full P: sqrt(Unit MVA^2 - Pmax^2), or from Unit "
+     "PF", None, 8),
     ("unit_qmin_mvar", "Unit Qmin MVAr", "blank = -Qmax", None, 8),
-    ("unit_pf", "Unit PF", "Q at Pmax when Qmax is blank (blank = 0.95)", None, 7),
+    ("unit_pf", "Unit PF", "Q at Pmax when Qmax is blank, instead of from Unit MVA (blank = 0.95 where Unit MVA is "
+     "blank too)", None, 7),
     ("kv", "Terminal kV", "blank = GSU LV kV", None, 8),
     ("dispatch_mw", "Dispatch MW", "this generator's total; blank = Pmax (BESS charging: negative)", None, 8),
     ("q_mode", "Q mode", "share: holds the POI with the other share generators | fixed: its own Q "
@@ -616,7 +624,7 @@ EXAMPLE = {
         "out_dyr": "YES", "out_pscad": "YES", "out_epc": "YES", "out_dyd": "YES", "freq_hz": 60.0,
         "first_bus": 1000,
         "poi_kv": 230.0, "poi_name": "POI", "grid_scr": 3.0, "grid_x_r": 10.0,
-        "tie_length": 5.0, "tie_unit": "km", "tie_per_unit": "km", "tie_r_per": 0.0720, "tie_x_per": 0.4950,
+        "tie_length": 16400, "tie_unit": "ft", "tie_per_unit": "km", "tie_r_per": 0.0720, "tie_x_per": 0.4950,
         "tie_b_per": 3.35,
         "tie_parallel": 1, "tie_rate_mva": 400.0,
         "control_mode": "Q", "v_poi_pu": 1.0, "q_poi_mvar": 0.0, "pf_poi": 1.0, "v_grid_pu": 1.0,
@@ -1074,12 +1082,14 @@ def parse_workbook(book, path, keep_comments=False):
         raise InputError("%s has no sheet 'Plant' -- start from: python smib_build.py --template x.xlsx" % path)
     items = dict((_key(lab), k) for k, lab, _u, _n, _c in PLANT_FIELDS)
     items.update((_key(k), k) for k, _l, _u, _n, _c in PLANT_FIELDS)
-    unknown = []
+    unknown, fmt = [], FORMAT
     for k, r in enumerate(rows):
         if k == 0 or not r or _skip(r):
             continue
         item = _txt(r[0])
         key = items.get(_key(item or ""))
+        if key == "tie_unit" and len(r) > 3 and _txt(r[3]) == "km":
+            fmt = 2                                  # a workbook from when a blank gen-tie unit was km
         if key is None:
             if len(r) > 1 and _txt(r[1]) is not None:       # a section title has no value
                 unknown.append(item)
@@ -1116,7 +1126,8 @@ def parse_workbook(book, path, keep_comments=False):
         if key == "feeders":                         # its notes row (the template's): what a blank unit meant
             notes = rows[hrow + 1] if hrow + 1 < len(rows) and rows[hrow + 1] and _skip(rows[hrow + 1]) else []
             said = [str(notes[i]) for i, kk in colmap.items() if kk == "unit" and i < len(notes) and notes[i]]
-            inp["_feeder_unit"] = "km" if said and "blank = km" in said[0] else FEEDER_UNIT
+            if said and "blank = km" in said[0]:
+                fmt = 1
         for k in range(hrow + 1, len(rows)):
             r = rows[k]
             if not r or _skip(r) and (not keep_comments or k == hrow + 1 or all(x is None for x in r)):
@@ -1126,7 +1137,7 @@ def parse_workbook(book, path, keep_comments=False):
                 d[kk] = r[i] if i < len(r) else None
             if any(v is not None for kk, v in d.items() if kk != "_where"):
                 inp[key].append(d)
-    _feeder_units(inp, inp.pop("_feeder_unit", FEEDER_UNIT))
+    _old_blanks(inp, fmt)
     return inp
 
 
@@ -1735,9 +1746,10 @@ def line_data(d, prefix, kv, sb, f, where, unused=None):
         if unused is not None:
             _unused(unused, d, [prefix + k for k in ("unit", "per_unit", "r_per", "x_per", "b_per", "c_per", "b_us",
                                                      "parallel", "rate_mva")], where,
-                    "no length (and no R, X totals): no line here", {prefix + "unit": "km", prefix + "parallel": 1})
+                    "no length (and no R, X totals): no line here", {prefix + "unit": FEEDER_UNIT,
+                                                                       prefix + "parallel": 1})
         return None
-    unit = _choice(d, prefix + "unit", where, LEN_UNITS, "km")
+    unit = _choice(d, prefix + "unit", where, LEN_UNITS, FEEDER_UNIT)
     per_unit = _choice(d, prefix + "per_unit", where, LEN_UNITS, None)
     km = (length or 0.0) * LEN_KM[unit]
     typ, notes, used = ohl_typical(kv, f), [], []
@@ -2916,19 +2928,29 @@ def build_mpt(net, r, f, loads=None):
 
 def unit_rating(r, w):
     """A Generators row's units and one unit's rating -> (units, Pmax, Pmin, PF, Qmax, Qmin, MVA): Pmin blank 0,
-       Qmax blank from Unit PF (blank 0.95), Qmin blank -Qmax, MVA blank from P and Q."""
+       Qmax blank the MVA left at full P (sqrt(MVA^2 - P^2), P the larger of Pmax and -Pmin) -- from Unit PF where
+       that is given or Unit MVA is blank (PF blank 0.95), Qmin blank -Qmax, MVA blank from P and Q."""
     n = _int(r, "units", w, required=True, minimum=1)
     pmax = _num(r, "unit_pmax_mw", w, required=True)
     pmin = _num(r, "unit_pmin_mw", w, 0.0)
     pf = _num(r, "unit_pf", w, 0.95)
     qmax = _num(r, "unit_qmax_mvar", w)
+    s0 = _num(r, "unit_mva", w, None, positive=True)
+    if qmax is None and s0 is not None and _txt(r.get("unit_pf")) is None:      # the MVA circle at full P
+        pm = max(abs(pmax), abs(pmin))
+        if pm > s0 + 1e-9:
+            raise InputError("%s: %s %g is above %s %g -- Unit Qmax, blank, is the MVA left at full P" % (
+                w, _label("unit_pmax_mw" if abs(pmax) >= abs(pmin) else "unit_pmin_mw", w),
+                pmax if abs(pmax) >= abs(pmin) else pmin, _label("unit_mva", w), s0))
+        qmax = math.sqrt(max(s0 * s0 - pm * pm, 0.0)) + 0.0
+        pf = abs(pmax) / math.hypot(pmax, qmax) if pmax else 1.0
     if qmax is None:
         if not 0.0 < abs(pf) <= 1.0:
             raise InputError("%s: %s %g must be between 0 and 1 (it sets Unit Qmax, which is blank)" % (
                 w, _label("unit_pf", w), pf))
         qmax = abs(pmax) * math.tan(math.acos(abs(pf)))
-    qmin = _num(r, "unit_qmin_mvar", w, -qmax)
-    s = _num(r, "unit_mva", w, None, positive=True) or math.hypot(max(abs(pmax), abs(pmin)), max(qmax, -qmin))
+    qmin = _num(r, "unit_qmin_mvar", w, -qmax if qmax else 0.0)
+    s = s0 or math.hypot(max(abs(pmax), abs(pmin)), max(qmax, -qmin))
     if pmin > pmax:
         raise InputError("%s: %s %g is above %s %g" % (w, _label("unit_pmin_mw", w), pmin, _label("unit_pmax_mw", w),
                                                       pmax))
@@ -3381,6 +3403,12 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
     if g["type"] == "BESS" and _txt(r.get("unit_pmin_mw")) is None:
         net.notes.append("CHECK: %s: %s blank (0) -- this BESS does not charge: give its charging limit (-Pmax ...) "
                          "if it does" % (w, _label("unit_pmin_mw", w)))
+    if _txt(r.get("unit_qmax_mvar")) is None and _txt(r.get("unit_pf")) is None and _txt(r.get("unit_mva")) and \
+            g["unit"]["qmax"] < 0.05 * g["unit"]["mva"]:   # the MVA circle leaves (next to) no Q at full P
+        net.notes.append("CHECK: %s: Unit MVA %s and P %s leave %.3g MVAr at full P (Unit Qmax blank: sqrt(MVA^2 - "
+                         "P^2)) -- give Unit Qmax, a larger Unit MVA, or Unit PF" % (
+                             w, _g(g["unit"]["mva"]), _g(max(abs(g["unit"]["pmax"]), abs(g["unit"]["pmin"]))),
+                             g["unit"]["qmax"]))
     if g["unit"]["qmax"] < 0:                        # given so, with its Qmin below it: Q taken only
         net.notes.append("CHECK: %s: %s %g is below 0 -- this unit only takes Q (%g .. %g MVAr)" % (
             w, _label("unit_qmax_mvar", w), g["unit"]["qmax"], g["unit"]["qmin"], g["unit"]["qmax"]))
@@ -8018,18 +8046,50 @@ def _psse_steps(net, recs, inp, files, out, work, log):
 # ============================================================================
 # MAIN
 # ============================================================================
-def _feeder_units(inp, blank):
-    """Feeders rows with a length and no Length unit: the unit a blank meant in the file they come from, written in
-       -- ft now (FEEDER_UNIT); km in projects and workbooks from before (said)."""
+def _old_blanks(inp, fmt):
+    """What blanks meant in the file the inputs come from (fmt: its FORMAT), written in -- what differs from now
+       said: before 2 a feeder's length unit km; before 3 the gen-tie's and MPT ties' km, and a blank Unit Qmax
+       from Unit PF (0.95) though Unit MVA is given (now from MVA and Pmax)."""
+    said = inp.setdefault("_said", [])
+    fu, tu = ("ft" if fmt >= 2 else "km"), ("ft" if fmt >= 3 else "km")
     n = 0
     for r in inp.get("feeders") or []:
         if _txt(r.get("length")) is not None and _txt(r.get("unit")) is None:
-            r["unit"] = blank
+            r["unit"] = fu
             n += 1
-    if n and blank != FEEDER_UNIT:
-        inp.setdefault("_said", []).append(
-            "NOTE: Feeders: %d row(s) with no Length unit read as %s -- a blank meant %s when this file was saved "
-            "(now %s); they say %s from now on" % (n, blank, blank, FEEDER_UNIT, blank))
+    if n and fu != FEEDER_UNIT:
+        said.append("NOTE: Feeders: %d row(s) with no Length unit read as %s -- a blank meant %s when this file was "
+                    "saved (now %s); they say %s from now on" % (n, fu, fu, FEEDER_UNIT, fu))
+    ties = []
+    pl = inp.get("plant") or {}
+    if _txt(pl.get("tie_length")) is not None and _txt(pl.get("tie_unit")) is None:
+        pl["tie_unit"] = tu
+        ties.append("Plant: Gen-tie length unit")
+    for r in inp.get("mpt") or []:
+        if _txt(r.get("tie_length")) is not None and _txt(r.get("tie_unit")) is None:
+            r["tie_unit"] = tu
+            ties.append("MPT %s: Tie length unit" % (_txt(r.get("name")) or "?"))
+    if ties and tu != FEEDER_UNIT:
+        said.append("NOTE: %s blank, read as %s -- a blank meant %s when this file was saved (now %s); it says %s "
+                    "from now on" % (", ".join(ties), tu, tu, FEEDER_UNIT, tu))
+    if fmt < 3:
+        q = []
+        for r in inp.get("generators") or []:
+            if _txt(r.get("unit_mva")) is not None and _txt(r.get("unit_qmax_mvar")) is None and \
+                    _txt(r.get("unit_pf")) is None:
+                r["unit_pf"] = 0.95
+                q.append(_txt(r.get("name")) or "?")
+        if q:
+            said.append("NOTE: Generators %s: Unit PF 0.95 written in -- a blank Unit Qmax came from Unit PF (blank "
+                        "0.95) when this file was saved; now, with Unit MVA given, from MVA and Pmax" % ", ".join(q))
+
+
+def _format_of(inp):
+    """The FORMAT a project (.json) was saved in: its mark (1 if none -- before the marks)."""
+    try:
+        return int(inp.get("_format") or (2 if _txt(inp.get("_feeder_unit")) == "ft" else 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 def read_input(path, keep_comments=False):
@@ -8065,7 +8125,7 @@ def read_input(path, keep_comments=False):
             for k, r in enumerate(inp[key]):
                 r.setdefault("_where", "%s row %d" % (sheet, k + 1))
         inp["_source"], inp["_unknown"] = path, unknown
-        _feeder_units(inp, _txt(inp.get("_feeder_unit")) or "km")      # no mark: saved when a blank meant km
+        _old_blanks(inp, _format_of(inp))            # no mark: saved when blanks meant what they did then
         return inp
     return parse_workbook(read_xlsx(path), path, keep_comments)
 
@@ -8226,7 +8286,7 @@ def _build_case(inp, src, out_dir, check, pscad, log):
         else:
             comps = []
         clean = dict((k, v) for k, v in inp.items() if not k.startswith("_"))
-        clean["_feeder_unit"] = FEEDER_UNIT
+        clean["_feeder_unit"], clean["_format"] = FEEDER_UNIT, FORMAT
         _write_text(files["json"], json.dumps(clean, indent=1, sort_keys=True, default=str))
         if src.lower().endswith((".xlsx", ".xlsm")):
             files["xlsx"] = os.path.join(out, os.path.basename(src))
@@ -8613,7 +8673,7 @@ def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None, tie="PER
             if k.startswith("tie_"):
                 pl[k] = None
         did.append("gen-tie: one per MPT, POI to each MPT, each as the plant's was (%s %s%s)%s" % (
-            _g(num(gt["tie_length"])), gt.get("tie_unit") or "km",
+            _g(num(gt["tie_length"])), gt.get("tie_unit") or FEEDER_UNIT,
             (", %s MVA" % _g(num(gt["tie_rate_mva"]))) if num(gt.get("tie_rate_mva")) else "",
             (" -- %s circuits were one each" % _g(num(gt["tie_parallel"]))) if (num(gt.get("tie_parallel")) or 1) > 1
             else ""))
@@ -8682,7 +8742,8 @@ def gui_save_data(data):
             if row:
                 rows.append(row)
         out[key] = rows
-    out["_feeder_unit"] = FEEDER_UNIT                # what a blank Length unit means in it (before: km)
+    out["_feeder_unit"] = FEEDER_UNIT                # what blanks mean in it (FORMAT; _feeder_unit: format 2's mark)
+    out["_format"] = FORMAT
     return out
 
 
@@ -9270,8 +9331,11 @@ def gui(start=None):
                             if g is not self:
                                 g.refresh()
                         set_status("%s renamed %s: %d place(s) using it changed too" % (was, v, n))
-                    said = feeders_follow(self.rows[i], was, v) if self.sheet == "Generators" and \
-                        key == "units" else None                          # its feeders follow its Units
+                    said = None
+                    if self.sheet == "Generators" and key == "units":      # its feeders follow its Units
+                        said = feeders_follow(self.rows[i], was, v)
+                    elif self.sheet == "Generators" and key in ("unit_mva", "unit_pmax_mw", "unit_pmin_mw"):
+                        said = q_follow(self.rows[i], key, was)          # its Q follows its MVA and P
                     if self.sheet == "Generators" and key == "type":       # model choices its Type does not take
                         gone, lab = [], dict((c[0], c[1]) for c in self.cols)
                         for k, (ok, _doc) in MODEL_CHOICE.items():
@@ -10873,6 +10937,39 @@ def gui(start=None):
                 hints[k][0].configure(text=txt)
         if "req_live" in app:                         # the SCR's short-circuit MVA: on the generators' Pmax
             app["req_live"]()
+
+    def q_follow(r, key, was):
+        """A unit's MVA or P changed: a Unit Qmax given on its MVA circle (sqrt(MVA^2 - P^2)) -- and a Unit Qmin
+           at -Qmax -- follow it -> what was done, or None (a blank Qmax follows by itself; one given otherwise,
+           or with Unit PF, stays)."""
+        q = _cell_num(r, "unit_qmax_mvar", None)
+        if q is None or _txt(r.get("unit_pf")) is not None:
+            return None
+        old = dict(r)
+        if _txt(was) is None:
+            old.pop(key, None)
+        else:
+            old[key] = was
+
+        def circle(x):
+            s0 = _cell_num(x, "unit_mva", None)
+            pm = max(abs(_cell_num(x, "unit_pmax_mw", 0.0)), abs(_cell_num(x, "unit_pmin_mw", 0.0)))
+            return math.sqrt(s0 * s0 - pm * pm) if s0 and s0 >= pm else None
+        c0, c1 = circle(old), circle(r)
+        if c0 is None or abs(q - c0) > 0.005 * max(c0, 1e-3) + 0.005:
+            return None                              # not on its circle: as given
+        nm = _txt(r.get("name")) or "the generator"
+        if c1 is None:
+            return "%s: its P is above Unit MVA -- Unit Qmax %s stays (it sat on the MVA circle)" % (
+                nm, _txt(r.get("unit_qmax_mvar")))
+        qmin = _cell_num(r, "unit_qmin_mvar", None)
+        f = lambda x: "%.4g" % x if abs(x) > 1e-9 else "0"
+        r["unit_qmax_mvar"] = f(c1)
+        both = qmin is not None and abs(qmin + q) <= 0.005 * max(q, 1e-3) + 0.005
+        if both:
+            r["unit_qmin_mvar"] = f(-c1)
+        return "%s: Unit Qmax %s -> %s MVAr%s -- the MVA left at full P, sqrt(MVA^2 - P^2)" % (
+            nm, f(q), f(c1), (", Qmin %s" % f(-c1)) if both else "")
 
     def feeders_follow(r, was, v):
         """A generator's Units changed: its own feeders follow when they carried its Units before -- as many
