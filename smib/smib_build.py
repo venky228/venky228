@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""SMIB plant models for PSS/E and PSCAD, built from an Excel input workbook.
+"""Plant Model Builder: SMIB and DETAILED plant models for PSS/E, PSLF, TSAT and PSCAD from one set of inputs.
 
    One plant -- any number of generators (PV, BESS, wind, synchronous), each
    with its own units, GSUs and collector system, on one or more main power
@@ -245,7 +245,8 @@ PLANT_FIELDS = [
     ("first_bus", "First bus number", "", "buses are numbered from here + 1 (Bus_Numbers sets any one)", None),
     ("poi_kv", "POI kV", "kV", "", None),
     ("poi_name", "POI name", "", "12 characters at most", None),
-    ("grid_scr", "Grid SCR", "", "short-circuit ratio at the POI, on the SCR base", None),
+    ("grid_scr", "Grid SCR", "", "short-circuit ratio at the POI, on the SCR base; several (3, 5, 10): a set of "
+     "models for each, named <name>_SCR3 ...", None),
     ("grid_x_r", "Grid X/R", "", "", None),
     ("scr_base_mw", "SCR base", "MW", "blank = the generators' Pmax", None),
     ("grid_sc_mva", "Grid short-circuit MVA", "MVA", "instead of the SCR (with Grid X/R)", None),
@@ -461,6 +462,49 @@ PSCADP_COLS = [
     ("parameter", "Parameter", "the vendor model's parameter name", None, 16),
     ("value", "Value", "as PSCAD takes it (0.63 [kV], 40, {UNITS}, {P_PU} ...)", None, 16),
 ]
+
+SIMPLE = {  # the GUI's simple view: these fields only (All fields: every one; a hidden field keeps its value)
+    "Plant": ("name", "model_type", "freq_hz", "poi_kv", "grid_scr", "grid_x_r", "tie_length", "tie_unit",
+              "tie_r_per", "tie_x_per", "tie_b_per", "control_mode", "v_poi_pu", "q_poi_mvar", "pf_poi", "p_poi_mw",
+              "plant_ctrl", "pscad_duration_s", "pscad_fault", "pscad_fault_s"),
+    "MPT": ("name", "windings", "hv_kv", "lv_kv", "tv_kv", "mva", "z_hl_pct", "x_r", "vector", "tap"),
+    "Generators": ("name", "type", "connect", "units", "unit_mva", "unit_pmax_mw", "unit_pmin_mw", "unit_qmax_mvar",
+                   "kv", "dispatch_mw", "gsu_mva", "gsu_hv_kv", "gsu_lv_kv", "gsu_z_pct", "collector", "regc", "reec",
+                   "pscad_definition", "pscad_source"),
+    "Feeders": ("collector", "feeder", "section", "cable", "length", "unit", "units", "units_of"),
+}
+SIMPLE_TABS = ("Plant", "MPT", "Generators", "Feeders", "Cables", "Dyr_Params", "PSCAD_Params", "Output")
+NAV_GROUPS = (  # the GUI's pages, grouped on its left: (group, [(page, what it is called there)])
+    ("Plant", (("Plant", "Plant and grid"), ("MPT", "Main transformers (MPT)"), ("Generators", "Generators"))),
+    ("Collector system", (("Feeders", "Feeders"), ("Cables", "Cables"), ("Collectors", "Shared collectors"))),
+    ("Dynamics: PSS/E, PSLF", (("Dyr_Params", "Model parameters"), ("Dyr_Records", "Records of your own"))),
+    ("PSCAD", (("PSCAD_Params", "Vendor model (UDM)"),)),
+    ("More inputs", (("Loads_Shunts", "Loads and shunts"), ("Machines", "DETAILED machines"),
+                     ("Bus_Numbers", "Bus numbers"))),
+    ("Reference", (("Input_Reference", "Input reference"), ("Dynamic_Models", "Dynamic models"),
+                   ("README", "Read me"))),
+    ("Results", (("Output", "Output"),)),
+)
+_HV, _MV, _LV = ("69", "115", "138", "161", "230", "345", "500"), ("12.47", "13.8", "24.9", "34.5"), \
+    ("0.48", "0.6", "0.63", "0.66", "0.69", "0.8")
+_TAPS, _N = ("0.975", "0.9875", "1", "1.0125", "1.025"), ("1", "2", "3", "4")
+SUGGEST = {  # the GUI's drop-down of typical values where a field has no list of its own (any value can be typed)
+    "freq_hz": ("60", "50"), "sbase_mva": ("100",), "poi_kv": _HV, "grid_scr": ("3", "5", "10", "20", "3, 5, 10"),
+    "grid_x_r": ("5", "10", "15", "20"), "v_poi_pu": ("0.95", "1.0", "1.05"), "v_grid_pu": ("0.95", "1.0", "1.05"),
+    "pf_poi": ("0.95", "-0.95", "0.9", "-0.9", "1"), "tie_parallel": ("1", "2"),
+    "pscad_time_step_us": ("1", "2", "5", "10", "20", "50"), "pscad_duration_s": ("2", "5", "10", "20"),
+    "pscad_plot_step_us": ("50", "100", "250", "500"), "pscad_fault_s": ("1", "2", "3", "100"),
+    "pscad_fault_dur_s": ("0.05", "0.1", "0.15", "0.2"), "pscad_fault_ohm": ("0.01", "1", "10"),
+    "MPT.hv_kv": _HV, "MPT.lv_kv": _MV, "MPT.tv_kv": _MV, "MPT.vector": ("YNd1", "YNd11", "YNyn0", "YNyn0d1",
+                                                                    "YNd1d1", "YNd11d11", "Dyn1", "Dyn11"),
+    "MPT.z_hl_pct": ("8", "9", "10", "12"), "MPT.x_r": ("30", "40", "45", "50"), "MPT.tap": _TAPS,
+    "MPT.count": _N, "Generators.id": ("1", "2", "3"), "Generators.units": _N, "Generators.kv": _LV,
+    "Generators.unit_pf": ("0.9", "0.95", "1"), "Generators.fixed_pf": ("0.9", "0.95", "1", "-0.95"),
+    "Generators.gsu_count": _N, "Generators.gsu_hv_kv": _MV, "Generators.gsu_lv_kv": _LV,
+    "Generators.gsu_z_pct": ("5.75", "6", "6.5", "8"), "Generators.gsu_x_r": ("6", "8", "10"),
+    "Generators.gsu_vector": ("Dyn1", "Dyn11", "YNd1", "YNd11", "Dy1", "Dy11", "YNyn0"), "Generators.gsu_tap": _TAPS,
+    "Generators.wmod": ("0", "1"), "Feeders.copies": _N, "Feeders.parallel": _N, "Machines.id": ("1", "2", "3"),
+}
 
 TABLES = [  # (sheet, input key, columns)
     ("MPT", "mpt", MPT_COLS),
@@ -1266,7 +1310,7 @@ def write_template(path, data=None, roles=None):
 
     # cover
     rows, merges, links, hts = [], [], [], {}
-    rows.append([("SMIB PLANT MODEL  |  INPUT WORKBOOK", XS_TITLE), ("", XS_TITLE), ("", XS_TITLE)])
+    rows.append([("PLANT MODEL BUILDER  |  INPUT WORKBOOK", XS_TITLE), ("", XS_TITLE), ("", XS_TITLE)])
     rows.append([("PSS/E (.raw, .dyr) and PSCAD (.pscx) models of a plant from one workbook -- smib_build.py, "
                   + stamp, XS_SUB), ("", XS_SUB), ("", XS_SUB)])
     merges += ["A1:C1", "A2:C2"]
@@ -2473,6 +2517,50 @@ def unit_rating(r, w):
     if qmin > qmax:
         raise InputError("%s: Unit Qmin is above Unit Qmax" % w)
     return n, pmax, pmin, pf, qmax, qmin, s
+
+
+def plant_totals(data):
+    """What the Generators rows add up to for the whole plant, and what each MPT carries -> (plant line, [MPT
+       lines], {"pmax": MW, "dispatch": MW}) -- a generator whose row does not read yet is left out, named."""
+    f = lambda x: "%.6g" % (x + 0.0)
+    mva = pmax = pmin = qmax = qmin = disp = 0.0
+    units, bad, on = 0, [], collections.defaultdict(list)
+    colls = dict(((_txt(c.get("name")) or "").upper(), (_txt(c.get("connect")) or "").upper())
+                 for c in data.get("collectors") or [])
+    for r in data.get("generators") or []:
+        if not any(v not in (None, "") for v in r.values()):
+            continue
+        nm = _txt(r.get("name")) or "?"
+        try:
+            n, p1, p0, _pf, q1, q0, s = unit_rating(r, nm)
+            d = _num(r, "dispatch_mw", nm)
+        except InputError:
+            bad.append(nm)
+            continue
+        units += n
+        mva, pmax, pmin, qmax, qmin = mva + n * s, pmax + n * p1, pmin + n * p0, qmax + n * q1, qmin + n * q0
+        disp += n * p1 if d is None else d
+        to = (_txt(r.get("connect")) or "").upper()
+        to = colls.get(to, to)
+        on[to.split(":")[0]].append((nm, n * s))
+    line = "Whole plant (from Generators): %s MVA, %d units  |  P %s to %s MW, dispatch %s MW  |  Q %s to %s MVAr" % (
+        f(mva), units, f(pmin), f(pmax), f(disp), f(qmin), f(qmax)) + (
+        ("   (%s not counted: its row does not read yet)" % ", ".join(bad)) if bad else "")
+    mpts = []
+    for m in data.get("mpt") or []:
+        nm = _txt(m.get("name"))
+        if not nm:
+            continue
+        try:
+            rate = _num(m, "mva", nm)
+        except InputError:
+            rate = None
+        gs = on.get(nm.upper(), [])
+        tot = sum(x for _g, x in gs)
+        mpts.append("%s%s: carries %s = %s MVA%s" % (
+            nm, (" %s MVA" % f(rate)) if rate else "", " + ".join(g for g, _x in gs) or "no generator", f(tot),
+            (" (%.0f %% of its rating)" % (100.0 * tot / rate)) if rate and gs else ""))
+    return line, mpts, {"pmax": pmax, "dispatch": disp}
 
 
 def unit_totals(r):
@@ -7142,11 +7230,43 @@ OUT_KINDS = (("raw", "PSS/E .raw"), ("dyr", "PSS/E .dyr"), ("pscad", "PSCAD mode
              ("dyd", "PSLF .dyd"))                              # what Plant: Build ... can say YES / NO to
 
 
+def scr_cases(inp):
+    """Plant: Grid SCR given as several values (3, 5, 10) -> one set of inputs for each, named <name>_SCR<n>
+       -> [(SCR as typed, inputs)]; one value -> [(None, inp)]."""
+    v = inp["plant"].get("grid_scr")
+    parts = [x for x in re.split(r"[,;\s]+", v.strip()) if x] if isinstance(v, str) else []
+    if len(parts) < 2:
+        return [(None, inp)]
+    out = []
+    for x in parts:
+        try:
+            if not float(x) > 0:
+                raise ValueError
+        except ValueError:
+            raise InputError("Plant: 'Grid SCR' = %r -- one value, or several separated by commas: 3, 5, 10" % v)
+        d = json.loads(json.dumps(inp))
+        d["plant"]["grid_scr"] = float(x)
+        d["plant"]["name"] = "%s_SCR%s" % (_txt(inp["plant"].get("name")) or "Plant", x.replace(".", "p"))
+        out.append((x, d))
+    return out
+
+
 def build(src, out_dir=None, check=True, pscad=True):
-    """Everything from the workbook `src`; returns (net, files)."""
+    """Everything from the workbook `src` -- a set of models for each Grid SCR where it gives several; returns
+       (net, files) of the last, files["cases"] the output folder of each."""
     log = Log()
     log("[smib] input  %s" % src)
-    inp = read_input(src)
+    cases = scr_cases(read_input(src))
+    if len(cases) > 1:
+        log("[smib] Grid SCR %s: a set of models for each" % ", ".join(x for x, _i in cases))
+    done = [_build_case(inp, src, out_dir, check, pscad, log) for _x, inp in cases]
+    net, files = done[-1]
+    if len(done) > 1:
+        files["cases"] = [f["dir"] for _n, f in done]
+    return net, files
+
+
+def _build_case(inp, src, out_dir, check, pscad, log):
     net = build_network(inp, log)
     gens = collections.OrderedDict((g.get("family", g["name"]), g["type"]) for g in net.gens)
     log("[smib] %s model: %d buses, %d generators (%s) as %d machines, %s"
@@ -7606,6 +7726,41 @@ def scale_plant(data, mpts=None, per_mpt=None, gsus=None, per_gsu=None, tie="PER
     return d, did
 
 
+RENAMES = {  # a name changed in the GUI -> where it is used: (table, column, bus: NAME:MV ... too, machine: NAME_...)
+    ("generators", "name"): (("feeders", "collector", 0), ("feeders", "units_of", 0), ("dyr_params", "generator", 0),
+                             ("dyr_records", "generator", 0), ("pscad_params", "generator", 0),
+                             ("machines", "machine", 2), ("generators", "connect", 1), ("collectors", "connect", 1),
+                             ("loads_shunts", "at", 1), ("bus_numbers", "bus", 1)),
+    ("mpt", "name"): (("generators", "connect", 1), ("collectors", "connect", 1), ("loads_shunts", "at", 1),
+                      ("bus_numbers", "bus", 1)),
+    ("cables", "cable"): (("feeders", "cable", 0),),
+    ("collectors", "name"): (("feeders", "collector", 0), ("generators", "connect", 1), ("collectors", "connect", 1),
+                             ("loads_shunts", "at", 1), ("bus_numbers", "bus", 1)),
+}
+
+
+def rename_refs(data, table, col, old, new):
+    """A generator, MPT, cable or collector renamed in the GUI: every place its old name is used takes the new --
+       its own buses (NAME:MV ...) and DETAILED machines (NAME_F1_S2 ...) too -> how many cells changed."""
+    old, new = str(old or "").strip(), str(new or "").strip()
+    if not old or not new or old == new:
+        return 0
+    n = 0
+    for tb, c, how in RENAMES.get((table, col), ()):
+        for r in data.get(tb, []):
+            v = str(r.get(c) or "")
+            if v.upper() == old.upper():
+                r[c] = new
+            elif how == 1 and v.upper().startswith(old.upper() + ":"):
+                r[c] = new + v[len(old):]
+            elif how == 2 and v.upper().startswith(old.upper() + "_"):
+                r[c] = new + v[len(old):]
+            else:
+                continue
+            n += 1
+    return n
+
+
 def gui_save_data(data):
     """The project as written to its .json (and read back by read_input): typed values, empty rows left out."""
     out = {"plant": dict((k, gui_value(k, v)) for k, v in data["plant"].items() if gui_value(k, v) is not None)}
@@ -7662,7 +7817,7 @@ def gui(start=None):
 
     here = os.path.dirname(os.path.abspath(__file__))
     root = tk.Tk()
-    root.title("SMIB plant model")
+    root.title("Plant Model Builder")
     root.geometry("1280x800")
     root.minsize(900, 560)
     st = ttk.Style(root)
@@ -7685,21 +7840,32 @@ def gui(start=None):
     st.configure("TNotebook.Tab", padding=(5, 2), font=("Segoe UI", 9))
     st.configure("Treeview", rowheight=22)
     st.configure("Status.TLabel", background="#F2F2F2", padding=(8, 3))
+    st.configure("Nav.Treeview", rowheight=24, font=("Segoe UI", 9))
+    st.configure("Input.TCombobox", fieldbackground=input_bg)
+    st.map("Input.TCombobox", fieldbackground=[("readonly", input_bg)])
 
     app = {"path": None, "dirty": False, "running": False, "out": None, "grids": {}, "vars": {}, "q": queue.Queue()}
     data = {"plant": {}}
 
     # ---------------------------------------------------------------- header, toolbar, tabs, status
-    ttk.Label(root, text="SMIB PLANT MODEL  |  PSS/E, PSLF, TSAT and PSCAD from one set of inputs",
+    ttk.Label(root, text="PLANT MODEL BUILDER  |  PSS/E, PSLF, TSAT and PSCAD from one set of inputs",
               style="Head.TLabel").pack(fill="x")
-    ttk.Label(root, text="Each tab is a sheet of the input workbook. A blank cell takes its default; the line under "
-                         "each tab explains the field you are on.", style="Sub.TLabel").pack(fill="x")
+    ttk.Label(root, text="Pick a page on the left. A blank field takes its default; the line at the bottom explains "
+                         "the field you are on. The simple view shows the fields most plants need -- tick All fields "
+                         "for every one.",
+              style="Sub.TLabel").pack(fill="x")
     bar = ttk.Frame(root, padding=(6, 4))
     bar.pack(fill="x")
     bar2 = ttk.Frame(root, padding=(6, 0, 6, 4))
     bar2.pack(fill="x")
-    nb = ttk.Notebook(root)
-    nb.pack(fill="both", expand=True, padx=4, pady=(0, 2))
+    body = ttk.Frame(root)
+    body.pack(fill="both", expand=True, padx=4, pady=(0, 2))
+    nav = ttk.Treeview(body, show="tree", selectmode="browse", style="Nav.Treeview")
+    nav.column("#0", width=210, stretch=False)
+    nav.pack(side="left", fill="y", padx=(0, 4))
+    st.layout("Grouped.TNotebook.Tab", [])               # the pages are picked on the left
+    nb = ttk.Notebook(body, style="Grouped.TNotebook")
+    nb.pack(side="left", fill="both", expand=True)
     status = tk.StringVar()
     ttk.Label(root, textvariable=status, style="Status.TLabel", anchor="w").pack(fill="x", side="bottom")
 
@@ -7788,6 +7954,35 @@ def gui(start=None):
         if sheet == "Dyr_Params" and key == "parameter":
             m = (row.get("model") or "").upper()
             return (list(DYR_LIB[m][2]) if m in DYR_LIB else []), False
+        if sheet == "Feeders" and key in ("feeder", "section", "from_section"):
+            k2 = "feeder" if key == "feeder" else "section"
+            same = [r for r in data.get("feeders", []) if key == "feeder" or (
+                (r.get("collector") or "").upper() == (row.get("collector") or "").upper() and
+                (r.get("feeder") or "").upper() == (row.get("feeder") or "").upper())]
+            got = sorted(set(str(r[k2]) for r in same if r.get(k2) not in (None, "")),
+                         key=lambda v: (len(v), v))
+            if key == "section":
+                whole = []
+                for v in got:
+                    try:
+                        whole.append(int(float(v)))
+                    except ValueError:
+                        pass
+                got = got + [str(max(whole or [0]) + 1)]
+            return got, False
+        if sheet == "PSCAD_Params" and key in ("parameter", "value"):
+            gens, secs, _notes = udm_table(data)
+            mine = [(k, e) for sec in secs for k, e in sec["params"]
+                    if (row.get("generator") or "").upper() in [g.upper() for g in e["cells"]]]
+            if key == "parameter":
+                return [k for k, _e in mine], False
+            e = next((e for k, e in mine if k.upper() == (row.get("parameter") or "").upper()), None)
+            if e is not None and e["p"]["choices"]:
+                return [""] + e["p"]["choices"], True
+            return ["{%s}" % k for k in PSCAD_KEYS] if e is None or "/" not in e["key"] else None, False
+        got = SUGGEST.get("%s.%s" % (sheet, key)) or SUGGEST.get(key)
+        if got:
+            return [""] + list(got), False
         return None, False
 
     TABLE_KEY = dict((t[0], t[1]) for t in TABLES)
@@ -7800,25 +7995,36 @@ def gui(start=None):
     plant_help = tk.StringVar(value="Click a field to see what it is.")
     ttk.Label(plant_tab, textvariable=plant_help, style="Help.TLabel", wraplength=1200, justify="left").pack(
         fill="x", side="bottom")
+    plant_total = tk.StringVar()                       # the whole plant, from Generators -- live
+    ttk.Label(plant_tab, textvariable=plant_total, style="Total.TLabel", wraplength=1200, justify="left").pack(
+        fill="x", padx=8, pady=(6, 2), before=outer)
     widgets, hints = {}, {}
     row_i = [0]
+    field_w, sec_w, sec_of = {}, {}, {}           # each field's widgets, each section's title, each field's section
     for key, item, unit, note, choices in PLANT_FIELDS:
         if key in PLANT_SECTIONS:
-            ttk.Label(form, text=PLANT_SECTIONS[key], style="Section.TLabel").grid(
-                row=row_i[0], column=0, columnspan=5, sticky="ew", pady=(8, 2))
+            sec_w[key] = ttk.Label(form, text=PLANT_SECTIONS[key], style="Section.TLabel")
+            sec_w[key].grid(row=row_i[0], column=0, columnspan=5, sticky="ew", pady=(8, 2))
             row_i[0] += 1
+        sec_of[key] = list(sec_w)[-1] if sec_w else None
         var = tk.StringVar()
         app["vars"][key] = var
-        ttk.Label(form, text=item, style="Item.TLabel", background="white").grid(row=row_i[0], column=0, sticky="w",
-                                                                               padx=(8, 4), pady=1)
+        lab = ttk.Label(form, text=item, style="Item.TLabel", background="white")
+        lab.grid(row=row_i[0], column=0, sticky="w", padx=(8, 4), pady=1)
+        field_w[key] = [lab]
         if choices:
-            w = ttk.Combobox(form, textvariable=var, values=[""] + list(choices), state="readonly", width=26)
+            w = ttk.Combobox(form, textvariable=var, values=[""] + list(choices), state="readonly", width=26,
+                             style="Input.TCombobox")
+        elif key in SUGGEST:                          # typical values to pick, or any typed
+            w = ttk.Combobox(form, textvariable=var, values=[""] + list(SUGGEST[key]), width=28,
+                             style="Input.TCombobox")
         else:
             w = tk.Entry(form, textvariable=var, width=30 if key != "pscad_libraries" else 60, background=input_bg,
                          relief="solid", borderwidth=1)
         w.grid(row=row_i[0], column=1, sticky="w", padx=2, pady=1)
         widgets[key] = w
-        ttk.Label(form, text=unit, background="white").grid(row=row_i[0], column=2, sticky="w", padx=2)
+        ulab = ttk.Label(form, text=unit, background="white")
+        ulab.grid(row=row_i[0], column=2, sticky="w", padx=2)
         blank = "required" if key == "poi_kv" else ("one of SCR, short-circuit MVA or R + X" if key == "grid_scr"
                                                     else _blank_means(note))
         hint = ttk.Label(form, text=("blank = " + blank) if blank and not blank.startswith(("required", "one of"))
@@ -7826,8 +8032,9 @@ def gui(start=None):
                          background="white")
         hint.grid(row=row_i[0], column=3, sticky="w", padx=6)
         hints[key] = (hint, hint.cget("text"), hint.cget("style"))
-        ttk.Label(form, text=_used_by("Plant", key), style="Tag.TLabel", background="white").grid(
-            row=row_i[0], column=4, sticky="w", padx=6)
+        tag = ttk.Label(form, text=_used_by("Plant", key), style="Tag.TLabel", background="white")
+        tag.grid(row=row_i[0], column=4, sticky="w", padx=6)
+        field_w[key] += [w, ulab, hint, tag]
         txt = help_text("Plant", key, item, note, choices, unit)
         w.bind("<FocusIn>", lambda e, t=txt: plant_help.set(t))
         var.trace_add("write", dirty) if hasattr(var, "trace_add") else var.trace("w", dirty)
@@ -7894,6 +8101,7 @@ def gui(start=None):
             box = ttk.Frame(tab)
             box.pack(fill="both", expand=True)
             self.tab, self.tools, self.box = tab, tools, box
+            self.vis = list(self.keys)                   # the columns shown (the simple view: some of them)
             self.tree = ttk.Treeview(box, columns=self.keys, show="headings", selectmode="browse")
             ys = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
             xs = ttk.Scrollbar(box, orient="horizontal", command=self.tree.xview)
@@ -7914,8 +8122,8 @@ def gui(start=None):
             self.help = tk.StringVar(value="Click a column title or a cell to see what the column is.")
             ttk.Label(tab, textvariable=self.help, style="Help.TLabel", wraplength=1200, justify="left").pack(
                 fill="x", side="bottom")
-            self.total = tk.StringVar()                  # Generators: what its units add up to, live
-            if sheet == "Generators":
+            self.total = tk.StringVar()                  # Generators, MPT: what they add up to, live
+            if sheet in ("Generators", "MPT"):
                 ttk.Label(tab, textvariable=self.total, style="Total.TLabel", wraplength=1200, justify="left").pack(
                     fill="x", side="bottom", padx=8, pady=(4, 2))
             self.col = 0
@@ -7948,6 +8156,8 @@ def gui(start=None):
                 rows = [r for r in self.rows if any(v not in (None, "") for v in r.values())]
                 self.total.set("Totals -- units x one unit, as the models take them:\n" +
                                "\n".join("   " + unit_totals(r) for r in rows) if rows else "")
+            if self.sheet in ("Generators", "MPT", "Collectors"):
+                live_totals()
 
         def refresh(self, select=None):
             self.tree.delete(*self.tree.get_children())
@@ -7968,11 +8178,23 @@ def gui(start=None):
             c = self.cols[self.keys.index(key)]
             self.help.set(help_text(self.sheet, key, c[1], c[2] or "", c[3]))
 
+        def set_vis(self, keys):
+            """Show these columns only (the simple view), the rest kept as they are."""
+            self.close_edit(True)
+            self.vis = [k for k in self.keys if k in keys] or list(self.keys)
+            self.tree.configure(displaycolumns=self.vis)
+            if self.keys[self.col] not in self.vis:
+                self.col = self.keys.index(self.vis[0])
+
+        def at_x(self, x):
+            """The column (its index among all) under x."""
+            n = int(self.tree.identify_column(x)[1:] or 1) - 1
+            return self.keys.index(self.vis[max(0, min(n, len(self.vis) - 1))])
+
         def on_click(self, e):
             self.close_edit(True)
             if self.tree.identify_region(e.x, e.y) == "cell":
-                col = self.tree.identify_column(e.x)
-                self.col = int(col[1:]) - 1
+                self.col = self.at_x(e.x)
                 self.show_help(self.keys[self.col])
                 item = self.tree.identify_row(e.y)
                 if item and self.sheet == "Generators" and self.keys[self.col] in MODEL_CHOICE:
@@ -7991,22 +8213,24 @@ def gui(start=None):
             if self.tree.identify_region(e.x, e.y) != "cell":
                 return
             item = self.tree.identify_row(e.y)
-            self.col = int(self.tree.identify_column(e.x)[1:]) - 1
+            self.col = self.at_x(e.x)
             if item:
                 self.edit(int(item), self.col)
 
         def step_col(self, d):
-            self.col = max(0, min(len(self.keys) - 1, self.col + d))
+            v = self.vis.index(self.keys[self.col]) if self.keys[self.col] in self.vis else 0
+            self.col = self.keys.index(self.vis[max(0, min(len(self.vis) - 1, v + d))])
             self.show_help(self.keys[self.col])
             self.reveal(self.col)
             return "break"
 
         def reveal(self, ci):
             """Scroll so that column ci shows."""
-            total = float(sum(self.widths))
-            left = sum(self.widths[:ci])
+            ws = [self.widths[self.keys.index(k)] for k in self.vis]
+            k = self.vis.index(self.keys[ci]) if self.keys[ci] in self.vis else 0
+            total, left = float(sum(ws)), sum(ws[:k])
             first, last = self.tree.xview()
-            if left / total < first or (left + self.widths[ci]) / total > last:
+            if left / total < first or (left + ws[k]) / total > last:
                 self.tree.xview_moveto(max(0.0, left / total - 0.02))
 
         def edit(self, i, ci):
@@ -8064,11 +8288,20 @@ def gui(start=None):
                 v = var.get().strip()
                 if self.sheet == "Generators" and key in MODEL_CHOICE:
                     v = v.split(" ")[0] if v else ""          # its code, not what it is for
+                if self.sheet == "PSCAD_Params" and key == "value" and " = " in v:
+                    v = v.split("=")[0].strip()
                 if (self.rows[i].get(key) or "") != v:
+                    was = self.rows[i].get(key)
                     if v:
                         self.rows[i][key] = v
                     else:
                         self.rows[i].pop(key, None)
+                    n = rename_refs(data, self.key, key, was, v) if v else 0
+                    if n:                                 # a name: where it is used, the new one too
+                        for g in app["grids"].values():
+                            if g is not self:
+                                g.refresh()
+                        set_status("%s renamed %s: %d place(s) using it changed too" % (was, v, n))
                     if self.sheet == "Generators" and key == "type":       # model choices its Type does not take
                         for k, (ok, _doc) in MODEL_CHOICE.items():
                             if self.rows[i].get(k) and self.rows[i][k] not in ok.get(v.upper(), ()):
@@ -8083,11 +8316,12 @@ def gui(start=None):
             i = self.current()
             if i is None:
                 return
-            ci = self.col + dc
-            if ci >= len(self.keys):
-                ci, dr = 0, 1
-            if ci < 0:
-                ci, dr = len(self.keys) - 1, -1
+            v = (self.vis.index(self.keys[self.col]) if self.keys[self.col] in self.vis else 0) + dc
+            if v >= len(self.vis):
+                v, dr = 0, 1
+            if v < 0:
+                v, dr = len(self.vis) - 1, -1
+            ci = self.keys.index(self.vis[v])
             i += dr
             if i >= len(self.rows):
                 return
@@ -8850,7 +9084,8 @@ def gui(start=None):
         data.update(new)
         app["path"] = path
         to_widgets()
-        root.title("SMIB plant model -- %s" % (data["plant"].get("name") or "new"))
+        root.title("Plant Model Builder -- %s" % (data["plant"].get("name") or "new"))
+        apply_view()
         set_status(what)
 
     def save_temp():
@@ -9041,6 +9276,12 @@ def gui(start=None):
         """Show the tab (and row) an input error names: 'Generators row 2 (BESS): ...', 'Plant: ...'."""
         m = re.match(r"^(\w+) row (\d+)", err or "")
         tabs = [nb.tab(t, "text") for t in nb.tabs()]
+        g0 = app["grids"].get(TABLE_KEY.get(m.group(1))) if m else None
+        if (m and m.group(1) in tabs and (not shown_view(m.group(1)) or (g0 and any(
+                c[1].lower() in err.lower() and not shown_view(g0.sheet, c[0]) for c in g0.cols)))) or \
+                ((err or "").startswith("Plant") and any("'%s'" % f[1] in err and not shown_view("Plant", f[0])
+                                                         for f in PLANT_FIELDS)):
+            show_all()                                # the field it names is hidden: every field shown
         if m and m.group(1) in tabs:
             nb.select(nb.tabs()[tabs.index(m.group(1))])
             g = app["grids"].get(TABLE_KEY.get(m.group(1)))
@@ -9066,21 +9307,25 @@ def gui(start=None):
         p = save_temp()
 
         def job():
-            inp = read_input(p)
-            net = build_network(inp, Log())
-            operating_point(net, Log())
-            dyr_models(net, inp)                    # Dyr_Params, Dyr_Records and PSCAD_Params checked too
-            user_records(net, inp)
-            pscad_spec(net, inp, pscad_model(net, inp))
-            net.notes[:] = list(collections.OrderedDict.fromkeys(net.notes))
-            s = net.op["s_grid"]
-            for n in net.notes:
-                print("[smib] " + n)
-            msg = ("Inputs OK -- %s model: %d buses, %d machines; P at POI %.3f MW, Q %.3f MVAr, infinite bus %.5f pu"
-                   % (net.model, len(net.bus), len(net.gens), s.real, s.imag, net.op["e"]))
-            print("[smib] " + msg)
-            return {"ok": True, "msg": msg + ("" if not net.notes else "\n%d note(s) in the Output tab"
-                                                % len(net.notes))}
+            msgs, notes = [], 0
+            for x, inp in scr_cases(read_input(p)):          # each Grid SCR where it gives several
+                net = build_network(inp, Log())
+                operating_point(net, Log())
+                dyr_models(net, inp)                # Dyr_Params, Dyr_Records and PSCAD_Params checked too
+                user_records(net, inp)
+                pscad_spec(net, inp, pscad_model(net, inp))
+                net.notes[:] = list(collections.OrderedDict.fromkeys(net.notes))
+                s = net.op["s_grid"]
+                for n in net.notes:
+                    print("[smib] " + n)
+                notes += len(net.notes)
+                msg = ("%sInputs OK -- %s model: %d buses, %d machines; P at POI %.3f MW, Q %.3f MVAr, infinite bus "
+                       "%.5f pu" % ("SCR %s: " % x if x else "", net.model, len(net.bus), len(net.gens), s.real,
+                                    s.imag, net.op["e"]))
+                print("[smib] " + msg)
+                msgs.append(msg)
+            return {"ok": True, "msg": "\n".join(msgs) + ("" if not notes else "\n%d note(s) in the Output tab"
+                                                         % notes)}
         run(job, "CHECK")
 
     def build_models():
@@ -9097,6 +9342,10 @@ def gui(start=None):
             out_dir = files["dir"]
             made = [w for k, w in (("raw", "PSSE\\ .raw"), ("dyr", "PSSE\\ .dyr"), ("epc", "PSLF\\ .epc"),
                                    ("dyd", "PSLF\\ .dyd"), ("pscad_build", "PSCAD\\ model")) if files.get(k)]
+            if files.get("cases"):                     # a set for each Grid SCR
+                return {"ok": True, "out": os.path.dirname(out_dir), "msg": "Models written, a set for each Grid "
+                        "SCR:\n%s\n\n%s model, %d machines: %s" % ("\n".join(files["cases"]), net.model,
+                                                                   len(net.gens), ", ".join(made))}
             return {"ok": True, "out": out_dir, "msg": "Models written to\n%s\n\n%s model, %d machines: %s; the "
                     "report: %s" % (out_dir, net.model, len(net.gens), ", ".join(made),
                                     os.path.basename(files["report"]))}
@@ -9111,6 +9360,123 @@ def gui(start=None):
         else:
             subprocess.Popen(["xdg-open" if sys.platform != "darwin" else "open", p])
 
+    # ---------------------------------------------------------------- the whole plant, wherever it shows
+    def live_totals():
+        """The whole plant's MVA, P and Q (Plant tab), what each MPT carries (MPT tab), the Plant fields whose
+           blank takes the generators' totals -- from the Generators rows as they are now."""
+        line, mpts, tot = plant_totals(data)
+        plant_total.set(line)
+        g = app["grids"].get("mpt")
+        if g is not None:
+            g.total.set(("Generators on each MPT:   " + "   |   ".join(mpts)) if mpts else "")
+        for k, txt in (("scr_base_mw", "blank = %s MW, the generators' Pmax" % ("%.6g" % tot["pmax"])),
+                       ("p_poi_mw", "blank = each generator at its dispatch: %s MW in all" % (
+                           "%.6g" % tot["dispatch"]))):
+            if k in hints and not hints[k][2].startswith("Req"):
+                hints[k][0].configure(text=txt)
+
+    def req_live(*_a):
+        """A required field's red note only while it is blank (the grid's: while none of its three ways is given)."""
+        v = dict((k, app["vars"][k].get().strip()) for k in ("poi_kv", "grid_scr", "grid_sc_mva", "grid_r_pu",
+                                                              "grid_x_pu"))
+        for k, ok, done in (("poi_kv", v["poi_kv"], ""),
+                            ("grid_scr", v["grid_scr"] or v["grid_sc_mva"] or (v["grid_r_pu"] and v["grid_x_pu"]),
+                             "several (3, 5, 10): a set of models for each")):
+            h, txt, style = hints[k]
+            h.configure(text=txt if not ok else done, style=style if not ok else "Hint.TLabel")
+    for k in ("poi_kv", "grid_scr", "grid_sc_mva", "grid_r_pu", "grid_x_pu"):
+        v = app["vars"][k]
+        v.trace_add("write", req_live) if hasattr(v, "trace_add") else v.trace("w", req_live)
+
+    # ---------------------------------------------------------------- the simple view, or every field
+    allv = tk.BooleanVar(value=False)
+
+    def shown_view(sheet, key=None):
+        """Whether a tab (and a field of it) shows now."""
+        if allv.get():
+            return True
+        g = next((x for x in app["grids"].values() if x.sheet == sheet), None)
+        if key is None:
+            return sheet in SIMPLE_TABS or bool(g and any(any(v not in (None, "") for v in r.values()) for r in g.rows))
+        return sheet not in SIMPLE or key in SIMPLE[sheet]
+
+    def apply_view(*_a):
+        """The simple view -- the fields most plants need (SIMPLE), the tabs they are on and any tab with rows of
+           its own -- or every field (All fields). A hidden field keeps its value."""
+        for key, ws in field_w.items():
+            for w in ws:
+                w.grid() if shown_view("Plant", key) else w.grid_remove()
+        for sk, lab in sec_w.items():
+            on = any(shown_view("Plant", k) for k, s2 in sec_of.items() if s2 == sk)
+            lab.grid() if on else lab.grid_remove()
+        for g in app["grids"].values():
+            g.set_vis([k for k in g.keys if shown_view(g.sheet, k)])
+        for t in nb.tabs():
+            nb.tab(t, state="normal" if shown_view(nb.tab(t, "text")) else "hidden")
+        if "nav_view" in app:
+            app["nav_view"]()
+
+    def show_all():
+        if not allv.get():
+            allv.set(True)
+            apply_view()
+
+    page = dict((nb.tab(t, "text"), t) for t in nb.tabs())
+    for grp, items in NAV_GROUPS:
+        nav.insert("", "end", iid="g|" + grp, text=grp, open=True, tags=("grp",))
+        for sheet, label in items:
+            if sheet in page:
+                nav.insert("g|" + grp, "end", iid=sheet, text=label)
+    nav.tag_configure("grp", font=("Segoe UI", 9, "bold"), foreground=navy)
+    syncing = [False]
+
+    def nav_pick(_e=None):
+        if syncing[0]:
+            return
+        sel = nav.selection()
+        if not sel:
+            return
+        it = sel[0]
+        if it.startswith("g|"):                           # a group: its first page
+            kids = nav.get_children(it)
+            if not kids:
+                return
+            it = kids[0]
+        if it in page:
+            nb.select(page[it])
+
+    def nav_follow(_e=None):
+        try:
+            name = nb.tab(nb.select(), "text")
+        except tk.TclError:
+            return
+        if nav.exists(name) and nav.selection() != (name,):
+            syncing[0] = True
+            nav.selection_set(name)
+            nav.see(name)
+            root.after_idle(lambda: syncing.__setitem__(0, False))
+
+    def nav_view():
+        """The navigator shows the pages shown: a group with none left out."""
+        for grp, items in NAV_GROUPS:
+            g = "g|" + grp
+            k = 0
+            for sheet, _label in items:
+                if not nav.exists(sheet):
+                    continue
+                if nb.tab(page[sheet], "state") == "hidden":
+                    nav.detach(sheet)
+                else:
+                    nav.move(sheet, g, k)
+                    k += 1
+            if k:
+                nav.move(g, "", [x[0] for x in NAV_GROUPS].index(grp))
+            else:
+                nav.detach(g)
+    nav.bind("<<TreeviewSelect>>", nav_pick)
+    nb.bind("<<NotebookTabChanged>>", nav_follow, add="+")
+    app["nav_view"] = nav_view
+
     # ---------------------------------------------------------------- toolbar and menu
     model_var = app["vars"]["model_type"]
     psse_var, pscad_var = tk.BooleanVar(value=PSSE_CHECK), tk.BooleanVar(value=PSCAD_BUILD)
@@ -9120,6 +9486,7 @@ def gui(start=None):
     ttk.Label(bar, text="Model type:", style="Item.TLabel").pack(side="left")
     ttk.Combobox(bar, textvariable=model_var, values=["SMIB", "DETAILED"], state="readonly", width=10).pack(
         side="left", padx=4)
+    ttk.Checkbutton(bar, text="All fields", variable=allv, command=apply_view).pack(side="left", padx=(8, 2))
     ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
     b_check = ttk.Button(bar, text="Check inputs", command=check)
     b_check.pack(side="left", padx=2)
@@ -9182,7 +9549,8 @@ def gui(start=None):
     root.smib = {"data": data, "app": app, "nb": nb, "save": save, "check": check, "build": build_models,
                  "open": open_any, "export": export_xlsx, "load": load, "vars": app["vars"], "grids": app["grids"],
                  "new": new, "scale": scale_up, "goto": goto, "from_widgets": from_widgets, "status": status,
-                 "psse": psse_var, "hints": hints,
+                 "psse": psse_var, "hints": hints, "allv": allv, "view": apply_view, "widgets": widgets,
+                 "plant_total": plant_total, "field_w": field_w,
                  "pscad": pscad_var, "ot": ot}               # the window's parts, for smib_build's own tests
     root.mainloop()
     return 0
