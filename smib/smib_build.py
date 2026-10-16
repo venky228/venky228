@@ -168,6 +168,7 @@ import json
 import glob
 import math
 import cmath
+import itertools
 import time
 import shutil
 import subprocess
@@ -245,8 +246,7 @@ PLANT_FIELDS = [
     ("first_bus", "First bus number", "", "buses are numbered from here + 1 (Bus_Numbers sets any one)", None),
     ("poi_kv", "POI kV", "kV", "", None),
     ("poi_name", "POI name", "", "12 characters at most", None),
-    ("grid_scr", "Grid SCR", "", "short-circuit ratio at the POI, on the SCR base; several (3, 5, 10): a set of "
-     "models for each, named <name>_SCR3 ...", None),
+    ("grid_scr", "Grid SCR", "", "short-circuit ratio at the POI, on the SCR base", None),
     ("grid_x_r", "Grid X/R", "", "", None),
     ("scr_base_mw", "SCR base", "MW", "blank = the generators' Pmax", None),
     ("grid_sc_mva", "Grid short-circuit MVA", "MVA", "instead of the SCR (with Grid X/R)", None),
@@ -296,6 +296,12 @@ PLANT_FIELDS = [
     ("pscad_fault_ohm", "PSCAD fault resistance", "ohm", "blank = 0.01", None),
     ("pscad_libraries", "PSCAD libraries", "", "user-model libraries (.pslx) to load, separated by ;", None),
 ]
+
+SWEEP = (("grid_scr", "SCR"), ("grid_x_r", "XR"), ("grid_sc_mva", "SC"), ("v_poi_pu", "V"), ("v_grid_pu", "VG"),
+         ("q_poi_mvar", "Q"), ("pf_poi", "PF"), ("p_poi_mw", "P"), ("tie_length", "TIE"))   # Plant fields as lists
+SWEEP_MAX = 50             # sets of models one build makes at most
+PLANT_FIELDS = [(k, i, u, ((n + "; ") if n else "") + "several values (3, 5, 10): a set of models for each, "
+                 "<name>_%s<value>" % dict(SWEEP)[k] if k in dict(SWEEP) else n, c) for k, i, u, n, c in PLANT_FIELDS]
 
 # table sheets: (key, column, note, choices, width)
 MPT_COLS = [
@@ -467,20 +473,27 @@ SIMPLE = {  # the GUI's simple view: these fields only (All fields: every one; a
     "Plant": ("name", "model_type", "freq_hz", "poi_kv", "grid_scr", "grid_x_r", "tie_length", "tie_unit",
               "tie_r_per", "tie_x_per", "tie_b_per", "control_mode", "v_poi_pu", "q_poi_mvar", "pf_poi", "p_poi_mw",
               "plant_ctrl", "pscad_duration_s", "pscad_fault", "pscad_fault_s"),
-    "MPT": ("name", "windings", "hv_kv", "lv_kv", "tv_kv", "mva", "z_hl_pct", "x_r", "vector", "tap"),
+    "MPT": ("name", "windings", "hv_kv", "lv_kv", "tv_kv", "mva", "lv_mva", "tv_mva", "rate_mva", "count",
+            "z_hl_pct", "x_r", "vector", "tap"),
     "Generators": ("name", "type", "connect", "units", "unit_mva", "unit_pmax_mw", "unit_pmin_mw", "unit_qmax_mvar",
-                   "kv", "dispatch_mw", "gsu_mva", "gsu_hv_kv", "gsu_lv_kv", "gsu_z_pct", "collector", "regc", "reec",
-                   "pscad_definition", "pscad_source"),
+                   "kv", "dispatch_mw", "collector", "regc", "reec", "pscad_definition", "pscad_source"),
+    "GSUs": ("name", "units", "gsu_count", "gsu_mva", "gsu_hv_kv", "gsu_lv_kv", "gsu_z_pct", "gsu_x_r", "gsu_vector",
+             "gsu_tap"),
     "Feeders": ("collector", "feeder", "section", "cable", "length", "unit", "units", "units_of"),
 }
-SIMPLE_TABS = ("Plant", "MPT", "Generators", "Feeders", "Cables", "Dyr_Params", "PSCAD_Params", "Output")
+SIMPLE_TABS = ("Plant", "MPT", "Generators", "GSUs", "Feeders", "Cables", "Dyr_Params", "PSCAD_Params", "Output")
+PAGE_COLS = {  # pages that show part of a sheet, in either view: the Generators sheet as its generators and its GSUs
+    "Generators": tuple(c[0] for c in GEN_COLS if not c[0].startswith("gsu_")),
+    "GSUs": ("name", "units") + tuple(c[0] for c in GEN_COLS if c[0].startswith("gsu_")),
+}
 NAV_GROUPS = (  # the GUI's pages, grouped on its left: (group, [(page, what it is called there)])
-    ("Plant", (("Plant", "Plant and grid"), ("MPT", "Main transformers (MPT)"), ("Generators", "Generators"))),
+    ("Plant", (("Plant", "Plant and grid"),)),
+    ("Generators", (("Generators", "Generators"), ("Machines", "DETAILED machines"))),
+    ("Transformers", (("MPT", "Main transformers (MPT)"), ("GSUs", "Generator step-ups (GSU)"))),
     ("Collector system", (("Feeders", "Feeders"), ("Cables", "Cables"), ("Collectors", "Shared collectors"))),
     ("Dynamics: PSS/E, PSLF", (("Dyr_Params", "Model parameters"), ("Dyr_Records", "Records of your own"))),
     ("PSCAD", (("PSCAD_Params", "Vendor model (UDM)"),)),
-    ("More inputs", (("Loads_Shunts", "Loads and shunts"), ("Machines", "DETAILED machines"),
-                     ("Bus_Numbers", "Bus numbers"))),
+    ("More inputs", (("Loads_Shunts", "Loads and shunts"), ("Bus_Numbers", "Bus numbers"))),
     ("Reference", (("Input_Reference", "Input reference"), ("Dynamic_Models", "Dynamic models"),
                    ("README", "Read me"))),
     ("Results", (("Output", "Output"),)),
@@ -1664,6 +1677,9 @@ def _mag(nll_pct, im_pct, mva, sb, kv_rated, kv_bus):
     return g * k, -b * k
 
 
+KV_OFF = 0.15             # a winding this far off its bus voltage (or a GSU off its collector): an input error
+
+
 def add_tx2(net, d):
     """A two-winding transformer: d = {name, kind, hv, lv, mva, z_pct, x_r, load_loss_kw, kv1, kv2, tap, vector,
        nll_pct, im_pct, rate, count, where}."""
@@ -1677,6 +1693,9 @@ def add_tx2(net, d):
               "nomv1": kvb1, "nomv2": kvb2, "vg": vg, "rate": d.get("rate") or d["mva"]})
     t["mag_g"], t["mag_b"] = _mag(d.get("nll_pct"), d.get("im_pct"), d["mva"], net.sb, d["kv1"], kvb1)
     for side, kvr, kvb in (("HV", d["kv1"], kvb1), ("LV", d["kv2"], kvb2)):
+        if abs(kvr / kvb - 1.0) > KV_OFF:
+            raise InputError("%s %s: %s winding %.4g kV on a %.4g kV bus -- the voltages do not match"
+                             % (w, d["name"], side, kvr, kvb))
         if abs(kvr / kvb - 1.0) > 0.05:
             net.notes.append("CHECK: %s %s: %s winding %.4g kV on a %.4g kV bus -- an off-nominal ratio of %.3f"
                              % (w, d["name"], side, kvr, kvb, kvr / kvb))
@@ -1704,6 +1723,9 @@ def add_tx3(net, d):
               "windv": [kvr[0] * d["tap"], kvr[1], kvr[2]], "nomv": kvb, "vg": vg})
     t["mag_g"], t["mag_b"] = _mag(d.get("nll_pct"), d.get("im_pct"), d["mva1"], net.sb, kvr[0], kvb[0])
     for side, a, b in zip(("HV", "LV", "TV"), kvr, kvb):
+        if abs(a / b - 1.0) > KV_OFF:
+            raise InputError("%s %s: %s winding %.4g kV on a %.4g kV bus -- the voltages do not match"
+                             % (w, d["name"], side, a, b))
         if abs(a / b - 1.0) > 0.05:
             net.notes.append("CHECK: %s %s: %s winding %.4g kV on a %.4g kV bus" % (w, d["name"], side, a, b))
     net.tx3.append(t)
@@ -2033,6 +2055,47 @@ def udm_check(p, text, where, part=False):
     if p["type"].upper() == "INTEGER" and x != int(x):
         raise InputError("%s: %s takes a whole number" % (where, p["name"]))
     return text
+
+
+PREFS = os.path.join(os.path.expanduser("~"), ".plant_model_builder.json")   # the GUI's remembered choices
+
+
+def gui_prefs(update=None):
+    """The GUI's remembered choices (which vendor model pages the PSCAD_Params page lists ...) -> dict; update:
+       merged in and saved (where the file cannot be written, kept for this session)."""
+    got = GUI_PREFS.setdefault("now", None)
+    if got is None:
+        try:
+            with io.open(PREFS, encoding="utf-8") as fh:
+                got = json.load(fh)
+        except Exception:
+            got = {}
+        GUI_PREFS["now"] = got
+    if update:
+        got.update(update)
+        try:
+            _write_json(PREFS, got)
+        except Exception:
+            pass
+    return got
+
+
+GUI_PREFS = {}
+
+
+def udm_default_shown(sec):
+    """Whether the PSCAD_Params page lists a section (udm_table's) until chosen otherwise: a vendor model itself,
+       its signals and the parts of its own placed in it -- not the parts inside those, nor the library's."""
+    lab = sec["label"]
+    return lab.endswith("(the UDM)") or lab.endswith(">  signals") or (
+        lab.count("  >  ") == 1 and not str(sec.get("defn") or "").lower().startswith("master:"))
+
+
+def udm_shown(secs):
+    """The sections the PSCAD_Params page lists: as chosen (Choose..., remembered), else as udm_default_shown."""
+    got = gui_prefs().get("pscad_pages")
+    got = got if isinstance(got, dict) else {}
+    return [x["label"] for x in secs if got.get(x["label"], udm_default_shown(x))]
 
 
 def udm_table(data, library=False):
@@ -2471,6 +2534,9 @@ def build_mpt(net, r, f):
         add_line(net, net.find("HV", w), hv, tie, name + "-TIE", "TIE", w)
     else:
         net.add_alias(name + ":HV", "HV", w)
+    if abs(kv1 / net.kv("HV") - 1.0) > KV_OFF:
+        raise InputError("%s: 'HV kV' %.4g kV, but the POI it connects to is %.4g kV (Plant: 'POI kV') -- the "
+                         "voltages do not match: set one to the other" % (w, kv1, net.kv("HV")))
     if abs(kv1 / net.kv("HV") - 1.0) > 0.05:
         net.notes.append("CHECK: %s: HV %.4g kV on the %.4g kV HV bus" % (w, kv1, net.kv("HV")))
     lv = net.add_bus(name + ":LV", kv2, w, aliases=(name,))
@@ -2696,6 +2762,13 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
     if gsu_mva:
         kv1 = _num(r, "gsu_hv_kv", w, kv, positive=True)
         kv2 = _num(r, "gsu_lv_kv", w, None, positive=True) or _num(r, "kv", w, required=True, positive=True)
+        if abs(kv1 / kv - 1.0) > KV_OFF:
+            raise InputError("%s: 'GSU HV kV' %.4g kV, but the bus it connects to (%s) is %.4g kV -- the voltages do "
+                             "not match" % (w, kv1, _txt(r.get("connect")) or "its collector", kv))
+        kvt0 = _num(r, "kv", w, None, positive=True)
+        if kvt0 and abs(kvt0 / kv2 - 1.0) > KV_OFF:
+            raise InputError("%s: 'Terminal kV' %.4g kV, but 'GSU LV kV' is %.4g kV -- the voltages do not match"
+                             % (w, kvt0, kv2))
         cnt = _int(r, "gsu_count", w, g["n"], minimum=1)
         x_r = _num(r, "gsu_x_r", w)
         if x_r is None:
@@ -3482,7 +3555,8 @@ def operating_point(net, log):
                              "beyond the plant (PSS/E will hold the limit)" % (g["name"], g["q"], g["qmin"], g["qmax"]))
         vt = net.bus[g["bus"]]["vm"]
         if not 0.9 <= vt <= 1.1:
-            net.notes.append("CHECK: %s terminal voltage %.4f pu" % (g["name"], vt))
+            net.notes.append("WARNING: %s terminal voltage %.4f pu -- outside 0.9 .. 1.1: check the transformers' kV "
+                             "and taps, and the POI voltage" % (g["name"], vt))
     return net.op
 
 
@@ -7230,35 +7304,50 @@ OUT_KINDS = (("raw", "PSS/E .raw"), ("dyr", "PSS/E .dyr"), ("pscad", "PSCAD mode
              ("dyd", "PSLF .dyd"))                              # what Plant: Build ... can say YES / NO to
 
 
-def scr_cases(inp):
-    """Plant: Grid SCR given as several values (3, 5, 10) -> one set of inputs for each, named <name>_SCR<n>
-       -> [(SCR as typed, inputs)]; one value -> [(None, inp)]."""
-    v = inp["plant"].get("grid_scr")
-    parts = [x for x in re.split(r"[,;\s]+", v.strip()) if x] if isinstance(v, str) else []
-    if len(parts) < 2:
+def plant_cases(inp):
+    """Plant fields given as several values (Grid SCR 3, 5, 10; X/R 10, 15 ...: SWEEP) -> a set of inputs for each
+       value -- each combination where several fields have them -- named <name>_SCR3_XR10 ... -> [(what it is,
+       inputs)]; none -> [(None, inp)]."""
+    lists = []
+    for key, tag in SWEEP:
+        v = inp["plant"].get(key)
+        parts = [x for x in re.split(r"[,;\s]+", v.strip()) if x] if isinstance(v, str) else []
+        if len(parts) < 2:
+            continue
+        for x in parts:
+            try:
+                float(x)
+            except ValueError:
+                raise InputError("Plant: %s = %r -- one value, or several separated by commas: 3, 5, 10" % (
+                    _label(key), v))
+        lists.append((key, tag, parts))
+    if not lists:
         return [(None, inp)]
-    out = []
-    for x in parts:
-        try:
-            if not float(x) > 0:
-                raise ValueError
-        except ValueError:
-            raise InputError("Plant: 'Grid SCR' = %r -- one value, or several separated by commas: 3, 5, 10" % v)
+    n = 1
+    for _k, _t, parts in lists:
+        n *= len(parts)
+    if n > SWEEP_MAX:
+        raise InputError("Plant: %s make %d sets of models -- %d at most at a time" % (
+            " x ".join("%d %s" % (len(pp), _label(k).strip("'")) for k, _t, pp in lists), n, SWEEP_MAX))
+    out, name = [], _txt(inp["plant"].get("name")) or "Plant"
+    for combo in itertools.product(*[pp for _k, _t, pp in lists]):
         d = json.loads(json.dumps(inp))
-        d["plant"]["grid_scr"] = float(x)
-        d["plant"]["name"] = "%s_SCR%s" % (_txt(inp["plant"].get("name")) or "Plant", x.replace(".", "p"))
-        out.append((x, d))
+        for (key, _t, _p), x in zip(lists, combo):
+            d["plant"][key] = float(x)
+        d["plant"]["name"] = "%s_%s" % (name, "_".join("%s%s" % (t, x.replace("-", "m").replace(".", "p"))
+                                                       for (_k, t, _p), x in zip(lists, combo)))
+        out.append((", ".join("%s %s" % (_label(k).strip("'"), x) for (k, _t, _p), x in zip(lists, combo)), d))
     return out
 
 
 def build(src, out_dir=None, check=True, pscad=True):
-    """Everything from the workbook `src` -- a set of models for each Grid SCR where it gives several; returns
-       (net, files) of the last, files["cases"] the output folder of each."""
+    """Everything from the workbook `src` -- a set of models for each value where Plant fields give several
+       (plant_cases); returns (net, files) of the last, files["cases"] the output folder of each."""
     log = Log()
     log("[smib] input  %s" % src)
-    cases = scr_cases(read_input(src))
+    cases = plant_cases(read_input(src))
     if len(cases) > 1:
-        log("[smib] Grid SCR %s: a set of models for each" % ", ".join(x for x, _i in cases))
+        log("[smib] %d sets of models: %s" % (len(cases), " | ".join(x for x, _i in cases)))
     done = [_build_case(inp, src, out_dir, check, pscad, log) for _x, inp in cases]
     net, files = done[-1]
     if len(done) > 1:
@@ -8072,18 +8161,24 @@ def gui(start=None):
 
     # ---------------------------------------------------------------- table tabs: a grid each, edited in place
     class Grid(object):
-        def __init__(self, sheet, key, cols):
+        def __init__(self, sheet, key, cols, page=None, fixed=False):
+            """A sheet's rows as a table -- page: shown as a page of its own (part of the sheet's columns, the GSUs
+               of the Generators sheet); fixed: its rows are added and removed on the sheet's own page."""
             self.sheet, self.key, self.cols = sheet, key, cols
+            self.page, self.fixed = page or sheet, fixed
             self.keys = [c[0] for c in cols]
             self.edit_w = None
             tab = ttk.Frame(nb)
-            nb.add(tab, text=sheet)
+            nb.add(tab, text=self.page)
             tools = ttk.Frame(tab, padding=(4, 4))
             tools.pack(fill="x")
             for txt, fn in (("Add row", self.add), ("Insert above", self.insert), ("Duplicate", self.duplicate),
                             ("Delete", self.delete), ("Move up", lambda: self.move(-1)),
-                            ("Move down", lambda: self.move(1))):
+                            ("Move down", lambda: self.move(1))) if not fixed else ():
                 ttk.Button(tools, text=txt, command=fn).pack(side="left", padx=2)
+            if fixed:
+                ttk.Label(tools, text="One row per generator -- add, remove and rename them on the Generators page.",
+                          style="Item.TLabel").pack(side="left", padx=4, pady=4)
             if sheet == "Bus_Numbers":
                 ttk.Button(tools, text="List this model's buses", command=self.fill_buses).pack(side="left", padx=12)
             if sheet == "Machines":
@@ -8093,7 +8188,7 @@ def gui(start=None):
                 ttk.Button(tools, text="Fill R, X, B from cables", command=self.fill_rxb).pack(side="left",
                                                                                             padx=(12, 2))
                 ttk.Button(tools, text="Clear R, X, B", command=self.clear_rxb).pack(side="left", padx=2)
-            if sheet == "Generators":
+            if sheet == "Generators" and not fixed:
                 ttk.Button(tools, text="Pick UDM from OEM model...", command=self.pick_udm).pack(
                     side="left", padx=12)
             ttk.Label(tools, text="Double-click a cell (or press Enter) to edit; Tab moves on.",
@@ -8122,8 +8217,8 @@ def gui(start=None):
             self.help = tk.StringVar(value="Click a column title or a cell to see what the column is.")
             ttk.Label(tab, textvariable=self.help, style="Help.TLabel", wraplength=1200, justify="left").pack(
                 fill="x", side="bottom")
-            self.total = tk.StringVar()                  # Generators, MPT: what they add up to, live
-            if sheet in ("Generators", "MPT"):
+            self.total = tk.StringVar()                  # Generators, GSUs, MPT: what they add up to, live
+            if self.page in ("Generators", "GSUs", "MPT"):
                 ttk.Label(tab, textvariable=self.total, style="Total.TLabel", wraplength=1200, justify="left").pack(
                     fill="x", side="bottom", padx=8, pady=(4, 2))
             self.col = 0
@@ -8152,6 +8247,26 @@ def gui(start=None):
             return out
 
         def sums(self):
+            if self.page == "GSUs":
+                lines = []
+                for r in self.rows:
+                    nm = _txt(r.get("name"))
+                    if not nm:
+                        continue
+                    try:
+                        n = _int(r, "units", nm, 0) or 0
+                        mva, cnt = _num(r, "gsu_mva", nm), _int(r, "gsu_count", nm, n)
+                        z, hv, lv = _num(r, "gsu_z_pct", nm), _txt(r.get("gsu_hv_kv")), _txt(r.get("gsu_lv_kv"))
+                    except InputError as e:
+                        lines.append("   %s: %s" % (nm, str(e).split(": ", 1)[-1]))
+                        continue
+                    lines.append("   %s: %s" % (nm, ("%d x %s MVA = %s MVA, %s / %s kV%s" % (
+                        cnt, "%.6g" % mva, "%.6g" % (cnt * mva), hv or "?", lv or "the terminal's",
+                        (", Z %s %%" % ("%.6g" % z)) if z is not None else "")) if mva else
+                        "no GSU (its units on the MV bus)"))
+                self.total.set(("GSUs -- each generator's, as the models take them:\n" + "\n".join(lines))
+                               if lines else "")
+                return
             if self.sheet == "Generators":
                 rows = [r for r in self.rows if any(v not in (None, "") for v in r.values())]
                 self.total.set("Totals -- units x one unit, as the models take them:\n" +
@@ -8236,6 +8351,9 @@ def gui(start=None):
         def edit(self, i, ci):
             if i is None or not (0 <= i < len(self.rows)):
                 return
+            if self.fixed and self.keys[ci] in ("name", "units"):
+                set_status("%s is set on the Generators page" % self.cols[ci][1])
+                return
             self.close_edit(True)
             self.tree.see(str(i))
             self.reveal(ci)
@@ -8296,6 +8414,9 @@ def gui(start=None):
                         self.rows[i][key] = v
                     else:
                         self.rows[i].pop(key, None)
+                    for g in app["grids"].values():          # the other page of these rows (GSUs)
+                        if g is not self and g.key == self.key:
+                            g.refresh(i)
                     n = rename_refs(data, self.key, key, was, v) if v else 0
                     if n:                                 # a name: where it is used, the new one too
                         for g in app["grids"].values():
@@ -8566,6 +8687,7 @@ def gui(start=None):
 
     for sheet, key, cols in TABLES:
         app["grids"][key] = Grid(sheet, key, cols)
+    app["grids"]["gsus"] = Grid("Generators", "generators", GEN_COLS, page="GSUs", fixed=True)
 
     # ---------------------------------------------------------------- Dyr_Params: every value, editable
     def dyr_all(grid):
@@ -8755,6 +8877,7 @@ def gui(start=None):
         pick = ttk.Combobox(bar, textvariable=which, state="readonly", width=44)
         pick.pack(side="left")
         pick.bind("<<ComboboxSelected>>", lambda _e: fill())
+        ttk.Button(bar, text="Choose...", command=lambda: choose()).pack(side="left", padx=(4, 0))
         lib = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text="library parts too", variable=lib, command=lambda: fill()).pack(side="left", padx=8)
         ttk.Label(bar, text="Search:").pack(side="left", padx=(8, 2))
@@ -8793,8 +8916,9 @@ def gui(start=None):
         def fill(*_a):
             close(False)
             cols, secs, notes = udm_table(data, lib.get())
-            state["cols"], state["secs"] = cols, secs
-            labels = [x["label"] for x in secs]
+            state["cols"], state["secs"], state["all"] = cols, secs, [x["label"] for x in secs]
+            labels = udm_shown(secs)
+            state["labels"] = labels
             pick.configure(values=(["All"] + labels) if labels else [])
             if which.get() not in ["All"] + labels:
                 which.set(labels[0] if labels else "")
@@ -8808,7 +8932,7 @@ def gui(start=None):
             f = find.get().strip().lower()
             n = 0
             for k, sec in enumerate(secs):
-                if which.get() not in ("All", sec["label"]):
+                if sec["label"] not in labels or which.get() not in ("All", sec["label"]):
                     continue
                 rows = [(nm, e) for nm, e in sec["params"] if not f or any(
                     f in str(x).lower() for x in [nm, e["p"]["desc"], udm_doc(e["p"])] +
@@ -8834,6 +8958,57 @@ def gui(start=None):
                      if cols else
                      "No generator has a vendor model (UDM) yet: Generators, Pick UDM from OEM model... -- its "
                      "parameters show here.") + ("  " + "  ".join(notes) if notes else ""))
+
+        def choose():
+            """Which definitions and parts the Definition list shows -- ticked, remembered."""
+            close(True)
+            if not state.get("all"):
+                set_status("No vendor model (UDM) yet: Generators, Pick UDM from OEM model...")
+                return
+            top = tk.Toplevel(root)
+            top.title("Vendor model pages to list")
+            top.transient(root)
+            ttk.Label(top, text="Tick what the Definition list shows (a vendor model, the parts inside it, its "
+                                "signals). Your choice is remembered.", wraplength=520, justify="left").pack(
+                fill="x", padx=12, pady=(10, 6))
+            box2 = ttk.Frame(top)
+            box2.pack(fill="both", expand=True, padx=12)
+            cv = tk.Canvas(box2, height=360, width=520, highlightthickness=0, background="white")
+            sb2 = ttk.Scrollbar(box2, orient="vertical", command=cv.yview)
+            inner = tk.Frame(cv, background="white")
+            inner.bind("<Configure>", lambda _e: cv.configure(scrollregion=cv.bbox("all")))
+            cv.create_window((0, 0), window=inner, anchor="nw")
+            cv.configure(yscrollcommand=sb2.set)
+            cv.pack(side="left", fill="both", expand=True)
+            sb2.pack(side="left", fill="y")
+            ticks = collections.OrderedDict()
+            for lab in state["all"]:
+                v = tk.BooleanVar(value=lab in state["labels"])
+                ticks[lab] = v
+                depth = lab.count("  >  ")
+                tk.Checkbutton(inner, text=lab.split("  >  ")[-1] if depth else lab, variable=v, anchor="w",
+                               background="white").pack(fill="x", padx=(6 + 22 * depth, 6))
+            row = ttk.Frame(top)
+            row.pack(fill="x", padx=12, pady=10)
+
+            sec_of = dict((x["label"], x) for x in state["secs"])
+
+            def setall(f):
+                for lab, v in ticks.items():
+                    v.set(f(sec_of[lab]))
+
+            def done():
+                was = gui_prefs().get("pscad_pages")
+                now = dict(was) if isinstance(was, dict) else {}
+                now.update((lab, bool(v.get())) for lab, v in ticks.items())
+                gui_prefs({"pscad_pages": now})
+                top.destroy()
+                fill()
+            for txt, f in (("Defaults", udm_default_shown), ("All", lambda _x: True), ("None", lambda _x: False)):
+                ttk.Button(row, text=txt, command=lambda f=f: setall(f)).pack(side="left", padx=2)
+            ttk.Button(row, text="OK", command=done).pack(side="right", padx=2)
+            ttk.Button(row, text="Cancel", command=top.destroy).pack(side="right", padx=2)
+            state["chooser"] = (top, ticks, done)
 
         def close(keep):
             ed = state["edit"]
@@ -8933,7 +9108,7 @@ def gui(start=None):
                 pass
         nb.bind("<<NotebookTabChanged>>", shown, add="+")
         app["pscad_all"] = {"fill": fill, "edit": edit, "close": close, "put": put, "tree": tv, "state": state,
-                            "msg": msg, "which": which, "pick": pick, "lib": lib}
+                            "msg": msg, "which": which, "pick": pick, "lib": lib, "choose": choose}
 
     pscad_all(app["grids"]["pscad_params"])
 
@@ -9265,26 +9440,34 @@ def gui(start=None):
         if res.get("ok"):
             set_status(res.get("msg", "done"))
             if res.get("msg"):
-                messagebox.showinfo("SMIB", res["msg"], parent=root)
+                (messagebox.showwarning if res.get("warn") else messagebox.showinfo)(
+                    "Plant Model Builder", res["msg"], parent=root)
         else:
             err = res.get("error", "")
             set_status("stopped: " + err[:120])
             goto(err)
-            messagebox.showerror("SMIB", err or "stopped -- see the Output tab", parent=root)
+            messagebox.showerror("Plant Model Builder", err or "stopped -- see the Output tab", parent=root)
 
     def goto(err):
         """Show the tab (and row) an input error names: 'Generators row 2 (BESS): ...', 'Plant: ...'."""
         m = re.match(r"^(\w+) row (\d+)", err or "")
         tabs = [nb.tab(t, "text") for t in nb.tabs()]
         g0 = app["grids"].get(TABLE_KEY.get(m.group(1))) if m else None
-        if (m and m.group(1) in tabs and (not shown_view(m.group(1)) or (g0 and any(
-                c[1].lower() in err.lower() and not shown_view(g0.sheet, c[0]) for c in g0.cols)))) or \
+        if g0 is not None:                            # the page the column it names is on (a GSU's: GSUs)
+            named = [c for c in g0.cols if c[1].lower() in err.lower()]
+            best = max(named, key=lambda c: len(c[1]))[0] if named else None
+            g0 = next((x for x in app["grids"].values() if x.key == g0.key and best in PAGE_COLS.get(x.page, ())),
+                      g0) if best else g0
+        page_of = g0.page if g0 is not None else (m.group(1) if m else None)
+        if (m and m.group(1) in tabs and (not shown_view(page_of) or (g0 and any(
+                c[1].lower() in err.lower() and not shown_view(g0.page, c[0]) and
+                c[0] in PAGE_COLS.get(g0.page, g0.keys) for c in g0.cols)))) or \
                 ((err or "").startswith("Plant") and any("'%s'" % f[1] in err and not shown_view("Plant", f[0])
                                                          for f in PLANT_FIELDS)):
             show_all()                                # the field it names is hidden: every field shown
         if m and m.group(1) in tabs:
-            nb.select(nb.tabs()[tabs.index(m.group(1))])
-            g = app["grids"].get(TABLE_KEY.get(m.group(1)))
+            nb.select(g0.tab if g0 is not None else nb.tabs()[tabs.index(m.group(1))])
+            g = g0
             if g:
                 n = int(m.group(2)) - 1                   # the n-th row with something in it
                 full = [i for i, r in enumerate(g.rows) if any(v for v in r.values()) and
@@ -9307,8 +9490,8 @@ def gui(start=None):
         p = save_temp()
 
         def job():
-            msgs, notes = [], 0
-            for x, inp in scr_cases(read_input(p)):          # each Grid SCR where it gives several
+            msgs, notes, warns = [], 0, []
+            for x, inp in plant_cases(read_input(p)):        # each set where Plant fields give several values
                 net = build_network(inp, Log())
                 operating_point(net, Log())
                 dyr_models(net, inp)                # Dyr_Params, Dyr_Records and PSCAD_Params checked too
@@ -9319,13 +9502,21 @@ def gui(start=None):
                 for n in net.notes:
                     print("[smib] " + n)
                 notes += len(net.notes)
-                msg = ("%sInputs OK -- %s model: %d buses, %d machines; P at POI %.3f MW, Q %.3f MVAr, infinite bus "
-                       "%.5f pu" % ("SCR %s: " % x if x else "", net.model, len(net.bus), len(net.gens), s.real,
+                for n in net.notes:
+                    if n.startswith(("WARNING", "CHECK")) and n not in warns:
+                        warns.append(n)
+                msg = ("%sInputs read -- %s model: %d buses, %d machines; P at POI %.3f MW, Q %.3f MVAr, infinite bus "
+                       "%.5f pu" % ("%s: " % x if x else "", net.model, len(net.bus), len(net.gens), s.real,
                                     s.imag, net.op["e"]))
                 print("[smib] " + msg)
                 msgs.append(msg)
-            return {"ok": True, "msg": "\n".join(msgs) + ("" if not notes else "\n%d note(s) in the Output tab"
-                                                         % notes)}
+            if warns:                                    # what to look at, in the dialog itself
+                return {"ok": True, "warn": True, "msg": "%d thing(s) to check:\n\n%s%s\n\n%s" % (
+                    len(warns), "\n".join("- " + w.split(": ", 1)[-1] for w in warns[:8]),
+                    "\n- ... %d more in the Output tab" % (len(warns) - 8) if len(warns) > 8 else "",
+                    "\n".join(msgs))}
+            return {"ok": True, "msg": "Inputs OK -- nothing to check.\n\n" + "\n".join(msgs) + (
+                "\n%d note(s) in the Output tab" % notes if notes else "")}
         run(job, "CHECK")
 
     def build_models():
@@ -9343,9 +9534,9 @@ def gui(start=None):
             made = [w for k, w in (("raw", "PSSE\\ .raw"), ("dyr", "PSSE\\ .dyr"), ("epc", "PSLF\\ .epc"),
                                    ("dyd", "PSLF\\ .dyd"), ("pscad_build", "PSCAD\\ model")) if files.get(k)]
             if files.get("cases"):                     # a set for each Grid SCR
-                return {"ok": True, "out": os.path.dirname(out_dir), "msg": "Models written, a set for each Grid "
-                        "SCR:\n%s\n\n%s model, %d machines: %s" % ("\n".join(files["cases"]), net.model,
-                                                                   len(net.gens), ", ".join(made))}
+                return {"ok": True, "out": os.path.dirname(out_dir), "msg": "Models written, %d sets:\n%s\n\n%s "
+                        "model, %d machines: %s" % (len(files["cases"]), "\n".join(files["cases"]), net.model,
+                                                     len(net.gens), ", ".join(made))}
             return {"ok": True, "out": out_dir, "msg": "Models written to\n%s\n\n%s model, %d machines: %s; the "
                     "report: %s" % (out_dir, net.model, len(net.gens), ", ".join(made),
                                     os.path.basename(files["report"]))}
@@ -9395,7 +9586,7 @@ def gui(start=None):
         """Whether a tab (and a field of it) shows now."""
         if allv.get():
             return True
-        g = next((x for x in app["grids"].values() if x.sheet == sheet), None)
+        g = next((x for x in app["grids"].values() if x.page == sheet), None)
         if key is None:
             return sheet in SIMPLE_TABS or bool(g and any(any(v not in (None, "") for v in r.values()) for r in g.rows))
         return sheet not in SIMPLE or key in SIMPLE[sheet]
@@ -9410,7 +9601,7 @@ def gui(start=None):
             on = any(shown_view("Plant", k) for k, s2 in sec_of.items() if s2 == sk)
             lab.grid() if on else lab.grid_remove()
         for g in app["grids"].values():
-            g.set_vis([k for k in g.keys if shown_view(g.sheet, k)])
+            g.set_vis([k for k in g.keys if shown_view(g.page, k) and k in PAGE_COLS.get(g.page, g.keys)])
         for t in nb.tabs():
             nb.tab(t, state="normal" if shown_view(nb.tab(t, "text")) else "hidden")
         if "nav_view" in app:
@@ -9495,7 +9686,15 @@ def gui(start=None):
     b_open = ttk.Button(bar, text="Open output folder", command=open_out)
     b_open.pack(side="left", padx=2)
     b_open.state(["disabled"])
+
+    def pick_all(on):
+        """Select all / Uncheck all: every model the Build: row lists (the Then: steps stay as they are --
+           each runs only for a model that is built)."""
+        for k, _w in OUT_KINDS:
+            app["vars"]["out_" + k].set("YES" if on else "NO")
     ttk.Label(bar2, text="Build:", style="Item.TLabel").pack(side="left")
+    ttk.Button(bar2, text="Select all", width=10, command=lambda: pick_all(True)).pack(side="left", padx=(4, 0))
+    ttk.Button(bar2, text="Uncheck all", width=11, command=lambda: pick_all(False)).pack(side="left", padx=(2, 6))
     for key, txt in OUT_KINDS:
         ttk.Checkbutton(bar2, text=txt, variable=app["vars"]["out_" + key], onvalue="YES", offvalue="NO").pack(
             side="left", padx=4)
