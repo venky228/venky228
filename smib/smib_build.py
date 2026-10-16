@@ -2804,6 +2804,13 @@ def build_network(inp, log):
     gens = []
     for r in inp["generators"]:
         gens.append(gen_data(r))
+        u, s0 = gens[-1]["unit"], _num(r, "unit_mva", r["_where"], None, positive=True)
+        if s0 and max(u["qmax"], -u["qmin"]) > s0 * 1.0001:
+            pm = max(abs(u["pmax"]), abs(u["pmin"]))
+            net.notes.append("CHECK: %s: Unit Qmax %g / Qmin %g MVAr, beyond its Unit MVA %g -- at full P (%g MW) it "
+                             "has %.4g MVAr, sqrt(MVA^2 - P^2) (blank Qmax and Qmin: that)" % (
+                                 gens[-1]["where"], u["qmax"], u["qmin"], s0, pm,
+                                 math.sqrt(max(s0 * s0 - pm * pm, 0.0))))
     names = [g["name"].upper() for g in gens]
     if len(set(names)) != len(names):
         raise InputError("Generators: generator names must be unique")
@@ -3317,6 +3324,17 @@ def feeder_lines(data):
         by.setdefault(on.get(nm.upper(), ("not on an MPT",))[0], []).append((sum(k for _f, k, _u in fs), txt))
     return ["   %s: %d feeder%s -- %s" % (m, sum(k for k, _t in v), "" if sum(k for k, _t in v) == 1 else "s",
                                          "; ".join(t for _k, t in v)) for m, v in by.items() if v]
+
+
+def gen_blanks(r):
+    """A Generators row's blank Unit MVA, Unit Qmax and Unit Qmin as the build takes them -> {key: value} (the GUI
+       shows them in brackets); {} where the row does not read yet."""
+    try:
+        _n, _p1, _p0, _pf, q1, q0, s1 = unit_rating(r, "Generators")
+    except (InputError, ValueError, TypeError, ZeroDivisionError):
+        return {}
+    return dict((k, v) for k, v in (("unit_mva", s1), ("unit_qmax_mvar", q1), ("unit_qmin_mvar", q0))
+                if _txt(r.get(k)) is None)
 
 
 def cable_b(r, data):
@@ -9544,7 +9562,7 @@ def gui(start=None):
                windings, MVA and three-winding values too."""
             out = []
             dflt = mpt_blanks(r, mpt_loads(data)) if self.sheet == "MPT" else cable_b(r, data) if \
-                self.sheet == "Cables" else {}
+                self.sheet == "Cables" else gen_blanks(r) if self.sheet == "Generators" else {}
             for k in self.keys:
                 v = r.get(k) or ""
                 if not v and self.sheet == "Generators" and k in MODEL_CHOICE:
@@ -11477,20 +11495,24 @@ def gui(start=None):
             pm = max(abs(_cell_num(x, "unit_pmax_mw", 0.0)), abs(_cell_num(x, "unit_pmin_mw", 0.0)))
             return math.sqrt(s0 * s0 - pm * pm) if s0 and s0 >= pm else None
         c0, c1 = circle(old), circle(r)
-        if c0 is None or abs(q - c0) > 0.005 * max(c0, 1e-3) + 0.005:
-            return None                              # not on its circle: as given
+        s1, qmin = _cell_num(r, "unit_mva", None), _cell_num(r, "unit_qmin_mvar", None)
+        on = c0 is not None and abs(q - c0) <= 0.005 * max(c0, 1e-3) + 0.005
+        big = lambda x: bool(s1) and x is not None and abs(x) > s1 * 1.0001     # beyond the unit's MVA: not so
+        if not (on or big(q) or big(qmin)):
+            return None                              # not on its circle, and possible: as given
         nm = _txt(r.get("name")) or "the generator"
         if c1 is None:
-            return "%s: its P is above Unit MVA -- Unit Qmax %s stays (it sat on the MVA circle)" % (
-                nm, _txt(r.get("unit_qmax_mvar")))
-        qmin = _cell_num(r, "unit_qmin_mvar", None)
+            return ("%s: its P is above Unit MVA -- Unit Qmax %s stays (it sat on the MVA circle)" % (
+                nm, _txt(r.get("unit_qmax_mvar")))) if on else None
         f = lambda x: "%.4g" % x if abs(x) > 1e-9 else "0"
-        r["unit_qmax_mvar"] = f(c1)
-        both = qmin is not None and abs(qmin + q) <= 0.005 * max(q, 1e-3) + 0.005
-        if both:
+        did, why = [], " (above the unit's %s MVA before)" % f(s1) if big(q) or big(qmin) else ""
+        if on or big(q):
+            r["unit_qmax_mvar"] = f(c1)
+            did.append("Unit Qmax %s -> %s MVAr" % (f(q), f(c1)))
+        if qmin is not None and (abs(qmin + q) <= 0.005 * max(q, 1e-3) + 0.005 or big(qmin)):
             r["unit_qmin_mvar"] = f(-c1)
-        return "%s: Unit Qmax %s -> %s MVAr%s -- the MVA left at full P, sqrt(MVA^2 - P^2)" % (
-            nm, f(q), f(c1), (", Qmin %s" % f(-c1)) if both else "")
+            did.append("Qmin %s" % f(-c1) if did else "Unit Qmin %s -> %s MVAr" % (f(qmin), f(-c1)))
+        return "%s: %s -- the MVA left at full P, sqrt(MVA^2 - P^2)%s" % (nm, ", ".join(did), why)
 
     def feeders_follow(r, was, v):
         """A generator's Units changed: its own feeders follow when they carried its Units before -- as many
