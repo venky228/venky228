@@ -172,7 +172,10 @@
      feeders follow -- Copies of its feeder as drawn, the units left over on
      one more (a feeder's sections with no units at them or beyond left out).
      Lengths: a blank length unit is ft -- feeders, the gen-tie, an MPT's own
-     tie (files saved before: km, written in and said). Unit Qmax blank: the
+     tie (files saved before: km, written in and said); a cable's values are
+     per ft (blank), a tie's per ft, kft, km or mi, whichever matches a line of
+     its kV; the GUI's Plant page, All lengths in ft: every length and value
+     per length in ft. Unit Qmax blank: the
      MVA left at full P, sqrt(Unit MVA^2 - P^2), when Unit MVA is given (Unit
      PF given: from it; files saved before: Unit PF 0.95 written in); in the
      GUI a Unit Qmax on that circle follows a change of Unit MVA or P.
@@ -261,11 +264,12 @@ REGCB_XE = 0.15                   # REGC_B: the converter's coupling reactance X
 # ============================================================================
 # THE INPUT WORKBOOK -- its sheets and columns, and the example it is written with
 # ============================================================================
-LEN_UNITS = ["km", "mi", "kft", "m", "ft"]
+LEN_UNITS = ["ft", "kft", "m", "km", "mi"]
 FEEDER_UNITS = ["ft", "kft", "m", "km", "mi"]    # a length's unit, ft first: feeders, the gen-tie, an MPT's tie
 FEEDER_UNIT = "ft"                               # what a blank length unit is (older files: km -- FORMAT)
-FORMAT = 4       # what blanks mean in a project: 1 km lengths, Qmax from PF | 2 feeders ft | 3 ties ft, Qmax from MVA |
-                 # 4 a three-winding MPT's LV / TV MVA from the units on each (before: its MVA)
+FORMAT = 5       # what blanks mean in a project: 1 km lengths, Qmax from PF | 2 feeders ft | 3 ties ft, Qmax from MVA |
+                 # 4 a three-winding MPT's LV / TV MVA from the units on each (before: its MVA) | 5 a cable's values
+                 # per ft (before: km)
 SPLIT_LT = 1.8   # a three-winding MPT's Z LV-TV, blank: this x its Z HV-LV -- a split LV winding's, the two LV
                  # windings well apart (each about its HV-LV impedance from HV, a little of it shared)
 LEN_KM = {"km": 1.0, "mi": 1.609344, "kft": 0.3048, "m": 0.001, "ft": 0.0003048}
@@ -331,8 +335,8 @@ PLANT_FIELDS = [
     ("tie_length", "Gen-tie length", "", "POI to the substation HV bus; blank = no gen-tie (the MPTs on the POI bus)",
      None),
     ("tie_unit", "Gen-tie length unit", "", "ft, kft, m, km, mi (blank = ft)", FEEDER_UNITS),
-    ("tie_per_unit", "Gen-tie values per", "", "the length R, X, B, C below are per: km, mi, kft, m, ft (blank = "
-     "km or mi, whichever matches a line of the POI kV)", LEN_UNITS),
+    ("tie_per_unit", "Gen-tie values per", "", "the length R, X, B, C below are per: ft, kft, m, km, mi (blank = "
+     "ft, kft, km or mi, whichever matches a line of the POI kV)", LEN_UNITS),
     ("tie_r_per", "Gen-tie R per length", "ohm", "one circuit (blank = a typical overhead line of the POI kV)", None),
     ("tie_x_per", "Gen-tie X per length", "ohm", "one circuit (blank = typical)", None),
     ("tie_b_per", "Gen-tie B per length", "uS", "one circuit, total charging (blank = typical)", None),
@@ -413,7 +417,7 @@ MPT_COLS = [
     ("im_pct", "Magnetising current %", "of MVA (blank = 0)", None, 10),
     ("tie_length", "Tie length", "a line of its own from HV to this MPT (blank = none)", None, 9),
     ("tie_unit", "Tie length unit", "blank = ft", FEEDER_UNITS, 7),
-    ("tie_per_unit", "Tie values per", "the length R, X, B are per (blank = km or mi, whichever matches a line of "
+    ("tie_per_unit", "Tie values per", "the length R, X, B are per (blank = ft, kft, km or mi, whichever matches a line of "
      "its kV)", LEN_UNITS, 7),
     ("tie_r_per", "Tie R per length", "ohm (blank = a typical overhead line of the HV kV)", None, 8),
     ("tie_x_per", "Tie X per length", "ohm (blank = typical)", None, 8),
@@ -511,7 +515,7 @@ FEEDER_COLS = [
 
 CABLE_COLS = [
     ("cable", "Cable", "# cable type", None, 11),
-    ("unit", "Length unit", "the values are per (blank = km)", LEN_UNITS, 7),
+    ("unit", "Length unit", "the values are per (blank = ft)", LEN_UNITS, 7),
     ("r_per", "R per length", "ohm, at operating temperature", None, 9),
     ("x_per", "X per length", "ohm", None, 9),
     ("b_per", "B per length", "uS, the charging susceptance (GUI: Cables page, C to B)", None, 9),
@@ -673,8 +677,8 @@ EXAMPLE = {
         "out_dyr": "YES", "out_pscad": "YES", "out_epc": "YES", "out_dyd": "YES", "freq_hz": 60.0,
         "first_bus": 1000,
         "poi_kv": 230.0, "poi_name": "POI", "grid_scr": 3.0, "grid_x_r": 10.0,
-        "tie_length": 16400, "tie_unit": "ft", "tie_per_unit": "km", "tie_r_per": 0.0720, "tie_x_per": 0.4950,
-        "tie_b_per": 3.35,
+        "tie_length": 16400, "tie_unit": "ft", "tie_per_unit": "ft", "tie_r_per": 2.19456e-05,
+        "tie_x_per": 0.000150876, "tie_b_per": 0.00102108,
         "tie_parallel": 1, "tie_rate_mva": 400.0,
         "control_mode": "Q", "v_poi_pu": 1.0, "q_poi_mvar": 0.0, "pf_poi": 1.0, "v_grid_pu": 1.0,
         "plant_ctrl": "REPC_B", "regc_repc": "standard",
@@ -700,10 +704,10 @@ EXAMPLE = {
                  "unit": "ft", "units": u}
                 for gen, secs in (("PV", _PV_FEEDER), ("BESS", _BESS_FEEDER)) for k, (c, ln, u) in enumerate(secs)],
     "cables": [
-        {"cable": "1000AL", "unit": "km", "r_per": 0.0460, "x_per": 0.1050, "b_per": 147.027},
-        {"cable": "500AL", "unit": "km", "r_per": 0.0900, "x_per": 0.1180, "b_per": 113.097},
-        {"cable": "4/0AL", "unit": "km", "r_per": 0.2010, "x_per": 0.1330, "b_per": 82.938},
-        {"cable": "1/0AL", "unit": "km", "r_per": 0.4040, "x_per": 0.1480, "b_per": 64.0885},
+        {"cable": "1000AL", "unit": "ft", "r_per": 1.40208e-05, "x_per": 3.2004e-05, "b_per": 0.0448138296},
+        {"cable": "500AL", "unit": "ft", "r_per": 2.7432e-05, "x_per": 3.59664e-05, "b_per": 0.0344719656},
+        {"cable": "4/0AL", "unit": "ft", "r_per": 6.12648e-05, "x_per": 4.05384e-05, "b_per": 0.0252795024},
+        {"cable": "1/0AL", "unit": "ft", "r_per": 0.0001231392, "x_per": 4.51104e-05, "b_per": 0.0195341748},
     ],
     "collectors": [],
     "loads_shunts": [{"kind": "LOAD", "at": "MPT1", "mw": 1.0, "mvar": 0.3, "name": "AUX"}],
@@ -1175,6 +1179,11 @@ def parse_workbook(book, path, keep_comments=False):
                 inp["_unknown"].append("%s: column '%s'" % (sheet, h))
             else:
                 colmap[i] = kk
+        if key == "cables":                          # its notes row (the template's): a blank unit km before 5
+            notes = rows[hrow + 1] if hrow + 1 < len(rows) and rows[hrow + 1] and _skip(rows[hrow + 1]) else []
+            said = [str(notes[i]) for i, kk in colmap.items() if kk == "unit" and i < len(notes) and notes[i]]
+            if said and "blank = km" in said[0]:
+                fmt = min(fmt, 4)
         if key == "mpt":                             # its notes row (the template's): no LV MVA default before 4
             notes = rows[hrow + 1] if hrow + 1 < len(rows) and rows[hrow + 1] and _skip(rows[hrow + 1]) else []
             said = [str(notes[i]) for i, kk in colmap.items() if kk == "lv_mva" and i < len(notes) and notes[i]]
@@ -1836,10 +1845,20 @@ def ohl_typical(kv, f):
     return {"kv": t[0], "r": t[1], "x": t[2] * f / 60.0, "b": t[3] * f / 60.0, "rate": t[4], "cond": t[5]}
 
 
+def per_guess(per, typ):
+    """The length R, X, B per length are per where 'values per' is blank: ft, kft, km or mi, whichever brings
+       them nearest the typical line `typ` (ohl_typical) -> (that, the next nearest)."""
+    given = [(v, typ[k]) for v, k in ((per.get("r_per"), "r"), (per.get("x_per"), "x"), (per.get("b_per"), "b"))
+             if v]
+    order = sorted(("ft", "kft", "km", "mi"), key=lambda u: sum(abs(math.log(abs(v) / LEN_KM[u] / t))
+                                                               for v, t in given))
+    return order[0], order[1]
+
+
 def line_data(d, prefix, kv, sb, f, where, unused=None):
     """A line from <prefix>length / _unit / _r_per ... (or _r_ohm ... totals): None when none is given. Each of
        R, X, B is its total where given, else its value per length times the length: per <prefix>per_unit (blank =
-       km or mi, whichever brings them nearer a typical line of its kV); with no totals given, blank ones take a
+       ft, kft, km or mi, whichever brings them nearest a typical line of its kV: per_guess); with no totals given, blank ones take a
        typical overhead line of its kV (OHL_TYPICAL), and ones far from it are CHECKed (a unit mixed up). A value
        given twice (a total and per length, B and C) that disagrees is CHECKed; unused (a list): a NOTE there of
        the values given for a line that is not there (no length, no totals) -- none is dropped unsaid.
@@ -1861,9 +1880,8 @@ def line_data(d, prefix, kv, sb, f, where, unused=None):
     per = dict((k, _num(d, prefix + k, where)) for k in ("r_per", "x_per", "b_per", "c_per"))
     tot = dict((k, _num(d, prefix + k, where)) for k in ("r_ohm", "x_ohm", "b_us"))
     inferred = per_unit is None
-    if inferred:                                      # per km or per mile: whichever is nearer a line of its kV
-        given = [(v, typ[k]) for v, k in ((per["r_per"], "r"), (per["x_per"], "x"), (per["b_per"], "b")) if v]
-        per_unit = min(("km", "mi"), key=lambda u: sum(abs(math.log(abs(v) / LEN_KM[u] / t)) for v, t in given))
+    if inferred:                                      # per ft, kft, km or mile: whichever is nearer a line of its kV
+        per_unit, other = per_guess(per, typ)
     b_per = per["b_per"]
     if per["c_per"] is not None:                      # C (uF) instead of B (uS)
         b_c = 2.0 * math.pi * f * per["c_per"]
@@ -1901,16 +1919,17 @@ def line_data(d, prefix, kv, sb, f, where, unused=None):
     if inferred and per_len:
         notes.append("NOTE: %s: values per blank -- %s taken per %s (nearer a typical %g kV line than per %s); set "
                      "its 'values per' if they are per another length" % (
-                         where, ", ".join(per_len), per_unit, typ["kv"], "mi" if per_unit == "km" else "km"))
+                         where, ", ".join(per_len), per_unit, typ["kv"], other))
     if unsaid:
         notes.append("CHECK: %s: %s per length not used -- no length is given (the totals are used)" % (
             where, ", ".join(unsaid)))
     if zero:
         notes.append("NOTE: %s: %s not given with the totals -- 0" % (where, ", ".join(zero)))
     if used:
-        notes.append("NOTE: %s: %s per length not given -- a typical %g kV overhead line (%s, one circuit): R %g, "
-                     "X %g ohm/km, B %g uS/km" % (where, ", ".join(used), typ["kv"], typ["cond"], typ["r"],
-                                                  round(typ["x"], 4), round(typ["b"], 4)))
+        notes.append("NOTE: %s: %s per length not given -- a typical %g kV overhead line (%s, one circuit): R %.4g, "
+                     "X %.4g ohm/ft, B %.4g uS/ft" % (where, ", ".join(used), typ["kv"], typ["cond"],
+                                                      typ["r"] * LEN_KM["ft"], typ["x"] * LEN_KM["ft"],
+                                                      typ["b"] * LEN_KM["ft"]))
     if abs(complex(R, X)) < 1e-9:
         raise InputError("%s: the line has no impedance -- %s and %s (or %s and %s) are 0" % (
             where, _label(prefix + "r_per", where), _label(prefix + "x_per", where), _label(prefix + "r_ohm", where),
@@ -1918,11 +1937,12 @@ def line_data(d, prefix, kv, sb, f, where, unused=None):
     if km > 0:                                        # far from a line of its kV: a unit mixed up?
         for what, v, t in (("R", R / km, typ["r"]), ("X", X / km, typ["x"]), ("B", B / km, typ["b"])):
             if v > 0 and not 0.2 <= v / t <= 5.0:
-                msg = "%s: %s %.4g %s/km%s is %s a typical %g kV line's %.4g -- %s" % (
-                    where, what, v, "uS" if what == "B" else "ohm", (" (from %s)" % _label(given_by[what], where))
-                    if given_by.get(what, prefix) != prefix else "", "%.0f times" % (v / t) if v > t else
-                    "1/%.0f of" % (t / v), typ["kv"], t, "the R, X, B are read per %s: set 'values per' to the "
-                    "length they are per (km, mi ...)" % per_unit if not totals else "check the totals and the length")
+                msg = "%s: %s %.4g %s/ft%s is %s a typical %g kV line's %.4g -- %s" % (
+                    where, what, v * LEN_KM["ft"], "uS" if what == "B" else "ohm",
+                    (" (from %s)" % _label(given_by[what], where)) if given_by.get(what, prefix) != prefix else "",
+                    "%.0f times" % (v / t) if v > t else "1/%.0f of" % (t / v), typ["kv"], t * LEN_KM["ft"],
+                    "the R, X, B are read per %s: set 'values per' to the length they are per (ft, kft, mi ...)" %
+                    per_unit if not totals else "check the totals and the length")
                 if not 0.02 <= v / t <= 50.0:
                     raise InputError(msg)
                 notes.append("CHECK: " + msg)
@@ -2071,12 +2091,18 @@ def read_cables(rows, log=None):
             raise InputError("%s: the cable has no name" % w)
         if name.upper() in out:
             raise InputError("%s: cable %s is already given in %s" % (w, name, out[name.upper()]["where"]))
-        unit = _choice(r, "unit", w, LEN_UNITS, "km")
+        unit = _choice(r, "unit", w, LEN_UNITS, FEEDER_UNIT)
         b = _num(r, "b_per", w)
         c = _num(r, "c_per", w)
         if b is not None and c is not None and log:
             log("NOTE: %s: cable %s has both B and C -- B used" % (w, name))
         notes = []
+        x = _num(r, "x_per", w, required=True)
+        if x and not 0.005 <= abs(x) / LEN_KM[unit] <= 5.0:     # no cable: the values are per another length
+            near = min((u for u in LEN_UNITS if u != unit), key=lambda u: abs(math.log(abs(x) / LEN_KM[u] / 0.12)))
+            raise InputError("%s: cable %s X %g ohm per %s is %.4g ohm/km -- no cable is (0.05 to 0.5): its values "
+                             "look per %s -- set its Length unit to the length they are per (blank = %s)" % (
+                                 w, name, x, unit, abs(x) / LEN_KM[unit], near, FEEDER_UNIT))
         rates = _abc(r, ("rate_a_mva", "rate_b_mva", "rate_c_mva"), "%s (cable %s)" % (w, name), 0.0, notes)
         for m in notes if log else ():
             log(m)
@@ -7915,7 +7941,8 @@ def report_text(net, inp, recs, comps, files, src):
     for ln in net.lines:
         L.append("   %-12s %-9s %s - %s  %d circuit(s)%s: R %.5f X %.5f ohm B %.3f uS each = r %.6f x %.6f b %.6f pu, "
                  "%s" % (ln["name"], ln["kind"], ln["fr"], ln["to"], ln["count"],
-                         (", %.3f km" % ln["km"]) if ln.get("km") else "", ln["R"], ln["X"], ln["B"], ln["r"],
+                         (", %.0f ft" % (ln["km"] / LEN_KM["ft"])) if ln.get("km") else "", ln["R"], ln["X"], ln["B"],
+                         ln["r"],
                          ln["x"], ln["b"], rates(_rabc(ln))))
     for t in net.tx2:
         L.append("   %-12s %-9s %s - %s  %s%.2f MVA %.4g/%.4g kV tap %.4f %s: Z %.4f%% X/R %s (own base) -> r %.6f "
@@ -7959,9 +7986,10 @@ def report_text(net, inp, recs, comps, files, src):
             cname, res["kv"], sum(fd["copies"] for fd in res["feeders"]),
             ", ".join("%d %s units" % (n, g) for g, n in res["N"].items()), res["W"]))
         for fd in res["feeders"]:
-            L.append("     feeder %s%s: %d section%s, %.3f km, %s, %.3f MW; its own equivalent R %.5f X %.5f ohm "
+            L.append("     feeder %s%s: %d section%s, %.0f ft, %s, %.3f MW; its own equivalent R %.5f X %.5f ohm "
                      "B %.3f uS" % (fd["name"], (" x %d" % fd["copies"]) if fd["copies"] > 1 else "",
-                                    len(fd["sections"]), "s" if len(fd["sections"]) != 1 else "", fd["km"],
+                                    len(fd["sections"]), "s" if len(fd["sections"]) != 1 else "",
+                                    fd["km"] / LEN_KM["ft"],
                                     ", ".join("%d %s" % (n, g) for g, n in
                                                                              fd["N"].items()), fd["W"],
                                     fd["z_own"].real * zb, fd["z_own"].imag * zb, fd["b_own"] / zb * 1e6))
@@ -8476,6 +8504,16 @@ def _old_blanks(inp, fmt):
         if q:
             said.append("NOTE: Generators %s: Unit PF 0.95 written in -- a blank Unit Qmax came from Unit PF (blank "
                         "0.95) when this file was saved; now, with Unit MVA given, from MVA and Pmax" % ", ".join(q))
+    if fmt < 5:
+        n = 0
+        for r in inp.get("cables") or []:
+            if _txt(r.get("unit")) is None and any(_txt(r.get(k)) is not None for k in ("r_per", "x_per", "b_per",
+                                                                                      "c_per")):
+                r["unit"] = "km"
+                n += 1
+        if n:
+            said.append("NOTE: Cables: %d cable(s) with no Length unit read per km -- a blank meant km when this file "
+                        "was saved (now ft); they say km from now on" % n)
     if fmt < 4:
         loads, done = None, []
         for r in inp.get("mpt") or []:
@@ -9393,6 +9431,7 @@ def gui(start=None):
     top_bar = ttk.Frame(plant_tab)
     top_bar.pack(fill="x", padx=8, pady=(6, 2), before=outer)
     ttk.Button(top_bar, text="Plant type...", command=lambda: plant_type()).pack(side="right", padx=(8, 0))
+    ttk.Button(top_bar, text="All lengths in ft", command=lambda: all_in_ft()).pack(side="right", padx=(8, 0))
     ttk.Label(top_bar, textvariable=plant_total, style="Total.TLabel", wraplength=1000, justify="left").pack(
         side="left", fill="x", expand=True)
     widgets, hints = {}, {}
@@ -9435,6 +9474,25 @@ def gui(start=None):
         txt = help_text("Plant", key, item, note, choices, unit)
         w.bind("<FocusIn>", lambda e, t=txt: plant_help.set(t))
         var.trace_add("write", dirty) if hasattr(var, "trace_add") else var.trace("w", dirty)
+        if key == "name":                             # blank: the name from the generators, shown in it in grey
+            ph = tk.Label(w, text="", fg="#7F7F7F", bg=input_bg, font=w.cget("font"), anchor="w", padx=0, pady=0)
+
+            def ph_show(*_a, ph=ph, w=w, var=var):
+                try:
+                    here = root.focus_get() is w
+                except (KeyError, tk.TclError):
+                    here = False
+                if var.get().strip() or here:
+                    ph.place_forget()
+                else:
+                    ph.configure(text=auto_name(data))
+                    ph.place(x=1, rely=0.5, anchor="w")
+                root.title("Plant Model Builder -- %s" % (var.get().strip() or auto_name(data)))
+            ph.bind("<Button-1>", lambda e, w=w: w.focus_set())
+            w.bind("<FocusIn>", lambda e, ph=ph: ph.place_forget(), add="+")
+            w.bind("<FocusOut>", ph_show, add="+")
+            var.trace_add("write", ph_show) if hasattr(var, "trace_add") else var.trace("w", ph_show)
+            app["name_ph"] = ph_show
         row_i[0] += 1
     form.columnconfigure(3, weight=1)
 
@@ -9459,8 +9517,8 @@ def gui(start=None):
         if per:
             hints["tie_per_unit"][0].configure(text="blank = per %s here" % per.split("taken per ")[1].split()[0])
         if not d.get("tie_r_ohm") and not d.get("tie_x_ohm"):
-            hints["tie_r_ohm"][0].configure(text="now %.5g ohm (%.3f km)  -> r %.6g x %.6g pu on %g MVA" % (
-                ln["R"], ln["km"], ln["r"], ln["x"], float(d.get("sbase_mva") or 100.0)))
+            hints["tie_r_ohm"][0].configure(text="now %.5g ohm (%.0f ft)  -> r %.6g x %.6g pu on %g MVA" % (
+                ln["R"], ln["km"] / LEN_KM["ft"], ln["r"], ln["x"], float(d.get("sbase_mva") or 100.0)))
             hints["tie_x_ohm"][0].configure(text="now %.5g ohm" % ln["X"])
             hints["tie_b_us"][0].configure(text="now %.5g uS  -> b %.6g pu" % (ln["B"], ln["b"]))
     for k in [k for k in app["vars"] if k.startswith("tie_")] + ["poi_kv", "sbase_mva", "freq_hz"]:
@@ -11392,8 +11450,64 @@ def gui(start=None):
                        ("name", "blank = %s, from the generators" % auto_name(data))):
             if k in hints and not hints[k][2].startswith("Req"):
                 hints[k][0].configure(text=txt)
+        if "name_ph" in app:                          # the name a blank Name takes, in its box
+            app["name_ph"]()
         if "req_live" in app:                         # the SCR's short-circuit MVA: on the generators' Pmax
             app["req_live"]()
+
+    def all_in_ft():
+        """Every length, and every value per length, in ft -- the same line: the gen-tie and the MPTs' ties (their
+           length; R, X, B, C per length), the cables (R, X, B, C per length) and the feeders' lengths."""
+        from_widgets()
+        pl, did = data["plant"], []
+        f = _cell_num(pl, "freq_hz", 60.0) or 60.0
+        kv = _cell_num(pl, "poi_kv", None)
+
+        def length(row, lk, uk):
+            v, u = _cell_num(row, lk, None), (_txt(row.get(uk)) or FEEDER_UNIT).lower()
+            if v is None or u == "ft" or u not in LEN_KM:
+                return False
+            row[lk], row[uk] = "%.10g" % (v * LEN_KM[u] / LEN_KM["ft"]), "ft"
+            return True
+
+        def per(row, uk, keys, line):
+            vals = dict((k, _cell_num(row, k, None)) for k in keys)
+            u = (_txt(row.get(uk)) or "").lower()
+            if not u and line and kv and any(vals.values()):       # blank: what the build reads them per
+                u = per_guess(dict((k.split("_", 1)[-1] if k.startswith("tie_") else k, v)
+                                   for k, v in vals.items()), ohl_typical(kv, f))[0]
+            if not u and not line:
+                u = FEEDER_UNIT
+            if u == "ft" or u not in LEN_KM:
+                return False
+            for k, v in vals.items():
+                if v is not None:
+                    row[k] = "%.10g" % (v * LEN_KM["ft"] / LEN_KM[u])
+            row[uk] = "ft"
+            return any(v is not None for v in vals.values())
+
+        tie = ("tie_r_per", "tie_x_per", "tie_b_per", "tie_c_per")
+        if length(pl, "tie_length", "tie_unit"):
+            did.append("the gen-tie's length")
+        if per(pl, "tie_per_unit", tie, True):
+            did.append("its R, X, B per ft")
+        n = sum(1 for r in data.get("mpt") or [] if length(r, "tie_length", "tie_unit") | per(r, "tie_per_unit",
+                                                                                              tie[:3], True))
+        if n:
+            did.append("%d MPT tie(s)" % n)
+        n = sum(1 for r in data.get("cables") or [] if per(r, "unit", ("r_per", "x_per", "b_per", "c_per"), False))
+        if n:
+            did.append("%d cable(s) per ft" % n)
+        n = sum(1 for r in data.get("feeders") or [] if length(r, "length", "unit"))
+        if n:
+            did.append("%d feeder length(s)" % n)
+        to_widgets()
+        for g in app["grids"].values():
+            g.refresh(g.current())
+        if did:
+            dirty()
+        set_status("All lengths in ft: %s -- the same lines" % ", ".join(did) if did else
+                   "All lengths in ft: every length and value per length is in ft already")
 
     def plant_type():
         """What kinds of generator the plant has -- PV only, BESS only, or a hybrid of any (set_kinds): ticked,
