@@ -143,6 +143,14 @@
      largest page -- is a CHECK or WARNING: in the report, and listed by the
      GUI's Check inputs.
 
+   PLANT TYPE
+     The GUI's Plant page, Plant type: the kinds of generator the plant has --
+     PV only, BESS only, or a hybrid of any of PV, BESS, wind and synchronous
+     machines. A kind ticked gets a generator (an inverter on the first MPT,
+     its feeders like the plant's; a synchronous one at HV behind its own
+     GSU); a kind unticked goes, with the rows naming it (asked first).
+     Plant: Name blank = from the generators: PV100, Hybrid_PV100_BESS50 ...
+
    SIZES AND RATINGS
      GSUs: Units per GSU (the units on one GSU) sets the GSU count (Units /
      Units per GSU, rounded up); a GSU far above or below the units on it is
@@ -270,7 +278,8 @@ MODEL_CHOICE = {                  # what each choice is for: the GUI lists a gen
 # Plant sheet (Item | Value | Unit | Notes): (key, item, unit, note, choices)
 FAULT_TYPES = ["ABCG", "ABC", "AG", "BG", "CG", "ABG", "BCG", "ACG", "AB", "BC", "AC"]
 PLANT_FIELDS = [
-    ("name", "Name", "", "model name: file names and the PSCAD case (letters, digits, _)", None),
+    ("name", "Name", "", "model name: file names and the PSCAD case (letters, digits, _; blank = from the "
+     "generators: PV100, Hybrid_PV100_BESS50 ...)", None),
     ("model_type", "Model type", "", "SMIB: each generator one machine behind one GSU on its own equivalent feeder "
      "(WECC) from its MPT | DETAILED: every feeder section, the units at each node a machine of their own behind "
      "their own GSU -- PSS/E and PSCAD alike (blank = SMIB)", ["SMIB", "DETAILED"]),
@@ -2656,7 +2665,7 @@ def wecc_check(res, sb):
 def build_network(inp, log):
     pl = inp["plant"]
     W = "Plant"
-    name = _safe_name(_txt(pl.get("name")) or "SMIB")
+    name = _safe_name(_txt(pl.get("name")) or auto_name(inp))
     sb = _num(pl, "sbase_mva", W, 100.0, positive=True)
     f = _num(pl, "freq_hz", W, 60.0, positive=True)
     if not 40.0 <= f <= 70.0:
@@ -2664,7 +2673,9 @@ def build_network(inp, log):
     net = Net(name, sb, f)
     if f not in (50.0, 60.0):
         net.notes.append("CHECK: Plant: 'Frequency' %g Hz -- not 50 or 60" % f)
-    if name != (_txt(pl.get("name")) or "SMIB"):
+    if _txt(pl.get("name")) is None:
+        net.notes.append("NOTE: Plant: Name blank -- %s, from the generators" % name)
+    elif name != _txt(pl.get("name")):
         net.notes.append("NOTE: model name %r is used as %r (letters, digits and _ only; 30 at most)" % (
             pl.get("name"), name))
     poi_kv = _num(pl, "poi_kv", W, required=True, positive=True)
@@ -2970,6 +2981,143 @@ def _rows(data, key):
     return [r for r in data.get(key) or [] if not _skip([r.get(c[0]) for c in cols])]
 
 
+KINDS = collections.OrderedDict([  # the kinds of generator a plant can have: (name, what, generator types)
+    ("PV", ("PV", "PV", ("PV",))), ("BESS", ("BESS", "BESS", ("BESS",))),
+    ("WT4", ("WIND", "wind, type 4", ("WT4",))), ("WT3", ("WIND", "wind, type 3", ("WT3",))),
+    ("SYNC", ("SYNC", "synchronous (gas, steam, hydro)", ("SYNC",))), ("USER", ("GEN", "your own records", ("USER",)))])
+
+
+def plant_kinds(data):
+    """The kinds of generator the Generators rows have, in KINDS' order -> {kind: (generator names, MW: their
+       Pmax)}."""
+    out = collections.OrderedDict()
+    for r in _rows(data, "generators"):
+        t, nm = (_txt(r.get("type")) or "").upper(), _txt(r.get("name"))
+        if t not in KINDS or not nm:
+            continue
+        e = out.setdefault(t, ([], 0.0))
+        e[0].append(nm)
+        out[t] = (e[0], e[1] + _cell_num(r, "units", 0.0) * _cell_num(r, "unit_pmax_mw", 0.0))
+    return collections.OrderedDict((k, out[k]) for k in KINDS if k in out)
+
+
+def plant_kind_text(data):
+    """What the plant is, from its generators: PV only, BESS only, a hybrid of PV + BESS + SYNC ..."""
+    ks = plant_kinds(data)
+    if not ks:
+        return "no generators yet"
+    names = [KINDS[k][1] for k in ks]
+    return ("%s only" % names[0]) if len(ks) == 1 else "a hybrid of %s" % " + ".join(names)
+
+
+def auto_name(data):
+    """A plant's name from its generators: their kinds and MW (Pmax) -- PV100, BESS50, Hybrid_PV100_BESS50,
+       Hybrid_PV50_WIND30_SYNC20 (no generators: Plant)."""
+    mw = collections.OrderedDict()
+    for k, (_names, x) in plant_kinds(data).items():
+        mw[KINDS[k][0]] = mw.get(KINDS[k][0], 0.0) + x
+    if not mw:
+        return "Plant"
+    f = lambda x: ("%d" % round(x)) if x >= 10 or abs(x - round(x)) < 0.05 else ("%.1f" % x).replace(".", "p")
+    return _safe_name(("Hybrid_" if len(mw) > 1 else "") + "_".join("%s%s" % (k, f(x)) for k, x in mw.items()))
+
+
+def kind_rows(data, kind, name):
+    """A new generator of a kind for this plant -> (its Generators row, its Feeders rows, the Cables rows it needs):
+       an inverter's on the first MPT, its feeders like the plant's first feeder (else the example's), its units on
+       them; a synchronous one at HV behind its own GSU."""
+    mpts = _rows(data, "mpt")
+    m = mpts[0] if mpts else {}
+    mpt, lv, poi = _txt(m.get("name")) or "MPT1", _txt(m.get("lv_kv")) or "34.5", _txt((data.get("plant") or {}).get(
+        "poi_kv")) or "230"
+    ex = dict((r["type"], r) for r in EXAMPLE["generators"])
+    if kind in ("PV", "BESS"):
+        row = dict((k, str(v)) for k, v in ex[kind].items())
+        row.update({"name": name, "connect": mpt, "gsu_hv_kv": lv})
+    elif kind in ("WT4", "WT3"):
+        row = {"name": name, "type": kind, "connect": mpt, "units": "20", "unit_mva": "3.6", "unit_pmax_mw": "3.3",
+               "kv": "0.69", "q_mode": "share", "gsu_mva": "3.6", "gsu_hv_kv": lv, "gsu_lv_kv": "0.69",
+               "gsu_z_pct": "6", "gsu_x_r": "8", "gsu_vector": "Dyn11", "collector": "FEEDERS"}
+    elif kind == "SYNC":
+        row = {"name": name, "type": "SYNC", "connect": "HV", "units": "1", "unit_mva": "50", "unit_pmax_mw": "45",
+               "unit_pmin_mw": "10", "kv": "13.8", "q_mode": "share", "gsu_mva": "50", "gsu_hv_kv": poi,
+               "gsu_lv_kv": "13.8", "gsu_z_pct": "10", "gsu_x_r": "40", "gsu_vector": "YNd1", "collector": "NONE"}
+    else:
+        row = {"name": name, "type": "USER", "connect": mpt, "units": "1", "unit_mva": "10", "unit_pmax_mw": "9",
+               "kv": lv, "q_mode": "share", "collector": "NONE"}
+    if row.get("collector") != "FEEDERS":
+        return row, [], []
+    lay = feeder_layout(data)
+    src = next((g for g in (_txt(r.get("name")) for r in _rows(data, "generators")) if g and g.upper() in lay), None)
+    cols = [c[0] for c in FEEDER_COLS]
+    if src:
+        mine = [r for r in _rows(data, "feeders") if (_txt(r.get("collector")) or "").upper() == src.upper()]
+        fs = _feeders_of(mine)
+        first = fs[max(fs, key=lambda f: (sum(_cell_num(r, "units") for r in fs[f]), len(fs[f])))]
+        cabs = []
+    else:
+        first = [dict((k, str(v)) for k, v in r.items()) for r in EXAMPLE["feeders"] if r["collector"] == "PV"]
+        have = set((_txt(c.get("cable")) or "").upper() for c in _rows(data, "cables"))
+        cabs = [dict((k, str(v)) for k, v in c.items()) for c in EXAMPLE["cables"] if c["cable"].upper() not in have]
+    feeders = [dict((k, r[k]) for k in cols if k in r and k not in ("collector", "feeder", "copies", "units_of")) for
+               r in first]
+    for f in feeders:
+        f.update({"collector": name, "feeder": "F", "copies": "1"})
+    return row, feeders, cabs
+
+
+def set_kinds(data, kinds, name=None):
+    """The plant made of these kinds of generator (KINDS) -> (the inputs as they would be, [what was done]): a kind
+       it has keeps its generators; one it does not have gets one (kind_rows), its units on its feeders; one not
+       wanted goes, with every row naming its generators (their feeders, parameters, records, bus numbers, loads
+       on their buses). name: the plant's name (blank: from the generators)."""
+    d = json.loads(json.dumps(data))
+    have = plant_kinds(d)
+    did = []
+    for k in [k for k in have if k not in kinds]:
+        gone = set(n.upper() for n in have[k][0])
+        own = lambda v: (_txt(v) or "").upper().split(":")[0] in gone
+        d["generators"] = [r for r in d.get("generators") or [] if not own(r.get("name"))]
+        n0 = sum(len(d.get(t) or []) for t in ("feeders", "machines", "dyr_params", "dyr_records", "pscad_params",
+                                                "bus_numbers", "loads_shunts"))
+        d["feeders"] = [r for r in d.get("feeders") or [] if not own(r.get("collector")) and not own(r.get("units_of"))]
+        d["machines"] = [r for r in d.get("machines") or [] if not any(
+            (_txt(r.get("machine")) or "").upper().startswith(g) for g in gone)]
+        for t in ("dyr_params", "dyr_records", "pscad_params"):
+            d[t] = [r for r in d.get(t) or [] if not own((_txt(r.get("generator")) or "").lstrip("#"))]
+        d["bus_numbers"] = [r for r in d.get("bus_numbers") or [] if not own(r.get("bus"))]
+        d["loads_shunts"] = [r for r in d.get("loads_shunts") or [] if not own(r.get("at"))]
+        n1 = sum(len(d.get(t) or []) for t in ("feeders", "machines", "dyr_params", "dyr_records", "pscad_params",
+                                                "bus_numbers", "loads_shunts"))
+        did.append("%s removed: %s%s" % (KINDS[k][1], ", ".join(have[k][0]),
+                                         (" and %d row(s) naming them" % (n0 - n1)) if n0 != n1 else ""))
+    for k in [k for k in kinds if k not in have]:
+        taken = set((_txt(r.get("name")) or "").upper() for t in ("generators", "mpt", "collectors")
+                    for r in d.get(t) or [])
+        nm, i = KINDS[k][0], 2
+        while nm.upper() in taken:
+            nm, i = "%s%d" % (KINDS[k][0], i), i + 1
+        row, feeders, cabs = kind_rows(d, k, nm)
+        d.setdefault("generators", []).append(row)
+        d.setdefault("feeders", []).extend(feeders)
+        d.setdefault("cables", []).extend(cabs)
+        said = ""
+        if feeders:
+            try:
+                d["feeders"], said = set_feeders(d, nm)
+            except InputError:
+                d["feeders"], said = set_feeders(d, nm, 1)
+            said = " -- " + said.split(" -- ", 1)[-1]
+        did.append("%s added: %s, %s x %s MW on %s%s" % (KINDS[k][1], nm, row["units"], row["unit_pmax_mw"],
+                                                         row["connect"], said))
+    if name is not None:
+        if _txt(name) is None or _txt(name) == auto_name(d):
+            d.setdefault("plant", {}).pop("name", None)
+        else:
+            d.setdefault("plant", {})["name"] = _txt(name)
+    return d, did
+
+
 def plant_totals(data):
     """What the Generators rows add up to for the whole plant, and what each MPT carries -> (plant line, [MPT
        lines], {"pmax": MW, "dispatch": MW}) -- a generator whose row does not read yet is left out, named."""
@@ -2989,8 +3137,8 @@ def plant_totals(data):
         units += n
         mva, pmax, pmin, qmax, qmin = mva + n * s, pmax + n * p1, pmin + n * p0, qmax + n * q1, qmin + n * q0
         disp += n * p1 if d is None else d
-    line = "Whole plant (from Generators): %s MVA, %d units  |  P %s to %s MW, dispatch %s MW  |  Q %s to %s MVAr" % (
-        f(mva), units, f(pmin), f(pmax), f(disp), f(qmin), f(qmax)) + (
+    line = "Whole plant (from Generators): %s -- %s MVA, %d units  |  P %s to %s MW, dispatch %s MW  |  Q %s to %s " \
+           "MVAr" % (plant_kind_text(data), f(mva), units, f(pmin), f(pmax), f(disp), f(qmin), f(qmax)) + (
         ("   (%s not counted: its row does not read yet)" % ", ".join(bad)) if bad else "")
     mpts, loads, fon = [], mpt_loads(data), feeders_on_mpts(data)
     for m in _rows(data, "mpt"):
@@ -8969,8 +9117,11 @@ def gui(start=None):
     ttk.Label(plant_tab, textvariable=plant_help, style="Help.TLabel", wraplength=1200, justify="left").pack(
         fill="x", side="bottom")
     plant_total = tk.StringVar()                       # the whole plant, from Generators -- live
-    ttk.Label(plant_tab, textvariable=plant_total, style="Total.TLabel", wraplength=1200, justify="left").pack(
-        fill="x", padx=8, pady=(6, 2), before=outer)
+    top_bar = ttk.Frame(plant_tab)
+    top_bar.pack(fill="x", padx=8, pady=(6, 2), before=outer)
+    ttk.Button(top_bar, text="Plant type...", command=lambda: plant_type()).pack(side="right", padx=(8, 0))
+    ttk.Label(top_bar, textvariable=plant_total, style="Total.TLabel", wraplength=1000, justify="left").pack(
+        side="left", fill="x", expand=True)
     widgets, hints = {}, {}
     row_i = [0]
     field_w, sec_w, sec_of = {}, {}, {}           # each field's widgets, each section's title, each field's section
@@ -10604,7 +10755,7 @@ def gui(start=None):
         data.update(new)
         app["path"] = path
         to_widgets()
-        root.title("Plant Model Builder -- %s" % (data["plant"].get("name") or "new"))
+        root.title("Plant Model Builder -- %s" % (data["plant"].get("name") or auto_name(data)))
         apply_view()
         set_status(what)
 
@@ -10932,11 +11083,94 @@ def gui(start=None):
             g.total.set(("Feeders on each MPT (Copies: identical feeders):\n" + "\n".join(fl)) if fl else "")
         for k, txt in (("scr_base_mw", "blank = %s MW, the generators' Pmax" % ("%.6g" % tot["pmax"])),
                        ("p_poi_mw", "blank = each generator at its dispatch: %s MW in all" % (
-                           "%.6g" % tot["dispatch"]))):
+                           "%.6g" % tot["dispatch"])),
+                       ("name", "blank = %s, from the generators" % auto_name(data))):
             if k in hints and not hints[k][2].startswith("Req"):
                 hints[k][0].configure(text=txt)
         if "req_live" in app:                         # the SCR's short-circuit MVA: on the generators' Pmax
             app["req_live"]()
+
+    def plant_type():
+        """What kinds of generator the plant has -- PV only, BESS only, or a hybrid of any (set_kinds): ticked,
+           a kind it does not have gets a generator; unticked, a kind goes with every row naming its generators
+           (asked first). Its name: from the generators unless one of your own is typed."""
+        from_widgets()
+        have = plant_kinds(data)
+        top = tk.Toplevel(root)
+        top.title("Plant type")
+        top.transient(root)
+        ttk.Label(top, text="What kinds of generator the plant has -- one kind (PV only, BESS only ...) or a hybrid "
+                            "of any of them. A kind ticked that it does not have gets a generator: an inverter on the "
+                            "first MPT, its feeders like the plant's; a synchronous one at HV behind its own GSU -- "
+                            "then set its units and data on the Generators page. A kind unticked goes, with every "
+                            "row naming its generators (asked first).", wraplength=640, justify="left").pack(
+            fill="x", padx=10, pady=(10, 6))
+        pre = ttk.Frame(top)
+        pre.pack(fill="x", padx=10)
+        box = ttk.Frame(top)
+        box.pack(fill="x", padx=10, pady=4)
+        vs = collections.OrderedDict()
+        for k, (short, what, _types) in KINDS.items():
+            v = tk.BooleanVar(value=k in have)
+            vs[k] = v
+            ttk.Checkbutton(box, text=what, variable=v).grid(row=len(vs), column=0, sticky="w", pady=1)
+            ttk.Label(box, text=("%s: %s MW" % (", ".join(have[k][0]), "%.6g" % have[k][1])) if k in have else
+                      "none yet", style="Hint.TLabel").grid(row=len(vs), column=1, sticky="w", padx=12)
+        for txt, ks in (("PV only", ("PV",)), ("BESS only", ("BESS",)), ("PV + BESS", ("PV", "BESS")),
+                        ("PV + BESS + SYNC", ("PV", "BESS", "SYNC")), ("Wind + BESS", ("WT4", "BESS"))):
+            ttk.Button(pre, text=txt, command=lambda ks=ks: [v.set(k in ks) for k, v in vs.items()]).pack(
+                side="left", padx=2)
+        nf = ttk.Frame(top)
+        nf.pack(fill="x", padx=10, pady=4)
+        ttk.Label(nf, text="Name").pack(side="left")
+        name = tk.StringVar(value=_txt(data["plant"].get("name")) or auto_name(data))
+        ttk.Entry(nf, textvariable=name, width=36).pack(side="left", padx=6)
+        ttk.Label(nf, text="(left as the one from the generators, it follows them)", style="Hint.TLabel").pack(
+            side="left")
+        then = tk.StringVar()
+        ttk.Label(top, textvariable=then, wraplength=640, justify="left").pack(fill="x", padx=10, pady=6)
+        last = {"auto": auto_name(data)}
+
+        def show(*_a):
+            ks = [k for k, v in vs.items() if v.get()]
+            d2, did = set_kinds(data, ks)
+            a = auto_name(d2)
+            if name.get().strip() in ("", last["auto"]):          # not one of the user's own: it follows
+                name.set(a)
+            last["auto"] = a
+            then.set(("Then %s:\n" % plant_kind_text(d2) + "\n".join("- " + x for x in did)) if did else
+                     "Nothing changes: %s." % plant_kind_text(d2))
+        for v in vs.values():
+            v.trace_add("write", show) if hasattr(v, "trace_add") else v.trace("w", show)
+        show()
+        got = {}
+
+        def ok():
+            ks = [k for k, v in vs.items() if v.get()]
+            if not ks:
+                return messagebox.showerror("Plant type", "Tick at least one kind of generator.", parent=top)
+            d2, did = set_kinds(data, ks, name.get())
+            gone = [x for x in did if " removed: " in x]
+            if gone and not messagebox.askyesno("Plant type", "This removes:\n\n%s\n\nGo on?" % "\n".join(
+                    "- " + x for x in gone), parent=top):
+                return
+            got["d"], got["did"] = d2, did
+            top.destroy()
+        bb = ttk.Frame(top)
+        bb.pack(pady=(0, 10))
+        ttk.Button(bb, text="Set the plant type", command=ok).pack(side="left", padx=4)
+        ttk.Button(bb, text="Cancel", command=top.destroy).pack(side="left", padx=4)
+        app["size_dialog"] = {"top": top, "kinds": vs, "name": name, "then": then, "ok": ok}
+        top.grab_set()
+        root.wait_window(top)
+        app["size_dialog"] = None
+        if "d" not in got:
+            return
+        load(got["d"], app["path"], "plant type: %s%s" % (plant_kind_text(got["d"]), (" -- " + "; ".join(
+            got["did"])) if got["did"] else ""))
+        app["dirty"] = True
+        set_status("plant type: %s%s" % (plant_kind_text(data), (" -- " + "; ".join(got["did"])) if got["did"] else
+                                         ""))
 
     def q_follow(r, key, was):
         """A unit's MVA or P changed: a Unit Qmax given on its MVA circle (sqrt(MVA^2 - P^2)) -- and a Unit Qmin
@@ -11233,7 +11467,7 @@ def gui(start=None):
                  "open": open_any, "export": export_xlsx, "load": load, "vars": app["vars"], "grids": app["grids"],
                  "new": new, "scale": scale_up, "goto": goto, "from_widgets": from_widgets, "status": status,
                  "psse": psse_var, "hints": hints, "allv": allv, "view": apply_view, "widgets": widgets,
-                 "plant_total": plant_total, "field_w": field_w,
+                 "plant_total": plant_total, "field_w": field_w, "plant_type": plant_type,
                  "pscad": pscad_var, "ot": ot}               # the window's parts, for smib_build's own tests
     root.mainloop()
     return 0
