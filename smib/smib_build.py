@@ -604,7 +604,10 @@ README = [
                      "{P_MW} {Q_MVAR} their P and Q where it connects, {P_PU} {Q_PU} on {MVA}, {UNIT_MVA} "
                      "{UNIT_P_MW} {UNIT_Q_MVAR} one unit's, {V_PU} {V_KV} {KV} {ANGLE} the voltage there, its base "
                      "and PSCAD angle, {P_INV_MW} {Q_INV_MVAR} {V_INV_PU} at the inverters' own terminals (a UDM on "
-                     "the MV side), {FREQ} -- e.g. Ninv = {UNITS}, Vt0 = {V_PU}."),
+                     "the MV side), {FREQ} -- e.g. Ninv = {UNITS}, Vt0 = {V_PU}. In the GUI, the PSCAD_Params tab "
+                     "shows each vendor model's parameters, read from its definition in its file, a column per "
+                     "generator: double-click one to change it (a choice from its list), clear it to go back to "
+                     "the model's own."),
     ("PSCAD", "The .pscx is built in the same run when PSCAD 5 and its Python library mhi.pscad (pip install "
               "mhi.pscad) are on the PC; otherwise run <name>_build_pscad.py where they are. "
               "The case holds the grid (source and Thevenin impedance), the gen-tie, the MPTs, each collector (the "
@@ -1782,6 +1785,120 @@ def port_pad(sym, port=None):
     far = [(tx - p[0]) * out + tw / 2.0 for tx, ty, tw in sym.get("texts", []) if abs(ty - p[1]) <= 1.5 and
            (tx - p[0]) * out > -tw / 2.0]
     return int(math.ceil(max(far))) if far else 0
+
+
+def udm_form(path, name=None, iid=None):
+    """The parameters of definition `name` -- or of the component with ID iid, with the values it has there -- in
+       an OEM's PSCAD file (.pscx / .pslx), from its XML -> {"defn": its name, "params": [{name, desc, type, unit,
+       min, max, default, choices, cat, help}], "placed": {name: value} of the component iid}, or None."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return None
+    placed = {}
+    if iid:
+        el = next((x for x in root.iter() if x.get("id") == str(iid) and ":" in (x.get("defn") or "")), None)
+        if el is None:
+            return None
+        name = name or el.get("defn").split(":", 1)[1]
+        for q in el.iter("param"):
+            if q.get("name") and q.get("name") not in placed:
+                placed[q.get("name")] = q.get("value") or ""
+    name = (name or "").split(":")[-1]
+    el = next((d for d in root.iter() if d.tag.lower() == "definition" and
+               (d.get("name") or "").upper() == name.upper()), None) if name else None
+    form = el.find(".//form") if el is not None else None
+    if form is None:
+        return None
+    out = []
+    for cat in form.iter("category"):
+        for x in cat.iter("parameter"):
+            if not x.get("name") or any(q["name"] == x.get("name") for q in out):
+                continue
+            val = x.find("value")
+            hlp = x.find("help")
+            out.append({"name": x.get("name"), "desc": x.get("desc") or "", "type": x.get("type") or "",
+                        "unit": x.get("unit") or "", "min": x.get("min"), "max": x.get("max"),
+                        "default": (val.text or "").strip() if val is not None and val.text else "",
+                        "choices": [(c.text or "").strip() for c in x.iter("choice")], "cat": cat.get("name") or "",
+                        "help": (hlp.text or "").strip() if hlp is not None and hlp.text else ""})
+    return {"defn": el.get("name"), "params": out, "placed": placed}
+
+
+def udm_choice(p, v):
+    """A choice parameter's value as its form shows it ("0 = 250 kW / 250 kVA") -> v itself where it is none."""
+    code = str(v).split("=")[0].strip()
+    return next((c for c in p["choices"] if c.split("=")[0].strip() == code), str(v))
+
+
+def udm_doc(p):
+    """A vendor model's parameter as its form has it: its type, unit, range or choices, its page and help."""
+    rng = ("%s .. %s" % (p["min"], p["max"])) if p["min"] not in (None, "") and p["max"] not in (None, "") and \
+        p["min"] != p["max"] else ""
+    what = " | ".join(p["choices"]) if p["choices"] else " ".join(x for x in (p["type"], p["unit"], rng) if x)
+    return "%s%s%s" % (what, ("   [%s]" % p["cat"]) if p["cat"] else "", ("   " + p["help"]) if p["help"] else "")
+
+
+def udm_check(p, text, where):
+    """A value typed for a vendor model's parameter p -> the value kept (a choice's code: 0, not 0 = 250 kW); an
+       InputError where it cannot be: a choice it does not have, a number outside its range, a {KEY} that is
+       not one."""
+    text = str(text).strip()
+    if p["type"].upper() == "CHOICE":
+        code = text.split("=")[0].strip()
+        if p["choices"] and code not in [c.split("=")[0].strip() for c in p["choices"]]:
+            raise InputError("%s: %s takes %s" % (where, p["name"], " | ".join(p["choices"])))
+        return code
+    _fill_pscad(text, dict((k, 1.0) for k in PSCAD_KEYS), where)
+    try:
+        x = float(text.split("[")[0])
+    except ValueError:
+        return text                                   # a {KEY}, a signal's name, a value with its unit
+    lo, hi = [_num({"v": v}, "v", where) if v not in (None, "") else None for v in (p["min"], p["max"])]
+    if lo is not None and hi is not None and hi > lo and not lo <= x <= hi:
+        raise InputError("%s: %s = %s is outside %s .. %s" % (where, p["name"], text, _g(lo), _g(hi)))
+    if p["type"].upper() == "INTEGER" and x != int(x):
+        raise InputError("%s: %s takes a whole number" % (where, p["name"]))
+    return text
+
+
+def udm_table(data):
+    """What the PSCAD_Params tab shows: each generator's vendor model (UDM) parameters, read from its definition,
+       with the value its PSCAD model gets -> ([generators with one], [{defn, src, params: [(param, {generator:
+       (value, how)})]}], notes); how: set (a PSCAD_Params row), case (the copied component's own), default."""
+    gens, secs, notes = [], collections.OrderedDict(), []
+    rows = data.get("pscad_params") or []
+    for r in data.get("generators") or []:
+        nm = _txt(r.get("name"))
+        dn, iid = _txt(r.get("pscad_definition")), _txt(r.get("pscad_component_id"))
+        if not nm or not (dn or iid):
+            continue
+        src = _txt(r.get("pscad_source")) or _txt(r.get("pscad_library"))
+        form = udm_form(src, dn, iid) if src and os.path.isfile(src) else None
+        if form is None:
+            notes.append("%s: %s cannot be read here -- type its parameters in the rows below" % (
+                nm, src or "no PSCAD source case / library given"))
+            continue
+        gens.append(nm)
+        sec = secs.setdefault((form["defn"].upper(), os.path.normcase(os.path.abspath(src))),
+                              {"defn": form["defn"], "src": src, "params": collections.OrderedDict()})
+        mine = [x for x in rows if (_txt(x.get("generator")) or "").upper() == nm.upper()]
+        names = set(q["name"].upper() for q in form["params"])
+        for x in mine:
+            if (_txt(x.get("parameter")) or "").upper() not in names:
+                notes.append("%s: %s is not a parameter of %s -- left out of the table; the build lists it as a "
+                             "CHECK" % (nm, _txt(x.get("parameter")), form["defn"]))
+        for q in form["params"]:
+            ent = sec["params"].setdefault(q["name"], {"p": q, "cells": {}})
+            got = [x for x in mine if (_txt(x.get("parameter")) or "").upper() == q["name"].upper()]
+            if got:
+                ent["cells"][nm] = (_txt(got[-1].get("value")) or "", "set")
+            elif q["name"] in form["placed"]:
+                ent["cells"][nm] = (form["placed"][q["name"]], "case")
+            else:
+                ent["cells"][nm] = (q["default"], "default")
+    return gens, [dict(v, params=list(v["params"].items())) for v in secs.values()], notes
 
 
 def section_rxb(r, cab, f, w):
@@ -8145,6 +8262,189 @@ def gui(start=None):
                           "msg": msg}
 
     dyr_all(app["grids"]["dyr_params"])
+
+    # ---------------------------------------------------------------- PSCAD_Params: each UDM's parameters, editable
+    def pscad_all(grid):
+        """Above the PSCAD_Params rows: each generator's vendor model (UDM) parameters, read from its definition,
+           a column per generator -- each value editable (a choice from its list): a change is a PSCAD_Params row,
+           a cleared one goes back to the model's own value."""
+        top = ttk.Frame(grid.tab)
+        top.pack(fill="both", expand=True, before=grid.tools)
+        bar = ttk.Frame(top, padding=(4, 4))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Refresh", command=lambda: fill()).pack(side="left", padx=2)
+        ttk.Label(bar, text="Search:").pack(side="left", padx=(12, 2))
+        find = tk.StringVar()
+        ttk.Entry(bar, textvariable=find, width=24).pack(side="left")
+        ttk.Label(bar, text="Each vendor model's parameters, from its definition. Double-click a value to change it "
+                            "(* = your value, kept in the rows below; {P_PU} {UNITS} ... filled in for each "
+                            "inverter); clear it to go back to the model's own.",
+                  style="Hint.TLabel").pack(side="left", padx=12)
+        state = {"cols": [], "secs": [], "edit": None}
+        msg = tk.StringVar()
+        ttk.Label(top, textvariable=msg, style="Help.TLabel", wraplength=1200, justify="left").pack(fill="x")
+        box = ttk.Frame(top)
+        box.pack(fill="both", expand=True)
+        tv = ttk.Treeview(box, show="headings", selectmode="browse")
+        ys = ttk.Scrollbar(box, orient="vertical", command=tv.yview)
+        xs = ttk.Scrollbar(box, orient="horizontal", command=tv.xview)
+        tv.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        tv.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+        tv.tag_configure("sec", background=light, font=("Segoe UI", 9, "bold"))
+        tv.tag_configure("set", background="#FFF2CC")
+        ttk.Label(grid.tab, text="Your values (saved in the project) -- the rows the table above writes:",
+                  style="Item.TLabel").pack(fill="x", padx=4, pady=(6, 0), before=grid.tools)
+        grid.box.pack_configure(expand=False, fill="x")
+        grid.tree.configure(height=6)
+
+        def entry(iid):
+            if not iid.startswith("p|"):
+                return None, None
+            _x, k, name = iid.split("|", 2)
+            sec = state["secs"][int(k)]
+            return sec, dict(sec["params"]).get(name)
+
+        def fill(*_a):
+            close(False)
+            cols, secs, notes = udm_table(data)
+            state["cols"], state["secs"] = cols, secs
+            heads = ["param", "what"] + ["g%d" % i for i in range(len(cols))] + ["doc"]
+            tv.configure(columns=heads)
+            for h, t, wd in zip(heads, ["Parameter", "Description"] + cols + ["Type, range or choices"],
+                                [110, 170] + [170] * len(cols) + [700]):
+                tv.heading(h, text=t)
+                tv.column(h, width=wd, minwidth=50, stretch=(h == "doc"), anchor="w")
+            tv.delete(*tv.get_children())
+            f = find.get().strip().lower()
+            n = 0
+            for k, sec in enumerate(secs):
+                rows = [(nm, e) for nm, e in sec["params"] if not f or any(
+                    f in str(x).lower() for x in [nm, e["p"]["desc"], udm_doc(e["p"])] +
+                    [c[0] for c in e["cells"].values()])]
+                if not rows:
+                    continue
+                users = [c for c in cols if any(c in e["cells"] for _nm, e in sec["params"])]
+                tv.insert("", "end", iid="s|%d" % k, values=[sec["defn"], ""] + [""] * len(cols) + [
+                    "%s from %s -- for %s" % (sec["defn"], sec["src"], ", ".join(users))], tags=("sec",))
+                for nm, e in rows:
+                    vals = []
+                    for c in cols:
+                        v, how = e["cells"].get(c, ("", None))
+                        vals.append("" if how is None else (udm_choice(e["p"], v) if e["p"]["choices"] else v) +
+                                    (" *" if how == "set" else ""))
+                    tv.insert("", "end", iid="p|%d|%s" % (k, nm), values=[nm, e["p"]["desc"]] + vals +
+                              [udm_doc(e["p"])], tags=("set",) if any(
+                                  c[1] == "set" for c in e["cells"].values()) else ())
+                    n += 1
+            msg.set(("%d parameters of %d vendor model(s), for %s." % (n, len(secs), ", ".join(cols)) if cols else
+                     "No generator has a vendor model (UDM) yet: Generators, Pick UDM from OEM model... -- its "
+                     "parameters show here.") + ("  " + "  ".join(notes) if notes else ""))
+
+        def close(keep):
+            ed = state["edit"]
+            if not ed:
+                return
+            state["edit"] = None
+            w, var, iid, col = ed
+            text = var.get().strip()
+            w.destroy()
+            if keep:
+                put(iid, col, text)
+
+        def put(iid, col, text):
+            sec, e = entry(iid)
+            if e is None or col not in e["cells"]:
+                return
+            p = e["p"]
+            rows = data.setdefault("pscad_params", [])
+            same = [r for r in rows if (_txt(r.get("generator")) or "").upper() == col.upper() and
+                    (_txt(r.get("parameter")) or "").upper() == p["name"].upper()]
+            now, how = e["cells"][col]
+            if text:
+                try:
+                    text = udm_check(p, text, "%s %s" % (col, p["name"]))
+                except InputError as ex:
+                    messagebox.showerror("PSCAD_Params", str(ex), parent=root)
+                    return
+            if not text:
+                if not same:
+                    return
+                for r in same:
+                    rows.remove(r)
+            elif same:
+                if len(same) == 1 and _txt(same[0].get("value")) == text:
+                    return
+                same[0]["value"] = text
+                for r in same[1:]:
+                    rows.remove(r)
+            elif text == now:
+                return
+            else:
+                rows.append({"generator": col, "parameter": p["name"], "value": text})
+            grid.refresh()
+            dirty()
+            fill()
+            if tv.exists(iid):
+                tv.selection_set(iid)
+                tv.see(iid)
+            set_status("%s %s: %s" % (col, p["name"], (udm_choice(p, text) if p["choices"] else text) if text else
+                                      "back to the model's own"))
+
+        def edit(iid, colid):
+            close(True)
+            sec, e = entry(iid)
+            if e is None:
+                return
+            ci = int(colid.lstrip("#")) - 1 - 2
+            if not 0 <= ci < len(state["cols"]):
+                return
+            col = state["cols"][ci]
+            if col not in e["cells"]:
+                set_status("%s's vendor model has no %s" % (col, e["p"]["name"]))
+                return
+            tv.see(iid)
+            tv.update_idletasks()
+            bbox = tv.bbox(iid, colid)
+            if not bbox:
+                return
+            x, y, wd, ht = bbox
+            v, _how = e["cells"][col]
+            if e["p"]["choices"]:
+                var = tk.StringVar(value=udm_choice(e["p"], v))
+                w = ttk.Combobox(tv, textvariable=var, values=[""] + e["p"]["choices"], state="readonly")
+                w.bind("<<ComboboxSelected>>", lambda _e: close(True))
+            else:
+                var = tk.StringVar(value=v)
+                w = tk.Entry(tv, textvariable=var, relief="solid", borderwidth=1, background="white")
+                w.select_range(0, "end")
+            w.place(x=x, y=y, width=max(wd, 150 if e["p"]["choices"] else 90), height=ht)
+            w.focus_set()
+            state["edit"] = (w, var, iid, col)
+            w.bind("<Return>", lambda _e: close(True))
+            w.bind("<KP_Enter>", lambda _e: close(True))
+            w.bind("<Escape>", lambda _e: close(False))
+            if not e["p"]["choices"]:
+                w.bind("<FocusOut>", lambda _e: close(True))
+
+        tv.bind("<Double-1>", lambda ev: edit(tv.identify_row(ev.y), tv.identify_column(ev.x)))
+        tv.bind("<Button-1>", lambda ev: close(True), add="+")
+        find.trace_add("write", fill) if hasattr(find, "trace_add") else find.trace("w", fill)
+
+        def shown(_e=None):
+            try:
+                if nb.tab(nb.select(), "text") == grid.sheet:
+                    fill()
+            except tk.TclError:
+                pass
+        nb.bind("<<NotebookTabChanged>>", shown, add="+")
+        app["pscad_all"] = {"fill": fill, "edit": edit, "close": close, "put": put, "tree": tv, "state": state,
+                            "msg": msg}
+
+    pscad_all(app["grids"]["pscad_params"])
 
     # ---------------------------------------------------------------- reference tabs
     def ref_tab(title, heads, widths, rows, sections=False, extra=None):
