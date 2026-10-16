@@ -492,7 +492,8 @@ SIMPLE = {  # the GUI's simple view: these fields only (All fields: every one; a
     "MPT": ("name", "windings", "hv_kv", "lv_kv", "tv_kv", "mva", "lv_mva", "tv_mva", "rate_mva", "count",
             "z_hl_pct", "x_r", "vector", "tap"),
     "Generators": ("name", "type", "connect", "units", "unit_mva", "unit_pmax_mw", "unit_pmin_mw", "unit_qmax_mvar",
-                   "kv", "dispatch_mw", "collector", "regc", "reec", "pscad_definition", "pscad_source"),
+                   "unit_qmin_mvar", "kv", "dispatch_mw", "collector", "regc", "reec", "pscad_definition",
+                   "pscad_source"),
     "GSUs": ("name", "units", "gsu_count", "gsu_mva", "gsu_hv_kv", "gsu_lv_kv", "gsu_z_pct", "gsu_x_r", "gsu_vector",
              "gsu_tap"),
     "Feeders": ("collector", "feeder", "section", "cable", "length", "unit", "units", "units_of"),
@@ -1316,15 +1317,6 @@ PSCAD_KEYS_DOC = [
 def _blank_means(note):
     m = re.search(r"blank\s*=\s*([^|;)]+)", note or "")
     return m.group(1).strip().rstrip(".,") if m else ""
-
-
-def _isnum(v):
-    """Whether a cell reads as a number."""
-    try:
-        float(v)
-        return True
-    except (TypeError, ValueError):
-        return False
 
 
 def _says_more(note, v):
@@ -2773,9 +2765,15 @@ def unit_rating(r, w):
     qmin = _num(r, "unit_qmin_mvar", w, -qmax)
     s = _num(r, "unit_mva", w, None, positive=True) or math.hypot(max(abs(pmax), abs(pmin)), max(qmax, -qmin))
     if pmin > pmax:
-        raise InputError("%s: Unit Pmin is above Unit Pmax" % w)
+        raise InputError("%s: %s %g is above %s %g" % (w, _label("unit_pmin_mw", w), pmin, _label("unit_pmax_mw", w),
+                                                      pmax))
+    if qmin > qmax and _txt(r.get("unit_qmin_mvar")) is None:    # Qmin blank: -Qmax -- a Qmax below 0
+        raise InputError("%s: %s %g is below 0 -- with %s blank (-Qmax, %g) the Q range is upside down: Qmax is the "
+                         "most Q it gives (+), Qmin the most it takes (-)" % (
+                             w, _label("unit_qmax_mvar", w), qmax, _label("unit_qmin_mvar", w), qmin))
     if qmin > qmax:
-        raise InputError("%s: Unit Qmin is above Unit Qmax" % w)
+        raise InputError("%s: %s %g is above %s %g" % (w, _label("unit_qmin_mvar", w), qmin,
+                                                      _label("unit_qmax_mvar", w), qmax))
     return n, pmax, pmin, pf, qmax, qmin, s
 
 
@@ -2926,6 +2924,9 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
     if _txt(r.get("unit_qmax_mvar")) is not None:
         _unused(net.notes, r, ("unit_pf",), w, "'Unit Qmax' is given (Unit PF sets Qmax where it is blank)",
                 {"unit_pf": 0.95})
+    if g["unit"]["qmax"] < 0:                        # given so, with its Qmin below it: Q taken only
+        net.notes.append("CHECK: %s: %s %g is below 0 -- this unit only takes Q (%g .. %g MVAr)" % (
+            w, _label("unit_qmax_mvar", w), g["unit"]["qmax"], g["unit"]["qmin"], g["unit"]["qmax"]))
     if g["q_mode"] == "share":
         _unused(net.notes, r, ("fixed_q_mvar", "fixed_pf"), w, "Q mode share (they are for Q mode fixed)")
     elif _txt(r.get("fixed_q_mvar")) is not None:
@@ -9909,9 +9910,6 @@ def gui(start=None):
         if g is None or key not in g.keys:
             return False
         note = g.cols[g.keys.index(key)][2]
-        if key == "unit_qmin_mvar":                  # blank = -Qmax: its row's own
-            return any(_says_more("blank = %s" % (-float(r["unit_qmax_mvar"])) if _isnum(r.get("unit_qmax_mvar"))
-                                  else note, r.get(key)) for r in g.rows)
         return any(_says_more(note, r.get(key)) for r in g.rows)
 
     def shown_view(sheet, key=None):
