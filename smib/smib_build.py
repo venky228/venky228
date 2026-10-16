@@ -486,11 +486,12 @@ PSCADP_COLS = [
 ]
 
 SIMPLE = {  # the GUI's simple view: these fields only (All fields: every one; a hidden field keeps its value)
-    "Plant": ("name", "model_type", "freq_hz", "poi_kv", "grid_scr", "grid_x_r", "tie_length", "tie_unit",
-              "tie_r_per", "tie_x_per", "tie_b_per", "control_mode", "v_poi_pu", "q_poi_mvar", "pf_poi", "p_poi_mw",
-              "plant_ctrl", "pscad_duration_s", "pscad_fault", "pscad_fault_s"),
+    "Plant": ("name", "model_type", "freq_hz", "poi_kv", "grid_scr", "grid_x_r", "scr_base_mw", "tie_length",
+              "tie_unit", "tie_per_unit", "tie_r_per", "tie_x_per", "tie_b_per", "control_mode", "v_poi_pu",
+              "q_poi_mvar", "pf_poi", "v_grid_pu", "p_poi_mw", "plant_ctrl", "pscad_duration_s", "pscad_fault",
+              "pscad_fault_s", "pscad_fault_dur_s", "pscad_fault_type", "pscad_fault_ohm"),
     "MPT": ("name", "windings", "hv_kv", "lv_kv", "tv_kv", "mva", "lv_mva", "tv_mva", "rate_mva", "count",
-            "z_hl_pct", "x_r", "vector", "tap"),
+            "z_hl_pct", "z_ht_pct", "z_lt_pct", "x_r", "vector", "tap"),
     "Generators": ("name", "type", "connect", "units", "unit_mva", "unit_pmax_mw", "unit_pmin_mw", "unit_qmax_mvar",
                    "unit_qmin_mvar", "kv", "dispatch_mw", "collector", "regc", "reec", "pscad_definition",
                    "pscad_source"),
@@ -499,6 +500,14 @@ SIMPLE = {  # the GUI's simple view: these fields only (All fields: every one; a
     "Feeders": ("collector", "feeder", "section", "cable", "length", "unit", "units", "units_of"),
 }
 SIMPLE_TABS = ("Plant", "MPT", "Generators", "GSUs", "Feeders", "Cables", "Dyr_Params", "PSCAD_Params", "Output")
+_is = lambda key, v: lambda r: (_txt(r.get(key)) or "").upper() == v
+SHOW_WITH = {  # the simple view: a column it hides, shown where a row's other value calls for it
+    ("Generators", "unit_pf"): lambda r: _txt(r.get("unit_qmax_mvar")) is None,      # it sets a blank Qmax
+    ("Generators", "fixed_q_mvar"): _is("q_mode", "FIXED"), ("Generators", "fixed_pf"): _is("q_mode", "FIXED"),
+    ("Generators", "coll_r"): _is("collector", "EQUIVALENT"), ("Generators", "coll_x"): _is("collector", "EQUIVALENT"),
+    ("Generators", "coll_b"): _is("collector", "EQUIVALENT"),
+    ("Generators", "coll_units"): _is("collector", "EQUIVALENT"),
+}
 PAGE_COLS = {  # pages that show part of a sheet, in either view: the Generators sheet as its generators and its GSUs
     "Generators": tuple(c[0] for c in GEN_COLS if not c[0].startswith("gsu_")),
     "GSUs": ("name", "units") + tuple(c[0] for c in GEN_COLS if c[0].startswith("gsu_")),
@@ -2760,7 +2769,8 @@ def unit_rating(r, w):
     qmax = _num(r, "unit_qmax_mvar", w)
     if qmax is None:
         if not 0.0 < abs(pf) <= 1.0:
-            raise InputError("%s: Unit PF must be between 0 and 1" % w)
+            raise InputError("%s: %s %g must be between 0 and 1 (it sets Unit Qmax, which is blank)" % (
+                w, _label("unit_pf", w), pf))
         qmax = abs(pmax) * math.tan(math.acos(abs(pf)))
     qmin = _num(r, "unit_qmin_mvar", w, -qmax)
     s = _num(r, "unit_mva", w, None, positive=True) or math.hypot(max(abs(pmax), abs(pmin)), max(qmax, -qmin))
@@ -2897,11 +2907,13 @@ def gen_data(r):
         fpf = _num(r, "fixed_pf", w)
         if q is None and fpf is not None:
             if not 0.0 < abs(fpf) <= 1.0:
-                raise InputError("%s: Fixed PF must be between 0 and 1" % w)
+                raise InputError("%s: %s %g must be between 0 and 1 (+ lagging, - leading)" % (
+                    w, _label("fixed_pf", w), fpf))
             q = ("pf", fpf)
         g["q_fixed"] = q if q is not None else 0.0
     if pmax > s + 1e-9:
-        raise InputError("%s: Unit Pmax %.3f MW is above Unit MVA %.3f" % (w, pmax, s))
+        raise InputError("%s: %s %.3f MW is above %s %.3f" % (w, _label("unit_pmax_mw", w), pmax,
+                                                              _label("unit_mva", w), s))
     return g
 
 
@@ -2924,6 +2936,9 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
     if _txt(r.get("unit_qmax_mvar")) is not None:
         _unused(net.notes, r, ("unit_pf",), w, "'Unit Qmax' is given (Unit PF sets Qmax where it is blank)",
                 {"unit_pf": 0.95})
+    if g["type"] == "BESS" and _txt(r.get("unit_pmin_mw")) is None:
+        net.notes.append("CHECK: %s: %s blank (0) -- this BESS does not charge: give its charging limit (-Pmax ...) "
+                         "if it does" % (w, _label("unit_pmin_mw", w)))
     if g["unit"]["qmax"] < 0:                        # given so, with its Qmin below it: Q taken only
         net.notes.append("CHECK: %s: %s %g is below 0 -- this unit only takes Q (%g .. %g MVAr)" % (
             w, _label("unit_qmax_mvar", w), g["unit"]["qmax"], g["unit"]["qmin"], g["unit"]["qmax"]))
@@ -2992,6 +3007,13 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
                                   "nll_pct": 0.0, "im_pct": 0.0, "rate": cnt * gsu_mva, "count": 1, "where": w})
         if g["mbase"] > cnt * gsu_mva * 1.02:
             net.notes.append("CHECK: %s: units %.1f MVA behind GSUs of %.1f MVA" % (w, g["mbase"], cnt * gsu_mva))
+        elif cnt * gsu_mva > 2.0 * g["mbase"]:           # their impedance on their MVA: far too stiff a GSU
+            net.notes.append("CHECK: %s: GSUs %d x %s MVA = %s MVA for units of %s MVA in all%s -- the GSU's Z is on "
+                             "its MVA: give %s" % (
+                                 w, cnt, _g(gsu_mva), _g(cnt * gsu_mva), _g(g["mbase"]),
+                                 " ('GSU count' blank: one GSU per unit)" if _txt(r.get("gsu_count")) is None else "",
+                                 "'GSU count', the GSUs there are" if _txt(r.get("gsu_count")) is None else
+                                 "the GSUs' count and MVA as they are"))
     else:
         g["gsu"] = None
         lv = net.alias[mv.upper()]
@@ -3192,8 +3214,13 @@ def machines(net, rows):
             done.append("ID %s" % g["id"])
         for lo, hi, what in (("pmin", "pmax", "P"), ("qmin", "qmax", "Q")):
             if g[lo] > g[hi] + 1e-9:
-                raise InputError("%s: %s %smin %s is above its %smax %s" % (w, g["name"], what, _g(g[lo]), what,
-                                                                           _g(g[hi])))
+                blank = [x for x in (lo, hi) if _txt(r.get(x + ("_mw" if what == "P" else "_mvar"))) is None]
+                raise InputError("%s: %s %smin %s is above its %smax %s%s" % (
+                    w, g["name"], what, _g(g[lo]), what, _g(g[hi]), (" (%s blank: its units x its generator's "
+                                                                     "Unit %s)" % (" and ".join(
+                                                                         x.capitalize() for x in blank), ", Unit ".join(
+                                                                         x.capitalize() for x in blank))) if blank
+                    else ""))
         if g["dispatch"] > g["pmax"] + 1e-6 or g["dispatch"] < g["pmin"] - 1e-6:
             raise InputError("%s: %s Pgen %.3f MW is outside Pmin..Pmax (%.3f .. %.3f MW)"
                              % (w, g["name"], g["dispatch"], g["pmin"], g["pmax"]))
@@ -9910,7 +9937,9 @@ def gui(start=None):
         if g is None or key not in g.keys:
             return False
         note = g.cols[g.keys.index(key)][2]
-        return any(_says_more(note, r.get(key)) for r in g.rows)
+        want = SHOW_WITH.get((g.sheet, key))
+        return any(_says_more(note, r.get(key)) or (want is not None and any(v for v in r.values()) and want(r))
+                   for r in g.rows)
 
     def shown_view(sheet, key=None):
         """Whether a tab (and a field of it) shows now: in the simple view, the fields most plants need and any
