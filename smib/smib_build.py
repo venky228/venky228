@@ -9908,17 +9908,46 @@ def gui(start=None):
                            "%.6g" % tot["dispatch"]))):
             if k in hints and not hints[k][2].startswith("Req"):
                 hints[k][0].configure(text=txt)
+        if "req_live" in app:                         # the SCR's short-circuit MVA: on the generators' Pmax
+            app["req_live"]()
+
+    def grid_says(v):
+        """What the grid fields make of the POI, live: the short-circuit MVA of each SCR given (SCR x SCR base),
+           or the SCR of the short-circuit MVA / R, X given."""
+        f = lambda x: "%.4g" % x
+        try:
+            base = float(v["scr_base_mw"]) if v["scr_base_mw"] else plant_totals(data)[2]["pmax"]
+            what = "%s MW (%s)" % (f(base), "SCR base" if v["scr_base_mw"] else "the generators' Pmax")
+            if v["grid_x_pu"]:
+                sc = float(v["sbase_mva"] or 100.0) / abs(complex(float(v["grid_r_pu"] or 0.0), float(v["grid_x_pu"])))
+                return "Grid R, X: %s MVA short-circuit at the POI -- SCR %s on %s" % (
+                    f(sc), f(sc / base) if base > 0 else "-", what)
+            if v["grid_sc_mva"]:
+                xs = [float(x) for x in re.split(r"[,;\s]+", v["grid_sc_mva"]) if x]
+                return "short-circuit MVA given: SCR %s on %s" % (
+                    ", ".join(f(x / base) for x in xs) if base > 0 else "-", what)
+            xs = [float(x) for x in re.split(r"[,;\s]+", v["grid_scr"]) if x]
+            if not base > 0:
+                return "the SCR needs an SCR base (the generators have no Pmax yet)"
+            return "short-circuit at the POI = SCR x %s: %s%s" % (what, ", ".join(
+                "%s MVA" % f(x * base) for x in xs), ("  (SCR %s: a set of models for each)" % ", ".join(
+                    f(x) for x in xs)) if len(xs) > 1 else "")
+        except (ValueError, ZeroDivisionError):
+            return "several (3, 5, 10): a set of models for each"
 
     def req_live(*_a):
-        """A required field's red note only while it is blank (the grid's: while none of its three ways is given)."""
+        """A required field's red note only while it is blank (the grid's: while none of its three ways is given);
+           given, the grid's says what it makes of the POI."""
         v = dict((k, app["vars"][k].get().strip()) for k in ("poi_kv", "grid_scr", "grid_sc_mva", "grid_r_pu",
-                                                              "grid_x_pu"))
+                                                              "grid_x_pu", "scr_base_mw", "sbase_mva"))
         for k, ok, done in (("poi_kv", v["poi_kv"], ""),
                             ("grid_scr", v["grid_scr"] or v["grid_sc_mva"] or (v["grid_r_pu"] and v["grid_x_pu"]),
-                             "several (3, 5, 10): a set of models for each")):
+                             None)):
             h, txt, style = hints[k]
-            h.configure(text=txt if not ok else done, style=style if not ok else "Hint.TLabel")
-    for k in ("poi_kv", "grid_scr", "grid_sc_mva", "grid_r_pu", "grid_x_pu"):
+            h.configure(text=txt if not ok else (grid_says(v) if done is None else done),
+                        style=style if not ok else "Hint.TLabel")
+    app["req_live"] = req_live
+    for k in ("poi_kv", "grid_scr", "grid_sc_mva", "grid_r_pu", "grid_x_pu", "scr_base_mw", "sbase_mva"):
         v = app["vars"][k]
         v.trace_add("write", req_live) if hasattr(v, "trace_add") else v.trace("w", req_live)
 
