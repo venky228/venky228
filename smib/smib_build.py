@@ -132,6 +132,17 @@
      <name>_PSCAD_DATA.txt   every PSCAD value: ohm, H, uF, kV, MVA, pu on the
                              equipment's own base, vector groups, initial values
 
+   CHECKS -- every input read, none dropped unsaid
+     An input that cannot be used stops the build, naming its sheet, row and
+     field (the GUI takes you there). One the model built does not use (a
+     control mode's other targets, three-winding values on a two-winding MPT,
+     collector R X B beside Feeders rows ...) is a NOTE saying so and why.
+     What to look at -- a voltage outside 0.9 .. 1.1, a branch past its
+     rating, kV that do not match, a value given twice that disagrees, a
+     vendor model's AC port that is not 3-phase, a PSCAD drawing past its
+     largest page -- is a CHECK or WARNING: in the report, and listed by the
+     GUI's Check inputs.
+
    OUTPUT -- nothing that exists is ever overwritten
      <name> = the plant's name and its model type: Hybrid_PV100_BESS100_SMIB, ..._DETAILED
      Models\\Detailed_Models\\ (DETAILED) or Models\\Equivalent_Models\\ (SMIB),
@@ -267,7 +278,7 @@ PLANT_FIELDS = [
     ("tie_parallel", "Gen-tie circuits", "", "identical circuits in parallel (blank = 1)", None),
     ("tie_rate_mva", "Gen-tie rating", "MVA", "one circuit (blank = typical for the POI kV)", None),
     ("control_mode", "Control mode", "", "Q: Q at the POI | PF: power factor at the POI | V: the plant holds the POI "
-     "voltage with the grid at Grid voltage", ["Q", "PF", "V"]),
+     "voltage with the grid at Grid voltage (blank = Q)", ["Q", "PF", "V"]),
     ("v_poi_pu", "POI voltage", "pu", "the POI voltage the plant holds (blank = 1.0)", None),
     ("q_poi_mvar", "Q at POI", "MVAr", "mode Q; + = into the grid (blank = 0)", None),
     ("pf_poi", "PF at POI", "", "mode PF; + lagging (Q into the grid), - leading", None),
@@ -282,14 +293,15 @@ PLANT_FIELDS = [
     ("pscad_time_step_us", "PSCAD time step", "us", "blank = 10 (the vendor model's own requirement wins)", None),
     ("pscad_duration_s", "PSCAD duration", "s", "blank = 5", None),
     ("pscad_plot_step_us", "PSCAD plot step", "us", "blank = 100", None),
-    ("pscad_meter", "PSCAD meter at POI", "", "YES = a multimeter between the grid and the POI", ["YES", "NO"]),
+    ("pscad_meter", "PSCAD meter at POI", "", "YES = a multimeter between the grid and the POI (blank = YES)",
+     ["YES", "NO"]),
     ("pscad_inv_meter", "PSCAD meter at each inverter", "", "YES = a multimeter between each inverter and its "
      "GSU: P_, Q_, V_<unit> in MW, MVAr, kV (blank = YES)", ["YES", "NO"]),
     ("pscad_lines", "PSCAD lines as", "", "PI = the gen-tie, each collector and each feeder section one Coupled PI "
      "Section (R, X, B in pu, its charging inside); RLC = an R and an L, the charging a C at each end (blank = PI)",
      ["PI", "RLC"]),
     ("pscad_fault", "PSCAD fault at POI", "", "YES = a fault on the grid side of the POI with its timed fault logic, "
-     "as vendors' test cases have", ["YES", "NO"]),
+     "as vendors' test cases have (blank = YES)", ["YES", "NO"]),
     ("pscad_fault_s", "PSCAD fault time", "s", "when the fault starts (blank = 100: none in the run)", None),
     ("pscad_fault_dur_s", "PSCAD fault duration", "s", "blank = 0.15", None),
     ("pscad_fault_type", "PSCAD fault type", "", "the phases faulted, G = to ground (blank = ABCG)", FAULT_TYPES),
@@ -352,7 +364,8 @@ GEN_COLS = [
     ("unit_pf", "Unit PF", "Q at Pmax when Qmax is blank (blank = 0.95)", None, 7),
     ("kv", "Terminal kV", "blank = GSU LV kV", None, 8),
     ("dispatch_mw", "Dispatch MW", "this generator's total; blank = Pmax (BESS charging: negative)", None, 8),
-    ("q_mode", "Q mode", "share: holds the POI with the other share generators | fixed: its own Q",
+    ("q_mode", "Q mode", "share: holds the POI with the other share generators | fixed: its own Q "
+     "(blank = share)",
      ["share", "fixed"], 7),
     ("fixed_q_mvar", "Fixed Q MVAr", "Q mode fixed (blank = 0)", None, 8),
     ("fixed_pf", "Fixed PF", "Q mode fixed, instead of Fixed Q (+ lagging)", None, 7),
@@ -364,12 +377,14 @@ GEN_COLS = [
     ("gsu_x_r", "GSU X/R", "", None, 6),
     ("gsu_vector", "GSU vector group", "", None, 8),
     ("gsu_tap", "GSU HV tap", "blank = 1", None, 6),
-    ("collector", "Collector", "FEEDERS: WECC equivalent of its Feeders rows | EQUIVALENT: R X B here | NONE",
+    ("collector", "Collector", "FEEDERS: WECC equivalent of its Feeders rows | EQUIVALENT: R X B here | NONE (blank = "
+     "FEEDERS where Feeders has rows for it, else EQUIVALENT where Collector X is given, else NONE)",
      ["FEEDERS", "EQUIVALENT", "NONE"], 10),
     ("coll_r", "Collector R", "EQUIVALENT", None, 8),
     ("coll_x", "Collector X", "EQUIVALENT", None, 8),
     ("coll_b", "Collector B", "EQUIVALENT, total charging", None, 8),
-    ("coll_units", "Collector units", "pu: system base at collector kV | ohm: R X in ohm, B in uS", ["pu", "ohm"], 8),
+    ("coll_units", "Collector units", "pu: system base at collector kV | ohm: R X in ohm, B in uS (blank = pu)",
+     ["pu", "ohm"], 8),
     ("zsorce_x", "ZSORCE X pu", "on MBASE (blank: inverters 9999, SYNC X''d)", None, 8),
     ("wmod", "WMOD", "blank: inverters 1, SYNC 0", None, 6),
     ("regc", "Converter model", "REGC_A: a current source, the standard | REGC_B: a voltage source behind ZSORCE "
@@ -423,7 +438,8 @@ COLLECTOR_COLS = [
 ]
 
 LOAD_COLS = [
-    ("kind", "Kind", "# LOAD: constant impedance | SHUNT: + capacitor, - reactor", ["LOAD", "SHUNT"], 8),
+    ("kind", "Kind", "# LOAD: constant impedance | SHUNT: + capacitor, - reactor (blank = LOAD)", ["LOAD", "SHUNT"],
+     8),
     ("at", "At bus", "POI, HV, MPT1, MPT1:TV, PV:MV, PV ...", None, 10),
     ("mw", "MW", "LOAD, at 1 pu", None, 7),
     ("mvar", "MVAr", "at 1 pu: LOAD + inductive | SHUNT + capacitive", None, 9),
@@ -791,6 +807,30 @@ def _label(key, where=None):
     return "'%s'" % _SHEET_LABELS.get((sheet, key), _LABELS.get(key, key))
 
 
+def _unused(notes, row, keys, where, why, defaults=None):
+    """Values given that the model built does not use: one NOTE (into notes: a list, or a function taking it)
+       naming them, their values and why -- none is dropped unsaid. A value equal to its blank's (defaults: key ->
+       what blank means) says nothing more: left out. -> the keys named."""
+    got = []
+    for k in keys:
+        v = _txt(row.get(k))
+        if v is None:
+            continue
+        dv = (defaults or {}).get(k)
+        if dv is not None:
+            try:
+                if float(v) == float(dv):
+                    continue
+            except ValueError:
+                if v.upper() == str(dv).upper():
+                    continue
+        got.append(k)
+    if got:
+        (notes.append if hasattr(notes, "append") else notes)("NOTE: %s: %s not used -- %s" % (where, ", ".join(
+            "%s %s" % (_label(k, where), _txt(row.get(k))) for k in got), why))
+    return got
+
+
 def _g(x, nd=6):
     """A number short and exact enough for PSS/E's and PSCAD's free format."""
     if isinstance(x, bool):
@@ -862,6 +902,8 @@ def read_xlsx(path):
             part = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
             if part in names:
                 out[sh.get("name")] = _sheet_rows(ET.fromstring(z.read(part)), shared)
+    except (KeyError, ET.ParseError, ValueError) as e:     # a zip, but not a workbook Excel can open
+        raise InputError("%s is not an .xlsx workbook Excel wrote (%s) -- save it from Excel as .xlsx" % (path, e))
     finally:
         z.close()
     return out
@@ -920,8 +962,9 @@ def _skip(row):
     return first is None or (isinstance(first, str) and first.strip().startswith("#"))
 
 
-def parse_workbook(book, path):
-    """The workbook as {"plant": {key: value}, "<table>": [{key: value, "_where": ...}]}."""
+def parse_workbook(book, path, keep_comments=False):
+    """The workbook as {"plant": {key: value}, "<table>": [{key: value, "_where": ...}]}. keep_comments: a row of
+       the user's starting with # (one set aside) is kept as it is -- the GUI shows it; the build skips it."""
     inp = {"plant": {}, "_source": path}
     rows = _find_sheet(book, "Plant")
     if rows is None:
@@ -967,8 +1010,8 @@ def parse_workbook(book, path):
                 colmap[i] = kk
         for k in range(hrow + 1, len(rows)):
             r = rows[k]
-            if not r or _skip(r):
-                continue
+            if not r or _skip(r) and (not keep_comments or k == hrow + 1 or all(x is None for x in r)):
+                continue                             # (right below the titles: the template's notes row)
             d = {"_where": "%s row %d" % (sheet, k + 1)}
             for i, kk in colmap.items():
                 d[kk] = r[i] if i < len(r) else None
@@ -1275,6 +1318,30 @@ def _blank_means(note):
     return m.group(1).strip().rstrip(".,") if m else ""
 
 
+def _isnum(v):
+    """Whether a cell reads as a number."""
+    try:
+        float(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _says_more(note, v):
+    """Whether a value says more than a blank would: it is given, and it is not the very default its note names
+       (blank = 1, blank = YES ...) -- the GUI's simple view shows such a field even where it hides its kind."""
+    v = _txt(v)
+    if v is None:
+        return False
+    m = re.match(r"^([-+\w.]+)\s*(\(.*)?$", _blank_means(note))
+    if not m:
+        return True
+    try:
+        return float(m.group(1)) != float(v)
+    except ValueError:
+        return m.group(1).upper() != v.upper()
+
+
 def _used_by(sheet, key):
     if sheet == "Dyr_Records" or key in ("regc_repc", "wmod"):
         return "PSS/E"
@@ -1550,60 +1617,90 @@ def ohl_typical(kv, f):
     return {"kv": t[0], "r": t[1], "x": t[2] * f / 60.0, "b": t[3] * f / 60.0, "rate": t[4], "cond": t[5]}
 
 
-def line_data(d, prefix, kv, sb, f, where):
-    """A line from <prefix>length / _unit / _r_per ... (or _r_ohm ... totals): None when none is given. The per
-       length values are per <prefix>per_unit (blank = km or mi, whichever brings them nearer a typical line of
-       its kV); blank ones take a typical overhead line of its kV (OHL_TYPICAL), and ones far from it are CHECKed
-       (a unit mixed up).
+def line_data(d, prefix, kv, sb, f, where, unused=None):
+    """A line from <prefix>length / _unit / _r_per ... (or _r_ohm ... totals): None when none is given. Each of
+       R, X, B is its total where given, else its value per length times the length: per <prefix>per_unit (blank =
+       km or mi, whichever brings them nearer a typical line of its kV); with no totals given, blank ones take a
+       typical overhead line of its kV (OHL_TYPICAL), and ones far from it are CHECKed (a unit mixed up). A value
+       given twice (a total and per length, B and C) that disagrees is CHECKed; unused (a list): a NOTE there of
+       the values given for a line that is not there (no length, no totals) -- none is dropped unsaid.
        r, x, b in pu on sb at kv for one circuit; R, X (ohm), B (uS) one circuit; count circuits; notes."""
     g = lambda k: d.get(prefix + k)
     length = _num(d, prefix + "length", where)
     totals = any(g(k) not in (None, "") for k in ("r_ohm", "x_ohm"))
     if not totals and not length:
+        if unused is not None:
+            _unused(unused, d, [prefix + k for k in ("unit", "per_unit", "r_per", "x_per", "b_per", "c_per", "b_us",
+                                                     "parallel", "rate_mva")], where,
+                    "no length (and no R, X totals): no line here", {prefix + "unit": "km", prefix + "parallel": 1})
         return None
     unit = _choice(d, prefix + "unit", where, LEN_UNITS, "km")
     per_unit = _choice(d, prefix + "per_unit", where, LEN_UNITS, None)
     km = (length or 0.0) * LEN_KM[unit]
     typ, notes, used = ohl_typical(kv, f), [], []
-    if per_unit is None:                              # per km or per mile: whichever is nearer a line of its kV
-        given = [(v, typ[k]) for v, k in ((_num(d, prefix + "r_per", where), "r"), (_num(d, prefix + "x_per", where),
-                                                                                   "x"),
-                                          (_num(d, prefix + "b_per", where), "b")) if v]
+    per = dict((k, _num(d, prefix + k, where)) for k in ("r_per", "x_per", "b_per", "c_per"))
+    tot = dict((k, _num(d, prefix + k, where)) for k in ("r_ohm", "x_ohm", "b_us"))
+    inferred = per_unit is None
+    if inferred:                                      # per km or per mile: whichever is nearer a line of its kV
+        given = [(v, typ[k]) for v, k in ((per["r_per"], "r"), (per["x_per"], "x"), (per["b_per"], "b")) if v]
         per_unit = min(("km", "mi"), key=lambda u: sum(abs(math.log(abs(v) / LEN_KM[u] / t)) for v, t in given))
-        if given and not totals:
-            notes.append("NOTE: %s: values per blank -- R, X, B taken per %s (nearer a typical %g kV line than per "
-                         "%s); set its 'values per' if they are per another length" % (
-                             where, per_unit, typ["kv"], "mi" if per_unit == "km" else "km"))
-    if totals:
-        R = _num(d, prefix + "r_ohm", where, 0.0)
-        X = _num(d, prefix + "x_ohm", where, 0.0)
-        B = _num(d, prefix + "b_us", where, 0.0)
-    else:
-        def per_km(key, typical, what):
-            v = _num(d, prefix + key, where)
-            if v is None:
-                used.append(what)
-                return typical
-            return v / LEN_KM[per_unit]               # per <per_unit> -> per km
-        r_km, x_km = per_km("r_per", typ["r"], "R"), per_km("x_per", typ["x"], "X")
-        b, c = _num(d, prefix + "b_per", where), _num(d, prefix + "c_per", where)
-        if b is None and c is None:
-            used.append("B")
-            b_km = typ["b"]
-        else:
-            b_km = (b if b is not None else 2.0 * math.pi * f * c) / LEN_KM[per_unit]
-        R, X, B = r_km * km, x_km * km, b_km * km
-        if used:
-            notes.append("NOTE: %s: %s per length not given -- a typical %g kV overhead line (%s, one circuit): R %g, "
-                         "X %g ohm/km, B %g uS/km" % (where, ", ".join(used), typ["kv"], typ["cond"], typ["r"],
-                                                      round(typ["x"], 4), round(typ["b"], 4)))
+    b_per = per["b_per"]
+    if per["c_per"] is not None:                      # C (uF) instead of B (uS)
+        b_c = 2.0 * math.pi * f * per["c_per"]
+        if b_per is None:
+            b_per = b_c
+        elif abs(b_c - b_per) > 0.01 * max(abs(b_per), 1e-9):
+            notes.append("CHECK: %s: B per length %g uS and C per length %g uF (= %.4g uS) disagree -- B is used"
+                         % (where, b_per, per["c_per"], b_c))
+    per_len, zero, unsaid, given_by = [], [], [], {}
+
+    def one(t, p, typical, what, unit_txt, tkey=None, pkey=None):
+        """One of R, X, B for one circuit: the total given, else per length x the length, else typical (or 0)."""
+        if p is not None and km <= 0:
+            unsaid.append(what)
+            p = None
+        given_by[what] = prefix + (tkey if t is not None else pkey if p is not None else "")
+        if t is not None:
+            if p is not None and abs(p / LEN_KM[per_unit] * km - t) > 0.01 * max(abs(t), 1e-9):
+                notes.append("CHECK: %s: %s given as a total, %g %s, and per length, %g %s/%s x %.4g %s = %.4g %s "
+                             "-- they disagree: the total is used" % (
+                                 where, what, t, unit_txt, p, unit_txt, per_unit, length, unit,
+                                 p / LEN_KM[per_unit] * km, unit_txt))
+            return t
+        if p is not None:
+            per_len.append(what)
+            return p / LEN_KM[per_unit] * km          # per <per_unit> -> per km, times the length
+        if totals:                                    # totals given: what is not given is none
+            zero.append(what)
+            return 0.0
+        used.append(what)
+        return typical * km
+    R = one(tot["r_ohm"], per["r_per"], typ["r"], "R", "ohm", "r_ohm", "r_per")
+    X = one(tot["x_ohm"], per["x_per"], typ["x"], "X", "ohm", "x_ohm", "x_per")
+    B = one(tot["b_us"], b_per, typ["b"], "B", "uS", "b_us", "b_per" if per["b_per"] is not None else "c_per")
+    if inferred and per_len:
+        notes.append("NOTE: %s: values per blank -- %s taken per %s (nearer a typical %g kV line than per %s); set "
+                     "its 'values per' if they are per another length" % (
+                         where, ", ".join(per_len), per_unit, typ["kv"], "mi" if per_unit == "km" else "km"))
+    if unsaid:
+        notes.append("CHECK: %s: %s per length not used -- no length is given (the totals are used)" % (
+            where, ", ".join(unsaid)))
+    if zero:
+        notes.append("NOTE: %s: %s not given with the totals -- 0" % (where, ", ".join(zero)))
+    if used:
+        notes.append("NOTE: %s: %s per length not given -- a typical %g kV overhead line (%s, one circuit): R %g, "
+                     "X %g ohm/km, B %g uS/km" % (where, ", ".join(used), typ["kv"], typ["cond"], typ["r"],
+                                                  round(typ["x"], 4), round(typ["b"], 4)))
     if abs(complex(R, X)) < 1e-9:
-        raise InputError("%s: the line has no impedance" % where)
+        raise InputError("%s: the line has no impedance -- %s and %s (or %s and %s) are 0" % (
+            where, _label(prefix + "r_per", where), _label(prefix + "x_per", where), _label(prefix + "r_ohm", where),
+            _label(prefix + "x_ohm", where)))
     if km > 0:                                        # far from a line of its kV: a unit mixed up?
         for what, v, t in (("R", R / km, typ["r"]), ("X", X / km, typ["x"]), ("B", B / km, typ["b"])):
             if v > 0 and not 0.2 <= v / t <= 5.0:
-                msg = "%s: %s %.4g %s/km is %s a typical %g kV line's %.4g -- %s" % (
-                    where, what, v, "uS" if what == "B" else "ohm", "%.0f times" % (v / t) if v > t else
+                msg = "%s: %s %.4g %s/km%s is %s a typical %g kV line's %.4g -- %s" % (
+                    where, what, v, "uS" if what == "B" else "ohm", (" (from %s)" % _label(given_by[what], where))
+                    if given_by.get(what, prefix) != prefix else "", "%.0f times" % (v / t) if v > t else
                     "1/%.0f of" % (t / v), typ["kv"], t, "the R, X, B are read per %s: set 'values per' to the "
                     "length they are per (km, mi ...)" % per_unit if not totals else "check the totals and the length")
                 if not 0.02 <= v / t <= 50.0:
@@ -1623,6 +1720,8 @@ def tx_rx(z_pct, x_r, load_loss_kw, mva, where, what):
     if z_pct is None or not z_pct > 0:
         raise InputError("%s: %s impedance (Z %%) is missing" % (where, what))
     z = z_pct / 100.0
+    if load_loss_kw is not None and load_loss_kw < 0:
+        raise InputError("%s: %s load loss %g kW -- 0 or more" % (where, what, load_loss_kw))
     if load_loss_kw:
         r = load_loss_kw / 1000.0 / mva
         if r >= z:
@@ -1761,9 +1860,69 @@ def read_cables(rows, log=None):
     return out
 
 
+_OEM_READ = {}
+
+
 def oem_model(path):
     """An OEM's PSCAD model (.pscx case or .pslx library) read as XML, without PSCAD -> (project name,
-       [{name, desc, ports [(name, dim, kind)], params [(name, desc)], ids [component IDs placed]}])."""
+       [{name, desc, ports [(name, dim, kind)], params [(name, desc)], ids [component IDs placed]}]) -- read once
+       while the file stays as it is."""
+    try:
+        st = os.stat(path)
+        key = (os.path.abspath(path), st.st_mtime, st.st_size)
+    except OSError:
+        key = None
+    if key in _OEM_READ:
+        return _OEM_READ[key]
+    got = _oem_model(path)
+    if key:
+        if len(_OEM_READ) > 8:
+            _OEM_READ.clear()
+        _OEM_READ[key] = got
+    return got
+
+
+def udm_ports_check(g, notes):
+    """A generator's vendor model (UDM): its AC port against its definition's own ports, read from the OEM's
+       file -- a port it has not, one not 3-phase, two 3-phase ones and none named: CHECKed (the PSCAD build would
+       wire the wrong one, or none)."""
+    ps, w = g["pscad"], g["where"]
+    src = ps["source"] or ps["library"]
+    if not src or not os.path.isfile(src) or not (ps["definition"] or ps["iid"]):
+        return
+    try:
+        _scope, defs = oem_model(src)
+    except Exception:
+        return                                       # (a file PSCAD may still read: said when its form is read)
+    want = (ps["definition"] or "").split(":")[-1].upper()
+    d = next((x for x in defs if want and x["name"].upper() == want), None) or \
+        next((x for x in defs if ps["iid"] and str(ps["iid"]) in x["ids"]), None)
+    if d is None:
+        if want:
+            notes.append("CHECK: %s: %s %s is no definition of %s -- its definitions: %s" % (
+                w, _label("pscad_definition"), ps["definition"], os.path.basename(src),
+                ", ".join(x["name"] for x in defs[:20]) + (" ..." if len(defs) > 20 else "")))
+        return
+    el = [(n, dim) for n, dim, kind in d["ports"] if kind == "electrical"]
+    say = ", ".join("%s (%d-phase)" % (n, dim) for n, dim in el) or "none"
+    three = [n for n, dim in el if dim == 3]
+    if ps["ac_port"]:
+        hit = [(n, dim) for n, dim in el if n.upper() == ps["ac_port"].upper()]
+        if not hit:
+            notes.append("CHECK: %s: %s %s is no port of %s -- its electrical ports: %s" % (
+                w, _label("pscad_ac_port"), ps["ac_port"], d["name"], say))
+        elif hit[0][1] != 3:
+            notes.append("CHECK: %s: %s %s of %s is %d-phase, the plant's node 3-phase -- its electrical ports: %s"
+                         % (w, _label("pscad_ac_port"), ps["ac_port"], d["name"], hit[0][1], say))
+    elif not three:
+        notes.append("CHECK: %s: %s has no 3-phase port -- its electrical ports: %s; give %s" % (
+            w, d["name"], say, _label("pscad_ac_port")))
+    elif len(three) > 1:
+        notes.append("CHECK: %s: %s has %d 3-phase ports (%s) -- %s is taken as its AC port: give %s if it is "
+                     "another" % (w, d["name"], len(three), ", ".join(three), three[0], _label("pscad_ac_port")))
+
+
+def _oem_model(path):
     import xml.etree.ElementTree as ET
     root = ET.parse(path).getroot()
     scope = root.get("name") or os.path.splitext(os.path.basename(path))[0]
@@ -1789,7 +1948,8 @@ def oem_model(path):
                     dim = int(x.get("dim") or prm.get("dim") or 1)
                 except ValueError:
                     dim = 1
-                ports.append((x.get("name") or prm["name"], dim, kind))
+                if (x.get("name") or prm["name"]) not in [q[0] for q in ports]:   # PSCAD 5: in svg and graphics
+                    ports.append((x.get("name") or prm["name"], dim, kind))
             elif t == "parameter" and x.get("name"):
                 params.append((x.get("name"), x.get("desc") or ""))
         defs[el.get("name")] = {"name": el.get("name"), "desc": desc, "ports": ports, "params": params}
@@ -2091,11 +2251,17 @@ def udm_default_shown(sec):
         lab.count("  >  ") == 1 and not str(sec.get("defn") or "").lower().startswith("master:"))
 
 
+def udm_has_set(sec):
+    """Whether a udm_table section holds a value of the user's (a PSCAD_Params row)."""
+    return any(how == "set" for _k, e in sec["params"] for _v, how in e["cells"].values())
+
+
 def udm_shown(secs):
-    """The sections the PSCAD_Params page lists: as chosen (Choose..., remembered), else as udm_default_shown."""
+    """The sections the PSCAD_Params page lists: as chosen (Choose..., remembered), else as udm_default_shown --
+       and always one that holds a value of the user's (none is out of sight)."""
     got = gui_prefs().get("pscad_pages")
     got = got if isinstance(got, dict) else {}
-    return [x["label"] for x in secs if got.get(x["label"], udm_default_shown(x))]
+    return [x["label"] for x in secs if got.get(x["label"], udm_default_shown(x)) or udm_has_set(x)]
 
 
 def udm_table(data, library=False):
@@ -2222,6 +2388,8 @@ def wecc_collector(cname, rows, cables, kv, sb, f, unit_mw, own_gen, log):
                 raise InputError("%s: section %d of feeder %s is given twice" % (w, num, fname))
             last = max(last, num)
             n = _int(r, "units", w, 0, minimum=0)
+            if not n and _txt(r.get("units_of")):
+                _unused(log, r, ("units_of",), w, "no units on this row")
             if n:
                 who = (_txt(r.get("units_of")) or own_gen or "").upper()
                 if not who:
@@ -2356,11 +2524,16 @@ def build_network(inp, log):
     pl = inp["plant"]
     W = "Plant"
     name = _safe_name(_txt(pl.get("name")) or "SMIB")
-    if name != (_txt(pl.get("name")) or "SMIB"):
-        log("NOTE: model name %r is used as %r (letters, digits and _ only; 30 at most)" % (pl.get("name"), name))
     sb = _num(pl, "sbase_mva", W, 100.0, positive=True)
     f = _num(pl, "freq_hz", W, 60.0, positive=True)
+    if not 40.0 <= f <= 70.0:
+        raise InputError("Plant: 'Frequency' = %g Hz -- 50 or 60" % f)
     net = Net(name, sb, f)
+    if f not in (50.0, 60.0):
+        net.notes.append("CHECK: Plant: 'Frequency' %g Hz -- not 50 or 60" % f)
+    if name != (_txt(pl.get("name")) or "SMIB"):
+        net.notes.append("NOTE: model name %r is used as %r (letters, digits and _ only; 30 at most)" % (
+            pl.get("name"), name))
     poi_kv = _num(pl, "poi_kv", W, required=True, positive=True)
     net.add_bus("IB", poi_kv, W)
     net.add_bus("POI", poi_kv, W)
@@ -2368,7 +2541,7 @@ def build_network(inp, log):
     if poi_name:
         net.bus["POI"]["name"] = poi_name[:12]
 
-    tie = line_data(pl, "tie_", poi_kv, sb, f, "Plant (gen-tie)")
+    tie = line_data(pl, "tie_", poi_kv, sb, f, "Plant (gen-tie)", net.notes)
     if tie:
         net.notes.extend(tie["notes"])
         net.add_bus("HV", poi_kv, W)
@@ -2408,7 +2581,7 @@ def build_network(inp, log):
         if not rows:
             raise InputError("%s: collector %s has no rows in Feeders" % (w, cname))
         used.add(cname.upper())
-        res = wecc_collector(cname, rows, cables, net.kv(at), sb, f, unit_mw, None, log)
+        res = wecc_collector(cname, rows, cables, net.kv(at), sb, f, unit_mw, None, net.notes.append)
         res.update({"root": at, "own": None, "end": "C:" + cname})
         net.colls[cname] = res
         net.add_bus("C:" + cname, net.kv(at), w, aliases=(cname,))
@@ -2440,13 +2613,25 @@ def build_network(inp, log):
         expand_collectors(net)
     machines(net, inp["machines"])
 
-    taken = set()
+    taken, det_nodes = set(), {}
+    if net.model == "SMIB":                          # the DETAILED model's nodes: here, its collector's equivalent
+        for cname, res in net.colls.items():
+            for fd in res.get("feeders", []):
+                for sc in fd["sections"]:
+                    nm = ("%s_%s_S%d" % (_node(cname), _node(fd["name"]), sc["num"])).upper()
+                    det_nodes[nm] = det_nodes[nm + ":LV"] = res["end"]
     for r in inp["loads_shunts"]:
         w = r["_where"]
         kind = _choice(r, "kind", w, ["LOAD", "SHUNT"], "LOAD")
         if not _txt(r.get("at")):
             raise InputError("%s: At is missing -- the bus of this %s" % (w, kind.lower()))
-        at = net.find(_txt(r.get("at")), w + " At")
+        ref = _txt(r.get("at"))
+        if ref.upper() not in net.alias and ref.upper() in det_nodes:
+            at = net.find(det_nodes[ref.upper()], w + " At")
+            net.notes.append("NOTE: %s: %s is a node of the DETAILED model -- in this SMIB model the %s is at %s, "
+                             "the far end of its collector's equivalent" % (w, ref, kind.lower(), at))
+        else:
+            at = net.find(ref, w + " At")
         if _txt(r.get("at")).upper() in net.moved:
             net.notes.append("NOTE: %s: %s -- in the DETAILED model %s, the collector's root" % (
                 w, _txt(r.get("at")), at))
@@ -2460,6 +2645,7 @@ def build_network(inp, log):
             net.loads.append({"bus": at, "mw": _num(r, "mw", w, 0.0), "mvar": _num(r, "mvar", w, 0.0),
                               "name": nm, "where": w})
         else:
+            _unused(net.notes, r, ("mw",), w, "a SHUNT is MVAr only (a LOAD takes MW)", {"mw": 0.0})
             mvar = _num(r, "mvar", w, required=True)
             if mvar == 0:
                 net.notes.append("NOTE: %s: shunt %s of 0 MVAr -- not used" % (w, nm))
@@ -2508,8 +2694,7 @@ def build_mpt(net, r, f):
     vm = _VG.match((vector or "").replace(" ", ""))
     turns = re.findall(r"(yn|y|d|zn|z)(\d{1,2})", vm.group(2)) if vm else []
     if nw == 2 and kv3 is not None:
-        net.notes.append("NOTE: %s: Windings 2 -- its TV kV (and the other three-winding values) not used" % w)
-        kv3 = None
+        kv3 = None                                   # its TV kV and other three-winding values: said below
     if nw == 3 and kv3 is None:
         kv3 = kv2
         net.notes.append("NOTE: %s: Windings 3, no TV kV -- the TV winding at the LV's %g kV (a split LV winding)"
@@ -2527,7 +2712,7 @@ def build_mpt(net, r, f):
     tap = _num(r, "tap", w, 1.0, positive=True)
     count = _int(r, "count", w, 1, minimum=1)
     hv = net.find("HV", w)
-    tie = line_data(r, "tie_", net.kv("HV"), net.sb, f, w + " tie")
+    tie = line_data(r, "tie_", net.kv("HV"), net.sb, f, w + " tie", net.notes)
     if tie:
         net.notes.extend(tie["notes"])
         hv = net.add_bus(name + ":HV", net.kv("HV"), w)
@@ -2544,12 +2729,21 @@ def build_mpt(net, r, f):
               "nll_pct": _num(r, "nll_pct", w, 0.0), "im_pct": _num(r, "im_pct", w, 0.0),
               "x_r": _num(r, "x_r", w)}
     if kv3 is None:
+        _unused(net.notes, r, ("tv_kv", "lv_mva", "tv_mva", "z_ht_pct", "z_lt_pct", "base_ht_mva", "base_lt_mva"), w,
+                "two windings: they are three-winding values")
+        z = _num(r, "z_hl_pct", w, required=True, positive=True)
+        zb = _num(r, "base_hl_mva", w, mva, positive=True)
+        if abs(zb - mva) > 1e-9 * mva:               # Z on a base of its own (ONAN ...): on its MVA here
+            net.notes.append("NOTE: %s: Z HV-LV %g %% on %g MVA = %.6g %% on its MVA %g" % (w, z, zb, z * mva / zb,
+                                                                                         mva))
+            z = z * mva / zb
         d = dict(common)
-        d.update({"hv": hv, "lv": lv, "mva": mva, "z_pct": _num(r, "z_hl_pct", w, required=True, positive=True),
+        d.update({"hv": hv, "lv": lv, "mva": mva, "z_pct": z,
                   "load_loss_kw": _num(r, "load_loss_kw", w), "kv1": kv1, "kv2": kv2,
                   "rate": _num(r, "rate_mva", w, mva)})
         add_tx2(net, d)
     else:
+        _unused(net.notes, r, ("load_loss_kw",), w, "three windings: each R from its X/R (the load loss is for two)")
         tv = net.add_bus(name + ":TV", kv3, w)
         d = dict(common)
         d.update({"hv": hv, "lv": lv, "tv": tv, "kv1": kv1, "kv2": kv2, "kv3": kv3, "mva1": mva,
@@ -2719,19 +2913,33 @@ def build_generator(net, g, feeders, cables, unit_mw, used, log):
     if src and os.path.splitext(src)[1] and not os.path.isfile(src):
         net.notes.append("CHECK: %s: %s %s is not on this PC -- the PSCAD build looks for it there" % (
             w, _label("pscad_source"), src))
+    udm_ports_check(g, net.notes)
     at = net.find(_txt(r.get("connect")), w + " Connect to")
     g["connect"] = at
     rows = feeders.get(name.upper())
     mode = _choice(r, "collector", w, ["FEEDERS", "EQUIVALENT", "NONE"], None)
     if mode is None:
         mode = "FEEDERS" if rows else ("EQUIVALENT" if _txt(r.get("coll_x")) or _txt(r.get("coll_r")) else "NONE")
+    if mode != "EQUIVALENT":                         # what this row gives that its model does not use: said
+        _unused(net.notes, r, ("coll_r", "coll_x", "coll_b", "coll_units"), w,
+                "Collector %s (they are for EQUIVALENT)" % mode, {"coll_units": "pu"})
+    if _txt(r.get("unit_qmax_mvar")) is not None:
+        _unused(net.notes, r, ("unit_pf",), w, "'Unit Qmax' is given (Unit PF sets Qmax where it is blank)",
+                {"unit_pf": 0.95})
+    if g["q_mode"] == "share":
+        _unused(net.notes, r, ("fixed_q_mvar", "fixed_pf"), w, "Q mode share (they are for Q mode fixed)")
+    elif _txt(r.get("fixed_q_mvar")) is not None:
+        _unused(net.notes, r, ("fixed_pf",), w, "'Fixed Q MVAr' is given")
+    if not (g["pscad"]["definition"] or g["pscad"]["iid"]):
+        _unused(net.notes, r, ("pscad_ac_port", "pscad_library"), w,
+                "no vendor model (UDM): 'PSCAD definition' is blank")
     kv = net.kv(at)
     mv = name + ":MV"
     if mode == "FEEDERS":
         if not rows:
             raise InputError("%s: Collector FEEDERS but Feeders has no rows for %s" % (w, name))
         used.add(name.upper())
-        res = wecc_collector(name, rows, cables, kv, net.sb, net.f, unit_mw, name, log)
+        res = wecc_collector(name, rows, cables, kv, net.sb, net.f, unit_mw, name, net.notes.append)
         res.update({"root": at, "own": name, "end": mv})
         net.colls[name] = res
         line = {"r": res["r"], "x": res["x"], "b": res["b"], "R": res["R"], "X": res["X"], "B": res["B"],
@@ -3022,11 +3230,14 @@ def _unit_group(net, g, name, units, at, where):
 def thevenin(net, pl, gens):
     W = "Plant"
     rated = _num(pl, "scr_base_mw", W, None, positive=True) or sum(max(g["pmax"], 0.0) for g in gens)
-    x_r = _num(pl, "grid_x_r", W, None)
-    r_pu, x_pu = _num(pl, "grid_r_pu", W), _num(pl, "grid_x_pu", W)
+    x_r = _num(pl, "grid_x_r", W, None, positive=True)
+    r_pu, x_pu = _num(pl, "grid_r_pu", W), _num(pl, "grid_x_pu", W, None, positive=True)
+    if r_pu is not None and r_pu < 0:
+        raise InputError("Plant: 'Grid R' must be 0 or more (it is %g)" % r_pu)
     sc = _num(pl, "grid_sc_mva", W, None, positive=True)
     scr = _num(pl, "grid_scr", W, None, positive=True)
     if x_pu is not None:
+        _unused(net.notes, pl, ("grid_scr", "grid_sc_mva", "grid_x_r"), W, "the grid is set by 'Grid R' and 'Grid X'")
         r_pu = r_pu or 0.0
         how = "R and X given"
         z = math.hypot(r_pu, x_pu)
@@ -3035,12 +3246,16 @@ def thevenin(net, pl, gens):
         x_r = x_pu / r_pu if r_pu else float("inf")
     else:
         if sc is None and scr is None:
-            raise InputError("Plant: Grid SCR (or Grid short-circuit MVA, or Grid R / X) is missing")
+            raise InputError("Plant: 'Grid SCR' (or 'Grid short-circuit MVA', or 'Grid R' / 'Grid X') is missing")
+        _unused(net.notes, pl, ("grid_r_pu",), W, "'Grid R' goes with 'Grid X' (instead of the SCR), which is blank")
         if x_r is None:
-            raise InputError("Plant: Grid X/R is missing")
+            raise InputError("Plant: 'Grid X/R' is missing")
+        if sc is not None:
+            _unused(net.notes, pl, ("grid_scr",), W, "'Grid short-circuit MVA' %g sets the grid (an SCR of %.4g)" % (
+                sc, sc / rated if rated else float("nan")))
         if sc is None:
             if not rated:
-                raise InputError("Plant: the SCR needs an SCR base (the generators have no Pmax)")
+                raise InputError("Plant: the SCR needs an 'SCR base' (the generators have no Pmax)")
             sc = scr * rated
             how = "SCR given"
         else:
@@ -3071,7 +3286,15 @@ def control(net, pl):
          "plant_ctrl": _choice(pl, "plant_ctrl", W, ["REPC_A", "REPC_B"], "REPC_A"),
          "regc_repc": _choice(pl, "regc_repc", W, ["standard", "USRMDL"], "standard")}
     if c["mode"] == "PF" and not 0.0 < abs(c["pf_poi"]) <= 1.0:
-        raise InputError("Plant: PF at POI must be between 0 and 1 (+ lagging, - leading)")
+        raise InputError("Plant: 'PF at POI' must be between 0 and 1 (+ lagging, - leading)")
+    for k, key, used in (("v_poi", "v_poi_pu", True), ("v_grid", "v_grid_pu", c["mode"] == "V")):
+        if used and not 0.5 <= c[k] <= 1.5:
+            raise InputError("Plant: %s = %g pu -- a voltage in pu (0.9 .. 1.1), not in kV" % (_label(key), c[k]))
+        if used and not 0.9 <= c[k] <= 1.1:
+            net.notes.append("CHECK: Plant: %s %g pu -- outside 0.9 .. 1.1" % (_label(key), c[k]))
+    _unused(net.notes, pl, {"Q": ("pf_poi", "v_grid_pu"), "PF": ("q_poi_mvar", "v_grid_pu"),
+                            "V": ("q_poi_mvar", "pf_poi")}[c["mode"]], W, "Control mode %s" % c["mode"],
+            {"pf_poi": 1.0, "v_grid_pu": 1.0, "q_poi_mvar": 0.0})
     c["pscad"] = {"time_step_us": _num(pl, "pscad_time_step_us", W, 10.0, positive=True),
                   "duration_s": _num(pl, "pscad_duration_s", W, 5.0, positive=True),
                   "plot_step_us": _num(pl, "pscad_plot_step_us", W, 100.0, positive=True),
@@ -3136,7 +3359,7 @@ def number_buses(net, pl, rows):
                 nxt += 1
             b["num"] = nxt
         if b["num"] > 999997:
-            raise InputError("Plant: bus numbers run past 999997 -- a lower First bus number")
+            raise InputError("Plant: bus numbers run past 999997 -- a lower 'First bus number'")
         b["name"] = names.get(role) or b["name"] or role.replace("C:", "").replace(":", "_")[:12]
     seen = {}
     for role in names:                            # names given in Bus_Numbers stay as given
@@ -3304,7 +3527,10 @@ def newton(Y, slack, vslack, sinj, v0=None, tol=1e-10, itmax=40):
                     J[a][m + b_] = vm[i] * (G * c + B * s)
                     J[m + a][b_] = -vm[i] * vm[k] * (G * c + B * s)
                     J[m + a][m + b_] = vm[i] * (G * s - B * c)
-        dx = _lin_solve(J, mis)
+        try:
+            dx = _lin_solve(J, mis)
+        except ZeroDivisionError:                    # singular: no solution from here (said by the caller)
+            return V, False, it
         for a, k in enumerate(pq):
             ang = va[k] + dx[a]
             mag = vm[k] + dx[m + a]
@@ -3316,6 +3542,9 @@ def newton(Y, slack, vslack, sinj, v0=None, tol=1e-10, itmax=40):
 
 class SolveError(Exception):
     pass
+
+
+TARGET_FIELDS = {"P": "P at POI", "Q": "Q at POI", "PF": "PF at POI", "V": "POI voltage"}   # what each POI target is
 
 
 def ramped(Y, slack, vslack, sinj, steps=10):
@@ -3426,8 +3655,8 @@ def operating_point(net, log):
                    "that branch's data (a line's length and its unit, R and X; a transformer's Z %% and MVA)" % (
                        100.0 * share_ok, share_ok * p_all, p_all, bottleneck(net, roles, idx, Vg))
                    if Vg is not None else
-                   " -- not even 10%% of it solves: a branch's data is far off (a length and its unit, R and X, "
-                   "a transformer's Z %% and MVA)")
+                   " -- not even 10% of it solves: a branch's data is far off (a length and its unit, R and X, "
+                   "a transformer's Z % and MVA)")
             raise SolveError("the plant's load flow does not converge (alpha %.3f, Q %.1f MVAr)%s%s" % (
                 alpha, beta, why, (" -- %s %s %s not solve on %s own either: check the Feeders lengths and their "
                                    "unit (km, mi, kft, m, ft) and the cables' R and X" % (
@@ -3444,6 +3673,11 @@ def operating_point(net, log):
     if c["p_poi"] is not None:
         if not any(abs(g["dispatch"]) > 0 for g in net.gens):
             raise InputError("Plant: P at POI is given but every generator's dispatch is 0")
+        hi, lo = sum(g["pmax"] for g in net.gens), sum(g["pmin"] for g in net.gens)
+        if not lo - 1e-6 <= c["p_poi"] <= hi + 1e-6:    # beyond the plant: no load flow can give it
+            raise InputError("Plant: 'P at POI' %g MW is %s the generators' %s, %g MW in all -- the plant cannot "
+                             "deliver it" % (c["p_poi"], "above" if c["p_poi"] > hi else "below",
+                                             "Pmax" if c["p_poi"] > hi else "Pmin", hi if c["p_poi"] > hi else lo))
         targets.append("P")
     free_v = not share and c["mode"] == "V"           # nothing holds the POI: the grid sets its voltage
     if share or free_v:
@@ -3492,7 +3726,11 @@ def operating_point(net, log):
         try:
             dx = _lin_solve(Jt, [-v for v in r])
         except ZeroDivisionError:
-            raise SolveError("the POI targets cannot be met (no generator moves them)")
+            raise SolveError("Plant: the POI targets (%s) cannot be met -- no generator moves them: check 'P at POI' "
+                             "against the generators' Dispatch MW, the Control mode and its target, and that a "
+                             "generator has Q mode share" % ", ".join(
+                                 TARGET_FIELDS[t]
+                                 for t in targets))
         step = 1.0
         for _k in range(8):
             xn = [x[j] + step * dx[j] for j in range(len(x))]
@@ -3505,7 +3743,11 @@ def operating_point(net, log):
             step *= 0.5
         x = xn
     else:
-        raise SolveError("the POI targets are not met after 60 iterations: residuals %s" % r)
+        raise SolveError("Plant: the POI targets (%s) are not met after 60 iterations (still %s off) -- check them "
+                         "against what the plant can give: 'P at POI' against the generators' Pmax, the Control "
+                         "mode's target against their Q range" % (", ".join(
+                             TARGET_FIELDS[t]
+                             for t in targets), ", ".join("%.3g" % v for v in r)))
     V, s_grid, e, pq = sol
     rot = cmath.rect(1.0, -cmath.phase(e))                     # the infinite bus at 0 degrees
     for role, k in idx.items():
@@ -3557,6 +3799,11 @@ def operating_point(net, log):
         if not 0.9 <= vt <= 1.1:
             net.notes.append("WARNING: %s terminal voltage %.4f pu -- outside 0.9 .. 1.1: check the transformers' kV "
                              "and taps, and the POI voltage" % (g["name"], vt))
+    terms = set(g["bus"] for g in net.gens)
+    for role, b in net.bus.items():                  # every other bus of the plant too
+        if role != "IB" and role not in terms and not 0.9 <= b.get("vm", 1.0) <= 1.1:
+            net.notes.append("WARNING: bus %s at %.4f pu -- outside 0.9 .. 1.1: check the transformers' kV and taps, "
+                             "and the POI voltage" % (role, b["vm"]))
     return net.op
 
 
@@ -4817,6 +5064,13 @@ def pscad_model(net, inp):
     comps, net.pscad_groups = pscad_layout(comps)
     _turn(comps)
     net.pscad_comps = comps
+    w = max([max(c["x"], c.get("x3", c["x"])) for c in comps] or [0]) + 12      # the page it needs, as the
+    h = max([max(c["y"], c.get("y3", c["y"])) for c in comps] or [0]) + 16      # build script sizes it
+    if max(w, h) > PSCAD_PAGE and not any("PSCAD: the drawing" in n for n in net.notes):
+        net.notes.append("CHECK: PSCAD: the drawing is %d x %d grid units -- past PSCAD's largest page (%d x %d): what "
+                         "lies beyond it is not shown, to be moved by hand (the build log names it)%s" % (
+                             w, h, PSCAD_PAGE, PSCAD_PAGE, "; the Equivalent (SMIB) model of the plant is far smaller"
+                             if net.model == "DETAILED" else ""))
     return comps
 
 
@@ -4828,6 +5082,7 @@ PSCAD_W3 = 8          # the same where PSCAD's R, L, C take the wire's three pha
 PSCAD_H3 = 10
 NAME_CH = 0.42        # a node name's width per character (grid units) at PSCAD's default zoom
 PSCAD_TALL = 720       # a drawing this tall (grid units) goes on in another column: PSCAD's largest page is 800
+PSCAD_PAGE = 800       # PSCAD's largest page (100 x 100 inches) in grid units
 SYMBOL_HALF = {"XFMR2": 4, "XFMR3": 4, "PI": 3, "METER": 2, "SCALER": 2, "SOURCE": 3, "VENDOR": 3}   # half widths
 
 
@@ -4924,9 +5179,9 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
         for c in others:
             mark = len(order)
             b, r = chain(c, n, cx + gap, cbot + ch)
-            if b > PSCAD_TALL and k:             # past the page: a column of its own right of all so far, joined to
-                for c2 in order[mark:]:          # the rest of n by n's name (a node label)
-                    placed.discard(id(c2))
+            if b > PSCAD_TALL and (k or cbot > y + ch):   # past the page below what is there already: a column
+                for c2 in order[mark:]:          # of its own right of all so far, joined to the rest of n by n's
+                    placed.discard(id(c2))       # name (a node label)
                     c2.pop("parts", None)
                 del order[mark:]
                 part, k, cx, cbot = part + 1, 0, right + room(n) + gap, y
@@ -7241,19 +7496,41 @@ def _psse_steps(net, recs, inp, files, out, work, log):
 # ============================================================================
 # MAIN
 # ============================================================================
-def read_input(path):
+def read_input(path, keep_comments=False):
+    """A project (.json) or workbook read -> the inputs. keep_comments (the GUI): the rows starting with # (set
+       aside) kept as they are, so a save keeps them -- the build skips them."""
     if path.lower().endswith(".json"):
-        with io.open(path, encoding="utf-8") as fh:
-            inp = json.load(fh)
+        try:
+            with io.open(path, encoding="utf-8") as fh:
+                inp = json.load(fh)
+        except ValueError as e:                      # not JSON (or not UTF-8): said plainly
+            raise InputError("%s cannot be read as a project (.json): %s -- open a project this tool saved, or "
+                             "a workbook (.xlsx)" % (path, e))
+        if not isinstance(inp, dict) or not isinstance(inp.get("plant", {}), dict):
+            raise InputError("%s is no project of this tool (no 'plant' in it)" % path)
+        unknown, tables = [], dict((t[1], t) for t in TABLES)
+        for k in inp:                                # what this version does not know: said, not dropped unseen
+            if k != "plant" and k not in tables and not k.startswith("_") and inp[k] not in (None, [], {}, ""):
+                unknown.append("'%s' (no sheet of this name)" % k)
+        known = set(f[0] for f in PLANT_FIELDS)
+        unknown += ["Plant: '%s'" % k for k, v in (inp.get("plant") or {}).items()
+                    if k not in known and not k.startswith("_") and _txt(v) is not None]
         for key in ["plant"] + [t[1] for t in TABLES]:
             inp.setdefault(key, {} if key == "plant" else [])
         for sheet, key, cols in TABLES:             # a row whose first value starts with # is skipped, as in Excel
-            inp[key] = [r for r in inp[key] if not _skip([r.get(c[0]) for c in cols])]
+            if not isinstance(inp[key], list) or not all(isinstance(r, dict) for r in inp[key]):
+                raise InputError("%s: '%s' is not a list of rows" % (path, key))
+            inp[key] = [r for r in inp[key] if keep_comments and any(_txt(v) for v in r.values()) or
+                        not _skip([r.get(c[0]) for c in cols])]
+            names = set(c[0] for c in cols)
+            for col in sorted(set(c for r in inp[key] for c, v in r.items()
+                                  if c not in names and not c.startswith("_") and _txt(v) is not None)):
+                unknown.append("%s: column '%s'" % (sheet, col))
             for k, r in enumerate(inp[key]):
                 r.setdefault("_where", "%s row %d" % (sheet, k + 1))
-        inp["_source"], inp["_unknown"] = path, []
+        inp["_source"], inp["_unknown"] = path, unknown
         return inp
-    return parse_workbook(read_xlsx(path), path)
+    return parse_workbook(read_xlsx(path), path, keep_comments)
 
 
 def example_roles():
@@ -8284,6 +8561,10 @@ def gui(start=None):
                 self.tree.selection_set(str(select))
                 self.tree.focus(str(select))
                 self.tree.see(str(select))
+            if "vis_keys" in app:                        # a column now holding a value of the user's shows
+                vis = app["vis_keys"](self)
+                if vis != getattr(self, "vis", None):
+                    self.set_vis(vis)
 
         def current(self):
             sel = self.tree.selection()
@@ -8424,9 +8705,14 @@ def gui(start=None):
                                 g.refresh()
                         set_status("%s renamed %s: %d place(s) using it changed too" % (was, v, n))
                     if self.sheet == "Generators" and key == "type":       # model choices its Type does not take
+                        gone, lab = [], dict((c[0], c[1]) for c in self.cols)
                         for k, (ok, _doc) in MODEL_CHOICE.items():
                             if self.rows[i].get(k) and self.rows[i][k] not in ok.get(v.upper(), ()):
-                                self.rows[i].pop(k)
+                                gone.append("'%s' %s" % (lab.get(k, k), self.rows[i].pop(k)))
+                        if gone:                                  # said, not dropped unseen
+                            set_status("Type %s: %s cleared -- not a choice for %s" % (v, ", ".join(gone), v))
+                            out("[smib] %s row %d: Type %s -- %s cleared (not a choice for %s)\n" % (
+                                self.sheet, i + 1, v, ", ".join(gone), v))
                     self.tree.item(str(i), values=self.shown(self.rows[i]))
                     self.sums()
                     dirty()
@@ -8982,11 +9268,13 @@ def gui(start=None):
             cv.pack(side="left", fill="both", expand=True)
             sb2.pack(side="left", fill="y")
             ticks = collections.OrderedDict()
+            mine = set(x["label"] for x in state["secs"] if udm_has_set(x))
             for lab in state["all"]:
                 v = tk.BooleanVar(value=lab in state["labels"])
                 ticks[lab] = v
                 depth = lab.count("  >  ")
-                tk.Checkbutton(inner, text=lab.split("  >  ")[-1] if depth else lab, variable=v, anchor="w",
+                tk.Checkbutton(inner, text=(lab.split("  >  ")[-1] if depth else lab) + (
+                    "   (holds values of yours: always listed)" if lab in mine else ""), variable=v, anchor="w",
                                background="white").pack(fill="x", padx=(6 + 22 * depth, 6))
             row = ttk.Frame(top)
             row.pack(fill="x", padx=12, pady=10)
@@ -9302,7 +9590,7 @@ def gui(start=None):
         if not path:
             return
         try:
-            inp = read_input(path)
+            inp = read_input(path, keep_comments=True)
         except Exception as e:
             return messagebox.showerror("Open", "%s:\n\n%s" % (path, e), parent=root)
         load(inp, path if path.lower().endswith(".json") else None,
@@ -9310,6 +9598,11 @@ def gui(start=None):
              else "imported %s -- Save makes it a project (.json)" % path)
         if inp.get("_unknown"):
             out("[smib] not used from %s: %s\n" % (path, "; ".join(inp["_unknown"])))
+            messagebox.showwarning("Open", "%d item(s) in this file are not inputs of this version -- they are not "
+                                   "used, and Save leaves them out:\n\n%s%s" % (
+                                       len(inp["_unknown"]), "\n".join("- " + u for u in inp["_unknown"][:12]),
+                                       "\n- ... (the Output tab lists them all)" if len(inp["_unknown"]) > 12
+                                       else ""), parent=root)
 
     def new(example):
         if not ask_save_changes():
@@ -9471,7 +9764,7 @@ def gui(start=None):
             if g:
                 n = int(m.group(2)) - 1                   # the n-th row with something in it
                 full = [i for i, r in enumerate(g.rows) if any(v for v in r.values()) and
-                        not str(r.get(g.keys[0]) or "").startswith("#")]
+                        not _skip([r.get(k) for k in g.keys])]          # as the build numbers them
                 if 0 <= n < len(full):
                     g.refresh(full[n])
                 named = [k for k, c in enumerate(g.cols) if c[1].lower() in err.lower()]
@@ -9481,16 +9774,25 @@ def gui(start=None):
                 g.show_help(g.keys[g.col])
         elif (err or "").startswith("Plant"):
             nb.select(nb.tabs()[0])
-            for key, item, _u2, _n, _c in PLANT_FIELDS:
-                if "'%s'" % item in err:
-                    widgets[key].focus_set()
-                    break
+            hit = [f for f in PLANT_FIELDS if "'%s'" % f[1] in err] or \
+                [f for f in PLANT_FIELDS if re.search(r"\b%s\b" % re.escape(f[1]), err.split(" -- ")[0])]
+            if hit:                                   # the field it names (quoted, else the longest named)
+                key = max(hit, key=lambda f: len(f[1]))[0]
+                if not shown_view("Plant", key):
+                    show_all()
+                widgets[key].focus_set()
+        else:                                         # 'Feeders: ...', 'Generators (collector ...)': its page
+            m2 = re.match(r"^(\w+)\b", err or "")
+            if m2 and m2.group(1) in tabs:
+                if not shown_view(m2.group(1)):
+                    show_all()
+                nb.select(nb.tabs()[tabs.index(m2.group(1))])
 
     def check():
         p = save_temp()
 
         def job():
-            msgs, notes, warns = [], 0, []
+            msgs, notes, warns, unused = [], 0, [], []
             for x, inp in plant_cases(read_input(p)):        # each set where Plant fields give several values
                 net = build_network(inp, Log())
                 operating_point(net, Log())
@@ -9505,16 +9807,20 @@ def gui(start=None):
                 for n in net.notes:
                     if n.startswith(("WARNING", "CHECK")) and n not in warns:
                         warns.append(n)
+                    elif "not used" in n and n not in unused:     # given, but not in this model: said here too
+                        unused.append(n)
                 msg = ("%sInputs read -- %s model: %d buses, %d machines; P at POI %.3f MW, Q %.3f MVAr, infinite bus "
                        "%.5f pu" % ("%s: " % x if x else "", net.model, len(net.bus), len(net.gens), s.real,
                                     s.imag, net.op["e"]))
                 print("[smib] " + msg)
                 msgs.append(msg)
-            if warns:                                    # what to look at, in the dialog itself
-                return {"ok": True, "warn": True, "msg": "%d thing(s) to check:\n\n%s%s\n\n%s" % (
-                    len(warns), "\n".join("- " + w.split(": ", 1)[-1] for w in warns[:8]),
-                    "\n- ... %d more in the Output tab" % (len(warns) - 8) if len(warns) > 8 else "",
-                    "\n".join(msgs))}
+            if warns or unused:                          # what to look at, in the dialog itself
+                parts = [("%d thing(s) to check:" % len(warns), warns),
+                         ("Given but not used (%d):" % len(unused), unused)]
+                return {"ok": True, "warn": True, "msg": "\n\n".join("%s\n%s%s" % (
+                    head, "\n".join("- " + w.split(": ", 1)[-1] for w in got[:8]),
+                    "\n- ... %d more in the Output tab" % (len(got) - 8) if len(got) > 8 else "")
+                    for head, got in parts if got) + "\n\n" + "\n".join(msgs)}
             return {"ok": True, "msg": "Inputs OK -- nothing to check.\n\n" + "\n".join(msgs) + (
                 "\n%d note(s) in the Output tab" % notes if notes else "")}
         run(job, "CHECK")
@@ -9582,14 +9888,38 @@ def gui(start=None):
     # ---------------------------------------------------------------- the simple view, or every field
     allv = tk.BooleanVar(value=False)
 
+    plant_note = dict((f[0], f[3]) for f in PLANT_FIELDS)
+
+    def holds_data(sheet, key):
+        """Whether a field the simple view would hide holds a value of the user's (not its blank's default) --
+           then it shows: no value is out of sight (the Build: models are on the toolbar)."""
+        if sheet == "Plant":
+            return key in app["vars"] and not key.startswith("out_") and _says_more(plant_note.get(key),
+                                                                                     app["vars"][key].get())
+        g = next((x for x in app["grids"].values() if x.page == sheet), None)
+        if g is None or key not in g.keys:
+            return False
+        note = g.cols[g.keys.index(key)][2]
+        if key == "unit_qmin_mvar":                  # blank = -Qmax: its row's own
+            return any(_says_more("blank = %s" % (-float(r["unit_qmax_mvar"])) if _isnum(r.get("unit_qmax_mvar"))
+                                  else note, r.get(key)) for r in g.rows)
+        return any(_says_more(note, r.get(key)) for r in g.rows)
+
     def shown_view(sheet, key=None):
-        """Whether a tab (and a field of it) shows now."""
+        """Whether a tab (and a field of it) shows now: in the simple view, the fields most plants need and any
+           holding a value of the user's."""
         if allv.get():
             return True
         g = next((x for x in app["grids"].values() if x.page == sheet), None)
-        if key is None:
-            return sheet in SIMPLE_TABS or bool(g and any(any(v not in (None, "") for v in r.values()) for r in g.rows))
-        return sheet not in SIMPLE or key in SIMPLE[sheet]
+        if key is None:                          # rows set aside (#) only: nothing of the model's hidden
+            return sheet in SIMPLE_TABS or bool(g and any(any(v not in (None, "") for v in r.values()) and
+                                                          not _skip([r.get(k) for k in g.keys]) for r in g.rows))
+        return sheet not in SIMPLE or key in SIMPLE[sheet] or holds_data(sheet, key)
+
+    def vis_keys(g):
+        """The columns a page shows now."""
+        return [k for k in g.keys if shown_view(g.page, k) and k in PAGE_COLS.get(g.page, g.keys)]
+    app["vis_keys"] = vis_keys
 
     def apply_view(*_a):
         """The simple view -- the fields most plants need (SIMPLE), the tabs they are on and any tab with rows of
@@ -9601,7 +9931,7 @@ def gui(start=None):
             on = any(shown_view("Plant", k) for k, s2 in sec_of.items() if s2 == sk)
             lab.grid() if on else lab.grid_remove()
         for g in app["grids"].values():
-            g.set_vis([k for k in g.keys if shown_view(g.page, k) and k in PAGE_COLS.get(g.page, g.keys)])
+            g.set_vis(vis_keys(g))
         for t in nb.tabs():
             nb.tab(t, state="normal" if shown_view(nb.tab(t, "text")) else "hidden")
         if "nav_view" in app:
@@ -9737,9 +10067,12 @@ def gui(start=None):
         start = found[0] if found else None
     if start:
         try:
-            load(read_input(start), start if start.lower().endswith(".json") else None,
+            inp0 = read_input(start, keep_comments=True)
+            load(inp0, start if start.lower().endswith(".json") else None,
                  "opened %s" % start if start.lower().endswith(".json") else
                  "imported %s -- Save makes it a project (.json)" % start)
+            if inp0.get("_unknown"):
+                out("[smib] not used from %s (Save leaves them out): %s\n" % (start, "; ".join(inp0["_unknown"])))
         except Exception as e:
             load(EXAMPLE, None, "%s could not be read (%s) -- the example plant" % (start, e))
     else:
