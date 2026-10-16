@@ -5092,6 +5092,8 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
        below those. Sets every component's x, y (grid units) and its upstream node ("in"); returns the components
        in drawing order and the runs of R, L, C -- [{kind series | shunt, members [(tag, in, out)], a, b}] -- that
        the build script draws three times over, between breakouts, where PSCAD's R, L and C are single-phase."""
+    tall = max([int(math.ceil(c["sym_h"] / 2.0)) + 2 for c in comps if c.get("sym_h")] or [0])
+    ch = max(ch, 2 * tall)                       # rows far enough apart for the tallest symbol (a vendor model's)
     nodes = dict((id(c), [p["node"] for p in c["ports"] if p["node"] != "GND"]) for c in comps)
     at = collections.defaultdict(list)
     for c in comps:
@@ -5193,7 +5195,7 @@ def pscad_layout(comps, root="IB", cw=PSCAD_W, ch=PSCAD_H, gap=PSCAD_GAP, pad=PS
             bottom, right = max(bottom, cbot), max(right, r)
         return bottom, right
 
-    x0, y0 = 20, 10
+    x0, y0 = 20, max(10, tall + 2)                # (a tall symbol on the first row: inside the page)
     for c in [c for c in at[root] if len(nodes[id(c)]) == 1]:
         if not any(p["node"] == "GND" for p in c["ports"]):
             put(c, x0 - cw // 2 - 6, y0, None)      # the infinite source, left of its bus: room for its name
