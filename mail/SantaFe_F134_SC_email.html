@@ -26,14 +26,8 @@
 
 <p><b>2. Why it happens</b></p>
 
-<p>The Buckner line itself is short (about 12 miles), so the line is not the limitation. The limitation is the strength of the grid seen from the POI once both Spearville circuits are out:</p>
-<ul style="margin-top:0;margin-bottom:0;">
-  <li><b>Weaker connection:</b> losing Spearville removes the plant&rsquo;s strongest path to the grid. All the plant&rsquo;s output must flow through Buckner and the network beyond it, so the impedance between the POI and the strong part of the system rises sharply and the short-circuit ratio at the POI falls.</li>
-  <li><b>Higher reactive power losses:</b> at 984 MW, the plant&rsquo;s main transformers, the collector system and the network beyond Buckner absorb a large amount of reactive power. These losses rise with the square of the current, so they rise further as the voltage falls.</li>
-  <li><b>Operating at the voltage-stability limit:</b> for this outage, 984 MW puts the plant at the &ldquo;nose&rdquo; of its power&ndash;voltage curve. Near that point, a small increase in output causes a large drop in voltage.</li>
-  <li><b>Inverter current limit:</b> after the fault, the inverters ramp back to full active power. At a reduced voltage this needs more current, and that uses up most of the inverters&rsquo; current capability, leaving little room for reactive current to support the voltage. The POI voltage therefore stalls below 0.90 pu, and the SGF under-voltage protection trips the units.</li>
-</ul>
-<p>At 900 MW, the reactive power losses are lower and the inverters have more reactive capability available. The voltage recovers above 0.90 pu, and the fault meets every criterion.</p>
+<p>With both Spearville circuits out, the POI becomes a weak bus. At 984 MW, the transformers and the network beyond Buckner absorb more reactive power than the inverters can supply at full active current, so the POI voltage stalls below 0.90 pu and the SGF units trip on under-voltage.<br>
+At 900 MW, the reactive losses are lower and the inverters have more reactive headroom, so the voltage recovers above 0.90 pu and the fault meets every criterion.</p>
 
 <p><b>3. Options</b></p>
 <ol style="margin-top:0;margin-bottom:0;">
