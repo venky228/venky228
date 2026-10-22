@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Santa Fe F134 email</title>
+</head>
+<body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000000;background:#ffffff;">
+
+<p><b>Subject:</b> Santa Fe &ndash; Fault F134 Results and Short Circuit Update</p>
+
+<p>Hi Milad,</p>
+
+<p>Thank you for your time on the call. As requested, here is a more detailed explanation of the Santa Fe fault F134 result, followed by an update on the short circuit results.</p>
+
+<p><b>1. Fault F134 &ndash; what happens</b></p>
+
+<p>F134 is a stuck-breaker fault at Spearville 345 kV (bus 531469). When the fault is cleared, both Spearville 345 kV circuits are out of service. The Santa Fe POI (bus 765911) is then connected to the system only through the single 345 kV line to Buckner (bus 531501).</p>
+
+<p>In Scenario 1, the EGF and SGF together deliver 983.8 MW at the POI. Under this outage:</p>
+<ul style="margin-top:0;margin-bottom:0;">
+  <li>the POI voltage does not recover above 0.90 pu after the fault is cleared</li>
+  <li>the four SGF units trip on their under-voltage protection</li>
+  <li>the plant output falls from about 984 MW to about 312 MW</li>
+</ul>
+<p>The same fault meets all SPP criteria in the base case and in Scenario 2 (SGF alone at 502 MW).</p>
+
+<p><b>2. Why it happens</b></p>
+
+<p>The Buckner line itself is short (about 12 miles), so the line is not the limitation. The limitation is the strength of the grid seen from the POI once both Spearville circuits are out:</p>
+<ul style="margin-top:0;margin-bottom:0;">
+  <li><b>Weaker connection:</b> losing Spearville removes the plant&rsquo;s strongest path to the grid. All the plant&rsquo;s output must flow through Buckner and the network beyond it, so the impedance between the POI and the strong part of the system rises sharply and the short-circuit ratio at the POI falls.</li>
+  <li><b>Higher reactive power losses:</b> at 984 MW, the plant&rsquo;s main transformers, the collector system and the network beyond Buckner absorb a large amount of reactive power. These losses rise with the square of the current, so they rise further as the voltage falls.</li>
+  <li><b>Operating at the voltage-stability limit:</b> for this outage, 984 MW puts the plant at the &ldquo;nose&rdquo; of its power&ndash;voltage curve. Near that point, a small increase in output causes a large drop in voltage.</li>
+  <li><b>Inverter current limit:</b> after the fault, the inverters ramp back to full active power. At a reduced voltage this needs more current, and that uses up most of the inverters&rsquo; current capability, leaving little room for reactive current to support the voltage. The POI voltage therefore stalls below 0.90 pu, and the SGF under-voltage protection trips the units.</li>
+</ul>
+<p>At 900 MW, the reactive power losses are lower and the inverters have more reactive capability available. The voltage recovers above 0.90 pu, and the fault meets every criterion.</p>
+
+<p><b>3. Options</b></p>
+<ol style="margin-top:0;margin-bottom:0;">
+  <li><b>Operating limit:</b> limit the combined EGF and SGF output to 900 MW while both Spearville circuits are out. This is a reduction of about 84 MW (8.5&nbsp;%), and only for this outage condition; in normal operation the plant can deliver its full 984 MW. How the limit would be applied (for example, an operating instruction or a protection scheme) would be agreed with SPP and the Transmission Owner.</li>
+  <li><b>Dynamic reactive support:</b> our preliminary analysis indicates that a fast-acting dynamic reactive device (STATCOM or SVC) of 250 to 280 MVAr at the POI would supply the missing reactive power within a few cycles of fault clearing and hold the POI voltage above 0.90 pu. This would allow the full 984 MW under all studied conditions with no violations. The size, type and performance would need to be confirmed in a follow-up study.</li>
+</ol>
+
+<p><b>4. Short circuit update</b></p>
+
+<p style="background:#ffff00;">[Add here the specific update discussed on the call, if any.]</p>
+
+<p>The short circuit results in the report are:</p>
+
+<table cellpadding="5" cellspacing="0" style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:10.5pt;">
+  <tr style="background:#1F3864;color:#ffffff;">
+    <th style="border:1px solid #808080;text-align:left;">Site</th>
+    <th style="border:1px solid #808080;text-align:left;">POI</th>
+    <th style="border:1px solid #808080;text-align:right;">EGF only (kA)</th>
+    <th style="border:1px solid #808080;text-align:right;">EGF + SGF (kA)</th>
+    <th style="border:1px solid #808080;text-align:right;">SGF contribution</th>
+  </tr>
+  <tr>
+    <td style="border:1px solid #808080;">Santa Fe</td>
+    <td style="border:1px solid #808080;">765911, 345 kV</td>
+    <td style="border:1px solid #808080;text-align:right;">13.172</td>
+    <td style="border:1px solid #808080;text-align:right;">13.917</td>
+    <td style="border:1px solid #808080;text-align:right;">0.744 kA (5.65&nbsp;%)</td>
+  </tr>
+  <tr>
+    <td style="border:1px solid #808080;">Iron Star</td>
+    <td style="border:1px solid #808080;">560080, 345 kV</td>
+    <td style="border:1px solid #808080;text-align:right;">11.975</td>
+    <td style="border:1px solid #808080;text-align:right;">12.210</td>
+    <td style="border:1px solid #808080;text-align:right;">0.235 kA (1.96&nbsp;%)</td>
+  </tr>
+  <tr>
+    <td style="border:1px solid #808080;">Empire Prairie</td>
+    <td style="border:1px solid #808080;">761383, 345 kV</td>
+    <td style="border:1px solid #808080;text-align:right;">16.889</td>
+    <td style="border:1px solid #808080;text-align:right;">17.604</td>
+    <td style="border:1px solid #808080;text-align:right;">0.716 kA (4.24&nbsp;%)</td>
+  </tr>
+  <tr>
+    <td style="border:1px solid #808080;">East Fork</td>
+    <td style="border:1px solid #808080;">531429, 115 kV</td>
+    <td style="border:1px solid #808080;text-align:right;">12.598</td>
+    <td style="border:1px solid #808080;text-align:right;">13.293</td>
+    <td style="border:1px solid #808080;text-align:right;">0.694 kA (5.51&nbsp;%)</td>
+  </tr>
+</table>
+
+<ul>
+  <li><b>40 kA threshold:</b> with the SGFs added, no additional bus reaches the 40 kA screening threshold.</li>
+  <li><b>Empire Prairie:</b> near Empire Prairie, twelve buses are already at 40 kA or more in the base case without the SGF; the SGF adds no more than 0.198 kA (0.34&nbsp;%) at these buses.</li>
+  <li><b>East Fork:</b> the existing units are given a sub-transient reactance of 9999 pu in the SPP short circuit data, so they contribute no fault current.</li>
+  <li><b>Detailed results:</b> these are in the workbook linked in Appendix B.</li>
+</ul>
+
+<p>Please let us know if you would like to go through any of this in more detail, or if you would like us to prepare a scope for the dynamic reactive support study.</p>
+
+<p>Best regards,<br>Sandeep</p>
+
+</body>
+</html>
